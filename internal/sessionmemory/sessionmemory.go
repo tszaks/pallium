@@ -776,55 +776,54 @@ func parseRollout(path string) (ParsedSession, error) {
 	p.Session.RolloutSHA256 = sha
 	files := map[string]bool{}
 	tools := map[string]bool{}
-	scanner := bufio.NewScanner(f)
-	// Codex rollout jsonl files can contain very large single-line events
-	// (for example embedded tool output or compacted context). Raise the
-	// scanner limit well above the 64 KiB default so one huge event does not
-	// abort indexing the entire transcript archive.
-	scanner.Buffer(make([]byte, 1024), 100*1024*1024)
+	reader := bufio.NewReader(f)
 	lineNo := 0
-	for scanner.Scan() {
-		lineNo++
-		line := scanner.Bytes()
-		var obj map[string]any
-		if json.Unmarshal(line, &obj) != nil {
-			continue
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			lineNo++
+			var obj map[string]any
+			if json.Unmarshal(line, &obj) == nil {
+				obj = redactObj(obj).(map[string]any)
+				typ := str(obj["type"])
+				if typ == "" {
+					typ = "unknown"
+				}
+				p.EventCounts[typ]++
+				ts := isoAny(obj["timestamp"])
+				if p.Session.CreatedAt == "" {
+					p.Session.CreatedAt = ts
+				}
+				if ts != "" {
+					p.Session.UpdatedAt = ts
+				}
+				payload, _ := obj["payload"].(map[string]any)
+				ptype := str(payload["type"])
+				raw, _ := json.Marshal(obj)
+				p.RawEvents = append(p.RawEvents, RawEvent{lineNo, ts, typ, ptype, string(raw)})
+				switch typ {
+				case "session_meta":
+					p.Session.ID = str(payload["id"])
+					p.Session.CWD = first(p.Session.CWD, str(payload["cwd"]))
+					p.Session.Source = first(p.Session.Source, str(payload["source"]), str(payload["originator"]))
+					p.Session.ModelProvider = first(p.Session.ModelProvider, str(payload["model_provider"]))
+					p.Session.Model = first(p.Session.Model, str(payload["model"]))
+					p.Session.CLIVersion = first(p.Session.CLIVersion, str(payload["cli_version"]))
+				case "turn_context":
+					p.Session.CWD = first(p.Session.CWD, str(payload["cwd"]))
+				case "event_msg":
+					handleEventMessage(&p, payload, lineNo, ts, files)
+				case "response_item":
+					handleResponseItem(&p, payload, lineNo, ts, files, tools)
+				}
+			}
 		}
-		obj = redactObj(obj).(map[string]any)
-		typ := str(obj["type"])
-		if typ == "" {
-			typ = "unknown"
+		if errors.Is(err, io.EOF) {
+			break
 		}
-		p.EventCounts[typ]++
-		ts := isoAny(obj["timestamp"])
-		if p.Session.CreatedAt == "" {
-			p.Session.CreatedAt = ts
+		if err != nil {
+			return p, err
 		}
-		if ts != "" {
-			p.Session.UpdatedAt = ts
-		}
-		payload, _ := obj["payload"].(map[string]any)
-		ptype := str(payload["type"])
-		raw, _ := json.Marshal(obj)
-		p.RawEvents = append(p.RawEvents, RawEvent{lineNo, ts, typ, ptype, string(raw)})
-		switch typ {
-		case "session_meta":
-			p.Session.ID = str(payload["id"])
-			p.Session.CWD = first(p.Session.CWD, str(payload["cwd"]))
-			p.Session.Source = first(p.Session.Source, str(payload["source"]), str(payload["originator"]))
-			p.Session.ModelProvider = first(p.Session.ModelProvider, str(payload["model_provider"]))
-			p.Session.Model = first(p.Session.Model, str(payload["model"]))
-			p.Session.CLIVersion = first(p.Session.CLIVersion, str(payload["cli_version"]))
-		case "turn_context":
-			p.Session.CWD = first(p.Session.CWD, str(payload["cwd"]))
-		case "event_msg":
-			handleEventMessage(&p, payload, lineNo, ts, files)
-		case "response_item":
-			handleResponseItem(&p, payload, lineNo, ts, files, tools)
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return p, err
 	}
 	if p.Session.ID == "" {
 		p.Session.ID = strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
