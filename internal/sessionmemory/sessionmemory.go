@@ -777,7 +777,11 @@ func parseRollout(path string) (ParsedSession, error) {
 	files := map[string]bool{}
 	tools := map[string]bool{}
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 1024), 10*1024*1024)
+	// Codex rollout jsonl files can contain very large single-line events
+	// (for example embedded tool output or compacted context). Raise the
+	// scanner limit well above the 64 KiB default so one huge event does not
+	// abort indexing the entire transcript archive.
+	scanner.Buffer(make([]byte, 1024), 100*1024*1024)
 	lineNo := 0
 	for scanner.Scan() {
 		lineNo++
