@@ -44,6 +44,30 @@ codex-memory task show
 
 Use `--json` with any command for agent-friendly output.
 
+## Codex Session Memory
+
+`codex-memory` can also index Codex CLI session transcripts from `~/.codex/sessions/**/*.jsonl` plus metadata from `~/.codex/state_5.sqlite`.
+
+```bash
+codex-memory sessions live --details
+codex-memory sessions index
+codex-memory sessions list --limit 20
+codex-memory sessions search "MCP auth" --limit 10
+codex-memory sessions grep "Timed out waiting for PGLite lock" --limit 20
+codex-memory sessions show <session-id> --transcript
+codex-memory sessions embed
+codex-memory sessions semantic "find the session where we debugged MCP startup failures"
+codex-memory sessions stats
+```
+
+Session-memory data is stored outside any one repo at `~/.codex-memory/codex-sessions.sqlite`. It includes redacted raw rollout events, transcript/tool-call rows, FTS indexes, chunks, OpenAI embeddings, and brute-force cosine semantic search. Use `OPENAI_API_KEY` or `OPENAI_ADMIN_API_KEY` for embedding commands.
+
+For another machine's sessions:
+
+```bash
+codex-memory sessions index --include /path/to/other/.codex/sessions --machine tylers-macbook
+```
+
 ## Typical Agent Loop
 
 ```bash
