@@ -58,6 +58,8 @@ func (a *App) Run(args []string) error {
 		return runHandoff(a.stdout, filtered[1:], jsonOutput)
 	case "task":
 		return runTask(a.stdout, filtered[1:], jsonOutput)
+	case "sessions":
+		return runSessions(a.stdout, filtered[1:], jsonOutput)
 	default:
 		a.printHelp()
 		return fmt.Errorf("unknown command: %s", filtered[0])
@@ -80,7 +82,8 @@ Usage:
   codex-memory handoff [base-ref] [repo-path] [--json]
   codex-memory task start <goal> [scope-paths...] [--json]
   codex-memory task show [--json]
-  codex-memory task clear [--json]`)
+  codex-memory task clear [--json]
+  codex-memory sessions <index|list|search|grep|show|embed|semantic|stats> [--json]`)
 }
 
 func requireArg(args []string, field string) (string, error) {
