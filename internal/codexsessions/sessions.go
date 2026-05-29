@@ -1,14 +1,17 @@
 package codexsessions
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,10 +20,14 @@ import (
 
 const (
 	psCommand                 = "ps"
+	lsofCommand               = "lsof"
 	sqlite3Command            = "sqlite3"
 	codexStateDBFile          = "state_5.sqlite"
+	claudeProjectsDir         = "projects"
 	sessionLogPreviewLimit    = 5
 	codexToolLogTarget        = "codex_core::stream_events_utils"
+	providerCodex             = "codex"
+	providerClaude            = "claude"
 	activeSessionStatus       = "active"
 	inactiveSessionStatus     = "inactive"
 	startingSessionTitle      = "(starting up)"
@@ -30,10 +37,13 @@ const (
 var changeDirCommandRegex = regexp.MustCompile(`^\s*cd\s+(?:"([^"]+)"|'([^']+)'|([^&|;]+))\s*&&`)
 
 var (
-	nowFunc                   = time.Now
-	hostnameFunc              = os.Hostname
-	codexHomeDirFunc          = codexHomeDir
-	listLiveCodexProcessesVar = listLiveCodexProcesses
+	nowFunc                    = time.Now
+	hostnameFunc               = os.Hostname
+	codexHomeDirFunc           = codexHomeDir
+	claudeHomeDirFunc          = claudeHomeDir
+	listLiveCodexProcessesVar  = listLiveCodexProcesses
+	listLiveClaudeProcessesVar = listLiveClaudeProcesses
+	processCWDVar              = processCWD
 )
 
 type SessionCollectOptions struct {
@@ -48,6 +58,7 @@ type SessionSnapshot struct {
 }
 
 type SessionSummary struct {
+	Provider         string    `json:"provider,omitempty"`
 	PID              int       `json:"pid,omitempty"`
 	TTY              string    `json:"tty,omitempty"`
 	AgeSeconds       int64     `json:"age_seconds,omitempty"`
@@ -63,10 +74,12 @@ type SessionSummary struct {
 	RecentAction     string    `json:"recent_action,omitempty"`
 }
 
-type liveCodexProcess struct {
+type liveAgentProcess struct {
+	Provider   string
 	PID        int
 	TTY        string
 	AgeSeconds int64
+	CWD        string
 }
 
 type processThreadRow struct {
@@ -76,6 +89,7 @@ type processThreadRow struct {
 
 type threadRow struct {
 	ID               string `json:"id"`
+	RolloutPath      string `json:"rollout_path"`
 	Title            string `json:"title"`
 	FirstUserMessage string `json:"first_user_message"`
 	CWD              string `json:"cwd"`
@@ -89,20 +103,83 @@ type threadLogRow struct {
 	Message  string `json:"message"`
 }
 
+type sqliteTableRow struct {
+	Name string `json:"name"`
+}
+
+type claudeLogEntry struct {
+	Type       string        `json:"type"`
+	Timestamp  string        `json:"timestamp"`
+	SessionID  string        `json:"sessionId"`
+	CWD        string        `json:"cwd"`
+	GitBranch  string        `json:"gitBranch"`
+	AITitle    string        `json:"aiTitle"`
+	AgentName  string        `json:"agentName"`
+	LastPrompt string        `json:"lastPrompt"`
+	Message    claudeMessage `json:"message"`
+}
+
+type claudeMessage struct {
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content"`
+}
+
+type claudeContentItem struct {
+	Type  string          `json:"type"`
+	Text  string          `json:"text"`
+	Name  string          `json:"name"`
+	Input json.RawMessage `json:"input"`
+}
+
+type claudeToolInput struct {
+	Command     string `json:"command"`
+	Description string `json:"description"`
+}
+
+type codexRolloutEntry struct {
+	Type    string          `json:"type"`
+	Payload json.RawMessage `json:"payload"`
+}
+
+type codexResponseItem struct {
+	Type      string `json:"type"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
 type toolCall struct {
 	Name string
 	Args map[string]any
 }
 
 func CollectSessions(ctx context.Context, opts SessionCollectOptions) (*SessionSnapshot, error) {
+	generatedAt := nowFunc().UTC()
+	host, _ := hostnameFunc()
+
+	var sessions []SessionSummary
+	codexSessions, err := collectCodexSessions(ctx, opts, generatedAt)
+	if err != nil {
+		return nil, err
+	}
+	sessions = append(sessions, codexSessions...)
+
+	claudeSessions, err := collectClaudeSessions(ctx, opts, generatedAt)
+	if err != nil {
+		return nil, err
+	}
+	sessions = append(sessions, claudeSessions...)
+
+	sortSessions(sessions)
+	return &SessionSnapshot{GeneratedAt: generatedAt, Host: host, Sessions: sessions}, nil
+}
+
+func collectCodexSessions(ctx context.Context, opts SessionCollectOptions, generatedAt time.Time) ([]SessionSummary, error) {
 	codexHome, err := codexHomeDirFunc()
 	if err != nil {
 		return nil, err
 	}
 
 	dbPath := filepath.Join(codexHome, codexStateDBFile)
-	generatedAt := nowFunc().UTC()
-	host, _ := hostnameFunc()
 
 	liveProcesses, err := listLiveCodexProcessesVar(ctx)
 	if err != nil {
@@ -113,19 +190,20 @@ func CollectSessions(ctx context.Context, opts SessionCollectOptions) (*SessionS
 		if os.IsNotExist(err) {
 			sessions := make([]SessionSummary, 0, len(liveProcesses))
 			for _, proc := range liveProcesses {
-				sessions = append(sessions, SessionSummary{
-					PID:          proc.PID,
-					TTY:          proc.TTY,
-					AgeSeconds:   proc.AgeSeconds,
-					Title:        startingSessionTitle,
-					LastActiveAt: generatedAt,
-					Status:       activeSessionStatus,
-				})
+				sessions = append(sessions, startingCodexSession(proc, generatedAt))
 			}
 			sortSessions(sessions)
-			return &SessionSnapshot{GeneratedAt: generatedAt, Host: host, Sessions: sessions}, nil
+			return sessions, nil
 		}
 		return nil, fmt.Errorf("failed to access codex state database: %w", err)
+	}
+
+	hasLogs, err := sqliteTableExists(ctx, dbPath, "logs")
+	if err != nil {
+		return nil, err
+	}
+	if !hasLogs {
+		return collectCodexSessionsWithoutLogs(ctx, dbPath, opts, generatedAt, liveProcesses)
 	}
 
 	activeByThread := make(map[string]SessionSummary)
@@ -139,14 +217,9 @@ func CollectSessions(ctx context.Context, opts SessionCollectOptions) (*SessionS
 		}
 
 		if mapping.ThreadID == "" {
-			activeByThread[strconv.Itoa(proc.PID)] = SessionSummary{
-				PID:          proc.PID,
-				TTY:          proc.TTY,
-				AgeSeconds:   proc.AgeSeconds,
-				Title:        startingSessionTitle,
-				LastActiveAt: generatedAt,
-				Status:       activeSessionStatus,
-			}
+			active := startingCodexSession(proc, generatedAt)
+			active.ThreadID = strconv.Itoa(proc.PID)
+			activeByThread[active.ThreadID] = active
 			continue
 		}
 
@@ -155,6 +228,7 @@ func CollectSessions(ctx context.Context, opts SessionCollectOptions) (*SessionS
 		}
 
 		activeByThread[mapping.ThreadID] = SessionSummary{
+			Provider:   providerCodex,
 			PID:        proc.PID,
 			TTY:        proc.TTY,
 			AgeSeconds: proc.AgeSeconds,
@@ -192,14 +266,70 @@ func CollectSessions(ctx context.Context, opts SessionCollectOptions) (*SessionS
 			if _, ok := activeByThread[row.ID]; ok {
 				continue
 			}
-			session := SessionSummary{ThreadID: row.ID, Status: inactiveSessionStatus}
+			session := SessionSummary{Provider: providerCodex, ThreadID: row.ID, Status: inactiveSessionStatus}
 			enrichSession(&session, row, logsByThread[row.ID], opts.IncludeDetails)
 			sessions = append(sessions, session)
 		}
 	}
 
 	sortSessions(sessions)
-	return &SessionSnapshot{GeneratedAt: generatedAt, Host: host, Sessions: sessions}, nil
+	return sessions, nil
+}
+
+func collectCodexSessionsWithoutLogs(ctx context.Context, dbPath string, opts SessionCollectOptions, generatedAt time.Time, liveProcesses []liveAgentProcess) ([]SessionSummary, error) {
+	threads, err := queryThreads(ctx, dbPath, true, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	summaries := make([]SessionSummary, 0, len(threads))
+	rolloutPathsByID := make(map[string]string, len(threads))
+	for _, row := range threads {
+		session := SessionSummary{Provider: providerCodex, ThreadID: row.ID, Status: inactiveSessionStatus}
+		enrichSession(&session, row, nil, opts.IncludeDetails)
+		summaries = append(summaries, session)
+		rolloutPathsByID[row.ID] = row.RolloutPath
+	}
+
+	activeByID := matchActiveSessions(summaries, liveProcesses, generatedAt, startingCodexSession)
+	sessions := make([]SessionSummary, 0, len(summaries)+len(liveProcesses))
+	seen := make(map[string]bool, len(summaries))
+
+	for _, session := range summaries {
+		if active, ok := activeByID[session.ThreadID]; ok {
+			session = active
+		} else if !opts.IncludeAll {
+			continue
+		}
+		if session.Status == activeSessionStatus || opts.IncludeDetails {
+			enrichCodexSessionFromRollout(&session, rolloutPathsByID[session.ThreadID], opts.IncludeDetails)
+		}
+		sessions = append(sessions, session)
+		seen[session.ThreadID] = true
+	}
+
+	for _, session := range activeByID {
+		if !seen[session.ThreadID] {
+			sessions = append(sessions, session)
+		}
+	}
+
+	sortSessions(sessions)
+	return sessions, nil
+}
+
+func startingCodexSession(proc liveAgentProcess, generatedAt time.Time) SessionSummary {
+	return SessionSummary{
+		Provider:         providerCodex,
+		PID:              proc.PID,
+		TTY:              proc.TTY,
+		AgeSeconds:       proc.AgeSeconds,
+		Title:            startingSessionTitle,
+		SessionCWD:       proc.CWD,
+		EffectiveWorkdir: proc.CWD,
+		LastActiveAt:     generatedAt,
+		Status:           activeSessionStatus,
+	}
 }
 
 func enrichSession(session *SessionSummary, row threadRow, logs []threadLogRow, includeDetails bool) {
@@ -213,6 +343,311 @@ func enrichSession(session *SessionSummary, row threadRow, logs []threadLogRow, 
 	if includeDetails {
 		session.RecentAction = summarizeRecentAction(logs)
 	}
+}
+
+func enrichCodexSessionFromRollout(session *SessionSummary, rolloutPath string, includeDetails bool) {
+	if rolloutPath == "" {
+		return
+	}
+	workdir, recentAction, err := readCodexRolloutDetails(rolloutPath)
+	if err != nil {
+		return
+	}
+	if workdir != "" {
+		session.EffectiveWorkdir = workdir
+	}
+	if includeDetails && recentAction != "" {
+		session.RecentAction = recentAction
+	}
+}
+
+func collectClaudeSessions(ctx context.Context, opts SessionCollectOptions, generatedAt time.Time) ([]SessionSummary, error) {
+	claudeHome, err := claudeHomeDirFunc()
+	if err != nil {
+		return nil, err
+	}
+
+	liveProcesses, err := listLiveClaudeProcessesVar(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	projectsRoot := filepath.Join(claudeHome, claudeProjectsDir)
+	if _, err := os.Stat(projectsRoot); err != nil {
+		if os.IsNotExist(err) {
+			sessions := make([]SessionSummary, 0, len(liveProcesses))
+			for _, proc := range liveProcesses {
+				sessions = append(sessions, startingClaudeSession(proc, generatedAt))
+			}
+			return sessions, nil
+		}
+		return nil, fmt.Errorf("failed to access claude projects directory: %w", err)
+	}
+
+	sessionFiles, err := listClaudeSessionFiles(projectsRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	summaries := make([]SessionSummary, 0, len(sessionFiles))
+	for _, path := range sessionFiles {
+		session, err := readClaudeSessionFile(path, opts.IncludeDetails)
+		if err != nil {
+			return nil, err
+		}
+		summaries = append(summaries, session)
+	}
+
+	activeByID := matchActiveSessions(summaries, liveProcesses, generatedAt, startingClaudeSession)
+	sessions := make([]SessionSummary, 0, len(summaries)+len(liveProcesses))
+	seen := make(map[string]bool, len(summaries))
+
+	for _, session := range summaries {
+		if active, ok := activeByID[session.ThreadID]; ok {
+			session = active
+		} else if !opts.IncludeAll {
+			continue
+		}
+		sessions = append(sessions, session)
+		seen[session.ThreadID] = true
+	}
+
+	for _, session := range activeByID {
+		if !seen[session.ThreadID] {
+			sessions = append(sessions, session)
+		}
+	}
+
+	return sessions, nil
+}
+
+func startingClaudeSession(proc liveAgentProcess, generatedAt time.Time) SessionSummary {
+	return SessionSummary{
+		Provider:         providerClaude,
+		PID:              proc.PID,
+		TTY:              proc.TTY,
+		AgeSeconds:       proc.AgeSeconds,
+		Title:            startingSessionTitle,
+		SessionCWD:       proc.CWD,
+		EffectiveWorkdir: proc.CWD,
+		LastActiveAt:     generatedAt,
+		Status:           activeSessionStatus,
+	}
+}
+
+func matchActiveSessions(sessions []SessionSummary, liveProcesses []liveAgentProcess, generatedAt time.Time, startSession func(liveAgentProcess, time.Time) SessionSummary) map[string]SessionSummary {
+	activeByID := make(map[string]SessionSummary)
+	used := make(map[string]bool)
+
+	for _, proc := range liveProcesses {
+		match, ok := findSessionForProcess(sessions, proc, generatedAt, used)
+		if !ok {
+			active := startSession(proc, generatedAt)
+			active.ThreadID = strconv.Itoa(proc.PID)
+			activeByID[active.ThreadID] = active
+			continue
+		}
+
+		match.PID = proc.PID
+		match.TTY = proc.TTY
+		match.AgeSeconds = proc.AgeSeconds
+		match.Status = activeSessionStatus
+		activeByID[match.ThreadID] = match
+		used[match.ThreadID] = true
+	}
+
+	return activeByID
+}
+
+func findSessionForProcess(sessions []SessionSummary, proc liveAgentProcess, generatedAt time.Time, used map[string]bool) (SessionSummary, bool) {
+	startCutoff := generatedAt.Unix() - proc.AgeSeconds - 30
+	candidates := make([]SessionSummary, 0)
+	for _, session := range sessions {
+		if used[session.ThreadID] {
+			continue
+		}
+		if proc.CWD != "" && session.EffectiveWorkdir != proc.CWD && session.SessionCWD != proc.CWD {
+			continue
+		}
+		candidates = append(candidates, session)
+	}
+
+	if len(candidates) == 0 {
+		return SessionSummary{}, false
+	}
+
+	sortSessions(candidates)
+	for _, session := range candidates {
+		if !session.LastActiveAt.IsZero() && session.LastActiveAt.Unix() >= startCutoff {
+			return session, true
+		}
+	}
+	return candidates[0], true
+}
+
+func listClaudeSessionFiles(projectsRoot string) ([]string, error) {
+	projectDirs, err := os.ReadDir(projectsRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	var files []string
+	for _, projectDir := range projectDirs {
+		if !projectDir.IsDir() {
+			continue
+		}
+		dirPath := filepath.Join(projectsRoot, projectDir.Name())
+		entries, err := os.ReadDir(dirPath)
+		if err != nil {
+			return nil, err
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || filepath.Ext(entry.Name()) != ".jsonl" {
+				continue
+			}
+			files = append(files, filepath.Join(dirPath, entry.Name()))
+		}
+	}
+	return files, nil
+}
+
+func readClaudeSessionFile(path string, includeDetails bool) (SessionSummary, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return SessionSummary{}, err
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return SessionSummary{}, err
+	}
+
+	session := SessionSummary{
+		Provider: providerClaude,
+		ThreadID: strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)),
+		Status:   inactiveSessionStatus,
+	}
+
+	var firstUserMessage string
+	var title string
+	var agentName string
+	var lastPrompt string
+	var recentAction string
+
+	reader := bufio.NewReader(file)
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(bytes.TrimSpace(line)) > 0 {
+			var entry claudeLogEntry
+			if jsonErr := json.Unmarshal(bytes.TrimSpace(line), &entry); jsonErr != nil {
+				return SessionSummary{}, fmt.Errorf("failed to parse claude session %s: %w", path, jsonErr)
+			}
+
+			if entry.SessionID != "" {
+				session.ThreadID = entry.SessionID
+			}
+			if entry.CWD != "" {
+				session.SessionCWD = entry.CWD
+				session.EffectiveWorkdir = entry.CWD
+			}
+			if entry.GitBranch != "" {
+				session.GitBranch = entry.GitBranch
+			}
+			if parsed, ok := parseClaudeTimestamp(entry.Timestamp); ok && parsed.After(session.LastActiveAt) {
+				session.LastActiveAt = parsed
+			}
+			if entry.AITitle != "" {
+				title = entry.AITitle
+			}
+			if entry.AgentName != "" {
+				agentName = entry.AgentName
+			}
+			if entry.LastPrompt != "" {
+				lastPrompt = entry.LastPrompt
+			}
+			if firstUserMessage == "" && entry.Type == "user" && entry.Message.Role == "user" {
+				firstUserMessage = claudeMessageText(entry.Message.Content)
+			}
+			if includeDetails && entry.Type == "assistant" {
+				if action := claudeRecentAction(entry.Message.Content); action != "" {
+					recentAction = action
+				}
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return SessionSummary{}, err
+		}
+	}
+
+	session.FirstUserMessage = firstUserMessage
+	session.Title = firstNonEmpty(title, agentName, firstUserMessage, lastPrompt, startingSessionTitle)
+	if session.LastActiveAt.IsZero() {
+		session.LastActiveAt = info.ModTime().UTC()
+	}
+	if session.EffectiveWorkdir == "" {
+		session.EffectiveWorkdir = session.SessionCWD
+	}
+	if includeDetails {
+		session.RecentAction = recentAction
+	}
+	return session, nil
+}
+
+func parseClaudeTimestamp(raw string) (time.Time, bool) {
+	if raw == "" {
+		return time.Time{}, false
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return parsed.UTC(), true
+}
+
+func claudeMessageText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		return compactWhitespace(text)
+	}
+
+	var items []claudeContentItem
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return ""
+	}
+	for _, item := range items {
+		if item.Type == "text" && item.Text != "" {
+			return compactWhitespace(item.Text)
+		}
+	}
+	return ""
+}
+
+func claudeRecentAction(raw json.RawMessage) string {
+	var items []claudeContentItem
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return ""
+	}
+	for _, item := range items {
+		if item.Type != "tool_use" || item.Name == "" {
+			continue
+		}
+		var input claudeToolInput
+		_ = json.Unmarshal(item.Input, &input)
+		detail := compactWhitespace(firstNonEmpty(input.Description, input.Command))
+		if detail == "" {
+			return item.Name
+		}
+		return item.Name + ": " + detail
+	}
+	return ""
 }
 
 func queryPrimaryThreadForPID(ctx context.Context, dbPath string, pid int, minTS int64) (processThreadRow, error) {
@@ -243,7 +678,16 @@ LIMIT 1;`,
 }
 
 func queryThreads(ctx context.Context, dbPath string, includeAll bool, activeThreadIDs []string) ([]threadRow, error) {
-	query := "SELECT id, title, first_user_message, cwd, updated_at, git_branch, git_origin_url FROM threads WHERE archived = 0"
+	rolloutPathColumn := "'' AS rollout_path"
+	hasRolloutPath, err := sqliteColumnExists(ctx, dbPath, "threads", "rollout_path")
+	if err != nil {
+		return nil, err
+	}
+	if hasRolloutPath {
+		rolloutPathColumn = "rollout_path"
+	}
+
+	query := "SELECT id, " + rolloutPathColumn + ", title, first_user_message, cwd, updated_at, git_branch, git_origin_url FROM threads WHERE archived = 0"
 	if !includeAll && len(activeThreadIDs) > 0 {
 		query += " AND id IN (" + sqliteStringList(activeThreadIDs) + ")"
 	}
@@ -289,6 +733,56 @@ ORDER BY thread_id ASC, rn ASC;`,
 	return grouped, nil
 }
 
+func readCodexRolloutDetails(path string) (string, string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", "", err
+	}
+	defer file.Close()
+
+	var workdir string
+	var recentAction string
+	reader := bufio.NewReader(file)
+	for {
+		line, err := reader.ReadBytes('\n')
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) > 0 && bytes.Contains(trimmed, []byte(`"type":"response_item"`)) && bytes.Contains(trimmed, []byte(`"function_call"`)) {
+			call, ok := parseCodexFunctionCall(trimmed)
+			if ok {
+				if nextWorkdir := extractWorkdir(call); nextWorkdir != "" {
+					workdir = nextWorkdir
+				}
+				if nextAction := summarizeToolCall(call); nextAction != "" {
+					recentAction = nextAction
+				}
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", "", err
+		}
+	}
+	return workdir, recentAction, nil
+}
+
+func parseCodexFunctionCall(line []byte) (toolCall, bool) {
+	var entry codexRolloutEntry
+	if err := json.Unmarshal(line, &entry); err != nil || entry.Type != "response_item" {
+		return toolCall{}, false
+	}
+
+	var item codexResponseItem
+	if err := json.Unmarshal(entry.Payload, &item); err != nil || item.Type != "function_call" || item.Name == "" {
+		return toolCall{}, false
+	}
+
+	args := make(map[string]any)
+	_ = json.Unmarshal([]byte(item.Arguments), &args)
+	return toolCall{Name: item.Name, Args: args}, true
+}
+
 func querySQLiteRows[T any](ctx context.Context, dbPath, query string) ([]T, error) {
 	cmd := exec.CommandContext(ctx, sqlite3Command, "-json", dbPath, query)
 	output, err := cmd.CombinedOutput()
@@ -308,21 +802,57 @@ func querySQLiteRows[T any](ctx context.Context, dbPath, query string) ([]T, err
 	return rows, nil
 }
 
-func listLiveCodexProcesses(ctx context.Context) ([]liveCodexProcess, error) {
+func sqliteTableExists(ctx context.Context, dbPath, tableName string) (bool, error) {
+	rows, err := querySQLiteRows[sqliteTableRow](
+		ctx,
+		dbPath,
+		"SELECT name FROM sqlite_master WHERE type = 'table' AND name = "+sqliteQuote(tableName)+" LIMIT 1;",
+	)
+	if err != nil {
+		return false, err
+	}
+	return len(rows) > 0, nil
+}
+
+func sqliteColumnExists(ctx context.Context, dbPath, tableName, columnName string) (bool, error) {
+	rows, err := querySQLiteRows[sqliteTableRow](ctx, dbPath, "PRAGMA table_info("+tableName+");")
+	if err != nil {
+		return false, err
+	}
+	for _, row := range rows {
+		if row.Name == columnName {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func listLiveCodexProcesses(ctx context.Context) ([]liveAgentProcess, error) {
+	return listLiveAgentProcesses(ctx, providerCodex, looksLikeCodexCommand, true)
+}
+
+func listLiveClaudeProcesses(ctx context.Context) ([]liveAgentProcess, error) {
+	return listLiveAgentProcesses(ctx, providerClaude, looksLikeClaudeCommand, true)
+}
+
+func listLiveAgentProcesses(ctx context.Context, provider string, predicate func(string) bool, includeCWD bool) ([]liveAgentProcess, error) {
 	cmd := exec.CommandContext(ctx, psCommand, "-axo", "pid=,tty=,etime=,comm=")
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("failed to list processes: %w", err)
 	}
 
-	var processes []liveCodexProcess
+	var processes []liveAgentProcess
 	for _, line := range strings.Split(string(output), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 4 {
 			continue
 		}
+		if !isInteractiveTTY(fields[1]) {
+			continue
+		}
 		command := strings.Join(fields[3:], " ")
-		if !looksLikeCodexCommand(command) {
+		if !predicate(command) {
 			continue
 		}
 
@@ -335,14 +865,24 @@ func listLiveCodexProcesses(ctx context.Context) ([]liveCodexProcess, error) {
 			return nil, err
 		}
 
-		processes = append(processes, liveCodexProcess{
+		process := liveAgentProcess{
+			Provider:   provider,
 			PID:        pid,
 			TTY:        fields[1],
 			AgeSeconds: ageSeconds,
-		})
+		}
+		if includeCWD {
+			process.CWD, _ = processCWDVar(ctx, pid)
+		}
+
+		processes = append(processes, process)
 	}
 
 	return processes, nil
+}
+
+func isInteractiveTTY(tty string) bool {
+	return tty != "" && tty != "??" && tty != "?"
 }
 
 func looksLikeCodexCommand(command string) bool {
@@ -352,6 +892,34 @@ func looksLikeCodexCommand(command string) bool {
 	}
 	base := filepath.Base(command)
 	return base == "codex" || strings.Contains(command, "/codex/")
+}
+
+func looksLikeClaudeCommand(command string) bool {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return false
+	}
+	base := filepath.Base(command)
+	return base == "claude" || base == "claude.exe" || strings.HasSuffix(command, "/claude")
+}
+
+func processCWD(ctx context.Context, pid int) (string, error) {
+	switch runtime.GOOS {
+	case "linux":
+		return os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "cwd"))
+	case "darwin":
+		cmd := exec.CommandContext(ctx, lsofCommand, "-a", "-p", strconv.Itoa(pid), "-d", "cwd", "-Fn")
+		output, err := cmd.Output()
+		if err != nil {
+			return "", err
+		}
+		for _, line := range strings.Split(string(output), "\n") {
+			if strings.HasPrefix(line, "n") && len(line) > 1 {
+				return strings.TrimSpace(strings.TrimPrefix(line, "n")), nil
+			}
+		}
+	}
+	return "", nil
 }
 
 func parseElapsedTime(raw string) (int64, error) {
@@ -405,18 +973,25 @@ func summarizeRecentAction(logs []threadLogRow) string {
 		if !ok {
 			continue
 		}
-		if call.Name == "exec_command" {
-			if cmd := compactWhitespace(stringArg(call.Args, "cmd")); cmd != "" {
-				return "exec_command: " + cmd
-			}
+		if summary := summarizeToolCall(call); summary != "" {
+			return summary
 		}
-		if message := compactWhitespace(firstNonEmpty(
-			stringArg(call.Args, "message"),
-			stringArg(call.Args, "query"),
-			call.Name,
-		)); message != "" {
-			return message
+	}
+	return ""
+}
+
+func summarizeToolCall(call toolCall) string {
+	if call.Name == "exec_command" {
+		if cmd := compactWhitespace(stringArg(call.Args, "cmd")); cmd != "" {
+			return "exec_command: " + cmd
 		}
+	}
+	if message := compactWhitespace(firstNonEmpty(
+		stringArg(call.Args, "message"),
+		stringArg(call.Args, "query"),
+		call.Name,
+	)); message != "" {
+		return message
 	}
 	return ""
 }
@@ -518,6 +1093,14 @@ func codexHomeDir() (string, error) {
 		return "", fmt.Errorf("failed to get home directory: %w", err)
 	}
 	return filepath.Join(homeDir, ".codex"), nil
+}
+
+func claudeHomeDir() (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to get home directory: %w", err)
+	}
+	return filepath.Join(homeDir, ".claude"), nil
 }
 
 func shortThreadID(threadID string) string {
