@@ -28,6 +28,8 @@ const DefaultEmbeddingModel = "text-embedding-3-small"
 const (
 	maxStoredRawEventJSON        = 20_000
 	maxStoredRawEventsPerSession = 100
+	maxStoredMessageText         = 50_000
+	maxSearchBlobText            = 1_000_000
 )
 
 var secretPatterns = []*regexp.Regexp{
@@ -789,7 +791,6 @@ func parseRollout(path string) (ParsedSession, error) {
 			lineNo++
 			var obj map[string]any
 			if json.Unmarshal(line, &obj) == nil {
-				obj = redactObj(obj).(map[string]any)
 				typ := str(obj["type"])
 				if typ == "" {
 					typ = "unknown"
@@ -810,6 +811,7 @@ func parseRollout(path string) (ParsedSession, error) {
 					if len(rawJSON) > maxStoredRawEventJSON {
 						rawJSON = rawJSON[:maxStoredRawEventJSON] + fmt.Sprintf("\n...[truncated raw event from %d bytes]", len(rawJSON))
 					}
+					rawJSON = redact(rawJSON)
 					p.RawEvents = append(p.RawEvents, RawEvent{lineNo, ts, typ, ptype, rawJSON})
 				}
 				switch typ {
@@ -848,7 +850,7 @@ func parseRollout(path string) (ParsedSession, error) {
 	}
 	sort.Strings(p.Session.ToolNames)
 	p.Session.Title = short(first(p.Session.FirstUserMessage, p.Session.Title), 240)
-	p.SearchBlob = strings.Join([]string{p.Session.Title, p.Session.CWD, strings.Join(p.Session.Commands, "\n"), strings.Join(p.Session.FilesTouched, "\n"), messagesText(p.Messages)}, "\n")
+	p.SearchBlob = truncate(strings.Join([]string{p.Session.Title, p.Session.CWD, strings.Join(p.Session.Commands, "\n"), strings.Join(p.Session.FilesTouched, "\n"), messagesText(p.Messages)}, "\n"), maxSearchBlobText)
 	return p, nil
 }
 
@@ -856,24 +858,24 @@ func handleEventMessage(p *ParsedSession, payload map[string]any, lineNo int, ts
 	ptype := str(payload["type"])
 	switch ptype {
 	case "user_message":
-		text := str(payload["message"])
+		text := capMessageText(str(payload["message"]))
 		if text != "" && !isContextNoise(text) {
 			if p.Session.FirstUserMessage == "" {
-				p.Session.FirstUserMessage = text
+				p.Session.FirstUserMessage = short(text, maxStoredMessageText)
 			}
 			p.Messages = append(p.Messages, Message{lineNo, ts, "user", "message", text})
 		}
 	case "agent_message":
-		text := str(payload["message"])
+		text := capMessageText(str(payload["message"]))
 		if text != "" {
-			p.Session.LastAgentMessage = text
+			p.Session.LastAgentMessage = short(text, maxStoredMessageText)
 			p.Messages = append(p.Messages, Message{lineNo, ts, "assistant", "message", text})
 		}
 	case "task_complete":
 		p.Session.Status = "complete"
-		text := str(payload["last_agent_message"])
+		text := capMessageText(str(payload["last_agent_message"]))
 		if text != "" {
-			p.Session.LastAgentMessage = text
+			p.Session.LastAgentMessage = short(text, maxStoredMessageText)
 			p.Messages = append(p.Messages, Message{lineNo, ts, "assistant", "task_complete", text})
 		}
 	case "turn_aborted":
@@ -895,13 +897,13 @@ func handleResponseItem(p *ParsedSession, payload map[string]any, lineNo int, ts
 	switch ptype {
 	case "message":
 		role := str(payload["role"])
-		text := contentText(payload["content"])
+		text := capMessageText(contentText(payload["content"]))
 		if (role == "user" || role == "assistant") && text != "" && !isContextNoise(text) {
 			if role == "user" && p.Session.FirstUserMessage == "" {
-				p.Session.FirstUserMessage = text
+				p.Session.FirstUserMessage = short(text, maxStoredMessageText)
 			}
 			if role == "assistant" {
-				p.Session.LastAgentMessage = text
+				p.Session.LastAgentMessage = short(text, maxStoredMessageText)
 			}
 			p.Messages = append(p.Messages, Message{lineNo, ts, role, "message", text})
 		}
@@ -1069,6 +1071,12 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n]
+}
+func capMessageText(s string) string {
+	if len(s) <= maxStoredMessageText {
+		return s
+	}
+	return s[:maxStoredMessageText] + fmt.Sprintf("\n...[truncated message from %d bytes]", len(s))
 }
 func isoAny(v any) string {
 	raw := str(v)
