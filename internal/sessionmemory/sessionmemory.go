@@ -30,6 +30,7 @@ const (
 	maxStoredRawEventsPerSession = 100
 	maxStoredMessageText         = 50_000
 	maxSearchBlobText            = 1_000_000
+	maxParseRolloutBytes         = 100 * 1024 * 1024
 )
 
 var secretPatterns = []*regexp.Regexp{
@@ -772,6 +773,13 @@ func chunkText(text string, maxChars, overlap int) []string {
 }
 
 func parseRollout(path string) (ParsedSession, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return ParsedSession{}, err
+	}
+	if info.Size() > maxParseRolloutBytes {
+		return parseRolloutMetadataOnly(path, info), nil
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return ParsedSession{}, err
@@ -852,6 +860,20 @@ func parseRollout(path string) (ParsedSession, error) {
 	p.Session.Title = short(first(p.Session.FirstUserMessage, p.Session.Title), 240)
 	p.SearchBlob = truncate(strings.Join([]string{p.Session.Title, p.Session.CWD, strings.Join(p.Session.Commands, "\n"), strings.Join(p.Session.FilesTouched, "\n"), messagesText(p.Messages)}, "\n"), maxSearchBlobText)
 	return p, nil
+}
+
+func parseRolloutMetadataOnly(path string, info os.FileInfo) ParsedSession {
+	id := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	p := ParsedSession{EventCounts: map[string]int{"skipped_large_rollout": 1}}
+	p.Session.ID = id
+	p.Session.RolloutPath = path
+	p.Session.UpdatedAt = info.ModTime().UTC().Format(time.RFC3339Nano)
+	p.Session.CreatedAt = p.Session.UpdatedAt
+	p.Session.Status = "skipped_large_rollout"
+	p.Session.Errors = append(p.Session.Errors, fmt.Sprintf("skipped full parse: rollout is %d bytes (> %d byte safety limit)", info.Size(), maxParseRolloutBytes))
+	p.Session.Title = id
+	p.SearchBlob = strings.Join([]string{p.Session.Title, p.Session.RolloutPath, strings.Join(p.Session.Errors, "\n")}, "\n")
+	return p
 }
 
 func handleEventMessage(p *ParsedSession, payload map[string]any, lineNo int, ts string, files map[string]bool) {
