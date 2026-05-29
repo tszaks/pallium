@@ -25,6 +25,8 @@ import (
 
 const DefaultEmbeddingModel = "text-embedding-3-small"
 
+const maxStoredRawEventJSON = 100_000
+
 var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)(api[_-]?key|secret|token|password|passwd|authorization|bearer)\s*[:=]\s*['"]?([A-Za-z0-9_./+=:-]{12,})`),
 	regexp.MustCompile(`sk-[A-Za-z0-9_-]{20,}`),
@@ -800,7 +802,11 @@ func parseRollout(path string) (ParsedSession, error) {
 				payload, _ := obj["payload"].(map[string]any)
 				ptype := str(payload["type"])
 				raw, _ := json.Marshal(obj)
-				p.RawEvents = append(p.RawEvents, RawEvent{lineNo, ts, typ, ptype, string(raw)})
+				rawJSON := string(raw)
+				if len(rawJSON) > maxStoredRawEventJSON {
+					rawJSON = rawJSON[:maxStoredRawEventJSON] + fmt.Sprintf("\n...[truncated raw event from %d bytes]", len(rawJSON))
+				}
+				p.RawEvents = append(p.RawEvents, RawEvent{lineNo, ts, typ, ptype, rawJSON})
 				switch typ {
 				case "session_meta":
 					p.Session.ID = str(payload["id"])
