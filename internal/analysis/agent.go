@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tszaks/codex-memory/internal/db"
+	"github.com/tszaks/pallium/internal/db"
 )
 
 type BoundaryWarning struct {
@@ -47,7 +47,7 @@ func buildActionGuidance(path string, risk RiskReport, confidence Confidence, st
 
 	runNext := make([]string, 0, 2)
 	runNext = append(runNext, testCommands...)
-	runNext = append(runNext, fmt.Sprintf("codex-memory explain %s", path))
+	runNext = append(runNext, fmt.Sprintf("pallium explain %s", path))
 
 	askForReviewIf := make([]string, 0, 4)
 	if risk.Level == "high" {

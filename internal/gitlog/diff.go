@@ -51,7 +51,8 @@ func WorkingTreeChanges(repoRoot string) ([]WorkingTreeFile, error) {
 			path = path[idx+4:]
 		}
 		path = filepath.ToSlash(path)
-		if path == ".codex-memory.db" || path == ".codex-memory" || strings.HasPrefix(path, ".codex-memory/") {
+		if path == ".pallium.db" || path == ".pallium" || strings.HasPrefix(path, ".pallium/") ||
+			path == ".codex-memory.db" || path == ".codex-memory" || strings.HasPrefix(path, ".codex-memory/") {
 			continue
 		}
 		out = append(out, WorkingTreeFile{

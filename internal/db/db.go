@@ -68,12 +68,24 @@ type ActiveTask struct {
 }
 
 func Open(repoRoot string) (*Store, error) {
-	dbDir := filepath.Join(repoRoot, ".codex-memory")
-	if err := os.MkdirAll(dbDir, 0o755); err != nil {
+	dbPath := defaultDBPath(repoRoot)
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		return nil, fmt.Errorf("create db directory: %w", err)
 	}
 
-	return OpenPath(repoRoot, filepath.Join(dbDir, "codex-memory.sqlite"))
+	return OpenPath(repoRoot, dbPath)
+}
+
+func defaultDBPath(repoRoot string) string {
+	current := filepath.Join(repoRoot, ".pallium", "pallium.sqlite")
+	legacy := filepath.Join(repoRoot, ".codex-memory", "codex-memory.sqlite")
+	if _, err := os.Stat(current); err == nil {
+		return current
+	}
+	if _, err := os.Stat(legacy); err == nil {
+		return legacy
+	}
+	return current
 }
 
 func OpenPath(repoRoot, dbPath string) (*Store, error) {
@@ -218,7 +230,7 @@ func (s *Store) Repo() (RepoRecord, error) {
 	var indexedAt string
 	if err := row.Scan(&repo.ID, &repo.Root, &repo.Branch, &repo.LastIndexedCommit, &indexedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return RepoRecord{}, fmt.Errorf("%w: run `codex-memory index` first", ErrRepoNotIndexed)
+			return RepoRecord{}, fmt.Errorf("%w: run `pallium index` first", ErrRepoNotIndexed)
 		}
 		return RepoRecord{}, fmt.Errorf("read repo: %w", err)
 	}

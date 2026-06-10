@@ -1,10 +1,10 @@
-# Codex Memory Design
+# Pallium Design
 
 ## Scope
 Build a local-first CLI that indexes repository history and optional Codex session context into a lightweight memory database so developers and agents can ask better “what should I know before touching this?” questions.
 
 ## Product Goal
-Turn missing codebase context into a queryable local tool. `codex-memory` should help answer:
+Turn missing codebase context into a queryable local tool. `pallium` should help answer:
 - what files are risky
 - what files usually change together
 - what recently changed in an area
@@ -14,11 +14,11 @@ Turn missing codebase context into a queryable local tool. `codex-memory` should
 The tool should feel fast, local, and inspectable.
 
 Primary commands:
-- `codex-memory index`
-- `codex-memory explain <path>`
-- `codex-memory risk <path>`
-- `codex-memory neighbors <path>`
-- `codex-memory decisions <query>`
+- `pallium index`
+- `pallium explain <path>`
+- `pallium risk <path>`
+- `pallium neighbors <path>`
+- `pallium decisions <query>`
 
 ## Architecture
 - Runtime: Go CLI

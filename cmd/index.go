@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/tszaks/codex-memory/internal/output"
+	"github.com/tszaks/pallium/internal/output"
 )
 
 func runIndex(out io.Writer, args []string, jsonOutput bool) error {

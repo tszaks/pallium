@@ -1,6 +1,6 @@
-# codex-memory
+# pallium
 
-`codex-memory` is a local-first CLI for AI-powered coding workflows.
+`pallium` is a local-first CLI for AI-powered coding workflows.
 
 It gives an LLM fast repo context before, during, and after edits:
 
@@ -26,71 +26,71 @@ That leads to common mistakes:
 - skipping the most useful tests
 - handing work off without a clean summary
 
-`codex-memory` exists to lower those surprises.
+`pallium` exists to lower those surprises.
 
 ## Core Commands
 
 ```bash
-codex-memory index
-codex-memory explain <path>
-codex-memory safe <path>
-codex-memory plan <path>
-codex-memory changed-now
-codex-memory review [base-ref]
-codex-memory handoff [base-ref]
-codex-memory task start "Tighten auth flow" src/auth cmd
-codex-memory task show
+pallium index
+pallium explain <path>
+pallium safe <path>
+pallium plan <path>
+pallium changed-now
+pallium review [base-ref]
+pallium handoff [base-ref]
+pallium task start "Tighten auth flow" src/auth cmd
+pallium task show
 ```
 
 Use `--json` with any command for agent-friendly output.
 
 ## Codex Session Memory
 
-`codex-memory` can also index Codex CLI session transcripts from `~/.codex/sessions/**/*.jsonl` plus metadata from `~/.codex/state_5.sqlite`.
+`pallium` can also index Codex CLI session transcripts from `~/.codex/sessions/**/*.jsonl` plus metadata from `~/.codex/state_5.sqlite`.
 
 ```bash
-codex-memory sessions live --details
-codex-memory sessions index
-codex-memory sessions list --limit 20
-codex-memory sessions search "MCP auth" --limit 10
-codex-memory sessions grep "Timed out waiting for PGLite lock" --limit 20
-codex-memory sessions show <session-id> --transcript
-codex-memory sessions embed
-codex-memory sessions semantic "find the session where we debugged MCP startup failures"
-codex-memory sessions stats
+pallium sessions live --details
+pallium sessions index
+pallium sessions list --limit 20
+pallium sessions search "MCP auth" --limit 10
+pallium sessions grep "Timed out waiting for PGLite lock" --limit 20
+pallium sessions show <session-id> --transcript
+pallium sessions embed
+pallium sessions semantic "find the session where we debugged MCP startup failures"
+pallium sessions stats
 ```
 
-Session-memory data is stored outside any one repo at `~/.codex-memory/codex-sessions.sqlite`. It includes redacted raw rollout events, transcript/tool-call rows, FTS indexes, chunks, OpenAI embeddings, and brute-force cosine semantic search. Use `OPENAI_API_KEY` or `OPENAI_ADMIN_API_KEY` for embedding commands.
+Session-memory data is stored outside any one repo at `~/.pallium/codex-sessions.sqlite`. It includes redacted raw rollout events, transcript/tool-call rows, FTS indexes, chunks, OpenAI embeddings, and brute-force cosine semantic search. Use `OPENAI_API_KEY` or `OPENAI_ADMIN_API_KEY` for embedding commands.
 
 For another machine's sessions:
 
 ```bash
-codex-memory sessions index --include /path/to/other/.codex/sessions --machine tylers-macbook
+pallium sessions index --include /path/to/other/.codex/sessions --machine tylers-macbook
 ```
 
 ## Typical Agent Loop
 
 ```bash
-codex-memory index
-codex-memory explain path/to/file --json
-codex-memory safe path/to/file --json
-codex-memory plan path/to/file --json
-codex-memory task start "Tighten auth flow" src/auth cmd --json
-codex-memory changed-now --json
-codex-memory handoff origin/main --json
+pallium index
+pallium explain path/to/file --json
+pallium safe path/to/file --json
+pallium plan path/to/file --json
+pallium task start "Tighten auth flow" src/auth cmd --json
+pallium changed-now --json
+pallium handoff origin/main --json
 ```
 
 ## Install
 
 ```bash
-go install github.com/tszaks/codex-memory@latest
+go install github.com/tszaks/pallium@latest
 ```
 
 Or from source:
 
 ```bash
-git clone https://github.com/tszaks/codex-memory.git
-cd codex-memory
+git clone https://github.com/tszaks/pallium.git
+cd pallium
 go test ./...
 go run . --help
 ```
@@ -110,9 +110,9 @@ It also handles brand-new files better now by inferring likely related files and
 ## Example
 
 ```bash
-codex-memory explain src/auth/session.ts --json
-codex-memory safe src/auth/session.ts --json
-codex-memory handoff origin/main --json
+pallium explain src/auth/session.ts --json
+pallium safe src/auth/session.ts --json
+pallium handoff origin/main --json
 ```
 
 ## Development
@@ -127,8 +127,9 @@ go run . handoff HEAD~1
 
 ## Notes
 
-- Local data lives in `.codex-memory/`
-- If the repo has not been indexed yet, analysis commands will tell you to run `codex-memory index` first
+- Local data lives in `.pallium/`
+- Existing `.codex-memory/` indexes are still read when no `.pallium/` index exists
+- If the repo has not been indexed yet, analysis commands will tell you to run `pallium index` first
 
 ## License
 

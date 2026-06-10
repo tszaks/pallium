@@ -9,7 +9,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/tszaks/codex-memory/internal/db"
+	"github.com/tszaks/pallium/internal/db"
 )
 
 type StructuralLink struct {
@@ -232,7 +232,7 @@ func repoFiles(repoRoot string) ([]string, error) {
 		if d.IsDir() {
 			name := d.Name()
 			switch name {
-			case ".git", ".codex-memory":
+			case ".git", ".pallium", ".codex-memory":
 				return filepath.SkipDir
 			}
 			return nil

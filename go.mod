@@ -1,4 +1,4 @@
-module github.com/tszaks/codex-memory
+module github.com/tszaks/pallium
 
 go 1.26.0
 
