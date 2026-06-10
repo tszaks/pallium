@@ -89,9 +89,9 @@ func renderLiveSessions(out io.Writer, snapshot *codexsessions.SessionSnapshot, 
 		}
 	}
 	if includeAll {
-		fmt.Fprintf(out, "%d active, %d inactive Codex sessions\n", active, inactive)
+		fmt.Fprintf(out, "%d active, %d inactive agent sessions\n", active, inactive)
 	} else {
-		fmt.Fprintf(out, "%d active Codex sessions\n", active)
+		fmt.Fprintf(out, "%d active agent sessions\n", active)
 	}
 	fmt.Fprintf(out, "updated %s\n\n", snapshot.GeneratedAt.Local().Format(time.Kitchen))
 	if len(snapshot.Sessions) == 0 {
@@ -148,6 +148,18 @@ func runSessionsIndex(out io.Writer, args []string, jsonOutput bool) error {
 				return fmt.Errorf("missing value for --codex-home")
 			}
 			opts.CodexHome = args[i]
+		case "--claude-home":
+			i++
+			if i >= len(args) {
+				return fmt.Errorf("missing value for --claude-home")
+			}
+			opts.ClaudeHome = args[i]
+		case "--provider":
+			i++
+			if i >= len(args) {
+				return fmt.Errorf("missing value for --provider")
+			}
+			opts.Provider = args[i]
 		case "--db":
 			i++
 			if i >= len(args) {
@@ -174,7 +186,7 @@ func runSessionsIndex(out io.Writer, args []string, jsonOutput bool) error {
 	if err != nil {
 		return err
 	}
-	return writeMaybeJSON(out, jsonOutput, map[string]any{"indexed": count}, fmt.Sprintf("Indexed %d Codex sessions", count))
+	return writeMaybeJSON(out, jsonOutput, map[string]any{"indexed": count}, fmt.Sprintf("Indexed %d agent sessions", count))
 }
 
 func runSessionsList(out io.Writer, args []string, jsonOutput bool) error {
@@ -311,7 +323,7 @@ func printSessionsHelp(out io.Writer) {
 Usage:
   pallium sessions live [--all] [--details] [--json]
   pallium sessions watch [--all] [--details]
-  pallium sessions index [--codex-home ~/.codex] [--include path] [--machine name] [--json]
+  pallium sessions index [--provider all|codex|claude] [--codex-home ~/.codex] [--claude-home ~/.claude] [--include path] [--machine name] [--json]
   pallium sessions list [--limit 20] [--json]
   pallium sessions search <query> [--limit 10] [--json]
   pallium sessions grep <query> [--limit 20] [--json]

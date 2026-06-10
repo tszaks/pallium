@@ -44,9 +44,11 @@ var secretPatterns = []*regexp.Regexp{
 var pathLikePattern = regexp.MustCompile(`(?:^|\s)(/[A-Za-z0-9._~+/@:-][^\s'"` + "`" + `<>]*)`)
 
 type Options struct {
-	DBPath    string
-	CodexHome string
-	Machine   string
+	DBPath     string
+	CodexHome  string
+	ClaudeHome string
+	Machine    string
+	Provider   string
 }
 
 type Session struct {
@@ -154,6 +156,13 @@ func DefaultCodexHome() string {
 		return filepath.Join(home, ".codex")
 	}
 	return ".codex"
+}
+
+func DefaultClaudeHome() string {
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".claude")
+	}
+	return ".claude"
 }
 
 func Open(path string) (*Store, error) {
@@ -275,34 +284,66 @@ func Index(ctx context.Context, opts Options, include []string) (int, error) {
 	if opts.CodexHome == "" {
 		opts.CodexHome = DefaultCodexHome()
 	}
+	if opts.ClaudeHome == "" {
+		opts.ClaudeHome = DefaultClaudeHome()
+	}
 	if opts.Machine == "" {
 		host, _ := os.Hostname()
 		opts.Machine = host
+	}
+	provider := strings.ToLower(strings.TrimSpace(opts.Provider))
+	if provider == "" {
+		provider = "all"
+	}
+	if provider != "all" && provider != "codex" && provider != "claude" {
+		return 0, fmt.Errorf("unsupported session provider %q (want codex, claude, or all)", opts.Provider)
 	}
 	store, err := Open(opts.DBPath)
 	if err != nil {
 		return 0, err
 	}
 	defer store.Close()
-	state := loadStateMetadata(filepath.Join(opts.CodexHome, "state_5.sqlite"))
-	files := findRollouts(filepath.Join(opts.CodexHome, "sessions"), include)
 	count := 0
-	for _, file := range files {
-		select {
-		case <-ctx.Done():
-			return count, ctx.Err()
-		default:
+	if provider == "all" || provider == "codex" {
+		state := loadStateMetadata(filepath.Join(opts.CodexHome, "state_5.sqlite"))
+		files := findRollouts(filepath.Join(opts.CodexHome, "sessions"), include)
+		for _, file := range files {
+			select {
+			case <-ctx.Done():
+				return count, ctx.Err()
+			default:
+			}
+			parsed, err := parseRollout(file)
+			if err != nil {
+				return count, fmt.Errorf("parse %s: %w", file, err)
+			}
+			mergeState(&parsed.Session, state[parsed.Session.ID])
+			parsed.Session.Machine = opts.Machine
+			parsed.Session.Source = first(parsed.Session.Source, "codex")
+			if err := store.upsert(parsed, state[parsed.Session.ID]); err != nil {
+				return count, err
+			}
+			count++
 		}
-		parsed, err := parseRollout(file)
-		if err != nil {
-			return count, fmt.Errorf("parse %s: %w", file, err)
+	}
+	if provider == "all" || provider == "claude" {
+		files := findClaudeTranscripts(filepath.Join(opts.ClaudeHome, "projects"), include)
+		for _, file := range files {
+			select {
+			case <-ctx.Done():
+				return count, ctx.Err()
+			default:
+			}
+			parsed, err := parseClaudeTranscript(file)
+			if err != nil {
+				return count, fmt.Errorf("parse %s: %w", file, err)
+			}
+			parsed.Session.Machine = opts.Machine
+			if err := store.upsert(parsed, map[string]any{"provider": "claude"}); err != nil {
+				return count, err
+			}
+			count++
 		}
-		mergeState(&parsed.Session, state[parsed.Session.ID])
-		parsed.Session.Machine = opts.Machine
-		if err := store.upsert(parsed, state[parsed.Session.ID]); err != nil {
-			return count, err
-		}
-		count++
 	}
 	return count, nil
 }
@@ -884,6 +925,201 @@ func parseRolloutMetadataOnly(path string, info os.FileInfo) ParsedSession {
 	return p
 }
 
+func parseClaudeTranscript(path string) (ParsedSession, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return ParsedSession{}, err
+	}
+	if info.Size() > maxParseRolloutBytes {
+		p := parseRolloutMetadataOnly(path, info)
+		p.Session.Source = "claude"
+		p.Session.ModelProvider = "anthropic"
+		return p, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return ParsedSession{}, err
+	}
+	defer f.Close()
+	sha, _ := fileSHA(path)
+	p := ParsedSession{EventCounts: map[string]int{}}
+	p.Session.RolloutPath = path
+	p.Session.RolloutSHA256 = sha
+	p.Session.Source = "claude"
+	p.Session.ModelProvider = "anthropic"
+	p.Session.ID = strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	files := map[string]bool{}
+	tools := map[string]bool{}
+	reader := bufio.NewReader(f)
+	lineNo := 0
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			lineNo++
+			var obj map[string]any
+			if json.Unmarshal(line, &obj) == nil {
+				handleClaudeLine(&p, obj, lineNo, files, tools)
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return p, err
+		}
+	}
+	for f := range files {
+		p.Session.FilesTouched = append(p.Session.FilesTouched, f)
+	}
+	sort.Strings(p.Session.FilesTouched)
+	for t := range tools {
+		p.Session.ToolNames = append(p.Session.ToolNames, t)
+	}
+	sort.Strings(p.Session.ToolNames)
+	p.Session.Title = short(first(p.Session.Title, p.Session.FirstUserMessage, p.Session.ID), 240)
+	p.SearchBlob = truncate(strings.Join([]string{p.Session.Title, p.Session.CWD, strings.Join(p.Session.Commands, "\n"), strings.Join(p.Session.FilesTouched, "\n"), messagesText(p.Messages)}, "\n"), maxSearchBlobText)
+	return p, nil
+}
+
+func handleClaudeLine(p *ParsedSession, obj map[string]any, lineNo int, files, tools map[string]bool) {
+	typ := first(str(obj["type"]), "unknown")
+	p.EventCounts[typ]++
+	ts := isoAny(obj["timestamp"])
+	if p.Session.CreatedAt == "" && ts != "" {
+		p.Session.CreatedAt = ts
+	}
+	if ts != "" {
+		p.Session.UpdatedAt = ts
+	}
+	p.Session.ID = first(str(obj["sessionId"]), p.Session.ID)
+	p.Session.CWD = first(p.Session.CWD, str(obj["cwd"]))
+	p.Session.CLIVersion = first(p.Session.CLIVersion, str(obj["version"]))
+	p.Session.GitBranch = first(p.Session.GitBranch, str(obj["gitBranch"]))
+	p.Session.Title = first(p.Session.Title, str(obj["aiTitle"]))
+	if model := str(obj["model"]); model != "" {
+		p.Session.Model = first(p.Session.Model, model)
+	}
+	if len(p.RawEvents) < maxStoredRawEventsPerSession {
+		raw, _ := json.Marshal(redactObj(obj))
+		rawJSON := string(raw)
+		if len(rawJSON) > maxStoredRawEventJSON {
+			rawJSON = rawJSON[:maxStoredRawEventJSON] + fmt.Sprintf("\n...[truncated raw event from %d bytes]", len(rawJSON))
+		}
+		p.RawEvents = append(p.RawEvents, RawEvent{lineNo, ts, typ, "", rawJSON})
+	}
+	switch typ {
+	case "ai-title":
+		p.Session.Title = first(str(obj["aiTitle"]), p.Session.Title)
+	case "last-prompt", "queue-operation":
+		text := capMessageText(first(str(obj["lastPrompt"]), str(obj["content"])))
+		if text != "" && !isContextNoise(text) && p.Session.FirstUserMessage == "" {
+			p.Session.FirstUserMessage = short(text, maxStoredMessageText)
+		}
+	case "user", "assistant", "system":
+		handleClaudeMessage(p, obj, lineNo, ts, files, tools)
+	}
+}
+
+func handleClaudeMessage(p *ParsedSession, obj map[string]any, lineNo int, ts string, files, tools map[string]bool) {
+	message, _ := obj["message"].(map[string]any)
+	role := first(str(message["role"]), str(obj["type"]))
+	if role == "system" {
+		return
+	}
+	if model := str(message["model"]); model != "" {
+		p.Session.Model = first(p.Session.Model, model)
+	}
+	for i, item := range claudeContentItems(message["content"]) {
+		messageLineNo := lineNo*1000 + i
+		kind := str(item["type"])
+		switch kind {
+		case "", "text", "thinking":
+			text := capMessageText(first(str(item["text"]), str(item["content"])))
+			if text != "" && !isContextNoise(text) {
+				if role == "user" && p.Session.FirstUserMessage == "" {
+					p.Session.FirstUserMessage = short(text, maxStoredMessageText)
+				}
+				if role == "assistant" {
+					p.Session.LastAgentMessage = short(text, maxStoredMessageText)
+				}
+				p.Messages = append(p.Messages, Message{messageLineNo, ts, role, first(kind, "message"), text})
+			}
+		case "tool_use":
+			name := str(item["name"])
+			if name != "" {
+				tools[name] = true
+			}
+			input, _ := item["input"].(map[string]any)
+			cmd := first(str(input["command"]), str(input["cmd"]))
+			path := first(str(input["file_path"]), str(input["path"]), str(input["notebook_path"]))
+			if path != "" {
+				files[path] = true
+			}
+			if cmd != "" {
+				p.Session.Commands = append(p.Session.Commands, cmd)
+				addPaths(files, cmd)
+			}
+			text := capMessageText(first(cmd, path, compactJSON(item["input"])))
+			if text != "" {
+				p.Messages = append(p.Messages, Message{messageLineNo, ts, "tool", name, text})
+			}
+		case "tool_result":
+			text := capMessageText(claudeToolResultText(item["content"]))
+			addPaths(files, text)
+			if regexp.MustCompile(`(?i)(error|traceback|failed|exception|permission denied)`).MatchString(text) {
+				p.Session.Errors = append(p.Session.Errors, short(text, 500))
+			}
+			if text != "" {
+				p.Messages = append(p.Messages, Message{messageLineNo, ts, "tool", "tool_result", text})
+			}
+		}
+	}
+}
+
+func claudeContentItems(v any) []map[string]any {
+	switch x := v.(type) {
+	case string:
+		return []map[string]any{{"type": "text", "text": x}}
+	case []any:
+		items := make([]map[string]any, 0, len(x))
+		for _, it := range x {
+			if m, ok := it.(map[string]any); ok {
+				items = append(items, m)
+			}
+		}
+		return items
+	case map[string]any:
+		return []map[string]any{x}
+	default:
+		return nil
+	}
+}
+
+func claudeToolResultText(v any) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case []any:
+		var parts []string
+		for _, it := range x {
+			if m, ok := it.(map[string]any); ok {
+				parts = append(parts, first(str(m["text"]), str(m["content"])))
+			}
+		}
+		return strings.Join(parts, "\n")
+	default:
+		return str(v)
+	}
+}
+
+func compactJSON(v any) string {
+	if v == nil {
+		return ""
+	}
+	b, _ := json.Marshal(redactObj(v))
+	return string(b)
+}
+
 func handleEventMessage(p *ParsedSession, payload map[string]any, lineNo int, ts string, files map[string]bool) {
 	ptype := str(payload["type"])
 	switch ptype {
@@ -1038,6 +1274,36 @@ func findRollouts(root string, include []string) []string {
 	}
 	sort.Strings(files)
 	return files
+}
+
+func findClaudeTranscripts(root string, include []string) []string {
+	seen := map[string]bool{}
+	var files []string
+	roots := append([]string{root}, include...)
+	for _, r := range roots {
+		info, err := os.Stat(r)
+		if err != nil {
+			continue
+		}
+		if !info.IsDir() && isClaudeTranscriptPath(r) {
+			files = append(files, r)
+			continue
+		}
+		filepath.WalkDir(r, func(path string, d os.DirEntry, err error) error {
+			if err == nil && !d.IsDir() && isClaudeTranscriptPath(path) && !seen[path] {
+				seen[path] = true
+				files = append(files, path)
+			}
+			return nil
+		})
+	}
+	sort.Strings(files)
+	return files
+}
+
+func isClaudeTranscriptPath(path string) bool {
+	base := filepath.Base(path)
+	return strings.HasSuffix(base, ".jsonl") && !strings.HasPrefix(base, "rollout-")
 }
 func fileSHA(path string) (string, error) {
 	b, err := os.ReadFile(path)
