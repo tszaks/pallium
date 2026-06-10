@@ -6,8 +6,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/tszaks/codex-memory/internal/analysis"
-	"github.com/tszaks/codex-memory/internal/output"
+	"github.com/tszaks/pallium/internal/analysis"
+	"github.com/tszaks/pallium/internal/output"
 )
 
 func runReview(out io.Writer, args []string, jsonOutput bool) error {
