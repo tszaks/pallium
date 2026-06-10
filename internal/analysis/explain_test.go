@@ -3,7 +3,7 @@ package analysis
 import (
 	"testing"
 
-	"github.com/tszaks/codex-memory/internal/index"
+	"github.com/tszaks/pallium/internal/index"
 )
 
 func TestExplain(t *testing.T) {

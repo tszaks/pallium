@@ -136,7 +136,15 @@ type Store struct {
 
 func DefaultDBPath() string {
 	if home, err := os.UserHomeDir(); err == nil {
-		return filepath.Join(home, ".codex-memory", "codex-sessions.sqlite")
+		current := filepath.Join(home, ".pallium", "codex-sessions.sqlite")
+		legacy := filepath.Join(home, ".codex-memory", "codex-sessions.sqlite")
+		if _, err := os.Stat(current); err == nil {
+			return current
+		}
+		if _, err := os.Stat(legacy); err == nil {
+			return legacy
+		}
+		return current
 	}
 	return ".codex-sessions.sqlite"
 }

@@ -5,8 +5,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/tszaks/codex-memory/internal/db"
-	"github.com/tszaks/codex-memory/internal/gitlog"
+	"github.com/tszaks/pallium/internal/db"
+	"github.com/tszaks/pallium/internal/gitlog"
 )
 
 type SafeReport struct {
@@ -171,10 +171,10 @@ func Plan(store *db.Store, targetPath string) (PlanReport, error) {
 
 	filesToInspect := uniqueStrings(append([]string{safe.Path}, safe.BlastRadius...), 5)
 	steps := []string{
-		fmt.Sprintf("Read `codex-memory explain %s` and inspect the recent decisions.", safe.Path),
+		fmt.Sprintf("Read `pallium explain %s` and inspect the recent decisions.", safe.Path),
 		"Open the highest-signal related files before editing.",
 		"Make the minimal change needed for the task.",
-		"Run the focused tests suggested by codex-memory.",
+		"Run the focused tests suggested by pallium.",
 		"Re-run explain or review if the blast radius grew during the change.",
 	}
 

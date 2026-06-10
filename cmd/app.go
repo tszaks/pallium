@@ -67,23 +67,23 @@ func (a *App) Run(args []string) error {
 }
 
 func (a *App) printHelp() {
-	fmt.Fprintln(a.stdout, `codex-memory
+	fmt.Fprintln(a.stdout, `pallium
 
 Usage:
-  codex-memory index [repo-path] [--json]
-  codex-memory explain <path> [repo-path] [--json]
-  codex-memory risk <path> [repo-path] [--json]
-  codex-memory neighbors <path> [repo-path] [--json]
-  codex-memory decisions <query> [repo-path] [--json]
-  codex-memory safe <path> [repo-path] [--json]
-  codex-memory plan <path> [repo-path] [--json]
-  codex-memory review [base-ref] [repo-path] [--json]
-  codex-memory changed-now [repo-path] [--json]
-  codex-memory handoff [base-ref] [repo-path] [--json]
-  codex-memory task start <goal> [scope-paths...] [--json]
-  codex-memory task show [--json]
-  codex-memory task clear [--json]
-  codex-memory sessions <index|list|search|grep|show|embed|semantic|stats> [--json]`)
+  pallium index [repo-path] [--json]
+  pallium explain <path> [repo-path] [--json]
+  pallium risk <path> [repo-path] [--json]
+  pallium neighbors <path> [repo-path] [--json]
+  pallium decisions <query> [repo-path] [--json]
+  pallium safe <path> [repo-path] [--json]
+  pallium plan <path> [repo-path] [--json]
+  pallium review [base-ref] [repo-path] [--json]
+  pallium changed-now [repo-path] [--json]
+  pallium handoff [base-ref] [repo-path] [--json]
+  pallium task start <goal> [scope-paths...] [--json]
+  pallium task show [--json]
+  pallium task clear [--json]
+  pallium sessions <index|list|search|grep|show|embed|semantic|stats> [--json]`)
 }
 
 func requireArg(args []string, field string) (string, error) {

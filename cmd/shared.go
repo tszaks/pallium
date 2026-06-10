@@ -5,8 +5,8 @@ import (
 	"io"
 	"strings"
 
-	"github.com/tszaks/codex-memory/internal/analysis"
-	"github.com/tszaks/codex-memory/internal/index"
+	"github.com/tszaks/pallium/internal/analysis"
+	"github.com/tszaks/pallium/internal/index"
 )
 
 func openIndexedStore(path string) (*index.Indexer, error) {

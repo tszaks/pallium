@@ -3,8 +3,8 @@ package analysis
 import (
 	"time"
 
-	"github.com/tszaks/codex-memory/internal/db"
-	"github.com/tszaks/codex-memory/internal/gitlog"
+	"github.com/tszaks/pallium/internal/db"
+	"github.com/tszaks/pallium/internal/gitlog"
 )
 
 type Freshness struct {

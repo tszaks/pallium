@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tszaks/codex-memory/internal/db"
-	"github.com/tszaks/codex-memory/internal/output"
+	"github.com/tszaks/pallium/internal/db"
+	"github.com/tszaks/pallium/internal/output"
 )
 
 type taskStatus struct {

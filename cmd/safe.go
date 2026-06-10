@@ -5,8 +5,8 @@ import (
 	"io"
 	"strings"
 
-	"github.com/tszaks/codex-memory/internal/analysis"
-	"github.com/tszaks/codex-memory/internal/output"
+	"github.com/tszaks/pallium/internal/analysis"
+	"github.com/tszaks/pallium/internal/output"
 )
 
 func runSafe(out io.Writer, args []string, jsonOutput bool) error {

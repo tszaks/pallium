@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/tszaks/codex-memory/cmd"
+	"github.com/tszaks/pallium/cmd"
 )
 
 func main() {

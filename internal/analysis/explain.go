@@ -3,7 +3,7 @@ package analysis
 import (
 	"fmt"
 
-	"github.com/tszaks/codex-memory/internal/db"
+	"github.com/tszaks/pallium/internal/db"
 )
 
 type CommitSummary struct {

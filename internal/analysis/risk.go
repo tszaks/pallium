@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/tszaks/codex-memory/internal/db"
+	"github.com/tszaks/pallium/internal/db"
 )
 
 type RiskReport struct {

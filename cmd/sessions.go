@@ -10,8 +10,8 @@ import (
 
 	"time"
 
-	"github.com/tszaks/codex-memory/internal/codexsessions"
-	"github.com/tszaks/codex-memory/internal/sessionmemory"
+	"github.com/tszaks/pallium/internal/codexsessions"
+	"github.com/tszaks/pallium/internal/sessionmemory"
 )
 
 func runSessions(out io.Writer, args []string, jsonOutput bool) error {
@@ -195,7 +195,7 @@ func runSessionsList(out io.Writer, args []string, jsonOutput bool) error {
 func runSessionsSearch(out io.Writer, args []string, jsonOutput bool) error {
 	query := strings.TrimSpace(strings.Join(nonFlagArgs(args), " "))
 	if query == "" {
-		return fmt.Errorf("usage: codex-memory sessions search <query>")
+		return fmt.Errorf("usage: pallium sessions search <query>")
 	}
 	limit := intArg(args, "--limit", 10)
 	results, err := sessionmemory.Search(query, limit)
@@ -214,7 +214,7 @@ func runSessionsSearch(out io.Writer, args []string, jsonOutput bool) error {
 func runSessionsGrep(out io.Writer, args []string, jsonOutput bool) error {
 	query := strings.TrimSpace(strings.Join(nonFlagArgs(args), " "))
 	if query == "" {
-		return fmt.Errorf("usage: codex-memory sessions grep <query>")
+		return fmt.Errorf("usage: pallium sessions grep <query>")
 	}
 	limit := intArg(args, "--limit", 20)
 	results, err := sessionmemory.Grep(query, limit)
@@ -232,7 +232,7 @@ func runSessionsGrep(out io.Writer, args []string, jsonOutput bool) error {
 
 func runSessionsShow(out io.Writer, args []string, jsonOutput bool) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: codex-memory sessions show <session-id>")
+		return fmt.Errorf("usage: pallium sessions show <session-id>")
 	}
 	transcript := hasArg(args, "--transcript")
 	id := ""
@@ -273,7 +273,7 @@ func runSessionsEmbed(out io.Writer, args []string, jsonOutput bool) error {
 func runSessionsSemantic(out io.Writer, args []string, jsonOutput bool) error {
 	query := strings.TrimSpace(strings.Join(nonFlagArgs(args), " "))
 	if query == "" {
-		return fmt.Errorf("usage: codex-memory sessions semantic <query>")
+		return fmt.Errorf("usage: pallium sessions semantic <query>")
 	}
 	model := stringArg(args, "--model", sessionmemory.DefaultEmbeddingModel)
 	limit := intArg(args, "--limit", 10)
@@ -306,19 +306,19 @@ func runSessionsStats(out io.Writer, jsonOutput bool) error {
 }
 
 func printSessionsHelp(out io.Writer) {
-	fmt.Fprintln(out, `codex-memory sessions
+	fmt.Fprintln(out, `pallium sessions
 
 Usage:
-  codex-memory sessions live [--all] [--details] [--json]
-  codex-memory sessions watch [--all] [--details]
-  codex-memory sessions index [--codex-home ~/.codex] [--include path] [--machine name] [--json]
-  codex-memory sessions list [--limit 20] [--json]
-  codex-memory sessions search <query> [--limit 10] [--json]
-  codex-memory sessions grep <query> [--limit 20] [--json]
-  codex-memory sessions show <session-id> [--transcript] [--json]
-  codex-memory sessions embed [--model text-embedding-3-small] [--limit n] [--batch-size n] [--json]
-  codex-memory sessions semantic <query> [--model text-embedding-3-small] [--limit 10] [--json]
-  codex-memory sessions stats [--json]`)
+  pallium sessions live [--all] [--details] [--json]
+  pallium sessions watch [--all] [--details]
+  pallium sessions index [--codex-home ~/.codex] [--include path] [--machine name] [--json]
+  pallium sessions list [--limit 20] [--json]
+  pallium sessions search <query> [--limit 10] [--json]
+  pallium sessions grep <query> [--limit 20] [--json]
+  pallium sessions show <session-id> [--transcript] [--json]
+  pallium sessions embed [--model text-embedding-3-small] [--limit n] [--batch-size n] [--json]
+  pallium sessions semantic <query> [--model text-embedding-3-small] [--limit 10] [--json]
+  pallium sessions stats [--json]`)
 }
 
 func printSessionBrief(out io.Writer, s sessionmemory.Session) {

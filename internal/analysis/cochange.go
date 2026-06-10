@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/tszaks/codex-memory/internal/db"
+	"github.com/tszaks/pallium/internal/db"
 )
 
 type Neighbor struct {

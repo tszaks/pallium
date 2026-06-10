@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tszaks/codex-memory/internal/db"
-	"github.com/tszaks/codex-memory/internal/index"
+	"github.com/tszaks/pallium/internal/db"
+	"github.com/tszaks/pallium/internal/index"
 )
 
 func TestSafe(t *testing.T) {
