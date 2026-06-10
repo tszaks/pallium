@@ -44,13 +44,15 @@ pallium task show
 
 Use `--json` with any command for agent-friendly output.
 
-## Codex Session Memory
+## Agent Session Memory
 
-`pallium` can also index Codex CLI session transcripts from `~/.codex/sessions/**/*.jsonl` plus metadata from `~/.codex/state_5.sqlite`.
+`pallium` can also index Codex CLI transcripts from `~/.codex/sessions/**/*.jsonl` plus metadata from `~/.codex/state_5.sqlite`, and Claude Code transcripts from `~/.claude/projects/**/*.jsonl`.
 
 ```bash
 pallium sessions live --details
 pallium sessions index
+pallium sessions index --provider claude
+pallium sessions index --provider codex
 pallium sessions list --limit 20
 pallium sessions search "MCP auth" --limit 10
 pallium sessions grep "Timed out waiting for PGLite lock" --limit 20
@@ -60,12 +62,13 @@ pallium sessions semantic "find the session where we debugged MCP startup failur
 pallium sessions stats
 ```
 
-Session-memory data is stored outside any one repo at `~/.pallium/codex-sessions.sqlite`. It includes redacted raw rollout events, transcript/tool-call rows, FTS indexes, chunks, OpenAI embeddings, and brute-force cosine semantic search. Use `OPENAI_API_KEY` or `OPENAI_ADMIN_API_KEY` for embedding commands.
+Session-memory data is stored outside any one repo at `~/.pallium/codex-sessions.sqlite`. It includes redacted raw agent events, transcript/tool-call rows, FTS indexes, chunks, OpenAI embeddings, and brute-force cosine semantic search. Use `OPENAI_API_KEY` or `OPENAI_ADMIN_API_KEY` for embedding commands.
 
 For another machine's sessions:
 
 ```bash
 pallium sessions index --include /path/to/other/.codex/sessions --machine tylers-macbook
+pallium sessions index --provider claude --include /path/to/other/.claude/projects --machine tylers-macbook
 ```
 
 ## Typical Agent Loop
