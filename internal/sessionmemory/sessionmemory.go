@@ -43,6 +43,8 @@ var secretPatterns = []*regexp.Regexp{
 
 var pathLikePattern = regexp.MustCompile(`(?:^|\s)(/[A-Za-z0-9._~+/@:-][^\s'"` + "`" + `<>]*)`)
 
+var embedTexts = openAIEmbeddings
+
 type Options struct {
 	DBPath     string
 	CodexHome  string
@@ -602,6 +604,10 @@ func scanSessionRank(scanner interface{ Scan(...any) error }) (Session, float64,
 
 // Embedding and semantic search.
 func Embed(ctx context.Context, model string, limit, batchSize int) (int, error) {
+	return EmbedSession(ctx, "", model, limit, batchSize)
+}
+
+func EmbedSession(ctx context.Context, sessionID, model string, limit, batchSize int) (int, error) {
 	if model == "" {
 		model = DefaultEmbeddingModel
 	}
@@ -616,7 +622,16 @@ func Embed(ctx context.Context, model string, limit, batchSize int) (int, error)
 		return 0, err
 	}
 	defer store.Close()
-	rows, err := store.db.Query(`SELECT c.id,c.text,c.text_sha256 FROM codex_session_chunks c LEFT JOIN codex_session_embeddings e ON e.chunk_id=c.id AND e.provider='openai' AND e.model=? AND e.text_sha256=c.text_sha256 WHERE e.chunk_id IS NULL ORDER BY c.session_id,c.chunk_index LIMIT ?`, model, limit)
+	var rows *sql.Rows
+	if sessionID != "" {
+		resolvedID, err := store.resolveID(sessionID)
+		if err != nil {
+			return 0, err
+		}
+		rows, err = store.db.Query(`SELECT c.id,c.text,c.text_sha256 FROM codex_session_chunks c LEFT JOIN codex_session_embeddings e ON e.chunk_id=c.id AND e.provider='openai' AND e.model=? AND e.text_sha256=c.text_sha256 WHERE e.chunk_id IS NULL AND c.session_id=? ORDER BY c.session_id,c.chunk_index LIMIT ?`, model, resolvedID, limit)
+	} else {
+		rows, err = store.db.Query(`SELECT c.id,c.text,c.text_sha256 FROM codex_session_chunks c LEFT JOIN codex_session_embeddings e ON e.chunk_id=c.id AND e.provider='openai' AND e.model=? AND e.text_sha256=c.text_sha256 WHERE e.chunk_id IS NULL ORDER BY c.session_id,c.chunk_index LIMIT ?`, model, limit)
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -643,7 +658,7 @@ func Embed(ctx context.Context, model string, limit, batchSize int) (int, error)
 		for _, c := range chunks[i:end] {
 			texts = append(texts, c.text)
 		}
-		vecs, err := openAIEmbeddings(ctx, model, texts)
+		vecs, err := embedTexts(ctx, model, texts)
 		if err != nil {
 			return total, err
 		}
@@ -665,7 +680,7 @@ func Semantic(ctx context.Context, query, model string, limit int, sessionsOnly 
 	if limit <= 0 {
 		limit = 10
 	}
-	qvecs, err := openAIEmbeddings(ctx, model, []string{query})
+	qvecs, err := embedTexts(ctx, model, []string{query})
 	if err != nil {
 		return nil, err
 	}
