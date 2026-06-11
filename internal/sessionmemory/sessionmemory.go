@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -731,20 +732,39 @@ func openAIEmbeddings(ctx context.Context, model string, texts []string) ([][]fl
 		return nil, errors.New("OPENAI_API_KEY is required for embeddings")
 	}
 	body, _ := json.Marshal(map[string]any{"model": model, "input": texts})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.openai.com/v1/embeddings", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
+	var payload []byte
+	var status string
+	for attempt := 0; attempt < 10; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.openai.com/v1/embeddings", bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+key)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		payload, _ = io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		status = resp.Status
+		if resp.StatusCode < 300 {
+			break
+		}
+		if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
+			return nil, fmt.Errorf("openai embeddings failed: %s: %s", resp.Status, short(string(payload), 500))
+		}
+		wait := retryDelay(resp.Header.Get("Retry-After"), string(payload), attempt)
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
 	}
-	req.Header.Set("Authorization", "Bearer "+key)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	payload, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("openai embeddings failed: %s: %s", resp.Status, short(string(payload), 500))
+	if status == "" || !strings.HasPrefix(status, "2") {
+		return nil, fmt.Errorf("openai embeddings failed: %s: %s", status, short(string(payload), 500))
 	}
 	var decoded struct {
 		Data []struct {
@@ -759,6 +779,29 @@ func openAIEmbeddings(ctx context.Context, model string, texts []string) ([][]fl
 		out[i] = item.Embedding
 	}
 	return out, nil
+}
+
+func retryDelay(retryAfter, payload string, attempt int) time.Duration {
+	if retryAfter != "" {
+		if seconds, err := strconv.ParseFloat(strings.TrimSpace(retryAfter), 64); err == nil && seconds > 0 {
+			return time.Duration(seconds*1000) * time.Millisecond
+		}
+	}
+	re := regexp.MustCompile(`(?i)try again in ([0-9.]+)\s*(ms|s)`)
+	matches := re.FindStringSubmatch(payload)
+	if len(matches) == 3 {
+		if n, err := strconv.ParseFloat(matches[1], 64); err == nil && n > 0 {
+			if strings.EqualFold(matches[2], "ms") {
+				return time.Duration(n) * time.Millisecond
+			}
+			return time.Duration(n*1000) * time.Millisecond
+		}
+	}
+	delay := time.Duration(1<<min(attempt, 5)) * time.Second
+	if delay > 30*time.Second {
+		return 30 * time.Second
+	}
+	return delay
 }
 
 func packVector(vec []float64) []byte {
