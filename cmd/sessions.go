@@ -275,11 +275,16 @@ func runSessionsEmbed(out io.Writer, args []string, jsonOutput bool) error {
 	model := stringArg(args, "--model", sessionmemory.DefaultEmbeddingModel)
 	limit := intArg(args, "--limit", 1000000)
 	batch := intArg(args, "--batch-size", 64)
-	count, err := sessionmemory.Embed(context.Background(), model, limit, batch)
+	sessionID := stringArg(args, "--session", "")
+	count, err := sessionmemory.EmbedSession(context.Background(), sessionID, model, limit, batch)
 	if err != nil {
 		return err
 	}
-	return writeMaybeJSON(out, jsonOutput, map[string]any{"embedded": count, "model": model}, fmt.Sprintf("Embedded %d Codex session chunks with %s", count, model))
+	payload := map[string]any{"embedded": count, "model": model}
+	if sessionID != "" {
+		payload["session_id"] = sessionID
+	}
+	return writeMaybeJSON(out, jsonOutput, payload, fmt.Sprintf("Embedded %d session chunks with %s", count, model))
 }
 
 func runSessionsSemantic(out io.Writer, args []string, jsonOutput bool) error {
@@ -328,7 +333,7 @@ Usage:
   pallium sessions search <query> [--limit 10] [--json]
   pallium sessions grep <query> [--limit 20] [--json]
   pallium sessions show <session-id> [--transcript] [--json]
-  pallium sessions embed [--model text-embedding-3-small] [--limit n] [--batch-size n] [--json]
+  pallium sessions embed [--session id] [--model text-embedding-3-small] [--limit n] [--batch-size n] [--json]
   pallium sessions semantic <query> [--model text-embedding-3-small] [--limit 10] [--json]
   pallium sessions stats [--json]`)
 }
