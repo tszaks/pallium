@@ -54,21 +54,22 @@ type ReviewedFile struct {
 }
 
 type ReviewReport struct {
-	BaseRef          string                       `json:"base_ref"`
-	HeadRef          string                       `json:"head_ref"`
-	Summary          string                       `json:"summary"`
-	Freshness        Freshness                    `json:"freshness"`
-	Evidence         Evidence                     `json:"evidence"`
-	ChangedFiles     []ReviewedFile               `json:"changed_files"`
-	RequiredTests    []string                     `json:"required_tests"`
-	TestCommands     []string                     `json:"test_commands"`
-	Verification     VerificationPlan             `json:"verification"`
-	Confidence       Confidence                   `json:"confidence"`
-	ActionGuidance   ActionGuidance               `json:"action_guidance"`
-	Task             TaskScopeReport              `json:"task"`
-	BoundaryWarnings []BoundaryWarning            `json:"boundary_warnings"`
-	RelatedSessions  []sessionmemory.SearchResult `json:"related_sessions"`
-	Notes            []string                     `json:"notes"`
+	BaseRef             string                       `json:"base_ref"`
+	HeadRef             string                       `json:"head_ref"`
+	Summary             string                       `json:"summary"`
+	Freshness           Freshness                    `json:"freshness"`
+	Evidence            Evidence                     `json:"evidence"`
+	ChangedFiles        []ReviewedFile               `json:"changed_files"`
+	RequiredTests       []string                     `json:"required_tests"`
+	TestCommands        []string                     `json:"test_commands"`
+	Verification        VerificationPlan             `json:"verification"`
+	Confidence          Confidence                   `json:"confidence"`
+	ActionGuidance      ActionGuidance               `json:"action_guidance"`
+	Task                TaskScopeReport              `json:"task"`
+	BoundaryWarnings    []BoundaryWarning            `json:"boundary_warnings"`
+	RelatedSessions     []sessionmemory.SearchResult `json:"related_sessions"`
+	VerificationHistory []db.VerificationRun         `json:"verification_history"`
+	Notes               []string                     `json:"notes"`
 }
 
 type ChangedNowFile struct {
@@ -90,14 +91,15 @@ type ChangedNowReport struct {
 }
 
 type HandoffReport struct {
-	Summary         string                       `json:"summary"`
-	Freshness       Freshness                    `json:"freshness"`
-	Evidence        Evidence                     `json:"evidence"`
-	Review          ReviewReport                 `json:"review"`
-	ChangedNow      ChangedNowReport             `json:"changed_now"`
-	NextActions     []string                     `json:"next_actions"`
-	Task            TaskScopeReport              `json:"task"`
-	RelatedSessions []sessionmemory.SearchResult `json:"related_sessions"`
+	Summary             string                       `json:"summary"`
+	Freshness           Freshness                    `json:"freshness"`
+	Evidence            Evidence                     `json:"evidence"`
+	Review              ReviewReport                 `json:"review"`
+	ChangedNow          ChangedNowReport             `json:"changed_now"`
+	NextActions         []string                     `json:"next_actions"`
+	Task                TaskScopeReport              `json:"task"`
+	RelatedSessions     []sessionmemory.SearchResult `json:"related_sessions"`
+	VerificationHistory []db.VerificationRun         `json:"verification_history"`
 }
 
 func Safe(store *db.Store, targetPath string) (SafeReport, error) {
@@ -232,26 +234,30 @@ func Review(store *db.Store, baseRef string) (ReviewReport, error) {
 	reviewed := make([]ReviewedFile, 0, len(changed))
 	requiredTests := make([]string, 0)
 	testCommands := make([]string, 0)
-	reviewFast := make([]string, 0)
-	reviewSafe := make([]string, 0)
-	reviewFull := make([]string, 0)
 	notes := make([]string, 0)
 	allBoundaries := make([]BoundaryWarning, 0)
+	fileVerification := make(map[string]VerificationPlan, len(changed))
 	highRiskCount := 0
 
 	for _, path := range changed {
 		risk, err := Risk(store, path)
 		if err != nil {
+			tests, _ := SuggestedTests(store, path, 4)
+			commands, _ := SuggestedTestCommands(store, path, 3)
+			verification, _ := SuggestedVerificationPlan(store, path)
+			fileVerification[path] = verification
+			requiredTests = append(requiredTests, tests...)
+			testCommands = append(testCommands, commands...)
 			notes = append(notes, fmt.Sprintf("No indexed risk data for %s yet.", path))
 			reviewed = append(reviewed, ReviewedFile{
 				Path:           path,
 				ChangeSource:   changeSources[path],
 				RiskLevel:      "unknown",
 				TopReasons:     []string{"This file is new or outside indexed history, so risk is unknown."},
-				SuggestedTests: []string{},
+				SuggestedTests: tests,
 				BlastRadius:    []string{},
 				NeedsReview:    true,
-				NeedsTests:     true,
+				NeedsTests:     len(commands) > 0,
 			})
 			continue
 		}
@@ -275,6 +281,7 @@ func Review(store *db.Store, baseRef string) (ReviewReport, error) {
 		if risk.Level == "high" {
 			highRiskCount++
 		}
+		fileVerification[path] = verification
 		boundaries := detectBoundaryWarnings(append([]string{path}, blastRadius...))
 		boundaryLabels := make([]string, 0, len(boundaries))
 		for _, boundary := range boundaries {
@@ -283,9 +290,6 @@ func Review(store *db.Store, baseRef string) (ReviewReport, error) {
 
 		requiredTests = append(requiredTests, tests...)
 		testCommands = append(testCommands, commands...)
-		reviewFast = append(reviewFast, verification.Fast...)
-		reviewSafe = append(reviewSafe, verification.Safe...)
-		reviewFull = append(reviewFull, verification.Full...)
 		allBoundaries = append(allBoundaries, boundaries...)
 		reviewed = append(reviewed, ReviewedFile{
 			Path:           path,
@@ -306,11 +310,8 @@ func Review(store *db.Store, baseRef string) (ReviewReport, error) {
 	}
 	confidence := buildConfidence(len(reviewed) > 0, 1, len(requiredTests), len(reviewed))
 	freshness := buildFreshness(store)
-	verification := VerificationPlan{
-		Fast: uniqueStrings(reviewFast, 5),
-		Safe: uniqueStrings(reviewSafe, 6),
-		Full: uniqueStrings(reviewFull, 6),
-	}
+	sortReviewedFiles(reviewed, task)
+	verification := verificationPlanFromReviewed(reviewed, fileVerification)
 	actionGuidance := buildActionGuidance("working-tree", RiskReport{Level: "medium"}, confidence, nil, pathsFromReviewed(reviewed), verification.Fast)
 	if task.HasScopeDrift {
 		notes = append(notes, fmt.Sprintf("Active task drifted outside planned scope: %s.", strings.Join(task.OutOfScopeChanged, ", ")))
@@ -326,17 +327,16 @@ func Review(store *db.Store, baseRef string) (ReviewReport, error) {
 		actionGuidance.StopSignals = uniqueStrings(append(actionGuidance.StopSignals, "Multiple sensitive boundaries changed together: slow down and review the full flow."), 5)
 		actionGuidance.MustReview = true
 	}
-	if len(reviewFast) == 0 {
+	if len(verification.Fast) == 0 {
 		actionGuidance.StopSignals = uniqueStrings(append(actionGuidance.StopSignals, "No focused verification command was inferred for this review: pick a manual verification plan before handoff."), 5)
 		actionGuidance.MustVerify = true
 	}
-	if len(reviewFast) > 0 || len(reviewSafe) > 0 || len(reviewFull) > 0 {
+	if len(verification.Fast) > 0 || len(verification.Safe) > 0 || len(verification.Full) > 0 {
 		actionGuidance.MustVerify = true
 	}
 	if actionGuidance.RecommendedNextCommand == "" && len(verification.Fast) > 0 {
 		actionGuidance.RecommendedNextCommand = verification.Fast[0]
 	}
-	sortReviewedFiles(reviewed, task)
 	evidence := buildEvidence(freshness, len(reviewed), len(requiredTests), verification, task, len(reviewed))
 
 	summary := fmt.Sprintf("Review %d changed files before handing this branch back to an agent.", len(changed))
@@ -350,23 +350,33 @@ func Review(store *db.Store, baseRef string) (ReviewReport, error) {
 		Files:        changed,
 		Limit:        5,
 	})
+	verificationHistory, _ := store.RecentVerificationRuns(5)
+	if failed, ok := latestFailedVerification(verificationHistory); ok {
+		notes = append(notes, fmt.Sprintf("Most recent verification failed: `%s` exited %d.", failed.Command, failed.ExitCode))
+		actionGuidance.StopSignals = uniqueStrings(append(actionGuidance.StopSignals, "Most recent verification failed: re-run verification before handoff."), 5)
+		actionGuidance.MustVerify = true
+		if actionGuidance.RecommendedNextCommand == "" {
+			actionGuidance.RecommendedNextCommand = failed.Command
+		}
+	}
 
 	return ReviewReport{
-		BaseRef:          baseRef,
-		HeadRef:          "HEAD",
-		Summary:          summary,
-		Freshness:        freshness,
-		Evidence:         evidence,
-		ChangedFiles:     reviewed,
-		RequiredTests:    uniqueStrings(requiredTests, 10),
-		TestCommands:     uniqueStrings(testCommands, 5),
-		Verification:     verification,
-		Confidence:       confidence,
-		ActionGuidance:   actionGuidance,
-		Task:             task,
-		BoundaryWarnings: uniqueBoundaryWarnings(allBoundaries),
-		RelatedSessions:  relatedSessions,
-		Notes:            uniqueStrings(notes, 10),
+		BaseRef:             baseRef,
+		HeadRef:             "HEAD",
+		Summary:             summary,
+		Freshness:           freshness,
+		Evidence:            evidence,
+		ChangedFiles:        reviewed,
+		RequiredTests:       uniqueStrings(requiredTests, 10),
+		TestCommands:        uniqueStrings(testCommands, 5),
+		Verification:        verification,
+		Confidence:          confidence,
+		ActionGuidance:      actionGuidance,
+		Task:                task,
+		BoundaryWarnings:    uniqueBoundaryWarnings(allBoundaries),
+		RelatedSessions:     relatedSessions,
+		VerificationHistory: verificationHistory,
+		Notes:               uniqueStrings(notes, 10),
 	}, nil
 }
 
@@ -456,6 +466,9 @@ func Handoff(store *db.Store, baseRef string) (HandoffReport, error) {
 	if review.Task.HasScopeDrift {
 		nextActions = append(nextActions, fmt.Sprintf("Resolve task scope drift before handoff: %s.", strings.Join(review.Task.OutOfScopeChanged, ", ")))
 	}
+	if failed, ok := latestFailedVerification(review.VerificationHistory); ok {
+		nextActions = append(nextActions, fmt.Sprintf("Re-run failed verification before handoff: %s.", failed.Command))
+	}
 	if len(nextActions) == 0 {
 		nextActions = append(nextActions, "No extra handoff actions suggested.")
 	}
@@ -464,14 +477,15 @@ func Handoff(store *db.Store, baseRef string) (HandoffReport, error) {
 	evidence := buildEvidence(freshness, len(review.ChangedFiles), len(review.RequiredTests), review.Verification, review.Task, len(review.ChangedFiles))
 
 	return HandoffReport{
-		Summary:         "Use this report to hand work from an agent back to a human or another agent with less surprise.",
-		Freshness:       freshness,
-		Evidence:        evidence,
-		Review:          review,
-		ChangedNow:      changedNow,
-		NextActions:     nextActions,
-		Task:            review.Task,
-		RelatedSessions: review.RelatedSessions,
+		Summary:             "Use this report to hand work from an agent back to a human or another agent with less surprise.",
+		Freshness:           freshness,
+		Evidence:            evidence,
+		Review:              review,
+		ChangedNow:          changedNow,
+		NextActions:         nextActions,
+		Task:                review.Task,
+		RelatedSessions:     review.RelatedSessions,
+		VerificationHistory: review.VerificationHistory,
 	}, nil
 }
 
@@ -489,6 +503,23 @@ func pathsFromReviewed(files []ReviewedFile) []string {
 		out = append(out, file.Path)
 	}
 	return out
+}
+
+func verificationPlanFromReviewed(files []ReviewedFile, perFile map[string]VerificationPlan) VerificationPlan {
+	fast := make([]string, 0)
+	safe := make([]string, 0)
+	full := make([]string, 0)
+	for _, file := range files {
+		plan := perFile[file.Path]
+		fast = append(fast, plan.Fast...)
+		safe = append(safe, plan.Safe...)
+		full = append(full, plan.Full...)
+	}
+	return VerificationPlan{
+		Fast: uniqueStrings(fast, 5),
+		Safe: uniqueStrings(safe, 6),
+		Full: uniqueStrings(full, 6),
+	}
 }
 
 func uniqueBoundaryWarnings(values []BoundaryWarning) []BoundaryWarning {
@@ -525,6 +556,9 @@ func reviewPriority(file ReviewedFile, outOfScope map[string]struct{}) int {
 	if _, ok := outOfScope[file.Path]; ok {
 		score += 100
 	}
+	if file.ChangeSource == "untracked" || strings.Contains(file.ChangeSource, "working_tree") {
+		score += 100
+	}
 	switch file.RiskLevel {
 	case "high":
 		score += 50
@@ -542,6 +576,17 @@ func reviewPriority(file ReviewedFile, outOfScope map[string]struct{}) int {
 	}
 	score += min(len(file.BlastRadius), 5)
 	return score
+}
+
+func latestFailedVerification(runs []db.VerificationRun) (db.VerificationRun, bool) {
+	if len(runs) == 0 {
+		return db.VerificationRun{}, false
+	}
+	latest := runs[0]
+	if latest.ExitCode == 0 {
+		return db.VerificationRun{}, false
+	}
+	return latest, true
 }
 
 func firstNonEmptyString(values ...string) string {

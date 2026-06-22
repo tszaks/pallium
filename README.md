@@ -13,6 +13,8 @@ It gives an LLM fast repo context before, during, and after edits:
 - what the blast radius probably is
 - what action an agent should take next
 - whether the current task drifted outside its planned scope
+- what related agent sessions may explain the current repo or files
+- what verification commands actually passed or failed recently
 - what changed in the working tree right now
 
 ## Why It Matters
@@ -32,11 +34,14 @@ That leads to common mistakes:
 
 ```bash
 pallium index
+pallium doctor
+pallium version
 pallium explain <path>
 pallium safe <path>
 pallium plan <path>
 pallium changed-now
 pallium review [base-ref]
+pallium verify <fast|safe|full>
 pallium handoff [base-ref]
 pallium task start "Tighten auth flow" src/auth cmd
 pallium task show
@@ -55,6 +60,8 @@ pallium sessions index --provider claude
 pallium sessions index --provider codex
 pallium sessions list --limit 20
 pallium sessions search "MCP auth" --limit 10
+pallium sessions search "MCP auth" --hybrid --limit 10
+pallium sessions related . --file cmd/app.go --limit 5
 pallium sessions grep "Timed out waiting for PGLite lock" --limit 20
 pallium sessions show <session-id> --transcript
 pallium sessions embed
@@ -81,6 +88,7 @@ pallium plan path/to/file --json
 pallium task start "Tighten auth flow" src/auth cmd --json
 pallium changed-now --json
 pallium handoff origin/main --json
+pallium verify fast --json
 ```
 
 ## Install
@@ -100,13 +108,18 @@ go run . --help
 
 ## What Each Command Does
 
+- `doctor`: checks git, local DB, repo index, session index, embeddings backlog, and environment readiness
+- `version`: prints the installed Pallium build information
 - `explain`: best pre-edit briefing for a file
 - `safe`: tells an agent how cautious it should be, with confidence
 - `plan`: gives a lightweight edit plan plus likely test commands and verification tiers
-- `changed-now`: shows the live working tree
-- `review`: reviews branch diff plus working-tree changes with confidence, task drift, boundary warnings, and the riskiest files first
-- `handoff`: generates a final summary before handoff
+- `changed-now`: shows the live working tree, even before the repo has been indexed
+- `review`: reviews branch diff plus working-tree changes with confidence, task drift, boundary warnings, related sessions, verification history, and the riskiest files first
+- `verify`: runs Pallium's inferred fast, safe, or full verification command and records the result
+- `handoff`: generates a final summary before handoff with related sessions and recent verification history
 - `task`: stores the current goal and planned scope so drift shows up in review and handoff
+- `sessions related`: ranks prior sessions by current repo, git origin, touched files, query terms, and recency
+- `sessions search --hybrid`: mixes lexical search with repo and file-aware ranking
 
 It also handles brand-new files better now by inferring likely related files and tests even before they have indexed history, adds lightweight Go, JS/TS, and Python dependency signals including nested `tsconfig` aliases and Python `src/` layouts, prefers real repo verification commands when they exist across `package.json`, Python project files, and common `Makefile` targets, and surfaces boundary warnings for areas like auth, config, DB, API, payments, and jobs.
 
@@ -125,6 +138,7 @@ go test ./...
 go run . index
 go run . explain README.md
 go run . changed-now
+go run . verify fast
 go run . handoff HEAD~1
 ```
 
@@ -132,7 +146,7 @@ go run . handoff HEAD~1
 
 - Local data lives in `.pallium/`
 - Existing `.codex-memory/` indexes are still read when no `.pallium/` index exists
-- If the repo has not been indexed yet, analysis commands will tell you to run `pallium index` first
+- If the repo has not been indexed yet, `changed-now` still reports live working-tree files and recommends `pallium index`
 
 ## License
 

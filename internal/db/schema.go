@@ -65,4 +65,16 @@ CREATE TABLE IF NOT EXISTS active_tasks (
   scope_paths TEXT NOT NULL,
   started_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS verification_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  repo_id INTEGER NOT NULL,
+  tier TEXT NOT NULL,
+  command TEXT NOT NULL,
+  exit_code INTEGER NOT NULL,
+  duration_ms INTEGER NOT NULL,
+  changed_files_json TEXT NOT NULL,
+  cwd TEXT NOT NULL,
+  ran_at TEXT NOT NULL
+);
 `
