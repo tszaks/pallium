@@ -349,3 +349,29 @@ func TestExplainMarksStaleIndex(t *testing.T) {
 		t.Fatalf("expected stale freshness after new commit, got %#v", report.Freshness)
 	}
 }
+
+func TestChangedNowWorksBeforeRepoIsIndexed(t *testing.T) {
+	repo := indexRepo(t)
+	store, err := index.OpenStore(repo)
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+	defer store.Close()
+
+	writeFile(t, filepath.Join(repo, "scratch.go"), "package main\n\nfunc scratch() {}\n")
+
+	report, err := ChangedNow(store)
+	if err != nil {
+		t.Fatalf("ChangedNow failed before index: %v", err)
+	}
+
+	if report.IndexStatus != "missing" {
+		t.Fatalf("expected missing index status, got %#v", report)
+	}
+	if report.RecommendedNextCommand != "pallium index" {
+		t.Fatalf("expected index recommendation, got %#v", report)
+	}
+	if len(report.Files) != 1 || report.Files[0].Path != "scratch.go" || report.Files[0].RiskLevel != "unknown" {
+		t.Fatalf("expected unknown scratch.go working-tree report, got %#v", report.Files)
+	}
+}

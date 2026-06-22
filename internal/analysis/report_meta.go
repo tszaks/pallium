@@ -1,6 +1,7 @@
 package analysis
 
 import (
+	"errors"
 	"time"
 
 	"github.com/tszaks/pallium/internal/db"
@@ -8,6 +9,7 @@ import (
 )
 
 type Freshness struct {
+	IndexStatus          string   `json:"index_status"`
 	IndexedAt            string   `json:"indexed_at"`
 	IndexedBranch        string   `json:"indexed_branch"`
 	LastIndexedCommit    string   `json:"last_indexed_commit"`
@@ -25,14 +27,25 @@ type Evidence struct {
 }
 
 func buildFreshness(store *db.Store) Freshness {
-	repo, err := store.Repo()
-	if err != nil {
-		return Freshness{}
-	}
-
 	currentBranch, _ := gitlog.CurrentBranch(store.RepoRoot)
 	currentCommit, _ := gitlog.CurrentCommit(store.RepoRoot)
 	workingTree, _ := gitlog.WorkingTreeChanges(store.RepoRoot)
+
+	repo, err := store.Repo()
+	if err != nil {
+		if errors.Is(err, db.ErrRepoNotIndexed) {
+			return Freshness{
+				IndexStatus:          "missing",
+				CurrentBranch:        currentBranch,
+				CurrentCommit:        currentCommit,
+				WorkingTreeDirty:     len(workingTree) > 0,
+				WorkingTreeFileCount: len(workingTree),
+				IsStale:              true,
+				Reasons:              []string{"Repo has not been indexed yet. Run `pallium index` to enable history-backed guidance."},
+			}
+		}
+		return Freshness{}
+	}
 
 	reasons := make([]string, 0, 4)
 	isStale := false
@@ -52,6 +65,7 @@ func buildFreshness(store *db.Store) Freshness {
 	}
 
 	return Freshness{
+		IndexStatus:          "indexed",
 		IndexedAt:            formatReportTime(repo.IndexedAt),
 		IndexedBranch:        repo.Branch,
 		LastIndexedCommit:    repo.LastIndexedCommit,

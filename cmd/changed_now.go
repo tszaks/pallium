@@ -24,6 +24,12 @@ func runChangedNow(out io.Writer, args []string, jsonOutput bool) error {
 
 	return output.Write(out, report, jsonOutput, func() string {
 		lines := []string{report.Summary}
+		if report.IndexStatus != "" {
+			lines = append(lines, "Index status: "+report.IndexStatus)
+		}
+		if report.RecommendedNextCommand != "" {
+			lines = append(lines, "Recommended next command: "+report.RecommendedNextCommand)
+		}
 		if freshnessLines := renderFreshness(report.Freshness); len(freshnessLines) > 0 {
 			lines = append(lines, "")
 			lines = append(lines, freshnessLines...)

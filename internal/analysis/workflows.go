@@ -78,11 +78,13 @@ type ChangedNowFile struct {
 }
 
 type ChangedNowReport struct {
-	Summary   string           `json:"summary"`
-	Freshness Freshness        `json:"freshness"`
-	Evidence  Evidence         `json:"evidence"`
-	Files     []ChangedNowFile `json:"files"`
-	Task      TaskScopeReport  `json:"task"`
+	Summary                string           `json:"summary"`
+	IndexStatus            string           `json:"index_status"`
+	RecommendedNextCommand string           `json:"recommended_next_command,omitempty"`
+	Freshness              Freshness        `json:"freshness"`
+	Evidence               Evidence         `json:"evidence"`
+	Files                  []ChangedNowFile `json:"files"`
+	Task                   TaskScopeReport  `json:"task"`
 }
 
 type HandoffReport struct {
@@ -403,13 +405,20 @@ func ChangedNow(store *db.Store) (ChangedNowReport, error) {
 	}
 	freshness := buildFreshness(store)
 	evidence := buildEvidence(freshness, len(files), 0, VerificationPlan{}, task, 0)
+	indexStatus := firstNonEmptyString(freshness.IndexStatus, "unknown")
+	recommendedNextCommand := ""
+	if indexStatus == "missing" {
+		recommendedNextCommand = "pallium index"
+	}
 
 	return ChangedNowReport{
-		Summary:   fmt.Sprintf("Working tree currently touches %d file(s).", len(files)),
-		Freshness: freshness,
-		Evidence:  evidence,
-		Files:     files,
-		Task:      task,
+		Summary:                fmt.Sprintf("Working tree currently touches %d file(s).", len(files)),
+		IndexStatus:            indexStatus,
+		RecommendedNextCommand: recommendedNextCommand,
+		Freshness:              freshness,
+		Evidence:               evidence,
+		Files:                  files,
+		Task:                   task,
 	}, nil
 }
 
@@ -521,4 +530,13 @@ func reviewPriority(file ReviewedFile, outOfScope map[string]struct{}) int {
 	}
 	score += min(len(file.BlastRadius), 5)
 	return score
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
