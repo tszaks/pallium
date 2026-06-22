@@ -525,7 +525,11 @@ func Show(id string, transcript bool) (Session, []Message, error) {
 }
 
 func StatsRead() (Stats, error) {
-	store, err := Open("")
+	return StatsReadPath("")
+}
+
+func StatsReadPath(path string) (Stats, error) {
+	store, err := Open(path)
 	if err != nil {
 		return Stats{}, err
 	}
@@ -546,6 +550,27 @@ func StatsRead() (Stats, error) {
 		}
 	}
 	return st, nil
+}
+
+func EmbeddingBacklogPath(path, model string) (int, error) {
+	if model == "" {
+		model = DefaultEmbeddingModel
+	}
+	store, err := Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer store.Close()
+	var count int
+	err = store.db.QueryRow(`SELECT COUNT(*)
+FROM codex_session_chunks c
+LEFT JOIN codex_session_embeddings e
+  ON e.chunk_id = c.id
+ AND e.provider = 'openai'
+ AND e.model = ?
+ AND e.text_sha256 = c.text_sha256
+WHERE e.chunk_id IS NULL`, model).Scan(&count)
+	return count, err
 }
 
 func (s *Store) resolveID(prefix string) (string, error) {

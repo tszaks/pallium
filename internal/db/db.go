@@ -15,6 +15,7 @@ import (
 type Store struct {
 	conn     *sql.DB
 	RepoRoot string
+	DBPath   string
 }
 
 var ErrRepoNotIndexed = errors.New("repo has not been indexed yet")
@@ -68,7 +69,7 @@ type ActiveTask struct {
 }
 
 func Open(repoRoot string) (*Store, error) {
-	dbPath := defaultDBPath(repoRoot)
+	dbPath := DefaultDBPath(repoRoot)
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		return nil, fmt.Errorf("create db directory: %w", err)
 	}
@@ -76,7 +77,7 @@ func Open(repoRoot string) (*Store, error) {
 	return OpenPath(repoRoot, dbPath)
 }
 
-func defaultDBPath(repoRoot string) string {
+func DefaultDBPath(repoRoot string) string {
 	current := filepath.Join(repoRoot, ".pallium", "pallium.sqlite")
 	legacy := filepath.Join(repoRoot, ".codex-memory", "codex-memory.sqlite")
 	if _, err := os.Stat(current); err == nil {
@@ -96,7 +97,7 @@ func OpenPath(repoRoot, dbPath string) (*Store, error) {
 	conn.SetMaxOpenConns(1)
 	conn.SetMaxIdleConns(1)
 
-	store := &Store{conn: conn, RepoRoot: repoRoot}
+	store := &Store{conn: conn, RepoRoot: repoRoot, DBPath: dbPath}
 	if err := store.Init(); err != nil {
 		_ = conn.Close()
 		return nil, err

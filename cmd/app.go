@@ -38,6 +38,8 @@ func (a *App) Run(args []string) error {
 		return nil
 	case "index":
 		return runIndex(a.stdout, filtered[1:], jsonOutput)
+	case "doctor":
+		return runDoctor(a.stdout, filtered[1:], jsonOutput)
 	case "explain":
 		return runExplain(a.stdout, filtered[1:], jsonOutput)
 	case "risk":
@@ -71,6 +73,7 @@ func (a *App) printHelp() {
 
 Usage:
   pallium index [repo-path] [--json]
+  pallium doctor [repo-path] [--json]
   pallium explain <path> [repo-path] [--json]
   pallium risk <path> [repo-path] [--json]
   pallium neighbors <path> [repo-path] [--json]
