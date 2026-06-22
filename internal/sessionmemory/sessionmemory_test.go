@@ -87,6 +87,66 @@ func TestIndexProviderCodexSkipsClaudeIncludes(t *testing.T) {
 	}
 }
 
+func TestUpsertRedactsSessionSummarySearchSurfaces(t *testing.T) {
+	tmp := t.TempDir()
+	secret := "sk-1234567890abcdefghijklmnopqrst"
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	parsed := ParsedSession{
+		Session: Session{
+			ID:               "redact-session",
+			Title:            "Investigate " + secret,
+			FirstUserMessage: "Use api_key=" + secret,
+			LastAgentMessage: "Finished with token=" + secret,
+			CWD:              "/tmp/repo/" + secret,
+			Source:           "codex",
+			CreatedAt:        "2026-06-10T12:00:00Z",
+			UpdatedAt:        "2026-06-10T12:01:00Z",
+			FilesTouched:     []string{"internal/" + secret + ".go"},
+			Commands:         []string{"curl -H authorization=" + secret + " https://example.test"},
+			ToolNames:        []string{"exec_command"},
+			Errors:           []string{"failed with secret=" + secret},
+		},
+		SearchBlob: "search blob mentions " + secret,
+		Messages: []Message{
+			{LineNo: 1, Timestamp: "2026-06-10T12:00:00Z", Role: "user", Kind: "message", Text: "user text " + secret},
+			{LineNo: 2, Timestamp: "2026-06-10T12:01:00Z", Role: "assistant", Kind: "message", Text: "assistant text " + secret},
+		},
+		EventCounts: map[string]int{"response_item": 2},
+	}
+	metadata := map[string]any{
+		"api_key": secret,
+		"nested":  map[string]any{"value": "password=" + secret},
+	}
+	if err := store.upsert(parsed, metadata); err != nil {
+		t.Fatal(err)
+	}
+
+	assertNoSecretInQuery(t, store, secret, `SELECT title || first_user_message || last_agent_message || cwd || files_touched_json || commands_json || errors_json || metadata_json FROM codex_sessions WHERE id='redact-session'`)
+	assertNoSecretInQuery(t, store, secret, `SELECT title || cwd || first_user_message || last_agent_message || files || commands || text FROM codex_session_fts WHERE session_id='redact-session'`)
+	assertNoSecretInQuery(t, store, secret, `SELECT group_concat(text, char(10)) FROM codex_session_messages WHERE session_id='redact-session'`)
+	assertNoSecretInQuery(t, store, secret, `SELECT group_concat(text, char(10)) FROM codex_message_fts WHERE session_id='redact-session'`)
+	assertNoSecretInQuery(t, store, secret, `SELECT group_concat(text || metadata_json, char(10)) FROM codex_session_chunks WHERE session_id='redact-session'`)
+}
+
+func assertNoSecretInQuery(t *testing.T, store *Store, secret, query string) {
+	t.Helper()
+	var value string
+	if err := store.db.QueryRow(query).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(value, secret) {
+		t.Fatalf("query leaked secret %q in %q", secret, value)
+	}
+	if !strings.Contains(value, "<REDACTED>") {
+		t.Fatalf("query did not include redaction marker in %q", value)
+	}
+}
+
 func TestEmbedSessionOnlyEmbedsRequestedSession(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)

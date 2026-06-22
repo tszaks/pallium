@@ -69,7 +69,7 @@ pallium sessions semantic "find the session where we debugged MCP startup failur
 pallium sessions stats
 ```
 
-Session-memory data is stored outside any one repo at `~/.pallium/codex-sessions.sqlite`. It includes redacted raw agent events, transcript/tool-call rows, FTS indexes, chunks, OpenAI embeddings, and brute-force cosine semantic search. Use `OPENAI_API_KEY` or `OPENAI_ADMIN_API_KEY` for embedding commands.
+Session-memory data is stored outside any one repo at `~/.pallium/codex-sessions.sqlite`. If an existing legacy database is present, Pallium falls back to `~/.codex-memory/codex-sessions.sqlite` so older indexed memory keeps working. It includes redacted raw agent events, transcript/tool-call rows, FTS indexes, chunks, OpenAI embeddings, and brute-force cosine semantic search. Use `OPENAI_API_KEY` or `OPENAI_ADMIN_API_KEY` for embedding commands.
 
 For another machine's sessions:
 
@@ -90,6 +90,8 @@ pallium changed-now --json
 pallium handoff origin/main --json
 pallium verify fast --json
 ```
+
+`verify` records each run in the repo-local Pallium database so future `review` and `handoff` output can show recent verification history.
 
 ## Install
 

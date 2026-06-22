@@ -134,6 +134,10 @@ func TestReview(t *testing.T) {
 	if report.ActionGuidance.RecommendedNextCommand == "" {
 		t.Fatalf("expected review recommended next command")
 	}
+	if containsString(report.Confidence.Reasons, "Structural links were found in the repo.") &&
+		containsString(report.ActionGuidance.ConfidenceGaps, "No structural links were found.") {
+		t.Fatalf("review guidance contradicts structural-link confidence: %#v", report.ActionGuidance.ConfidenceGaps)
+	}
 	if !report.ActionGuidance.MustVerify {
 		t.Fatalf("expected review to require verification")
 	}
