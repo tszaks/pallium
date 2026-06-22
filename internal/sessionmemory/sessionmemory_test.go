@@ -3,11 +3,13 @@ package sessionmemory
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestIndexClaudeSessions(t *testing.T) {
@@ -28,7 +30,7 @@ func TestIndexClaudeSessions(t *testing.T) {
 	}
 
 	dbPath := filepath.Join(tmp, "sessions.sqlite")
-	count, err := Index(context.Background(), Options{DBPath: dbPath, ClaudeHome: claudeHome, Provider: "claude", Machine: "test-host"}, nil)
+	count, err := Index(context.Background(), Options{DBPath: dbPath, ClaudeHome: claudeHome, Provider: "claude", Machine: "test-host", Force: true}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,6 +86,277 @@ func TestIndexProviderCodexSkipsClaudeIncludes(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("indexed %d sessions, want 0", count)
+	}
+}
+
+func TestIndexAllDirectClaudeIncludeIsNotClaimedByCodex(t *testing.T) {
+	tmp := t.TempDir()
+	claudePath := filepath.Join(tmp, "claude-1.jsonl")
+	content := strings.Join([]string{
+		`{"type":"user","message":{"role":"user","content":"Claude include only"},"timestamp":"2026-06-10T12:00:00Z","sessionId":"claude-1"}`,
+		`{"type":"assistant","message":{"role":"assistant","content":"Claude response"},"timestamp":"2026-06-10T12:01:00Z","sessionId":"claude-1"}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(claudePath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldTime := time.Now().Add(-10 * time.Minute)
+	if err := os.Chtimes(claudePath, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	count, err := Index(context.Background(), Options{DBPath: dbPath, CodexHome: filepath.Join(tmp, ".codex"), ClaudeHome: filepath.Join(tmp, ".claude"), Provider: "all", Machine: "test-host"}, []string{claudePath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("indexed %d sessions, want 1", count)
+	}
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var source string
+	if err := store.db.QueryRow(`SELECT source FROM codex_sessions WHERE id=?`, "claude-1").Scan(&source); err != nil {
+		t.Fatal(err)
+	}
+	if source != "claude" {
+		t.Fatalf("source=%q, want claude", source)
+	}
+}
+
+func TestIndexSkipsUnchangedRollouts(t *testing.T) {
+	tmp := t.TempDir()
+	codexHome := filepath.Join(tmp, ".codex")
+	sessionDir := filepath.Join(codexHome, "sessions")
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rolloutPath := filepath.Join(sessionDir, "rollout-2026-06-22T12-00-00-codex-1.jsonl")
+	first := strings.Join([]string{
+		`{"type":"session_meta","timestamp":"2026-06-22T12:00:00Z","payload":{"id":"codex-1","cwd":"/tmp/repo","source":"codex"}}`,
+		`{"type":"event_msg","timestamp":"2026-06-22T12:01:00Z","payload":{"type":"user_message","message":"first prompt"}}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(rolloutPath, []byte(first), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldTime := time.Now().Add(-10 * time.Minute)
+	if err := os.Chtimes(rolloutPath, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	opts := Options{DBPath: dbPath, CodexHome: codexHome, Provider: "codex", Machine: "test-host"}
+	count, err := Index(context.Background(), opts, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("indexed %d sessions, want 1", count)
+	}
+	count, err = Index(context.Background(), opts, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("indexed unchanged rollout %d times, want 0", count)
+	}
+	indexedAt := time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339Nano)
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`UPDATE codex_sessions SET indexed_at=? WHERE id=?`, indexedAt, "codex-1"); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	changed := strings.Join([]string{
+		strings.TrimSpace(first),
+		`{"type":"event_msg","timestamp":"2026-06-22T12:02:00Z","payload":{"type":"agent_message","message":"changed answer"}}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(rolloutPath, []byte(changed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	changedTime := time.Now().Add(-5 * time.Minute)
+	if err := os.Chtimes(rolloutPath, changedTime, changedTime); err != nil {
+		t.Fatal(err)
+	}
+	count, err = Index(context.Background(), opts, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("indexed changed rollout %d times, want 1", count)
+	}
+	opts.Force = true
+	count, err = Index(context.Background(), opts, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("force indexed %d sessions, want 1", count)
+	}
+}
+
+func TestShouldSkipRolloutUsesIndexedAtBeforeHash(t *testing.T) {
+	tmp := t.TempDir()
+	rolloutPath := filepath.Join(tmp, "rollout-2026-06-22T12-00-00-codex-1.jsonl")
+	if err := os.WriteFile(rolloutPath, []byte("changed content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fileTime := time.Now().Add(-1 * time.Hour)
+	if err := os.Chtimes(rolloutPath, fileTime, fileTime); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	indexedAt := fileTime.Add(1 * time.Minute).UTC().Format(time.RFC3339Nano)
+	if _, err := store.db.Exec(`INSERT INTO codex_sessions(id,machine,indexed_at,rollout_path,rollout_sha256) VALUES(?,?,?,?,?)`, "codex-1", "test", indexedAt, rolloutPath, "different-sha"); err != nil {
+		t.Fatal(err)
+	}
+
+	skip, err := store.rolloutSkipReason(rolloutPath, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skip != rolloutSkipUnchanged {
+		t.Fatalf("skip=%v, want rolloutSkipUnchanged", skip)
+	}
+
+	newTime := fileTime.Add(2 * time.Minute)
+	if err := os.Chtimes(rolloutPath, newTime, newTime); err != nil {
+		t.Fatal(err)
+	}
+	skip, err = store.rolloutSkipReason(rolloutPath, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skip != rolloutSkipNone {
+		t.Fatalf("skip=%v, want rolloutSkipNone", skip)
+	}
+}
+
+func TestCodexStateFreshnessCanForceSkippedRolloutReindex(t *testing.T) {
+	tmp := t.TempDir()
+	rolloutPath := filepath.Join(tmp, "rollout-2026-06-22T12-00-00-codex-1.jsonl")
+	if err := os.WriteFile(rolloutPath, []byte("unchanged content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fileTime := time.Now().Add(-1 * time.Hour)
+	if err := os.Chtimes(rolloutPath, fileTime, fileTime); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	indexedAt := fileTime.Add(1 * time.Minute).UTC()
+	if _, err := store.db.Exec(`INSERT INTO codex_sessions(id,machine,indexed_at,rollout_path,rollout_sha256) VALUES(?,?,?,?,?)`, "codex-1", "test", indexedAt.Format(time.RFC3339Nano), rolloutPath, "sha"); err != nil {
+		t.Fatal(err)
+	}
+
+	fresh, err := store.codexStateFreshForRollout(rolloutPath, map[string]map[string]any{
+		"codex-1": {"updated_at_ms": fmt.Sprint(indexedAt.Add(-1 * time.Minute).UnixMilli())},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fresh {
+		t.Fatalf("expected older state metadata to be fresh")
+	}
+
+	fresh, err = store.codexStateFreshForRollout(rolloutPath, map[string]map[string]any{
+		"codex-1": {"updated_at_ms": fmt.Sprint(indexedAt.Add(1 * time.Minute).UnixMilli())},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh {
+		t.Fatalf("expected newer state metadata to require re-index")
+	}
+}
+
+func TestActiveRolloutSkipReasonWinsOverStateFreshness(t *testing.T) {
+	tmp := t.TempDir()
+	rolloutPath := filepath.Join(tmp, "rollout-2026-06-22T12-00-00-codex-1.jsonl")
+	if err := os.WriteFile(rolloutPath, []byte("active content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	indexedAt := time.Now().Add(-10 * time.Minute).UTC()
+	if _, err := store.db.Exec(`INSERT INTO codex_sessions(id,machine,indexed_at,rollout_path,rollout_sha256) VALUES(?,?,?,?,?)`, "codex-1", "test", indexedAt.Format(time.RFC3339Nano), rolloutPath, "sha"); err != nil {
+		t.Fatal(err)
+	}
+
+	reason, err := store.rolloutSkipReason(rolloutPath, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reason != rolloutSkipActive {
+		t.Fatalf("skip reason=%v, want rolloutSkipActive", reason)
+	}
+
+	fresh, err := store.codexStateFreshForRollout(rolloutPath, map[string]map[string]any{
+		"codex-1": {"updated_at_ms": fmt.Sprint(indexedAt.Add(1 * time.Minute).UnixMilli())},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh {
+		t.Fatalf("expected newer state metadata to be stale")
+	}
+}
+
+func TestIndexSkipsActiveRolloutsUnlessForced(t *testing.T) {
+	tmp := t.TempDir()
+	codexHome := filepath.Join(tmp, ".codex")
+	sessionDir := filepath.Join(codexHome, "sessions")
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rolloutPath := filepath.Join(sessionDir, "rollout-2026-06-22T12-00-00-codex-1.jsonl")
+	content := strings.Join([]string{
+		`{"type":"session_meta","timestamp":"2026-06-22T12:00:00Z","payload":{"id":"codex-1","cwd":"/tmp/repo","source":"codex"}}`,
+		`{"type":"event_msg","timestamp":"2026-06-22T12:01:00Z","payload":{"type":"user_message","message":"active prompt"}}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(rolloutPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	opts := Options{DBPath: dbPath, CodexHome: codexHome, Provider: "codex", Machine: "test-host"}
+	count, err := Index(context.Background(), opts, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("indexed active rollout %d times, want 0", count)
+	}
+
+	opts.Force = true
+	count, err = Index(context.Background(), opts, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("force indexed active rollout %d times, want 1", count)
 	}
 }
 

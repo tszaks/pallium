@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -48,6 +50,22 @@ func TestSessionsIndexRejectsPositionalIncludePath(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "use --include") {
 		t.Fatalf("expected --include guidance, got %v", err)
+	}
+}
+
+func TestSessionsIndexAcceptsForceFlag(t *testing.T) {
+	tmp := t.TempDir()
+	codexHome := filepath.Join(tmp, ".codex")
+	if err := os.MkdirAll(filepath.Join(codexHome, "sessions"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	err := runSessionsIndex(&out, []string{"--provider", "codex", "--codex-home", codexHome, "--db", filepath.Join(tmp, "sessions.sqlite"), "--force"}, false)
+	if err != nil {
+		t.Fatalf("force flag returned error: %v", err)
+	}
+	if !strings.Contains(out.String(), "Indexed 0") {
+		t.Fatalf("expected index output, got %q", out.String())
 	}
 }
 

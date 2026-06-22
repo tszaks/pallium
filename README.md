@@ -56,6 +56,7 @@ Use `--json` with any command for agent-friendly output.
 ```bash
 pallium sessions live --details
 pallium sessions index
+pallium sessions index --force
 pallium sessions index --provider claude
 pallium sessions index --provider codex
 pallium sessions list --limit 20
@@ -68,6 +69,8 @@ pallium sessions embed
 pallium sessions semantic "find the session where we debugged MCP startup failures"
 pallium sessions stats
 ```
+
+Session-memory indexing is incremental by default: unchanged transcript files are skipped using their last indexed timestamp, with a hash check only when the file looks newer. Files modified in the last two minutes are skipped so Pallium does not chase active agent logs. Use `--force` only when you intentionally want to rebuild existing session rows after parser or redaction changes.
 
 Session-memory data is stored outside any one repo at `~/.pallium/codex-sessions.sqlite`. If an existing legacy database is present, Pallium falls back to `~/.codex-memory/codex-sessions.sqlite` so older indexed memory keeps working. It includes redacted raw agent events, transcript/tool-call rows, FTS indexes, chunks, OpenAI embeddings, and brute-force cosine semantic search. Use `OPENAI_API_KEY` or `OPENAI_ADMIN_API_KEY` for embedding commands.
 
