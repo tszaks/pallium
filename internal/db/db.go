@@ -119,7 +119,7 @@ func OpenPath(repoRoot, dbPath string) (*Store, error) {
 
 func (s *Store) Init() error {
 	pragmas := []string{
-		"PRAGMA busy_timeout = 5000",
+		"PRAGMA busy_timeout = 60000",
 		"PRAGMA journal_mode = WAL",
 		"PRAGMA synchronous = NORMAL",
 	}
