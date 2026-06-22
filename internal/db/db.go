@@ -68,6 +68,17 @@ type ActiveTask struct {
 	StartedAt  time.Time
 }
 
+type VerificationRun struct {
+	ID           int64    `json:"id"`
+	Tier         string   `json:"tier"`
+	Command      string   `json:"command"`
+	ExitCode     int      `json:"exit_code"`
+	DurationMS   int64    `json:"duration_ms"`
+	ChangedFiles []string `json:"changed_files"`
+	CWD          string   `json:"cwd"`
+	RanAt        string   `json:"ran_at"`
+}
+
 func Open(repoRoot string) (*Store, error) {
 	dbPath := DefaultDBPath(repoRoot)
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
@@ -375,4 +386,62 @@ func (s *Store) ClearActiveTask() error {
 		return fmt.Errorf("clear active task: %w", err)
 	}
 	return nil
+}
+
+func (s *Store) SaveVerificationRun(run VerificationRun) (VerificationRun, error) {
+	repo, err := s.Repo()
+	if err != nil {
+		return VerificationRun{}, err
+	}
+	changedJSON, err := json.Marshal(run.ChangedFiles)
+	if err != nil {
+		return VerificationRun{}, fmt.Errorf("marshal changed files: %w", err)
+	}
+	ranAt := run.RanAt
+	if ranAt == "" {
+		ranAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	result, err := s.conn.Exec(`
+INSERT INTO verification_runs (repo_id, tier, command, exit_code, duration_ms, changed_files_json, cwd, ran_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+`, repo.ID, run.Tier, run.Command, run.ExitCode, run.DurationMS, string(changedJSON), run.CWD, ranAt)
+	if err != nil {
+		return VerificationRun{}, fmt.Errorf("save verification run: %w", err)
+	}
+	run.ID, _ = result.LastInsertId()
+	run.RanAt = ranAt
+	return run, nil
+}
+
+func (s *Store) RecentVerificationRuns(limit int) ([]VerificationRun, error) {
+	repo, err := s.Repo()
+	if err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		limit = 10
+	}
+	rows, err := s.conn.Query(`
+SELECT id, tier, command, exit_code, duration_ms, changed_files_json, cwd, ran_at
+FROM verification_runs
+WHERE repo_id = ?
+ORDER BY ran_at DESC, id DESC
+LIMIT ?
+`, repo.ID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("read verification runs: %w", err)
+	}
+	defer rows.Close()
+
+	runs := make([]VerificationRun, 0)
+	for rows.Next() {
+		var run VerificationRun
+		var changedJSON string
+		if err := rows.Scan(&run.ID, &run.Tier, &run.Command, &run.ExitCode, &run.DurationMS, &changedJSON, &run.CWD, &run.RanAt); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal([]byte(changedJSON), &run.ChangedFiles)
+		runs = append(runs, run)
+	}
+	return runs, rows.Err()
 }

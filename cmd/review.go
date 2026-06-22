@@ -91,6 +91,10 @@ func runReview(out io.Writer, args []string, jsonOutput bool) error {
 			lines = append(lines, "")
 			lines = append(lines, sessionLines...)
 		}
+		if historyLines := renderVerificationHistory(report.VerificationHistory); len(historyLines) > 0 {
+			lines = append(lines, "")
+			lines = append(lines, historyLines...)
+		}
 		if len(report.Notes) > 0 {
 			lines = append(lines, "", "Notes:")
 			for _, note := range report.Notes {

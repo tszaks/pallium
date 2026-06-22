@@ -56,6 +56,8 @@ func (a *App) Run(args []string) error {
 		return runPlan(a.stdout, filtered[1:], jsonOutput)
 	case "review":
 		return runReview(a.stdout, filtered[1:], jsonOutput)
+	case "verify":
+		return runVerify(a.stdout, filtered[1:], jsonOutput)
 	case "changed-now":
 		return runChangedNow(a.stdout, filtered[1:], jsonOutput)
 	case "handoff":
@@ -84,6 +86,7 @@ Usage:
   pallium safe <path> [repo-path] [--json]
   pallium plan <path> [repo-path] [--json]
   pallium review [base-ref] [repo-path] [--json]
+  pallium verify <fast|safe|full> [repo-path] [--json]
   pallium changed-now [repo-path] [--json]
   pallium handoff [base-ref] [repo-path] [--json]
   pallium task start <goal> [scope-paths...] [--json]

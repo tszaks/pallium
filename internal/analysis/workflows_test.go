@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -177,6 +178,44 @@ func TestReviewIncludesWorkingTreeChanges(t *testing.T) {
 	}
 }
 
+func TestReviewInfersVerificationForUnknownChangedFiles(t *testing.T) {
+	repo := indexRepo(t)
+	store, err := index.OpenStore(repo)
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+	defer store.Close()
+
+	if _, err := index.New(store).Run(); err != nil {
+		t.Fatalf("index run failed: %v", err)
+	}
+
+	writeFile(t, filepath.Join(repo, "cmd", "newtool.go"), "package cmd\n\nfunc newTool() string { return \"ok\" }\n")
+	writeFile(t, filepath.Join(repo, "cmd", "newtool_test.go"), "package cmd\n\nimport \"testing\"\n\nfunc TestNewTool(t *testing.T) {}\n")
+
+	report, err := Review(store, "HEAD~1")
+	if err != nil {
+		t.Fatalf("Review failed: %v", err)
+	}
+
+	if !containsString(report.Verification.Fast, "go test ./cmd") {
+		t.Fatalf("expected focused verification for new Go file, got %#v", report.Verification)
+	}
+
+	found := false
+	for _, file := range report.ChangedFiles {
+		if file.Path == "cmd/newtool.go" {
+			found = true
+			if len(file.SuggestedTests) == 0 {
+				t.Fatalf("expected suggested tests for new file, got %#v", file)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected cmd/newtool.go in review, got %#v", report.ChangedFiles)
+	}
+}
+
 func TestChangedNow(t *testing.T) {
 	repo := indexRepo(t)
 	store, err := index.OpenStore(repo)
@@ -322,6 +361,97 @@ func TestReviewPrioritizesSensitiveFilesFirst(t *testing.T) {
 	}
 }
 
+func TestReviewFlagsLatestFailedVerification(t *testing.T) {
+	repo := indexRepo(t)
+	store, err := index.OpenStore(repo)
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+	defer store.Close()
+
+	if _, err := index.New(store).Run(); err != nil {
+		t.Fatalf("index run failed: %v", err)
+	}
+
+	if _, err := store.SaveVerificationRun(db.VerificationRun{
+		Tier:         "fast",
+		Command:      "go test .",
+		ExitCode:     1,
+		DurationMS:   25,
+		ChangedFiles: []string{"main.go"},
+		CWD:          repo,
+		RanAt:        "2026-03-13T12:00:00Z",
+	}); err != nil {
+		t.Fatalf("SaveVerificationRun failed: %v", err)
+	}
+
+	report, err := Review(store, "HEAD~1")
+	if err != nil {
+		t.Fatalf("Review failed: %v", err)
+	}
+
+	if len(report.VerificationHistory) != 1 {
+		t.Fatalf("expected verification history, got %#v", report.VerificationHistory)
+	}
+	if !containsString(report.ActionGuidance.StopSignals, "Most recent verification failed") {
+		t.Fatalf("expected failed verification stop signal, got %#v", report.ActionGuidance.StopSignals)
+	}
+	if !containsString(report.Notes, "Most recent verification failed") {
+		t.Fatalf("expected failed verification note, got %#v", report.Notes)
+	}
+}
+
+func TestReviewDoesNotFlagOlderFailedVerificationAfterPass(t *testing.T) {
+	repo := indexRepo(t)
+	store, err := index.OpenStore(repo)
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+	defer store.Close()
+
+	if _, err := index.New(store).Run(); err != nil {
+		t.Fatalf("index run failed: %v", err)
+	}
+
+	if _, err := store.SaveVerificationRun(db.VerificationRun{
+		Tier:         "fast",
+		Command:      "go test .",
+		ExitCode:     1,
+		DurationMS:   25,
+		ChangedFiles: []string{"main.go"},
+		CWD:          repo,
+		RanAt:        "2026-03-13T12:00:00Z",
+	}); err != nil {
+		t.Fatalf("SaveVerificationRun failed: %v", err)
+	}
+	if _, err := store.SaveVerificationRun(db.VerificationRun{
+		Tier:         "fast",
+		Command:      "go test .",
+		ExitCode:     0,
+		DurationMS:   30,
+		ChangedFiles: []string{"main.go"},
+		CWD:          repo,
+		RanAt:        "2026-03-13T12:01:00Z",
+	}); err != nil {
+		t.Fatalf("SaveVerificationRun failed: %v", err)
+	}
+
+	report, err := Review(store, "HEAD~1")
+	if err != nil {
+		t.Fatalf("Review failed: %v", err)
+	}
+
+	if len(report.VerificationHistory) != 2 {
+		t.Fatalf("expected verification history, got %#v", report.VerificationHistory)
+	}
+	if containsString(report.ActionGuidance.StopSignals, "Most recent verification failed") {
+		t.Fatalf("did not expect stale failure stop signal, got %#v", report.ActionGuidance.StopSignals)
+	}
+	if containsString(report.Notes, "Most recent verification failed") {
+		t.Fatalf("did not expect stale failure note, got %#v", report.Notes)
+	}
+}
+
 func TestExplainMarksStaleIndex(t *testing.T) {
 	repo := indexRepo(t)
 	store, err := index.OpenStore(repo)
@@ -348,6 +478,15 @@ func TestExplainMarksStaleIndex(t *testing.T) {
 	if !report.Freshness.IsStale {
 		t.Fatalf("expected stale freshness after new commit, got %#v", report.Freshness)
 	}
+}
+
+func containsString(values []string, needle string) bool {
+	for _, value := range values {
+		if strings.Contains(value, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestChangedNowWorksBeforeRepoIsIndexed(t *testing.T) {

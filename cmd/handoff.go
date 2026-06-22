@@ -47,6 +47,10 @@ func runHandoff(out io.Writer, args []string, jsonOutput bool) error {
 			lines = append(lines, "")
 			lines = append(lines, sessionLines...)
 		}
+		if historyLines := renderVerificationHistory(report.VerificationHistory); len(historyLines) > 0 {
+			lines = append(lines, "")
+			lines = append(lines, historyLines...)
+		}
 		if taskLines := renderTaskScope(report.Task); len(taskLines) > 0 {
 			lines = append(lines, "")
 			lines = append(lines, taskLines...)
