@@ -87,6 +87,10 @@ func runReview(out io.Writer, args []string, jsonOutput bool) error {
 				lines = append(lines, fmt.Sprintf("- %s: %s", item.Label, item.Reason))
 			}
 		}
+		if sessionLines := renderRelatedSessions(report.RelatedSessions); len(sessionLines) > 0 {
+			lines = append(lines, "")
+			lines = append(lines, sessionLines...)
+		}
 		if len(report.Notes) > 0 {
 			lines = append(lines, "", "Notes:")
 			for _, note := range report.Notes {
