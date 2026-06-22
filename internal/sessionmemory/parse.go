@@ -19,15 +19,15 @@ func parseRollout(path string) (ParsedSession, error) {
 	if err != nil {
 		return ParsedSession{}, err
 	}
+	sha, _ := fileSHA(path)
 	if info.Size() > maxParseRolloutBytes {
-		return parseRolloutMetadataOnly(path, info), nil
+		return parseRolloutMetadataOnly(path, info, sha), nil
 	}
 	f, err := os.Open(path)
 	if err != nil {
 		return ParsedSession{}, err
 	}
 	defer f.Close()
-	sha, _ := fileSHA(path)
 	p := ParsedSession{EventCounts: map[string]int{}}
 	p.Session.RolloutPath = path
 	p.Session.RolloutSHA256 = sha
@@ -104,11 +104,12 @@ func parseRollout(path string) (ParsedSession, error) {
 	return p, nil
 }
 
-func parseRolloutMetadataOnly(path string, info os.FileInfo) ParsedSession {
+func parseRolloutMetadataOnly(path string, info os.FileInfo, sha string) ParsedSession {
 	id := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	p := ParsedSession{EventCounts: map[string]int{"skipped_large_rollout": 1}}
 	p.Session.ID = id
 	p.Session.RolloutPath = path
+	p.Session.RolloutSHA256 = sha
 	p.Session.UpdatedAt = info.ModTime().UTC().Format(time.RFC3339Nano)
 	p.Session.CreatedAt = p.Session.UpdatedAt
 	p.Session.Status = "skipped_large_rollout"
@@ -123,8 +124,9 @@ func parseClaudeTranscript(path string) (ParsedSession, error) {
 	if err != nil {
 		return ParsedSession{}, err
 	}
+	sha, _ := fileSHA(path)
 	if info.Size() > maxParseRolloutBytes {
-		p := parseRolloutMetadataOnly(path, info)
+		p := parseRolloutMetadataOnly(path, info, sha)
 		p.Session.Source = "claude"
 		p.Session.ModelProvider = "anthropic"
 		return p, nil
@@ -134,7 +136,6 @@ func parseClaudeTranscript(path string) (ParsedSession, error) {
 		return ParsedSession{}, err
 	}
 	defer f.Close()
-	sha, _ := fileSHA(path)
 	p := ParsedSession{EventCounts: map[string]int{}}
 	p.Session.RolloutPath = path
 	p.Session.RolloutSHA256 = sha

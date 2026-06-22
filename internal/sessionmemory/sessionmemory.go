@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -24,6 +25,7 @@ const (
 	maxStoredMessageText         = 50_000
 	maxSearchBlobText            = 1_000_000
 	maxParseRolloutBytes         = 100 * 1024 * 1024
+	activeRolloutQuietPeriod     = 2 * time.Minute
 )
 
 var secretPatterns = []*regexp.Regexp{
@@ -38,12 +40,21 @@ var pathLikePattern = regexp.MustCompile(`(?:^|\s)(/[A-Za-z0-9._~+/@:-][^\s'"` +
 
 var embedTexts = openAIEmbeddings
 
+type rolloutSkipReason int
+
+const (
+	rolloutSkipNone rolloutSkipReason = iota
+	rolloutSkipActive
+	rolloutSkipUnchanged
+)
+
 type Options struct {
 	DBPath     string
 	CodexHome  string
 	ClaudeHome string
 	Machine    string
 	Provider   string
+	Force      bool
 }
 
 type Session struct {
@@ -226,6 +237,7 @@ CREATE TABLE IF NOT EXISTS codex_sessions (
   errors_json TEXT,
   metadata_json TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_codex_sessions_rollout_path ON codex_sessions(rollout_path);
 CREATE TABLE IF NOT EXISTS codex_session_events (
   session_id TEXT NOT NULL,
   line_no INTEGER NOT NULL,
@@ -318,6 +330,22 @@ func Index(ctx context.Context, opts Options, include []string) (int, error) {
 				return count, ctx.Err()
 			default:
 			}
+			skip, err := store.rolloutSkipReason(file, opts.Force)
+			if err != nil {
+				return count, err
+			}
+			if skip == rolloutSkipActive {
+				continue
+			}
+			if skip == rolloutSkipUnchanged {
+				stateFresh, err := store.codexStateFreshForRollout(file, state)
+				if err != nil {
+					return count, err
+				}
+				if stateFresh {
+					continue
+				}
+			}
 			parsed, err := parseRollout(file)
 			if err != nil {
 				return count, fmt.Errorf("parse %s: %w", file, err)
@@ -339,6 +367,13 @@ func Index(ctx context.Context, opts Options, include []string) (int, error) {
 				return count, ctx.Err()
 			default:
 			}
+			skip, err := store.rolloutSkipReason(file, opts.Force)
+			if err != nil {
+				return count, err
+			}
+			if skip != rolloutSkipNone {
+				continue
+			}
 			parsed, err := parseClaudeTranscript(file)
 			if err != nil {
 				return count, fmt.Errorf("parse %s: %w", file, err)
@@ -351,6 +386,80 @@ func Index(ctx context.Context, opts Options, include []string) (int, error) {
 		}
 	}
 	return count, nil
+}
+
+func (s *Store) rolloutSkipReason(path string, force bool) (rolloutSkipReason, error) {
+	if force {
+		return rolloutSkipNone, nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return rolloutSkipNone, fmt.Errorf("stat %s: %w", path, err)
+	}
+	if time.Since(info.ModTime()) < activeRolloutQuietPeriod {
+		return rolloutSkipActive, nil
+	}
+	row := s.db.QueryRow(`SELECT rollout_sha256, indexed_at FROM codex_sessions WHERE rollout_path=? LIMIT 1`, path)
+	var storedSHA string
+	var indexedAt string
+	switch err := row.Scan(&storedSHA, &indexedAt); err {
+	case nil:
+	case sql.ErrNoRows:
+		return rolloutSkipNone, nil
+	default:
+		return rolloutSkipNone, fmt.Errorf("lookup indexed rollout %s: %w", path, err)
+	}
+
+	indexedTime := parseSessionTime(indexedAt)
+	if storedSHA != "" && !indexedTime.IsZero() && !info.ModTime().After(indexedTime) {
+		return rolloutSkipUnchanged, nil
+	}
+
+	sha, err := fileSHA(path)
+	if err != nil {
+		return rolloutSkipNone, fmt.Errorf("hash %s: %w", path, err)
+	}
+	if storedSHA != "" && storedSHA == sha {
+		return rolloutSkipUnchanged, nil
+	}
+	return rolloutSkipNone, nil
+}
+
+func (s *Store) codexStateFreshForRollout(path string, state map[string]map[string]any) (bool, error) {
+	if len(state) == 0 {
+		return true, nil
+	}
+	row := s.db.QueryRow(`SELECT id, indexed_at FROM codex_sessions WHERE rollout_path=? LIMIT 1`, path)
+	var id string
+	var indexedAt string
+	switch err := row.Scan(&id, &indexedAt); err {
+	case nil:
+	case sql.ErrNoRows:
+		return false, nil
+	default:
+		return false, fmt.Errorf("lookup indexed rollout %s: %w", path, err)
+	}
+	metadata := state[id]
+	if len(metadata) == 0 {
+		return true, nil
+	}
+	stateUpdatedAt := parseSessionTime(isoAny(metadata["updated_at_ms"]))
+	indexedTime := parseSessionTime(indexedAt)
+	if stateUpdatedAt.IsZero() || indexedTime.IsZero() {
+		return true, nil
+	}
+	return !stateUpdatedAt.After(indexedTime), nil
+}
+
+func parseSessionTime(raw string) time.Time {
+	if raw == "" {
+		return time.Time{}
+	}
+	value, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		value, _ = time.Parse(time.RFC3339, raw)
+	}
+	return value
 }
 
 func (s *Store) upsert(parsed ParsedSession, metadata map[string]any) error {
@@ -665,12 +774,12 @@ func findRollouts(root string, include []string) []string {
 		if err != nil {
 			continue
 		}
-		if !info.IsDir() && strings.HasSuffix(r, ".jsonl") {
+		if !info.IsDir() && isCodexRolloutPath(r) {
 			files = append(files, r)
 			continue
 		}
 		filepath.WalkDir(r, func(path string, d os.DirEntry, err error) error {
-			if err == nil && !d.IsDir() && strings.HasPrefix(filepath.Base(path), "rollout-") && strings.HasSuffix(path, ".jsonl") && !seen[path] {
+			if err == nil && !d.IsDir() && isCodexRolloutPath(path) && !seen[path] {
 				seen[path] = true
 				files = append(files, path)
 			}
@@ -679,6 +788,11 @@ func findRollouts(root string, include []string) []string {
 	}
 	sort.Strings(files)
 	return files
+}
+
+func isCodexRolloutPath(path string) bool {
+	base := filepath.Base(path)
+	return strings.HasPrefix(base, "rollout-") && strings.HasSuffix(base, ".jsonl")
 }
 
 func findClaudeTranscripts(root string, include []string) []string {
@@ -711,11 +825,16 @@ func isClaudeTranscriptPath(path string) bool {
 	return strings.HasSuffix(base, ".jsonl") && !strings.HasPrefix(base, "rollout-")
 }
 func fileSHA(path string) (string, error) {
-	b, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%x", sha256.Sum256(b)), nil
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }
 func redact(s string) string {
 	out := s
