@@ -4,6 +4,8 @@ import (
 	"fmt"
 
 	"github.com/tszaks/pallium/internal/db"
+	"github.com/tszaks/pallium/internal/gitlog"
+	"github.com/tszaks/pallium/internal/sessionmemory"
 )
 
 type CommitSummary struct {
@@ -13,22 +15,23 @@ type CommitSummary struct {
 }
 
 type ExplainReport struct {
-	Path            string           `json:"path"`
-	Summary         string           `json:"summary"`
-	Freshness       Freshness        `json:"freshness"`
-	Evidence        Evidence         `json:"evidence"`
-	EditChecklist   []string         `json:"edit_checklist"`
-	SuggestedTests  []string         `json:"suggested_tests"`
-	TestCommands    []string         `json:"test_commands"`
-	Verification    VerificationPlan `json:"verification"`
-	BlastRadius     []string         `json:"blast_radius"`
-	StructuralLinks []StructuralLink `json:"structural_links"`
-	Confidence      Confidence       `json:"confidence"`
-	ActionGuidance  ActionGuidance   `json:"action_guidance"`
-	Risk            RiskReport       `json:"risk"`
-	RecentCommits   []CommitSummary  `json:"recent_commits"`
-	Decisions       []Decision       `json:"decisions"`
-	Neighbors       []Neighbor       `json:"neighbors"`
+	Path            string                       `json:"path"`
+	Summary         string                       `json:"summary"`
+	Freshness       Freshness                    `json:"freshness"`
+	Evidence        Evidence                     `json:"evidence"`
+	EditChecklist   []string                     `json:"edit_checklist"`
+	SuggestedTests  []string                     `json:"suggested_tests"`
+	TestCommands    []string                     `json:"test_commands"`
+	Verification    VerificationPlan             `json:"verification"`
+	BlastRadius     []string                     `json:"blast_radius"`
+	StructuralLinks []StructuralLink             `json:"structural_links"`
+	Confidence      Confidence                   `json:"confidence"`
+	ActionGuidance  ActionGuidance               `json:"action_guidance"`
+	Risk            RiskReport                   `json:"risk"`
+	RecentCommits   []CommitSummary              `json:"recent_commits"`
+	Decisions       []Decision                   `json:"decisions"`
+	Neighbors       []Neighbor                   `json:"neighbors"`
+	RelatedSessions []sessionmemory.SearchResult `json:"related_sessions"`
 }
 
 func Explain(store *db.Store, targetPath string) (ExplainReport, error) {
@@ -95,6 +98,13 @@ LIMIT 5
 	freshness := buildFreshness(store)
 	actionGuidance := buildActionGuidance(risk.Path, risk, confidence, structuralLinks, blastRadius, verification.Fast)
 	evidence := buildEvidence(freshness, len(structuralLinks), len(suggestedTests), verification, TaskScopeReport{}, len(commits))
+	origin, _ := gitlog.OriginURL(store.RepoRoot)
+	relatedSessions, _ := sessionmemory.Related(sessionmemory.RelatedOptions{
+		RepoRoot:     store.RepoRoot,
+		GitOriginURL: origin,
+		Files:        []string{risk.Path},
+		Limit:        3,
+	})
 
 	return ExplainReport{
 		Path:            risk.Path,
@@ -113,6 +123,7 @@ LIMIT 5
 		RecentCommits:   commits,
 		Decisions:       decisions,
 		Neighbors:       risk.TopNeighbors,
+		RelatedSessions: relatedSessions,
 	}, nil
 }
 

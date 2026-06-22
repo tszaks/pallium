@@ -7,6 +7,7 @@ import (
 
 	"github.com/tszaks/pallium/internal/analysis"
 	"github.com/tszaks/pallium/internal/index"
+	"github.com/tszaks/pallium/internal/sessionmemory"
 )
 
 func openIndexedStore(path string) (*index.Indexer, error) {
@@ -160,6 +161,24 @@ func renderTaskScope(task analysis.TaskScopeReport) []string {
 		lines = append(lines, "Scope drift:")
 		for _, path := range task.OutOfScopeChanged {
 			lines = append(lines, "- "+path)
+		}
+	}
+	return lines
+}
+
+func renderRelatedSessions(results []sessionmemory.SearchResult) []string {
+	if len(results) == 0 {
+		return nil
+	}
+	lines := []string{"Related sessions:"}
+	for _, result := range results {
+		title := strings.Join(strings.Fields(result.Title), " ")
+		if title == "" {
+			title = result.ID
+		}
+		lines = append(lines, fmt.Sprintf("- score=%d %s %s", result.Score, shortID(result.ID), title))
+		if len(result.Signals) > 0 {
+			lines = append(lines, "  signals: "+strings.Join(result.Signals, ", "))
 		}
 	}
 	return lines

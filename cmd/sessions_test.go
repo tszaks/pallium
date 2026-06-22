@@ -60,3 +60,17 @@ func TestSessionsStatsHelpDoesNotReadStats(t *testing.T) {
 		t.Fatalf("expected sessions help, got %q", out.String())
 	}
 }
+
+func TestSessionFlagsCanFollowPositionals(t *testing.T) {
+	fs := newSessionFlagSet("test")
+	limit := fs.Int("limit", 10, "")
+	if err := parseSessionFlags(fs, []string{"repo", "--limit", "3"}, map[string]struct{}{"limit": {}}, nil); err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if *limit != 3 {
+		t.Fatalf("limit=%d, want 3", *limit)
+	}
+	if fs.NArg() != 1 || fs.Arg(0) != "repo" {
+		t.Fatalf("positionals=%v, want repo", fs.Args())
+	}
+}

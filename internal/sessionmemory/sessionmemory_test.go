@@ -2,6 +2,7 @@ package sessionmemory
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -167,5 +168,49 @@ func TestEmbedSessionOnlyEmbedsRequestedSession(t *testing.T) {
 	}
 	if targetCount != 2 || otherCount != 0 {
 		t.Fatalf("target embeddings=%d other embeddings=%d, want 2 and 0", targetCount, otherCount)
+	}
+}
+
+func TestRelatedRanksRepoAndFileMatches(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	store, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := "2026-06-10T12:00:00Z"
+	insertSessionForRelatedTest(t, store, "target", "/repo", "Fix auth file", []string{"src/auth.go"}, []string{"go test ./..."}, now)
+	insertSessionForRelatedTest(t, store, "other", "/other", "Unrelated work", []string{"README.md"}, []string{"npm test"}, now)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := Related(RelatedOptions{RepoRoot: "/repo", Files: []string{"src/auth.go"}, Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) == 0 {
+		t.Fatal("expected related results")
+	}
+	if results[0].ID != "target" {
+		t.Fatalf("expected target first, got %#v", results)
+	}
+	if results[0].Score <= results[len(results)-1].Score {
+		t.Fatalf("expected target score to lead, got %#v", results)
+	}
+}
+
+func insertSessionForRelatedTest(t *testing.T, store *Store, id, cwd, title string, files, commands []string, updatedAt string) {
+	t.Helper()
+	j := func(v any) string {
+		b, _ := json.Marshal(v)
+		return string(b)
+	}
+	_, err := store.db.Exec(`INSERT INTO codex_sessions(id,machine,title,first_user_message,last_agent_message,cwd,source,model_provider,model,cli_version,git_branch,git_origin_url,created_at,updated_at,indexed_at,tokens_used,status,rollout_path,rollout_sha256,event_counts_json,files_touched_json,commands_json,tool_names_json,errors_json,metadata_json)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		id, "test", title, title, "", cwd, "codex", "openai", "gpt", "dev", "main", "", updatedAt, updatedAt, updatedAt, 0, "complete", "", "", "{}", j(files), j(commands), "[]", "[]", "{}")
+	if err != nil {
+		t.Fatal(err)
 	}
 }

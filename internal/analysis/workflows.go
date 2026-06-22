@@ -7,6 +7,7 @@ import (
 
 	"github.com/tszaks/pallium/internal/db"
 	"github.com/tszaks/pallium/internal/gitlog"
+	"github.com/tszaks/pallium/internal/sessionmemory"
 )
 
 type SafeReport struct {
@@ -53,20 +54,21 @@ type ReviewedFile struct {
 }
 
 type ReviewReport struct {
-	BaseRef          string            `json:"base_ref"`
-	HeadRef          string            `json:"head_ref"`
-	Summary          string            `json:"summary"`
-	Freshness        Freshness         `json:"freshness"`
-	Evidence         Evidence          `json:"evidence"`
-	ChangedFiles     []ReviewedFile    `json:"changed_files"`
-	RequiredTests    []string          `json:"required_tests"`
-	TestCommands     []string          `json:"test_commands"`
-	Verification     VerificationPlan  `json:"verification"`
-	Confidence       Confidence        `json:"confidence"`
-	ActionGuidance   ActionGuidance    `json:"action_guidance"`
-	Task             TaskScopeReport   `json:"task"`
-	BoundaryWarnings []BoundaryWarning `json:"boundary_warnings"`
-	Notes            []string          `json:"notes"`
+	BaseRef          string                       `json:"base_ref"`
+	HeadRef          string                       `json:"head_ref"`
+	Summary          string                       `json:"summary"`
+	Freshness        Freshness                    `json:"freshness"`
+	Evidence         Evidence                     `json:"evidence"`
+	ChangedFiles     []ReviewedFile               `json:"changed_files"`
+	RequiredTests    []string                     `json:"required_tests"`
+	TestCommands     []string                     `json:"test_commands"`
+	Verification     VerificationPlan             `json:"verification"`
+	Confidence       Confidence                   `json:"confidence"`
+	ActionGuidance   ActionGuidance               `json:"action_guidance"`
+	Task             TaskScopeReport              `json:"task"`
+	BoundaryWarnings []BoundaryWarning            `json:"boundary_warnings"`
+	RelatedSessions  []sessionmemory.SearchResult `json:"related_sessions"`
+	Notes            []string                     `json:"notes"`
 }
 
 type ChangedNowFile struct {
@@ -88,13 +90,14 @@ type ChangedNowReport struct {
 }
 
 type HandoffReport struct {
-	Summary     string           `json:"summary"`
-	Freshness   Freshness        `json:"freshness"`
-	Evidence    Evidence         `json:"evidence"`
-	Review      ReviewReport     `json:"review"`
-	ChangedNow  ChangedNowReport `json:"changed_now"`
-	NextActions []string         `json:"next_actions"`
-	Task        TaskScopeReport  `json:"task"`
+	Summary         string                       `json:"summary"`
+	Freshness       Freshness                    `json:"freshness"`
+	Evidence        Evidence                     `json:"evidence"`
+	Review          ReviewReport                 `json:"review"`
+	ChangedNow      ChangedNowReport             `json:"changed_now"`
+	NextActions     []string                     `json:"next_actions"`
+	Task            TaskScopeReport              `json:"task"`
+	RelatedSessions []sessionmemory.SearchResult `json:"related_sessions"`
 }
 
 func Safe(store *db.Store, targetPath string) (SafeReport, error) {
@@ -340,6 +343,13 @@ func Review(store *db.Store, baseRef string) (ReviewReport, error) {
 	if highRiskCount > 0 {
 		summary = fmt.Sprintf("Review %d changed files carefully. %d high-risk file(s) need extra attention.", len(changed), highRiskCount)
 	}
+	origin, _ := gitlog.OriginURL(store.RepoRoot)
+	relatedSessions, _ := sessionmemory.Related(sessionmemory.RelatedOptions{
+		RepoRoot:     store.RepoRoot,
+		GitOriginURL: origin,
+		Files:        changed,
+		Limit:        5,
+	})
 
 	return ReviewReport{
 		BaseRef:          baseRef,
@@ -355,6 +365,7 @@ func Review(store *db.Store, baseRef string) (ReviewReport, error) {
 		ActionGuidance:   actionGuidance,
 		Task:             task,
 		BoundaryWarnings: uniqueBoundaryWarnings(allBoundaries),
+		RelatedSessions:  relatedSessions,
 		Notes:            uniqueStrings(notes, 10),
 	}, nil
 }
@@ -453,13 +464,14 @@ func Handoff(store *db.Store, baseRef string) (HandoffReport, error) {
 	evidence := buildEvidence(freshness, len(review.ChangedFiles), len(review.RequiredTests), review.Verification, review.Task, len(review.ChangedFiles))
 
 	return HandoffReport{
-		Summary:     "Use this report to hand work from an agent back to a human or another agent with less surprise.",
-		Freshness:   freshness,
-		Evidence:    evidence,
-		Review:      review,
-		ChangedNow:  changedNow,
-		NextActions: nextActions,
-		Task:        review.Task,
+		Summary:         "Use this report to hand work from an agent back to a human or another agent with less surprise.",
+		Freshness:       freshness,
+		Evidence:        evidence,
+		Review:          review,
+		ChangedNow:      changedNow,
+		NextActions:     nextActions,
+		Task:            review.Task,
+		RelatedSessions: review.RelatedSessions,
 	}, nil
 }
 
