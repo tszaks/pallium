@@ -1,4 +1,4 @@
-package cmd
+package verification
 
 import (
 	"errors"
@@ -9,24 +9,24 @@ import (
 	"github.com/tszaks/pallium/internal/db"
 )
 
-func TestCommandForVerificationTier(t *testing.T) {
+func TestCommandForTier(t *testing.T) {
 	plan := analysis.VerificationPlan{
 		Fast: []string{"go test ."},
 		Safe: []string{"go test ./pkg"},
 		Full: []string{"go test ./..."},
 	}
 
-	command, err := commandForVerificationTier(plan, "safe")
+	command, err := CommandForTier(plan, "safe")
 	if err != nil {
-		t.Fatalf("commandForVerificationTier failed: %v", err)
+		t.Fatalf("CommandForTier failed: %v", err)
 	}
 	if command != "go test ./pkg" {
 		t.Fatalf("command=%q, want go test ./pkg", command)
 	}
 }
 
-func TestCommandForVerificationTierRequiresInferredCommand(t *testing.T) {
-	_, err := commandForVerificationTier(analysis.VerificationPlan{}, "fast")
+func TestCommandForTierRequiresInferredCommand(t *testing.T) {
+	_, err := CommandForTier(analysis.VerificationPlan{}, "fast")
 	if err == nil {
 		t.Fatal("expected missing command error")
 	}
@@ -35,14 +35,14 @@ func TestCommandForVerificationTierRequiresInferredCommand(t *testing.T) {
 	}
 }
 
-func TestRunVerificationTierRequiresIndexedRepoBeforeExecuting(t *testing.T) {
+func TestRunRequiresIndexedRepoBeforeExecuting(t *testing.T) {
 	store, err := db.OpenPath(t.TempDir(), t.TempDir()+"/test.sqlite")
 	if err != nil {
 		t.Fatalf("OpenPath failed: %v", err)
 	}
 	defer store.Close()
 
-	_, err = runVerificationTier(store, "fast")
+	_, err = Run(store, "fast")
 	if !errors.Is(err, db.ErrRepoNotIndexed) {
 		t.Fatalf("expected ErrRepoNotIndexed, got %v", err)
 	}
