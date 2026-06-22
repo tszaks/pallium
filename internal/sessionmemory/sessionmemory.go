@@ -366,6 +366,9 @@ func (s *Store) upsert(parsed ParsedSession, metadata map[string]any) error {
 	if sess.Status == "" {
 		sess.Status = "seen"
 	}
+	sess = sanitizeSession(sess)
+	parsed.Session = sess
+	parsed.SearchBlob = redact(parsed.SearchBlob)
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	for _, stmt := range []string{
 		"DELETE FROM codex_session_events WHERE session_id=?",
@@ -378,7 +381,7 @@ func (s *Store) upsert(parsed ParsedSession, metadata map[string]any) error {
 			return err
 		}
 	}
-	j := func(v any) string { b, _ := json.Marshal(v); return string(b) }
+	j := func(v any) string { b, _ := json.Marshal(redactObj(v)); return string(b) }
 	_, err = tx.Exec(`INSERT INTO codex_sessions(id,machine,title,first_user_message,last_agent_message,cwd,source,model_provider,model,cli_version,git_branch,git_origin_url,created_at,updated_at,indexed_at,tokens_used,status,rollout_path,rollout_sha256,event_counts_json,files_touched_json,commands_json,tool_names_json,errors_json,metadata_json)
 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO UPDATE SET machine=excluded.machine,title=excluded.title,first_user_message=excluded.first_user_message,last_agent_message=excluded.last_agent_message,cwd=excluded.cwd,source=excluded.source,model_provider=excluded.model_provider,model=excluded.model,cli_version=excluded.cli_version,git_branch=excluded.git_branch,git_origin_url=excluded.git_origin_url,created_at=excluded.created_at,updated_at=excluded.updated_at,indexed_at=excluded.indexed_at,tokens_used=excluded.tokens_used,status=excluded.status,rollout_path=excluded.rollout_path,rollout_sha256=excluded.rollout_sha256,event_counts_json=excluded.event_counts_json,files_touched_json=excluded.files_touched_json,commands_json=excluded.commands_json,tool_names_json=excluded.tool_names_json,errors_json=excluded.errors_json,metadata_json=excluded.metadata_json`,
@@ -721,10 +724,40 @@ func redact(s string) string {
 	}
 	return out
 }
+
+func sanitizeSession(s Session) Session {
+	s.Title = redact(s.Title)
+	s.FirstUserMessage = redact(s.FirstUserMessage)
+	s.LastAgentMessage = redact(s.LastAgentMessage)
+	s.CWD = redact(s.CWD)
+	s.GitBranch = redact(s.GitBranch)
+	s.GitOriginURL = redact(s.GitOriginURL)
+	s.RolloutPath = redact(s.RolloutPath)
+	s.RolloutSHA256 = redact(s.RolloutSHA256)
+	s.FilesTouched = redactStrings(s.FilesTouched)
+	s.Commands = redactStrings(s.Commands)
+	s.ToolNames = redactStrings(s.ToolNames)
+	s.Errors = redactStrings(s.Errors)
+	return s
+}
+
+func redactStrings(values []string) []string {
+	if len(values) == 0 {
+		return values
+	}
+	out := make([]string, len(values))
+	for i, value := range values {
+		out[i] = redact(value)
+	}
+	return out
+}
+
 func redactObj(v any) any {
 	switch x := v.(type) {
 	case string:
 		return redact(x)
+	case []string:
+		return redactStrings(x)
 	case []any:
 		for i := range x {
 			x[i] = redactObj(x[i])

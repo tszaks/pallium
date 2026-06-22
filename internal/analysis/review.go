@@ -76,16 +76,19 @@ func Review(store *db.Store, baseRef string) (ReviewReport, error) {
 	testCommands := make([]string, 0)
 	notes := make([]string, 0)
 	allBoundaries := make([]BoundaryWarning, 0)
+	allStructuralLinks := make([]StructuralLink, 0)
 	fileVerification := make(map[string]VerificationPlan, len(changed))
 	highRiskCount := 0
 
 	for _, path := range changed {
 		risk, err := Risk(store, path)
 		if err != nil {
+			links, _ := StructuralLinks(store, path, 4)
 			tests, _ := SuggestedTests(store, path, 4)
 			commands, _ := SuggestedTestCommands(store, path, 3)
 			verification, _ := SuggestedVerificationPlan(store, path)
 			fileVerification[path] = verification
+			allStructuralLinks = append(allStructuralLinks, links...)
 			requiredTests = append(requiredTests, tests...)
 			testCommands = append(testCommands, commands...)
 			notes = append(notes, fmt.Sprintf("No indexed risk data for %s yet.", path))
@@ -100,6 +103,10 @@ func Review(store *db.Store, baseRef string) (ReviewReport, error) {
 				NeedsTests:     len(commands) > 0,
 			})
 			continue
+		}
+		links, err := StructuralLinks(store, path, 4)
+		if err != nil {
+			return ReviewReport{}, err
 		}
 		tests, err := SuggestedTests(store, path, 4)
 		if err != nil {
@@ -130,6 +137,7 @@ func Review(store *db.Store, baseRef string) (ReviewReport, error) {
 
 		requiredTests = append(requiredTests, tests...)
 		testCommands = append(testCommands, commands...)
+		allStructuralLinks = append(allStructuralLinks, links...)
 		allBoundaries = append(allBoundaries, boundaries...)
 		reviewed = append(reviewed, ReviewedFile{
 			Path:           path,
@@ -148,11 +156,12 @@ func Review(store *db.Store, baseRef string) (ReviewReport, error) {
 	if err != nil {
 		return ReviewReport{}, err
 	}
-	confidence := buildConfidence(len(reviewed) > 0, 1, len(requiredTests), len(reviewed))
+	structuralLinks := uniqueStructuralLinks(allStructuralLinks, 0)
+	confidence := buildConfidence(len(reviewed) > 0, len(structuralLinks), len(requiredTests), len(reviewed))
 	freshness := buildFreshness(store)
 	sortReviewedFiles(reviewed, task)
 	verification := verificationPlanFromReviewed(reviewed, fileVerification)
-	actionGuidance := buildActionGuidance("working-tree", RiskReport{Level: "medium"}, confidence, nil, pathsFromReviewed(reviewed), verification.Fast)
+	actionGuidance := buildActionGuidance("working-tree", RiskReport{Level: "medium"}, confidence, structuralLinks, pathsFromReviewed(reviewed), verification.Fast)
 	if task.HasScopeDrift {
 		notes = append(notes, fmt.Sprintf("Active task drifted outside planned scope: %s.", strings.Join(task.OutOfScopeChanged, ", ")))
 		actionGuidance.AskForReviewIf = uniqueStrings(append(actionGuidance.AskForReviewIf, "the change drifted outside the active task scope"), 5)

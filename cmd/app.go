@@ -92,7 +92,7 @@ Usage:
   pallium task start <goal> [scope-paths...] [--json]
   pallium task show [--json]
   pallium task clear [--json]
-  pallium sessions <index|list|search|grep|show|embed|semantic|stats> [--json]`)
+  pallium sessions <live|watch|index|list|search|related|grep|show|embed|semantic|stats> [--json]`)
 }
 
 func requireArg(args []string, field string) (string, error) {
