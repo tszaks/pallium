@@ -323,6 +323,81 @@ func TestActiveRolloutSkipReasonWinsOverStateFreshness(t *testing.T) {
 	}
 }
 
+func TestIndexUsesEmbeddingCursorWithSafetyBuffer(t *testing.T) {
+	tmp := t.TempDir()
+	codexHome := filepath.Join(tmp, ".codex")
+	sessionDir := filepath.Join(codexHome, "sessions")
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldRollout := filepath.Join(sessionDir, "rollout-2026-06-22T10-00-00-old.jsonl")
+	recentRollout := filepath.Join(sessionDir, "rollout-2026-06-22T11-00-00-recent.jsonl")
+	for path, id := range map[string]string{
+		oldRollout:    "old",
+		recentRollout: "recent",
+	} {
+		content := strings.Join([]string{
+			fmt.Sprintf(`{"type":"session_meta","timestamp":"2026-06-22T12:00:00Z","payload":{"id":%q,"cwd":"/tmp/repo","source":"codex"}}`, id),
+			fmt.Sprintf(`{"type":"event_msg","timestamp":"2026-06-22T12:01:00Z","payload":{"type":"user_message","message":"%s prompt"}}`, id),
+			"",
+		}, "\n")
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now()
+	if err := os.Chtimes(oldRollout, now.Add(-3*time.Hour), now.Add(-3*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(recentRollout, now.Add(-70*time.Minute), now.Add(-70*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.setEmbeddingCursor(DefaultEmbeddingModel, now.Add(-1*time.Hour)); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	count, err := Index(context.Background(), Options{
+		DBPath:         dbPath,
+		CodexHome:      codexHome,
+		Provider:       "codex",
+		Machine:        "test-host",
+		SafetyBuffer:   15 * time.Minute,
+		EmbeddingModel: DefaultEmbeddingModel,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("indexed %d sessions, want only recent session", count)
+	}
+
+	verify, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer verify.Close()
+	var oldCount, recentCount int
+	if err := verify.db.QueryRow(`SELECT COUNT(*) FROM codex_sessions WHERE id='old'`).Scan(&oldCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := verify.db.QueryRow(`SELECT COUNT(*) FROM codex_sessions WHERE id='recent'`).Scan(&recentCount); err != nil {
+		t.Fatal(err)
+	}
+	if oldCount != 0 || recentCount != 1 {
+		t.Fatalf("old indexed=%d recent indexed=%d, want 0 and 1", oldCount, recentCount)
+	}
+}
+
 func TestIndexSkipsActiveRolloutsUnlessForced(t *testing.T) {
 	tmp := t.TempDir()
 	codexHome := filepath.Join(tmp, ".codex")
@@ -501,6 +576,74 @@ func TestEmbedSessionOnlyEmbedsRequestedSession(t *testing.T) {
 	}
 	if targetCount != 2 || otherCount != 0 {
 		t.Fatalf("target embeddings=%d other embeddings=%d, want 2 and 0", targetCount, otherCount)
+	}
+}
+
+func TestEmbedSessionAdvancesEmbeddingCursorWhenBacklogIsClear(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	originalEmbedTexts := embedTexts
+	t.Cleanup(func() { embedTexts = originalEmbedTexts })
+	embedTexts = func(ctx context.Context, model string, texts []string) ([][]float64, error) {
+		vecs := make([][]float64, len(texts))
+		for i := range texts {
+			vecs[i] = []float64{float64(i + 1), 0.5}
+		}
+		return vecs, nil
+	}
+
+	store, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := "2026-06-10T12:00:00Z"
+	if _, err := store.db.Exec(`INSERT INTO codex_sessions(id,machine,title,indexed_at,updated_at) VALUES(?,?,?,?,?)`, "session-target", "test", "Target", now, now); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	for _, chunk := range []struct {
+		id    string
+		index int
+		text  string
+		sha   string
+	}{
+		{id: "target-1", index: 0, text: "first target chunk", sha: "sha-target-1"},
+		{id: "target-2", index: 1, text: "second target chunk", sha: "sha-target-2"},
+	} {
+		_, err := store.db.Exec(`INSERT INTO codex_session_chunks(id,session_id,chunk_index,kind,text,text_sha256) VALUES(?,?,?,?,?,?)`, chunk.id, "session-target", chunk.index, "message", chunk.text, chunk.sha)
+		if err != nil {
+			_ = store.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	count, err := EmbedSession(context.Background(), "", "test-model", 100, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("embedded %d chunks, want 2", count)
+	}
+
+	verify, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer verify.Close()
+	cursor := verify.embeddingCursor("test-model")
+	if cursor.IsZero() {
+		t.Fatalf("expected embedding cursor to be advanced")
+	}
+	backlog, err := verify.embeddingBacklog("test-model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backlog != 0 {
+		t.Fatalf("backlog=%d, want 0", backlog)
 	}
 }
 

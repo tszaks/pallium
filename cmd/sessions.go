@@ -166,13 +166,30 @@ func runSessionsIndex(out io.Writer, args []string, jsonOutput bool) error {
 	fs.StringVar(&opts.Provider, "provider", "", "")
 	fs.StringVar(&opts.DBPath, "db", "", "")
 	fs.StringVar(&opts.Machine, "machine", "", "")
+	fs.StringVar(&opts.EmbeddingModel, "model", sessionmemory.DefaultEmbeddingModel, "")
+	since := fs.String("since", "", "")
+	safetyBuffer := fs.String("safety-buffer", "30m", "")
 	fs.BoolVar(&opts.Force, "force", false, "")
 	fs.Var((*multiStringFlag)(&include), "include", "")
-	if err := parseSessionFlags(fs, args, map[string]struct{}{"codex-home": {}, "claude-home": {}, "provider": {}, "db": {}, "machine": {}, "include": {}}, map[string]struct{}{"force": {}}); err != nil {
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"codex-home": {}, "claude-home": {}, "provider": {}, "db": {}, "machine": {}, "include": {}, "model": {}, "since": {}, "safety-buffer": {}}, map[string]struct{}{"force": {}}); err != nil {
 		return err
 	}
 	if fs.NArg() > 0 {
 		return fmt.Errorf("unexpected sessions index argument %q; use --include for extra session paths", fs.Arg(0))
+	}
+	if strings.TrimSpace(*safetyBuffer) != "" {
+		duration, err := time.ParseDuration(*safetyBuffer)
+		if err != nil {
+			return fmt.Errorf("invalid --safety-buffer duration %q: %w", *safetyBuffer, err)
+		}
+		opts.SafetyBuffer = duration
+	}
+	if strings.TrimSpace(*since) != "" {
+		duration, err := time.ParseDuration(*since)
+		if err != nil {
+			return fmt.Errorf("invalid --since duration %q: %w", *since, err)
+		}
+		opts.Since = duration
 	}
 	count, err := sessionmemory.Index(context.Background(), opts, include)
 	if err != nil {
@@ -431,7 +448,7 @@ func printSessionsHelp(out io.Writer) {
 Usage:
   pallium sessions live [--all] [--details] [--json]
   pallium sessions watch [--all] [--details]
-  pallium sessions index [--provider all|codex|claude] [--codex-home ~/.codex] [--claude-home ~/.claude] [--include path] [--machine name] [--force] [--json]
+  pallium sessions index [--provider all|codex|claude] [--codex-home ~/.codex] [--claude-home ~/.claude] [--include path] [--machine name] [--model text-embedding-3-small] [--safety-buffer 30m] [--since 24h] [--force] [--json]
   pallium sessions list [--limit 20] [--json]
   pallium sessions search <query> [--limit 10] [--hybrid] [--json]
   pallium sessions related [repo-path] [--file path] [--limit 10] [--json]

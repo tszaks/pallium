@@ -26,6 +26,7 @@ const (
 	maxSearchBlobText            = 1_000_000
 	maxParseRolloutBytes         = 100 * 1024 * 1024
 	activeRolloutQuietPeriod     = 2 * time.Minute
+	defaultIndexSafetyBuffer     = 30 * time.Minute
 )
 
 var secretPatterns = []*regexp.Regexp{
@@ -49,12 +50,15 @@ const (
 )
 
 type Options struct {
-	DBPath     string
-	CodexHome  string
-	ClaudeHome string
-	Machine    string
-	Provider   string
-	Force      bool
+	DBPath         string
+	CodexHome      string
+	ClaudeHome     string
+	Machine        string
+	Provider       string
+	Force          bool
+	Since          time.Duration
+	SafetyBuffer   time.Duration
+	EmbeddingModel string
 }
 
 type Session struct {
@@ -293,6 +297,11 @@ CREATE TABLE IF NOT EXISTS codex_session_embeddings (
   embedded_at TEXT NOT NULL,
   PRIMARY KEY(chunk_id, provider, model)
 );
+CREATE TABLE IF NOT EXISTS codex_session_state (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 `)
 	return err
 }
@@ -321,9 +330,10 @@ func Index(ctx context.Context, opts Options, include []string) (int, error) {
 	}
 	defer store.Close()
 	count := 0
+	cutoff := store.indexCutoff(opts)
 	if provider == "all" || provider == "codex" {
 		state := loadStateMetadata(filepath.Join(opts.CodexHome, "state_5.sqlite"))
-		files := findRollouts(filepath.Join(opts.CodexHome, "sessions"), include)
+		files := findRollouts(filepath.Join(opts.CodexHome, "sessions"), include, cutoff)
 		for _, file := range files {
 			select {
 			case <-ctx.Done():
@@ -360,7 +370,7 @@ func Index(ctx context.Context, opts Options, include []string) (int, error) {
 		}
 	}
 	if provider == "all" || provider == "claude" {
-		files := findClaudeTranscripts(filepath.Join(opts.ClaudeHome, "projects"), include)
+		files := findClaudeTranscripts(filepath.Join(opts.ClaudeHome, "projects"), include, cutoff)
 		for _, file := range files {
 			select {
 			case <-ctx.Done():
@@ -386,6 +396,54 @@ func Index(ctx context.Context, opts Options, include []string) (int, error) {
 		}
 	}
 	return count, nil
+}
+
+func (s *Store) indexCutoff(opts Options) time.Time {
+	if opts.Force {
+		return time.Time{}
+	}
+	if opts.Since > 0 {
+		return time.Now().Add(-opts.Since)
+	}
+	model := strings.TrimSpace(opts.EmbeddingModel)
+	if model == "" {
+		model = DefaultEmbeddingModel
+	}
+	cursor := s.embeddingCursor(model)
+	if cursor.IsZero() {
+		return time.Time{}
+	}
+	buffer := opts.SafetyBuffer
+	if buffer <= 0 {
+		buffer = defaultIndexSafetyBuffer
+	}
+	return cursor.Add(-buffer)
+}
+
+func (s *Store) embeddingCursor(model string) time.Time {
+	key := embeddingCursorKey(model)
+	row := s.db.QueryRow(`SELECT value FROM codex_session_state WHERE key=?`, key)
+	var raw string
+	if err := row.Scan(&raw); err == nil {
+		return parseSessionTime(raw)
+	}
+	row = s.db.QueryRow(`SELECT MAX(embedded_at) FROM codex_session_embeddings WHERE provider='openai' AND model=?`, model)
+	var latest sql.NullString
+	if err := row.Scan(&latest); err == nil && latest.Valid {
+		return parseSessionTime(latest.String)
+	}
+	return time.Time{}
+}
+
+func (s *Store) setEmbeddingCursor(model string, at time.Time) error {
+	_, err := s.db.Exec(`INSERT INTO codex_session_state(key,value,updated_at) VALUES(?,?,?)
+ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+		embeddingCursorKey(model), at.UTC().Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+func embeddingCursorKey(model string) string {
+	return "last_successful_embed_at:openai:" + model
 }
 
 func (s *Store) rolloutSkipReason(path string, force bool) (rolloutSkipReason, error) {
@@ -649,8 +707,12 @@ func EmbeddingBacklogPath(path, model string) (int, error) {
 		return 0, err
 	}
 	defer store.Close()
+	return store.embeddingBacklog(model)
+}
+
+func (s *Store) embeddingBacklog(model string) (int, error) {
 	var count int
-	err = store.db.QueryRow(`SELECT COUNT(*)
+	err := s.db.QueryRow(`SELECT COUNT(*)
 FROM codex_session_chunks c
 LEFT JOIN codex_session_embeddings e
   ON e.chunk_id = c.id
@@ -765,7 +827,7 @@ func mergeState(s *Session, m map[string]any) {
 	}
 }
 
-func findRollouts(root string, include []string) []string {
+func findRollouts(root string, include []string, cutoff time.Time) []string {
 	seen := map[string]bool{}
 	var files []string
 	roots := append([]string{root}, include...)
@@ -774,12 +836,16 @@ func findRollouts(root string, include []string) []string {
 		if err != nil {
 			continue
 		}
-		if !info.IsDir() && isCodexRolloutPath(r) {
+		if !info.IsDir() && isCodexRolloutPath(r) && fileIsRecentEnough(info, cutoff) {
 			files = append(files, r)
 			continue
 		}
 		filepath.WalkDir(r, func(path string, d os.DirEntry, err error) error {
 			if err == nil && !d.IsDir() && isCodexRolloutPath(path) && !seen[path] {
+				info, statErr := d.Info()
+				if statErr != nil || !fileIsRecentEnough(info, cutoff) {
+					return nil
+				}
 				seen[path] = true
 				files = append(files, path)
 			}
@@ -795,7 +861,7 @@ func isCodexRolloutPath(path string) bool {
 	return strings.HasPrefix(base, "rollout-") && strings.HasSuffix(base, ".jsonl")
 }
 
-func findClaudeTranscripts(root string, include []string) []string {
+func findClaudeTranscripts(root string, include []string, cutoff time.Time) []string {
 	seen := map[string]bool{}
 	var files []string
 	roots := append([]string{root}, include...)
@@ -804,12 +870,16 @@ func findClaudeTranscripts(root string, include []string) []string {
 		if err != nil {
 			continue
 		}
-		if !info.IsDir() && isClaudeTranscriptPath(r) {
+		if !info.IsDir() && isClaudeTranscriptPath(r) && fileIsRecentEnough(info, cutoff) {
 			files = append(files, r)
 			continue
 		}
 		filepath.WalkDir(r, func(path string, d os.DirEntry, err error) error {
 			if err == nil && !d.IsDir() && isClaudeTranscriptPath(path) && !seen[path] {
+				info, statErr := d.Info()
+				if statErr != nil || !fileIsRecentEnough(info, cutoff) {
+					return nil
+				}
 				seen[path] = true
 				files = append(files, path)
 			}
@@ -818,6 +888,10 @@ func findClaudeTranscripts(root string, include []string) []string {
 	}
 	sort.Strings(files)
 	return files
+}
+
+func fileIsRecentEnough(info os.FileInfo, cutoff time.Time) bool {
+	return cutoff.IsZero() || !info.ModTime().Before(cutoff)
 }
 
 func isClaudeTranscriptPath(path string) bool {
