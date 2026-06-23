@@ -56,6 +56,7 @@ Use `--json` with any command for agent-friendly output.
 ```bash
 pallium sessions live --details
 pallium sessions index
+pallium sessions index --safety-buffer 30m
 pallium sessions index --force
 pallium sessions index --provider claude
 pallium sessions index --provider codex
@@ -65,12 +66,12 @@ pallium sessions search "MCP auth" --hybrid --limit 10
 pallium sessions related . --file cmd/app.go --limit 5
 pallium sessions grep "Timed out waiting for PGLite lock" --limit 20
 pallium sessions show <session-id> --transcript
-pallium sessions embed
+pallium sessions embed --batch-size 8
 pallium sessions semantic "find the session where we debugged MCP startup failures"
 pallium sessions stats
 ```
 
-Session-memory indexing is incremental by default: unchanged transcript files are skipped using their last indexed timestamp, with a hash check only when the file looks newer. Files modified in the last two minutes are skipped so Pallium does not chase active agent logs. Use `--force` only when you intentionally want to rebuild existing session rows after parser or redaction changes.
+Session-memory indexing is incremental by default: unchanged transcript files are skipped using their last indexed timestamp, with a hash check only when the file looks newer. After a global `sessions embed` pass completes and no embedding backlog remains for the model, Pallium records a model-specific embedding cursor. Later `sessions index` runs scan from that cursor minus `--safety-buffer` instead of walking historical session memory every time. This makes scheduled automation cadence-independent: hourly runs should touch about the last hour plus buffer, six-hour runs should touch about six hours plus buffer, and on-demand runs use the same cursor path. Files modified in the last two minutes are skipped so Pallium does not chase active agent logs. Use `--force` only when you intentionally want to rebuild existing session rows after parser or redaction changes.
 
 Session-memory data is stored outside any one repo at `~/.pallium/codex-sessions.sqlite`. If an existing legacy database is present, Pallium falls back to `~/.codex-memory/codex-sessions.sqlite` so older indexed memory keeps working. It includes redacted raw agent events, transcript/tool-call rows, FTS indexes, chunks, OpenAI embeddings, and brute-force cosine semantic search. Use `OPENAI_API_KEY` or `OPENAI_ADMIN_API_KEY` for embedding commands.
 

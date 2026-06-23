@@ -87,6 +87,17 @@ func EmbedSession(ctx context.Context, sessionID, model string, limit, batchSize
 			total++
 		}
 	}
+	if sessionID == "" && total < limit {
+		backlog, err := store.embeddingBacklog(model)
+		if err != nil {
+			return total, err
+		}
+		if backlog == 0 {
+			if err := store.setEmbeddingCursor(model, time.Now()); err != nil {
+				return total, err
+			}
+		}
+	}
 	return total, nil
 }
 
