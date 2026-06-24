@@ -15,6 +15,7 @@ import (
 type Store struct {
 	conn     *sql.DB
 	RepoRoot string
+	DBPath   string
 }
 
 var ErrRepoNotIndexed = errors.New("repo has not been indexed yet")
@@ -67,8 +68,19 @@ type ActiveTask struct {
 	StartedAt  time.Time
 }
 
+type VerificationRun struct {
+	ID           int64    `json:"id"`
+	Tier         string   `json:"tier"`
+	Command      string   `json:"command"`
+	ExitCode     int      `json:"exit_code"`
+	DurationMS   int64    `json:"duration_ms"`
+	ChangedFiles []string `json:"changed_files"`
+	CWD          string   `json:"cwd"`
+	RanAt        string   `json:"ran_at"`
+}
+
 func Open(repoRoot string) (*Store, error) {
-	dbPath := defaultDBPath(repoRoot)
+	dbPath := DefaultDBPath(repoRoot)
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		return nil, fmt.Errorf("create db directory: %w", err)
 	}
@@ -76,7 +88,7 @@ func Open(repoRoot string) (*Store, error) {
 	return OpenPath(repoRoot, dbPath)
 }
 
-func defaultDBPath(repoRoot string) string {
+func DefaultDBPath(repoRoot string) string {
 	current := filepath.Join(repoRoot, ".pallium", "pallium.sqlite")
 	legacy := filepath.Join(repoRoot, ".codex-memory", "codex-memory.sqlite")
 	if _, err := os.Stat(current); err == nil {
@@ -96,7 +108,7 @@ func OpenPath(repoRoot, dbPath string) (*Store, error) {
 	conn.SetMaxOpenConns(1)
 	conn.SetMaxIdleConns(1)
 
-	store := &Store{conn: conn, RepoRoot: repoRoot}
+	store := &Store{conn: conn, RepoRoot: repoRoot, DBPath: dbPath}
 	if err := store.Init(); err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -107,7 +119,7 @@ func OpenPath(repoRoot, dbPath string) (*Store, error) {
 
 func (s *Store) Init() error {
 	pragmas := []string{
-		"PRAGMA busy_timeout = 5000",
+		"PRAGMA busy_timeout = 60000",
 		"PRAGMA journal_mode = WAL",
 		"PRAGMA synchronous = NORMAL",
 	}
@@ -374,4 +386,62 @@ func (s *Store) ClearActiveTask() error {
 		return fmt.Errorf("clear active task: %w", err)
 	}
 	return nil
+}
+
+func (s *Store) SaveVerificationRun(run VerificationRun) (VerificationRun, error) {
+	repo, err := s.Repo()
+	if err != nil {
+		return VerificationRun{}, err
+	}
+	changedJSON, err := json.Marshal(run.ChangedFiles)
+	if err != nil {
+		return VerificationRun{}, fmt.Errorf("marshal changed files: %w", err)
+	}
+	ranAt := run.RanAt
+	if ranAt == "" {
+		ranAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	result, err := s.conn.Exec(`
+INSERT INTO verification_runs (repo_id, tier, command, exit_code, duration_ms, changed_files_json, cwd, ran_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+`, repo.ID, run.Tier, run.Command, run.ExitCode, run.DurationMS, string(changedJSON), run.CWD, ranAt)
+	if err != nil {
+		return VerificationRun{}, fmt.Errorf("save verification run: %w", err)
+	}
+	run.ID, _ = result.LastInsertId()
+	run.RanAt = ranAt
+	return run, nil
+}
+
+func (s *Store) RecentVerificationRuns(limit int) ([]VerificationRun, error) {
+	repo, err := s.Repo()
+	if err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		limit = 10
+	}
+	rows, err := s.conn.Query(`
+SELECT id, tier, command, exit_code, duration_ms, changed_files_json, cwd, ran_at
+FROM verification_runs
+WHERE repo_id = ?
+ORDER BY ran_at DESC, id DESC
+LIMIT ?
+`, repo.ID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("read verification runs: %w", err)
+	}
+	defer rows.Close()
+
+	runs := make([]VerificationRun, 0)
+	for rows.Next() {
+		var run VerificationRun
+		var changedJSON string
+		if err := rows.Scan(&run.ID, &run.Tier, &run.Command, &run.ExitCode, &run.DurationMS, &changedJSON, &run.CWD, &run.RanAt); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal([]byte(changedJSON), &run.ChangedFiles)
+		runs = append(runs, run)
+	}
+	return runs, rows.Err()
 }
