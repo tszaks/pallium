@@ -39,7 +39,7 @@ var secretPatterns = []*regexp.Regexp{
 
 var pathLikePattern = regexp.MustCompile(`(?:^|\s)(/[A-Za-z0-9._~+/@:-][^\s'"` + "`" + `<>]*)`)
 
-var embedTexts = openAIEmbeddings
+var embedTexts = openAICompatibleEmbeddings
 
 type rolloutSkipReason int
 
@@ -427,7 +427,7 @@ func (s *Store) embeddingCursor(model string) time.Time {
 	if err := row.Scan(&raw); err == nil {
 		return parseSessionTime(raw)
 	}
-	row = s.db.QueryRow(`SELECT MAX(embedded_at) FROM codex_session_embeddings WHERE provider='openai' AND model=?`, model)
+	row = s.db.QueryRow(`SELECT MAX(embedded_at) FROM codex_session_embeddings WHERE provider=? AND model=?`, embeddingProvider(), model)
 	var latest sql.NullString
 	if err := row.Scan(&latest); err == nil && latest.Valid {
 		return parseSessionTime(latest.String)
@@ -443,7 +443,7 @@ ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated
 }
 
 func embeddingCursorKey(model string) string {
-	return "last_successful_embed_at:openai:" + model
+	return "last_successful_embed_at:" + embeddingProvider() + ":" + model
 }
 
 func (s *Store) rolloutSkipReason(path string, force bool) (rolloutSkipReason, error) {
@@ -716,10 +716,10 @@ func (s *Store) embeddingBacklog(model string) (int, error) {
 FROM codex_session_chunks c
 LEFT JOIN codex_session_embeddings e
   ON e.chunk_id = c.id
- AND e.provider = 'openai'
+ AND e.provider = ?
  AND e.model = ?
  AND e.text_sha256 = c.text_sha256
-WHERE e.chunk_id IS NULL`, model).Scan(&count)
+WHERE e.chunk_id IS NULL`, embeddingProvider(), model).Scan(&count)
 	return count, err
 }
 
