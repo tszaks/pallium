@@ -16,7 +16,7 @@ func TestSchemaInitializes(t *testing.T) {
 	}
 	defer store.Close()
 
-	tables := []string{"repos", "files", "commits", "file_commits", "cochange_edges", "decision_notes", "active_tasks"}
+	tables := []string{"repos", "files", "commits", "file_commits", "cochange_edges", "decision_notes", "active_tasks", "verification_runs"}
 	for _, table := range tables {
 		row := store.DB().QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table)
 		var name string
@@ -192,5 +192,45 @@ func TestActiveTaskRoundTrip(t *testing.T) {
 	}
 	if _, err := store.ActiveTask(); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("expected sql.ErrNoRows after clear, got %v", err)
+	}
+}
+
+func TestVerificationRunRoundTrip(t *testing.T) {
+	repo := t.TempDir()
+	store, err := OpenPath(repo, t.TempDir()+"/test.sqlite")
+	if err != nil {
+		t.Fatalf("OpenPath failed: %v", err)
+	}
+	defer store.Close()
+
+	if _, err := store.DB().Exec(`INSERT INTO repos (root, branch, last_indexed_commit, indexed_at) VALUES (?, 'main', 'abc123', '2026-03-13T12:00:00Z')`, repo); err != nil {
+		t.Fatalf("insert repo: %v", err)
+	}
+
+	saved, err := store.SaveVerificationRun(VerificationRun{
+		Tier:         "fast",
+		Command:      "go test ./...",
+		ExitCode:     1,
+		DurationMS:   250,
+		ChangedFiles: []string{"main.go"},
+		CWD:          repo,
+		RanAt:        "2026-03-13T12:30:00Z",
+	})
+	if err != nil {
+		t.Fatalf("SaveVerificationRun failed: %v", err)
+	}
+	if saved.ID == 0 {
+		t.Fatalf("expected saved id, got %#v", saved)
+	}
+
+	runs, err := store.RecentVerificationRuns(5)
+	if err != nil {
+		t.Fatalf("RecentVerificationRuns failed: %v", err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("expected one run, got %#v", runs)
+	}
+	if runs[0].Command != "go test ./..." || runs[0].ExitCode != 1 || len(runs[0].ChangedFiles) != 1 {
+		t.Fatalf("unexpected run: %#v", runs[0])
 	}
 }

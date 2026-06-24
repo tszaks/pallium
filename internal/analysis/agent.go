@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -117,6 +118,9 @@ func activeTaskScope(store *db.Store, changed []string) (TaskScopeReport, error)
 	task, err := store.ActiveTask()
 	if err != nil {
 		if err == sql.ErrNoRows {
+			return TaskScopeReport{}, nil
+		}
+		if errors.Is(err, db.ErrRepoNotIndexed) {
 			return TaskScopeReport{}, nil
 		}
 		return TaskScopeReport{}, err
