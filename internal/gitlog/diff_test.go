@@ -1,7 +1,9 @@
 package gitlog
 
 import (
+	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -43,5 +45,28 @@ func TestWorkingTreeChanges(t *testing.T) {
 
 	if len(files) < 2 {
 		t.Fatalf("expected working tree changes, got %#v", files)
+	}
+}
+
+func TestWorkingTreeChangesExpandsUntrackedDirectories(t *testing.T) {
+	repo := initTempRepo(t)
+
+	if err := os.MkdirAll(filepath.Join(repo, "cmd"), 0o755); err != nil {
+		t.Fatalf("mkdir cmd: %v", err)
+	}
+	writeFile(t, filepath.Join(repo, "cmd", "newtool.go"), "package cmd\n")
+	writeFile(t, filepath.Join(repo, "cmd", "newtool_test.go"), "package cmd\n")
+
+	files, err := WorkingTreeChanges(repo)
+	if err != nil {
+		t.Fatalf("WorkingTreeChanges failed: %v", err)
+	}
+
+	paths := make([]string, 0, len(files))
+	for _, file := range files {
+		paths = append(paths, file.Path)
+	}
+	if !slices.Contains(paths, "cmd/newtool.go") || !slices.Contains(paths, "cmd/newtool_test.go") {
+		t.Fatalf("expected untracked directory files, got %#v", files)
 	}
 }

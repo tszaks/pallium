@@ -3,14 +3,17 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 
 	"time"
 
 	"github.com/tszaks/pallium/internal/codexsessions"
+	"github.com/tszaks/pallium/internal/gitlog"
 	"github.com/tszaks/pallium/internal/sessionmemory"
 )
 
@@ -30,6 +33,8 @@ func runSessions(out io.Writer, args []string, jsonOutput bool) error {
 		return runSessionsList(out, args[1:], jsonOutput)
 	case "search":
 		return runSessionsSearch(out, args[1:], jsonOutput)
+	case "related":
+		return runSessionsRelated(out, args[1:], jsonOutput)
 	case "grep":
 		return runSessionsGrep(out, args[1:], jsonOutput)
 	case "show":
@@ -39,7 +44,7 @@ func runSessions(out io.Writer, args []string, jsonOutput bool) error {
 	case "semantic":
 		return runSessionsSemantic(out, args[1:], jsonOutput)
 	case "stats":
-		return runSessionsStats(out, jsonOutput)
+		return runSessionsStats(out, args[1:], jsonOutput)
 	default:
 		printSessionsHelp(out)
 		return fmt.Errorf("unknown sessions command: %s", args[0])
@@ -47,13 +52,24 @@ func runSessions(out io.Writer, args []string, jsonOutput bool) error {
 }
 
 func runSessionsLive(out io.Writer, args []string, jsonOutput bool, watch bool) error {
-	includeAll := hasArg(args, "--all")
-	details := hasArg(args, "--details")
+	if hasHelpArg(args) {
+		printSessionsHelp(out)
+		return nil
+	}
+	fs := newSessionFlagSet("sessions live")
+	includeAll := fs.Bool("all", false, "")
+	details := fs.Bool("details", false, "")
+	if err := parseSessionFlags(fs, args, nil, map[string]struct{}{"all": {}, "details": {}}); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected sessions live argument: %s", fs.Arg(0))
+	}
 	if watch && jsonOutput {
 		return fmt.Errorf("sessions watch cannot be used with --json")
 	}
 	render := func() error {
-		snapshot, err := codexsessions.CollectSessions(context.Background(), codexsessions.SessionCollectOptions{IncludeAll: includeAll, IncludeDetails: details})
+		snapshot, err := codexsessions.CollectSessions(context.Background(), codexsessions.SessionCollectOptions{IncludeAll: *includeAll, IncludeDetails: *details})
 		if err != nil {
 			return err
 		}
@@ -62,7 +78,7 @@ func runSessionsLive(out io.Writer, args []string, jsonOutput bool, watch bool) 
 			enc.SetIndent("", "  ")
 			return enc.Encode(snapshot)
 		}
-		renderLiveSessions(out, snapshot, includeAll, details)
+		renderLiveSessions(out, snapshot, *includeAll, *details)
 		return nil
 	}
 	if !watch {
@@ -138,49 +154,42 @@ func compactPath(s string) string {
 }
 
 func runSessionsIndex(out io.Writer, args []string, jsonOutput bool) error {
+	if hasHelpArg(args) {
+		printSessionsHelp(out)
+		return nil
+	}
 	opts := sessionmemory.Options{}
 	var include []string
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--codex-home":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("missing value for --codex-home")
-			}
-			opts.CodexHome = args[i]
-		case "--claude-home":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("missing value for --claude-home")
-			}
-			opts.ClaudeHome = args[i]
-		case "--provider":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("missing value for --provider")
-			}
-			opts.Provider = args[i]
-		case "--db":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("missing value for --db")
-			}
-			opts.DBPath = args[i]
-		case "--machine":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("missing value for --machine")
-			}
-			opts.Machine = args[i]
-		case "--include":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("missing value for --include")
-			}
-			include = append(include, args[i])
-		default:
-			include = append(include, args[i])
+	fs := newSessionFlagSet("sessions index")
+	fs.StringVar(&opts.CodexHome, "codex-home", "", "")
+	fs.StringVar(&opts.ClaudeHome, "claude-home", "", "")
+	fs.StringVar(&opts.Provider, "provider", "", "")
+	fs.StringVar(&opts.DBPath, "db", "", "")
+	fs.StringVar(&opts.Machine, "machine", "", "")
+	fs.StringVar(&opts.EmbeddingModel, "model", sessionmemory.DefaultEmbeddingModel, "")
+	since := fs.String("since", "", "")
+	safetyBuffer := fs.String("safety-buffer", "30m", "")
+	fs.BoolVar(&opts.Force, "force", false, "")
+	fs.Var((*multiStringFlag)(&include), "include", "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"codex-home": {}, "claude-home": {}, "provider": {}, "db": {}, "machine": {}, "include": {}, "model": {}, "since": {}, "safety-buffer": {}}, map[string]struct{}{"force": {}}); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected sessions index argument %q; use --include for extra session paths", fs.Arg(0))
+	}
+	if strings.TrimSpace(*safetyBuffer) != "" {
+		duration, err := time.ParseDuration(*safetyBuffer)
+		if err != nil {
+			return fmt.Errorf("invalid --safety-buffer duration %q: %w", *safetyBuffer, err)
 		}
+		opts.SafetyBuffer = duration
+	}
+	if strings.TrimSpace(*since) != "" {
+		duration, err := time.ParseDuration(*since)
+		if err != nil {
+			return fmt.Errorf("invalid --since duration %q: %w", *since, err)
+		}
+		opts.Since = duration
 	}
 	count, err := sessionmemory.Index(context.Background(), opts, include)
 	if err != nil {
@@ -190,8 +199,19 @@ func runSessionsIndex(out io.Writer, args []string, jsonOutput bool) error {
 }
 
 func runSessionsList(out io.Writer, args []string, jsonOutput bool) error {
-	limit := intArg(args, "--limit", 20)
-	sessions, err := sessionmemory.List(limit)
+	if hasHelpArg(args) {
+		printSessionsHelp(out)
+		return nil
+	}
+	fs := newSessionFlagSet("sessions list")
+	limit := fs.Int("limit", 20, "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"limit": {}}, nil); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected sessions list argument: %s", fs.Arg(0))
+	}
+	sessions, err := sessionmemory.List(*limit)
 	if err != nil {
 		return err
 	}
@@ -205,12 +225,27 @@ func runSessionsList(out io.Writer, args []string, jsonOutput bool) error {
 }
 
 func runSessionsSearch(out io.Writer, args []string, jsonOutput bool) error {
-	query := strings.TrimSpace(strings.Join(nonFlagArgs(args), " "))
+	if hasHelpArg(args) {
+		printSessionsHelp(out)
+		return nil
+	}
+	fs := newSessionFlagSet("sessions search")
+	limit := fs.Int("limit", 10, "")
+	hybrid := fs.Bool("hybrid", false, "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"limit": {}}, map[string]struct{}{"hybrid": {}}); err != nil {
+		return err
+	}
+	query := strings.TrimSpace(strings.Join(fs.Args(), " "))
 	if query == "" {
 		return fmt.Errorf("usage: pallium sessions search <query>")
 	}
-	limit := intArg(args, "--limit", 10)
-	results, err := sessionmemory.Search(query, limit)
+	var results []sessionmemory.SearchResult
+	var err error
+	if *hybrid {
+		results, err = sessionmemory.SearchHybrid(query, *limit)
+	} else {
+		results, err = sessionmemory.Search(query, *limit)
+	}
 	if err != nil {
 		return err
 	}
@@ -223,13 +258,63 @@ func runSessionsSearch(out io.Writer, args []string, jsonOutput bool) error {
 	return nil
 }
 
+func runSessionsRelated(out io.Writer, args []string, jsonOutput bool) error {
+	if hasHelpArg(args) {
+		printSessionsHelp(out)
+		return nil
+	}
+	fs := newSessionFlagSet("sessions related")
+	limit := fs.Int("limit", 10, "")
+	var files []string
+	fs.Var((*multiStringFlag)(&files), "file", "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"limit": {}, "file": {}}, nil); err != nil {
+		return err
+	}
+	if fs.NArg() > 1 {
+		return fmt.Errorf("unexpected sessions related argument: %s", fs.Arg(1))
+	}
+	repoPath := "."
+	if fs.NArg() == 1 {
+		repoPath = fs.Arg(0)
+	}
+	repoRoot, err := gitlog.RepoRoot(repoPath)
+	if err != nil {
+		return err
+	}
+	origin, _ := gitlog.OriginURL(repoRoot)
+	results, err := sessionmemory.Related(sessionmemory.RelatedOptions{
+		RepoRoot:     repoRoot,
+		GitOriginURL: origin,
+		Files:        files,
+		Limit:        *limit,
+	})
+	if err != nil {
+		return err
+	}
+	if jsonOutput {
+		return json.NewEncoder(out).Encode(results)
+	}
+	for _, r := range results {
+		printSessionSearchResult(out, r)
+	}
+	return nil
+}
+
 func runSessionsGrep(out io.Writer, args []string, jsonOutput bool) error {
-	query := strings.TrimSpace(strings.Join(nonFlagArgs(args), " "))
+	if hasHelpArg(args) {
+		printSessionsHelp(out)
+		return nil
+	}
+	fs := newSessionFlagSet("sessions grep")
+	limit := fs.Int("limit", 20, "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"limit": {}}, nil); err != nil {
+		return err
+	}
+	query := strings.TrimSpace(strings.Join(fs.Args(), " "))
 	if query == "" {
 		return fmt.Errorf("usage: pallium sessions grep <query>")
 	}
-	limit := intArg(args, "--limit", 20)
-	results, err := sessionmemory.Grep(query, limit)
+	results, err := sessionmemory.Grep(query, *limit)
 	if err != nil {
 		return err
 	}
@@ -243,18 +328,23 @@ func runSessionsGrep(out io.Writer, args []string, jsonOutput bool) error {
 }
 
 func runSessionsShow(out io.Writer, args []string, jsonOutput bool) error {
-	if len(args) == 0 {
+	if hasHelpArg(args) {
+		printSessionsHelp(out)
+		return nil
+	}
+	fs := newSessionFlagSet("sessions show")
+	transcript := fs.Bool("transcript", false, "")
+	if err := parseSessionFlags(fs, args, nil, map[string]struct{}{"transcript": {}}); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
 		return fmt.Errorf("usage: pallium sessions show <session-id>")
 	}
-	transcript := hasArg(args, "--transcript")
-	id := ""
-	for _, a := range args {
-		if !strings.HasPrefix(a, "--") {
-			id = a
-			break
-		}
+	if fs.NArg() > 1 {
+		return fmt.Errorf("unexpected sessions show argument: %s", fs.Arg(1))
 	}
-	s, messages, err := sessionmemory.Show(id, transcript)
+	id := fs.Arg(0)
+	s, messages, err := sessionmemory.Show(id, *transcript)
 	if err != nil {
 		return err
 	}
@@ -262,7 +352,7 @@ func runSessionsShow(out io.Writer, args []string, jsonOutput bool) error {
 		return json.NewEncoder(out).Encode(map[string]any{"session": s, "messages": messages})
 	}
 	printSessionDetail(out, s)
-	if transcript {
+	if *transcript {
 		fmt.Fprintln(out, "\nTranscript")
 		for _, m := range messages {
 			fmt.Fprintf(out, "\n[%d] %s/%s %s\n%s\n", m.LineNo, m.Role, m.Kind, m.Timestamp, m.Text)
@@ -272,29 +362,48 @@ func runSessionsShow(out io.Writer, args []string, jsonOutput bool) error {
 }
 
 func runSessionsEmbed(out io.Writer, args []string, jsonOutput bool) error {
-	model := stringArg(args, "--model", sessionmemory.DefaultEmbeddingModel)
-	limit := intArg(args, "--limit", 1000000)
-	batch := intArg(args, "--batch-size", 64)
-	sessionID := stringArg(args, "--session", "")
-	count, err := sessionmemory.EmbedSession(context.Background(), sessionID, model, limit, batch)
+	if hasHelpArg(args) {
+		printSessionsHelp(out)
+		return nil
+	}
+	fs := newSessionFlagSet("sessions embed")
+	model := fs.String("model", sessionmemory.DefaultEmbeddingModel, "")
+	limit := fs.Int("limit", 1000000, "")
+	batch := fs.Int("batch-size", 64, "")
+	sessionID := fs.String("session", "", "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"model": {}, "limit": {}, "batch-size": {}, "session": {}}, nil); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected sessions embed argument: %s", fs.Arg(0))
+	}
+	count, err := sessionmemory.EmbedSession(context.Background(), *sessionID, *model, *limit, *batch)
 	if err != nil {
 		return err
 	}
-	payload := map[string]any{"embedded": count, "model": model}
-	if sessionID != "" {
-		payload["session_id"] = sessionID
+	payload := map[string]any{"embedded": count, "model": *model}
+	if *sessionID != "" {
+		payload["session_id"] = *sessionID
 	}
-	return writeMaybeJSON(out, jsonOutput, payload, fmt.Sprintf("Embedded %d session chunks with %s", count, model))
+	return writeMaybeJSON(out, jsonOutput, payload, fmt.Sprintf("Embedded %d session chunks with %s", count, *model))
 }
 
 func runSessionsSemantic(out io.Writer, args []string, jsonOutput bool) error {
-	query := strings.TrimSpace(strings.Join(nonFlagArgs(args), " "))
+	if hasHelpArg(args) {
+		printSessionsHelp(out)
+		return nil
+	}
+	fs := newSessionFlagSet("sessions semantic")
+	model := fs.String("model", sessionmemory.DefaultEmbeddingModel, "")
+	limit := fs.Int("limit", 10, "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"model": {}, "limit": {}}, nil); err != nil {
+		return err
+	}
+	query := strings.TrimSpace(strings.Join(fs.Args(), " "))
 	if query == "" {
 		return fmt.Errorf("usage: pallium sessions semantic <query>")
 	}
-	model := stringArg(args, "--model", sessionmemory.DefaultEmbeddingModel)
-	limit := intArg(args, "--limit", 10)
-	results, err := sessionmemory.Semantic(context.Background(), query, model, limit, true)
+	results, err := sessionmemory.Semantic(context.Background(), query, *model, *limit, true)
 	if err != nil {
 		return err
 	}
@@ -307,7 +416,18 @@ func runSessionsSemantic(out io.Writer, args []string, jsonOutput bool) error {
 	return nil
 }
 
-func runSessionsStats(out io.Writer, jsonOutput bool) error {
+func runSessionsStats(out io.Writer, args []string, jsonOutput bool) error {
+	if hasHelpArg(args) {
+		printSessionsHelp(out)
+		return nil
+	}
+	fs := newSessionFlagSet("sessions stats")
+	if err := parseSessionFlags(fs, args, nil, nil); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected sessions stats argument: %s", fs.Arg(0))
+	}
 	stats, err := sessionmemory.StatsRead()
 	if err != nil {
 		return err
@@ -328,9 +448,10 @@ func printSessionsHelp(out io.Writer) {
 Usage:
   pallium sessions live [--all] [--details] [--json]
   pallium sessions watch [--all] [--details]
-  pallium sessions index [--provider all|codex|claude] [--codex-home ~/.codex] [--claude-home ~/.claude] [--include path] [--machine name] [--json]
+  pallium sessions index [--provider all|codex|claude] [--codex-home ~/.codex] [--claude-home ~/.claude] [--include path] [--machine name] [--model text-embedding-3-small] [--safety-buffer 30m] [--since 24h] [--force] [--json]
   pallium sessions list [--limit 20] [--json]
-  pallium sessions search <query> [--limit 10] [--json]
+  pallium sessions search <query> [--limit 10] [--hybrid] [--json]
+  pallium sessions related [repo-path] [--file path] [--limit 10] [--json]
   pallium sessions grep <query> [--limit 20] [--json]
   pallium sessions show <session-id> [--transcript] [--json]
   pallium sessions embed [--session id] [--model text-embedding-3-small] [--limit n] [--batch-size n] [--json]
@@ -343,6 +464,18 @@ func printSessionBrief(out io.Writer, s sessionmemory.Session) {
 	fmt.Fprintf(out, "  cwd: %s\n", s.CWD)
 	if len(s.FilesTouched) > 0 {
 		fmt.Fprintf(out, "  files: %s\n", strings.Join(limitStrings(s.FilesTouched, 8), ", "))
+	}
+	fmt.Fprintln(out)
+}
+
+func printSessionSearchResult(out io.Writer, r sessionmemory.SearchResult) {
+	fmt.Fprintf(out, "score=%d %s  %s  %s\n", r.Score, firstNonEmpty(r.UpdatedAt, r.CreatedAt), r.ID, r.Title)
+	fmt.Fprintf(out, "  cwd: %s\n", r.CWD)
+	if len(r.Signals) > 0 {
+		fmt.Fprintf(out, "  signals: %s\n", strings.Join(r.Signals, ", "))
+	}
+	if len(r.FilesTouched) > 0 {
+		fmt.Fprintf(out, "  files: %s\n", strings.Join(limitStrings(r.FilesTouched, 8), ", "))
 	}
 	fmt.Fprintln(out)
 }
@@ -370,50 +503,66 @@ func writeMaybeJSON(out io.Writer, jsonOutput bool, payload any, text string) er
 	_, err := fmt.Fprintln(out, text)
 	return err
 }
-func intArg(args []string, name string, fallback int) int {
-	s := stringArg(args, name, "")
-	if s == "" {
-		return fallback
-	}
-	n, err := strconv.Atoi(s)
+func newSessionFlagSet(name string) *flag.FlagSet {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	return fs
+}
+
+func parseSessionFlags(fs *flag.FlagSet, args []string, valueFlags, boolFlags map[string]struct{}) error {
+	reordered, err := reorderSessionFlags(args, valueFlags, boolFlags)
 	if err != nil {
-		return fallback
+		return err
 	}
-	return n
+	return fs.Parse(reordered)
 }
-func stringArg(args []string, name, fallback string) string {
-	for i, a := range args {
-		if a == name && i+1 < len(args) {
-			return args[i+1]
-		}
-	}
-	return fallback
-}
-func hasArg(args []string, name string) bool {
-	for _, a := range args {
-		if a == name {
-			return true
-		}
-	}
-	return false
-}
-func nonFlagArgs(args []string) []string {
-	out := []string{}
-	skip := false
-	for i, a := range args {
-		if skip {
-			skip = false
+
+func reorderSessionFlags(args []string, valueFlags, boolFlags map[string]struct{}) ([]string, error) {
+	flags := make([]string, 0, len(args))
+	positionals := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if !strings.HasPrefix(arg, "-") || arg == "-" {
+			positionals = append(positionals, arg)
 			continue
 		}
-		if strings.HasPrefix(a, "--") {
-			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "--") {
-				skip = true
+		name := strings.TrimLeft(arg, "-")
+		if idx := strings.Index(name, "="); idx >= 0 {
+			name = name[:idx]
+		}
+		if _, ok := boolFlags[name]; ok {
+			flags = append(flags, arg)
+			continue
+		}
+		if _, ok := valueFlags[name]; ok {
+			flags = append(flags, arg)
+			if !strings.Contains(arg, "=") && i+1 < len(args) {
+				flags = append(flags, args[i+1])
+				i++
 			}
 			continue
 		}
-		out = append(out, a)
+		flags = append(flags, arg)
 	}
-	return out
+	return append(flags, positionals...), nil
+}
+
+func hasHelpArg(args []string) bool {
+	return slices.Contains(args, "help") || slices.Contains(args, "-h") || slices.Contains(args, "--help")
+}
+
+type multiStringFlag []string
+
+func (m *multiStringFlag) String() string {
+	return strings.Join(*m, ",")
+}
+
+func (m *multiStringFlag) Set(value string) error {
+	if strings.TrimSpace(value) == "" {
+		return fmt.Errorf("empty value")
+	}
+	*m = append(*m, value)
+	return nil
 }
 func limitStrings(in []string, n int) []string {
 	if len(in) <= n {

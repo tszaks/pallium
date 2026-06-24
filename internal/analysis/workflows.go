@@ -2,11 +2,11 @@ package analysis
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/tszaks/pallium/internal/db"
 	"github.com/tszaks/pallium/internal/gitlog"
+	"github.com/tszaks/pallium/internal/sessionmemory"
 )
 
 type SafeReport struct {
@@ -40,35 +40,6 @@ type PlanReport struct {
 	Risk           RiskReport       `json:"risk"`
 }
 
-type ReviewedFile struct {
-	Path           string   `json:"path"`
-	ChangeSource   string   `json:"change_source"`
-	RiskLevel      string   `json:"risk_level"`
-	TopReasons     []string `json:"top_reasons"`
-	SuggestedTests []string `json:"suggested_tests"`
-	BlastRadius    []string `json:"blast_radius"`
-	BoundaryLabels []string `json:"boundary_labels,omitempty"`
-	NeedsReview    bool     `json:"needs_review"`
-	NeedsTests     bool     `json:"needs_tests"`
-}
-
-type ReviewReport struct {
-	BaseRef          string            `json:"base_ref"`
-	HeadRef          string            `json:"head_ref"`
-	Summary          string            `json:"summary"`
-	Freshness        Freshness         `json:"freshness"`
-	Evidence         Evidence          `json:"evidence"`
-	ChangedFiles     []ReviewedFile    `json:"changed_files"`
-	RequiredTests    []string          `json:"required_tests"`
-	TestCommands     []string          `json:"test_commands"`
-	Verification     VerificationPlan  `json:"verification"`
-	Confidence       Confidence        `json:"confidence"`
-	ActionGuidance   ActionGuidance    `json:"action_guidance"`
-	Task             TaskScopeReport   `json:"task"`
-	BoundaryWarnings []BoundaryWarning `json:"boundary_warnings"`
-	Notes            []string          `json:"notes"`
-}
-
 type ChangedNowFile struct {
 	Path              string   `json:"path"`
 	WorkingTreeStatus string   `json:"working_tree_status"`
@@ -78,21 +49,25 @@ type ChangedNowFile struct {
 }
 
 type ChangedNowReport struct {
-	Summary   string           `json:"summary"`
-	Freshness Freshness        `json:"freshness"`
-	Evidence  Evidence         `json:"evidence"`
-	Files     []ChangedNowFile `json:"files"`
-	Task      TaskScopeReport  `json:"task"`
+	Summary                string           `json:"summary"`
+	IndexStatus            string           `json:"index_status"`
+	RecommendedNextCommand string           `json:"recommended_next_command,omitempty"`
+	Freshness              Freshness        `json:"freshness"`
+	Evidence               Evidence         `json:"evidence"`
+	Files                  []ChangedNowFile `json:"files"`
+	Task                   TaskScopeReport  `json:"task"`
 }
 
 type HandoffReport struct {
-	Summary     string           `json:"summary"`
-	Freshness   Freshness        `json:"freshness"`
-	Evidence    Evidence         `json:"evidence"`
-	Review      ReviewReport     `json:"review"`
-	ChangedNow  ChangedNowReport `json:"changed_now"`
-	NextActions []string         `json:"next_actions"`
-	Task        TaskScopeReport  `json:"task"`
+	Summary             string                       `json:"summary"`
+	Freshness           Freshness                    `json:"freshness"`
+	Evidence            Evidence                     `json:"evidence"`
+	Review              ReviewReport                 `json:"review"`
+	ChangedNow          ChangedNowReport             `json:"changed_now"`
+	NextActions         []string                     `json:"next_actions"`
+	Task                TaskScopeReport              `json:"task"`
+	RelatedSessions     []sessionmemory.SearchResult `json:"related_sessions"`
+	VerificationHistory []db.VerificationRun         `json:"verification_history"`
 }
 
 func Safe(store *db.Store, targetPath string) (SafeReport, error) {
@@ -194,169 +169,6 @@ func Plan(store *db.Store, targetPath string) (PlanReport, error) {
 	}, nil
 }
 
-func Review(store *db.Store, baseRef string) (ReviewReport, error) {
-	if strings.TrimSpace(baseRef) == "" {
-		baseRef = "HEAD~1"
-	}
-
-	changed, err := gitlog.ChangedFilesBetween(store.RepoRoot, baseRef, "HEAD")
-	if err != nil {
-		return ReviewReport{}, err
-	}
-	workingTree, err := gitlog.WorkingTreeChanges(store.RepoRoot)
-	if err != nil {
-		return ReviewReport{}, err
-	}
-
-	changeSources := make(map[string]string)
-	for _, path := range changed {
-		changeSources[path] = "committed"
-	}
-	for _, item := range workingTree {
-		source := "working_tree"
-		if item.Status == "??" {
-			source = "untracked"
-		}
-		if _, ok := changeSources[item.Path]; ok {
-			source = "committed+working_tree"
-		}
-		changeSources[item.Path] = source
-	}
-	changed = mapKeysSorted(changeSources)
-
-	reviewed := make([]ReviewedFile, 0, len(changed))
-	requiredTests := make([]string, 0)
-	testCommands := make([]string, 0)
-	reviewFast := make([]string, 0)
-	reviewSafe := make([]string, 0)
-	reviewFull := make([]string, 0)
-	notes := make([]string, 0)
-	allBoundaries := make([]BoundaryWarning, 0)
-	highRiskCount := 0
-
-	for _, path := range changed {
-		risk, err := Risk(store, path)
-		if err != nil {
-			notes = append(notes, fmt.Sprintf("No indexed risk data for %s yet.", path))
-			reviewed = append(reviewed, ReviewedFile{
-				Path:           path,
-				ChangeSource:   changeSources[path],
-				RiskLevel:      "unknown",
-				TopReasons:     []string{"This file is new or outside indexed history, so risk is unknown."},
-				SuggestedTests: []string{},
-				BlastRadius:    []string{},
-				NeedsReview:    true,
-				NeedsTests:     true,
-			})
-			continue
-		}
-		tests, err := SuggestedTests(store, path, 4)
-		if err != nil {
-			return ReviewReport{}, err
-		}
-		commands, err := SuggestedTestCommands(store, path, 3)
-		if err != nil {
-			return ReviewReport{}, err
-		}
-		verification, err := SuggestedVerificationPlan(store, path)
-		if err != nil {
-			return ReviewReport{}, err
-		}
-		blastRadius, err := BlastRadius(store, path, 4)
-		if err != nil {
-			return ReviewReport{}, err
-		}
-
-		if risk.Level == "high" {
-			highRiskCount++
-		}
-		boundaries := detectBoundaryWarnings(append([]string{path}, blastRadius...))
-		boundaryLabels := make([]string, 0, len(boundaries))
-		for _, boundary := range boundaries {
-			boundaryLabels = append(boundaryLabels, boundary.Label)
-		}
-
-		requiredTests = append(requiredTests, tests...)
-		testCommands = append(testCommands, commands...)
-		reviewFast = append(reviewFast, verification.Fast...)
-		reviewSafe = append(reviewSafe, verification.Safe...)
-		reviewFull = append(reviewFull, verification.Full...)
-		allBoundaries = append(allBoundaries, boundaries...)
-		reviewed = append(reviewed, ReviewedFile{
-			Path:           path,
-			ChangeSource:   changeSources[path],
-			RiskLevel:      risk.Level,
-			TopReasons:     risk.Reasons,
-			SuggestedTests: tests,
-			BlastRadius:    blastRadius,
-			BoundaryLabels: boundaryLabels,
-			NeedsReview:    risk.Level == "high" || len(boundaries) > 0 || len(blastRadius) >= 4,
-			NeedsTests:     len(commands) > 0,
-		})
-	}
-
-	task, err := activeTaskScope(store, changed)
-	if err != nil {
-		return ReviewReport{}, err
-	}
-	confidence := buildConfidence(len(reviewed) > 0, 1, len(requiredTests), len(reviewed))
-	freshness := buildFreshness(store)
-	verification := VerificationPlan{
-		Fast: uniqueStrings(reviewFast, 5),
-		Safe: uniqueStrings(reviewSafe, 6),
-		Full: uniqueStrings(reviewFull, 6),
-	}
-	actionGuidance := buildActionGuidance("working-tree", RiskReport{Level: "medium"}, confidence, nil, pathsFromReviewed(reviewed), verification.Fast)
-	if task.HasScopeDrift {
-		notes = append(notes, fmt.Sprintf("Active task drifted outside planned scope: %s.", strings.Join(task.OutOfScopeChanged, ", ")))
-		actionGuidance.AskForReviewIf = uniqueStrings(append(actionGuidance.AskForReviewIf, "the change drifted outside the active task scope"), 5)
-		actionGuidance.StopSignals = uniqueStrings(append(actionGuidance.StopSignals, "Task scope drift detected: review out-of-scope files before handoff."), 5)
-		actionGuidance.MustReview = true
-	}
-	if highRiskCount > 0 {
-		actionGuidance.StopSignals = uniqueStrings(append(actionGuidance.StopSignals, fmt.Sprintf("%d high-risk changed file(s) need extra review before handoff.", highRiskCount)), 5)
-		actionGuidance.MustReview = true
-	}
-	if len(uniqueBoundaryWarnings(allBoundaries)) > 1 {
-		actionGuidance.StopSignals = uniqueStrings(append(actionGuidance.StopSignals, "Multiple sensitive boundaries changed together: slow down and review the full flow."), 5)
-		actionGuidance.MustReview = true
-	}
-	if len(reviewFast) == 0 {
-		actionGuidance.StopSignals = uniqueStrings(append(actionGuidance.StopSignals, "No focused verification command was inferred for this review: pick a manual verification plan before handoff."), 5)
-		actionGuidance.MustVerify = true
-	}
-	if len(reviewFast) > 0 || len(reviewSafe) > 0 || len(reviewFull) > 0 {
-		actionGuidance.MustVerify = true
-	}
-	if actionGuidance.RecommendedNextCommand == "" && len(verification.Fast) > 0 {
-		actionGuidance.RecommendedNextCommand = verification.Fast[0]
-	}
-	sortReviewedFiles(reviewed, task)
-	evidence := buildEvidence(freshness, len(reviewed), len(requiredTests), verification, task, len(reviewed))
-
-	summary := fmt.Sprintf("Review %d changed files before handing this branch back to an agent.", len(changed))
-	if highRiskCount > 0 {
-		summary = fmt.Sprintf("Review %d changed files carefully. %d high-risk file(s) need extra attention.", len(changed), highRiskCount)
-	}
-
-	return ReviewReport{
-		BaseRef:          baseRef,
-		HeadRef:          "HEAD",
-		Summary:          summary,
-		Freshness:        freshness,
-		Evidence:         evidence,
-		ChangedFiles:     reviewed,
-		RequiredTests:    uniqueStrings(requiredTests, 10),
-		TestCommands:     uniqueStrings(testCommands, 5),
-		Verification:     verification,
-		Confidence:       confidence,
-		ActionGuidance:   actionGuidance,
-		Task:             task,
-		BoundaryWarnings: uniqueBoundaryWarnings(allBoundaries),
-		Notes:            uniqueStrings(notes, 10),
-	}, nil
-}
-
 func ChangedNow(store *db.Store) (ChangedNowReport, error) {
 	workingTree, err := gitlog.WorkingTreeChanges(store.RepoRoot)
 	if err != nil {
@@ -403,13 +215,20 @@ func ChangedNow(store *db.Store) (ChangedNowReport, error) {
 	}
 	freshness := buildFreshness(store)
 	evidence := buildEvidence(freshness, len(files), 0, VerificationPlan{}, task, 0)
+	indexStatus := firstNonEmptyString(freshness.IndexStatus, "unknown")
+	recommendedNextCommand := ""
+	if indexStatus == "missing" {
+		recommendedNextCommand = "pallium index"
+	}
 
 	return ChangedNowReport{
-		Summary:   fmt.Sprintf("Working tree currently touches %d file(s).", len(files)),
-		Freshness: freshness,
-		Evidence:  evidence,
-		Files:     files,
-		Task:      task,
+		Summary:                fmt.Sprintf("Working tree currently touches %d file(s).", len(files)),
+		IndexStatus:            indexStatus,
+		RecommendedNextCommand: recommendedNextCommand,
+		Freshness:              freshness,
+		Evidence:               evidence,
+		Files:                  files,
+		Task:                   task,
 	}, nil
 }
 
@@ -436,6 +255,9 @@ func Handoff(store *db.Store, baseRef string) (HandoffReport, error) {
 	if review.Task.HasScopeDrift {
 		nextActions = append(nextActions, fmt.Sprintf("Resolve task scope drift before handoff: %s.", strings.Join(review.Task.OutOfScopeChanged, ", ")))
 	}
+	if failed, ok := latestFailedVerification(review.VerificationHistory); ok {
+		nextActions = append(nextActions, fmt.Sprintf("Re-run failed verification before handoff: %s.", failed.Command))
+	}
 	if len(nextActions) == 0 {
 		nextActions = append(nextActions, "No extra handoff actions suggested.")
 	}
@@ -444,81 +266,23 @@ func Handoff(store *db.Store, baseRef string) (HandoffReport, error) {
 	evidence := buildEvidence(freshness, len(review.ChangedFiles), len(review.RequiredTests), review.Verification, review.Task, len(review.ChangedFiles))
 
 	return HandoffReport{
-		Summary:     "Use this report to hand work from an agent back to a human or another agent with less surprise.",
-		Freshness:   freshness,
-		Evidence:    evidence,
-		Review:      review,
-		ChangedNow:  changedNow,
-		NextActions: nextActions,
-		Task:        review.Task,
+		Summary:             "Use this report to hand work from an agent back to a human or another agent with less surprise.",
+		Freshness:           freshness,
+		Evidence:            evidence,
+		Review:              review,
+		ChangedNow:          changedNow,
+		NextActions:         nextActions,
+		Task:                review.Task,
+		RelatedSessions:     review.RelatedSessions,
+		VerificationHistory: review.VerificationHistory,
 	}, nil
 }
 
-func mapKeysSorted(values map[string]string) []string {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	return uniqueStrings(keys, 0)
-}
-
-func pathsFromReviewed(files []ReviewedFile) []string {
-	out := make([]string, 0, len(files))
-	for _, file := range files {
-		out = append(out, file.Path)
-	}
-	return out
-}
-
-func uniqueBoundaryWarnings(values []BoundaryWarning) []BoundaryWarning {
-	seen := map[string]struct{}{}
-	out := make([]BoundaryWarning, 0, len(values))
+func firstNonEmptyString(values ...string) string {
 	for _, value := range values {
-		if _, ok := seen[value.Label]; ok {
-			continue
+		if strings.TrimSpace(value) != "" {
+			return value
 		}
-		seen[value.Label] = struct{}{}
-		out = append(out, value)
 	}
-	return out
-}
-
-func sortReviewedFiles(files []ReviewedFile, task TaskScopeReport) {
-	outOfScope := make(map[string]struct{}, len(task.OutOfScopeChanged))
-	for _, path := range task.OutOfScopeChanged {
-		outOfScope[path] = struct{}{}
-	}
-
-	sort.SliceStable(files, func(i, j int) bool {
-		left := reviewPriority(files[i], outOfScope)
-		right := reviewPriority(files[j], outOfScope)
-		if left != right {
-			return left > right
-		}
-		return files[i].Path < files[j].Path
-	})
-}
-
-func reviewPriority(file ReviewedFile, outOfScope map[string]struct{}) int {
-	score := 0
-	if _, ok := outOfScope[file.Path]; ok {
-		score += 100
-	}
-	switch file.RiskLevel {
-	case "high":
-		score += 50
-	case "medium":
-		score += 25
-	case "unknown":
-		score += 20
-	}
-	score += len(file.BoundaryLabels) * 15
-	if file.NeedsReview {
-		score += 10
-	}
-	if !file.NeedsTests {
-		score += 8
-	}
-	score += min(len(file.BlastRadius), 5)
-	return score
+	return ""
 }

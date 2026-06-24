@@ -38,6 +38,10 @@ func (a *App) Run(args []string) error {
 		return nil
 	case "index":
 		return runIndex(a.stdout, filtered[1:], jsonOutput)
+	case "doctor":
+		return runDoctor(a.stdout, filtered[1:], jsonOutput)
+	case "version":
+		return runVersion(a.stdout, jsonOutput)
 	case "explain":
 		return runExplain(a.stdout, filtered[1:], jsonOutput)
 	case "risk":
@@ -52,6 +56,8 @@ func (a *App) Run(args []string) error {
 		return runPlan(a.stdout, filtered[1:], jsonOutput)
 	case "review":
 		return runReview(a.stdout, filtered[1:], jsonOutput)
+	case "verify":
+		return runVerify(a.stdout, filtered[1:], jsonOutput)
 	case "changed-now":
 		return runChangedNow(a.stdout, filtered[1:], jsonOutput)
 	case "handoff":
@@ -71,6 +77,8 @@ func (a *App) printHelp() {
 
 Usage:
   pallium index [repo-path] [--json]
+  pallium doctor [repo-path] [--json]
+  pallium version [--json]
   pallium explain <path> [repo-path] [--json]
   pallium risk <path> [repo-path] [--json]
   pallium neighbors <path> [repo-path] [--json]
@@ -78,12 +86,13 @@ Usage:
   pallium safe <path> [repo-path] [--json]
   pallium plan <path> [repo-path] [--json]
   pallium review [base-ref] [repo-path] [--json]
+  pallium verify <fast|safe|full> [repo-path] [--json]
   pallium changed-now [repo-path] [--json]
   pallium handoff [base-ref] [repo-path] [--json]
   pallium task start <goal> [scope-paths...] [--json]
   pallium task show [--json]
   pallium task clear [--json]
-  pallium sessions <index|list|search|grep|show|embed|semantic|stats> [--json]`)
+  pallium sessions <live|watch|index|list|search|related|grep|show|embed|semantic|stats> [--json]`)
 }
 
 func requireArg(args []string, field string) (string, error) {

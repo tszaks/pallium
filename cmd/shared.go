@@ -6,7 +6,9 @@ import (
 	"strings"
 
 	"github.com/tszaks/pallium/internal/analysis"
+	"github.com/tszaks/pallium/internal/db"
 	"github.com/tszaks/pallium/internal/index"
+	"github.com/tszaks/pallium/internal/sessionmemory"
 )
 
 func openIndexedStore(path string) (*index.Indexer, error) {
@@ -163,6 +165,46 @@ func renderTaskScope(task analysis.TaskScopeReport) []string {
 		}
 	}
 	return lines
+}
+
+func renderRelatedSessions(results []sessionmemory.SearchResult) []string {
+	if len(results) == 0 {
+		return nil
+	}
+	lines := []string{"Related sessions:"}
+	for _, result := range results {
+		title := strings.Join(strings.Fields(result.Title), " ")
+		if title == "" {
+			title = result.ID
+		}
+		lines = append(lines, fmt.Sprintf("- score=%d %s %s", result.Score, shortID(result.ID), title))
+		if len(result.Signals) > 0 {
+			lines = append(lines, "  signals: "+strings.Join(result.Signals, ", "))
+		}
+	}
+	return lines
+}
+
+func renderVerificationHistory(runs []db.VerificationRun) []string {
+	if len(runs) == 0 {
+		return nil
+	}
+	lines := []string{"Verification history:"}
+	for _, run := range runs {
+		status := "passed"
+		if run.ExitCode != 0 {
+			status = "failed"
+		}
+		lines = append(lines, fmt.Sprintf("- %s %s exit=%d duration=%dms %s", run.RanAt, status, run.ExitCode, run.DurationMS, run.Command))
+		if len(run.ChangedFiles) > 0 {
+			lines = append(lines, "  changed files: "+strings.Join(run.ChangedFiles, ", "))
+		}
+	}
+	return lines
+}
+
+func isHelpArg(arg string) bool {
+	return arg == "help" || arg == "-h" || arg == "--help"
 }
 
 func writeError(out io.Writer, err error) error {

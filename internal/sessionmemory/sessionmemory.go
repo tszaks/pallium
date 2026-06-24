@@ -1,23 +1,16 @@
 package sessionmemory
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
-	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
-	"math"
-	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -32,6 +25,8 @@ const (
 	maxStoredMessageText         = 50_000
 	maxSearchBlobText            = 1_000_000
 	maxParseRolloutBytes         = 100 * 1024 * 1024
+	activeRolloutQuietPeriod     = 2 * time.Minute
+	defaultIndexSafetyBuffer     = 30 * time.Minute
 )
 
 var secretPatterns = []*regexp.Regexp{
@@ -44,14 +39,26 @@ var secretPatterns = []*regexp.Regexp{
 
 var pathLikePattern = regexp.MustCompile(`(?:^|\s)(/[A-Za-z0-9._~+/@:-][^\s'"` + "`" + `<>]*)`)
 
-var embedTexts = openAIEmbeddings
+var embedTexts = openAICompatibleEmbeddings
+
+type rolloutSkipReason int
+
+const (
+	rolloutSkipNone rolloutSkipReason = iota
+	rolloutSkipActive
+	rolloutSkipUnchanged
+)
 
 type Options struct {
-	DBPath     string
-	CodexHome  string
-	ClaudeHome string
-	Machine    string
-	Provider   string
+	DBPath         string
+	CodexHome      string
+	ClaudeHome     string
+	Machine        string
+	Provider       string
+	Force          bool
+	Since          time.Duration
+	SafetyBuffer   time.Duration
+	EmbeddingModel string
 }
 
 type Session struct {
@@ -105,7 +112,9 @@ type RawEvent struct {
 
 type SearchResult struct {
 	Session
-	Rank float64 `json:"rank,omitempty"`
+	Rank    float64  `json:"rank,omitempty"`
+	Score   int      `json:"score,omitempty"`
+	Signals []string `json:"signals,omitempty"`
 }
 
 type SemanticResult struct {
@@ -126,6 +135,14 @@ type Stats struct {
 	Chunks     int              `json:"chunks"`
 	Embeddings int              `json:"embeddings"`
 	Models     []EmbeddingModel `json:"models"`
+}
+
+type RelatedOptions struct {
+	RepoRoot     string
+	GitOriginURL string
+	Files        []string
+	Query        string
+	Limit        int
 }
 
 type EmbeddingModel struct {
@@ -191,7 +208,7 @@ func Open(path string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) init() error {
-	for _, stmt := range []string{"PRAGMA busy_timeout=5000", "PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL"} {
+	for _, stmt := range []string{"PRAGMA busy_timeout=60000", "PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL"} {
 		if _, err := s.db.Exec(stmt); err != nil {
 			return err
 		}
@@ -224,6 +241,7 @@ CREATE TABLE IF NOT EXISTS codex_sessions (
   errors_json TEXT,
   metadata_json TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_codex_sessions_rollout_path ON codex_sessions(rollout_path);
 CREATE TABLE IF NOT EXISTS codex_session_events (
   session_id TEXT NOT NULL,
   line_no INTEGER NOT NULL,
@@ -279,6 +297,11 @@ CREATE TABLE IF NOT EXISTS codex_session_embeddings (
   embedded_at TEXT NOT NULL,
   PRIMARY KEY(chunk_id, provider, model)
 );
+CREATE TABLE IF NOT EXISTS codex_session_state (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 `)
 	return err
 }
@@ -307,14 +330,31 @@ func Index(ctx context.Context, opts Options, include []string) (int, error) {
 	}
 	defer store.Close()
 	count := 0
+	cutoff := store.indexCutoff(opts)
 	if provider == "all" || provider == "codex" {
 		state := loadStateMetadata(filepath.Join(opts.CodexHome, "state_5.sqlite"))
-		files := findRollouts(filepath.Join(opts.CodexHome, "sessions"), include)
+		files := findRollouts(filepath.Join(opts.CodexHome, "sessions"), include, cutoff)
 		for _, file := range files {
 			select {
 			case <-ctx.Done():
 				return count, ctx.Err()
 			default:
+			}
+			skip, err := store.rolloutSkipReason(file, opts.Force)
+			if err != nil {
+				return count, err
+			}
+			if skip == rolloutSkipActive {
+				continue
+			}
+			if skip == rolloutSkipUnchanged {
+				stateFresh, err := store.codexStateFreshForRollout(file, state)
+				if err != nil {
+					return count, err
+				}
+				if stateFresh {
+					continue
+				}
 			}
 			parsed, err := parseRollout(file)
 			if err != nil {
@@ -330,12 +370,19 @@ func Index(ctx context.Context, opts Options, include []string) (int, error) {
 		}
 	}
 	if provider == "all" || provider == "claude" {
-		files := findClaudeTranscripts(filepath.Join(opts.ClaudeHome, "projects"), include)
+		files := findClaudeTranscripts(filepath.Join(opts.ClaudeHome, "projects"), include, cutoff)
 		for _, file := range files {
 			select {
 			case <-ctx.Done():
 				return count, ctx.Err()
 			default:
+			}
+			skip, err := store.rolloutSkipReason(file, opts.Force)
+			if err != nil {
+				return count, err
+			}
+			if skip != rolloutSkipNone {
+				continue
 			}
 			parsed, err := parseClaudeTranscript(file)
 			if err != nil {
@@ -351,6 +398,128 @@ func Index(ctx context.Context, opts Options, include []string) (int, error) {
 	return count, nil
 }
 
+func (s *Store) indexCutoff(opts Options) time.Time {
+	if opts.Force {
+		return time.Time{}
+	}
+	if opts.Since > 0 {
+		return time.Now().Add(-opts.Since)
+	}
+	model := strings.TrimSpace(opts.EmbeddingModel)
+	if model == "" {
+		model = DefaultEmbeddingModel
+	}
+	cursor := s.embeddingCursor(model)
+	if cursor.IsZero() {
+		return time.Time{}
+	}
+	buffer := opts.SafetyBuffer
+	if buffer <= 0 {
+		buffer = defaultIndexSafetyBuffer
+	}
+	return cursor.Add(-buffer)
+}
+
+func (s *Store) embeddingCursor(model string) time.Time {
+	key := embeddingCursorKey(model)
+	row := s.db.QueryRow(`SELECT value FROM codex_session_state WHERE key=?`, key)
+	var raw string
+	if err := row.Scan(&raw); err == nil {
+		return parseSessionTime(raw)
+	}
+	row = s.db.QueryRow(`SELECT MAX(embedded_at) FROM codex_session_embeddings WHERE provider=? AND model=?`, embeddingProvider(), model)
+	var latest sql.NullString
+	if err := row.Scan(&latest); err == nil && latest.Valid {
+		return parseSessionTime(latest.String)
+	}
+	return time.Time{}
+}
+
+func (s *Store) setEmbeddingCursor(model string, at time.Time) error {
+	_, err := s.db.Exec(`INSERT INTO codex_session_state(key,value,updated_at) VALUES(?,?,?)
+ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+		embeddingCursorKey(model), at.UTC().Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+func embeddingCursorKey(model string) string {
+	return "last_successful_embed_at:" + embeddingProvider() + ":" + model
+}
+
+func (s *Store) rolloutSkipReason(path string, force bool) (rolloutSkipReason, error) {
+	if force {
+		return rolloutSkipNone, nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return rolloutSkipNone, fmt.Errorf("stat %s: %w", path, err)
+	}
+	if time.Since(info.ModTime()) < activeRolloutQuietPeriod {
+		return rolloutSkipActive, nil
+	}
+	row := s.db.QueryRow(`SELECT rollout_sha256, indexed_at FROM codex_sessions WHERE rollout_path=? LIMIT 1`, path)
+	var storedSHA string
+	var indexedAt string
+	switch err := row.Scan(&storedSHA, &indexedAt); err {
+	case nil:
+	case sql.ErrNoRows:
+		return rolloutSkipNone, nil
+	default:
+		return rolloutSkipNone, fmt.Errorf("lookup indexed rollout %s: %w", path, err)
+	}
+
+	indexedTime := parseSessionTime(indexedAt)
+	if storedSHA != "" && !indexedTime.IsZero() && !info.ModTime().After(indexedTime) {
+		return rolloutSkipUnchanged, nil
+	}
+
+	sha, err := fileSHA(path)
+	if err != nil {
+		return rolloutSkipNone, fmt.Errorf("hash %s: %w", path, err)
+	}
+	if storedSHA != "" && storedSHA == sha {
+		return rolloutSkipUnchanged, nil
+	}
+	return rolloutSkipNone, nil
+}
+
+func (s *Store) codexStateFreshForRollout(path string, state map[string]map[string]any) (bool, error) {
+	if len(state) == 0 {
+		return true, nil
+	}
+	row := s.db.QueryRow(`SELECT id, indexed_at FROM codex_sessions WHERE rollout_path=? LIMIT 1`, path)
+	var id string
+	var indexedAt string
+	switch err := row.Scan(&id, &indexedAt); err {
+	case nil:
+	case sql.ErrNoRows:
+		return false, nil
+	default:
+		return false, fmt.Errorf("lookup indexed rollout %s: %w", path, err)
+	}
+	metadata := state[id]
+	if len(metadata) == 0 {
+		return true, nil
+	}
+	stateUpdatedAt := parseSessionTime(isoAny(metadata["updated_at_ms"]))
+	indexedTime := parseSessionTime(indexedAt)
+	if stateUpdatedAt.IsZero() || indexedTime.IsZero() {
+		return true, nil
+	}
+	return !stateUpdatedAt.After(indexedTime), nil
+}
+
+func parseSessionTime(raw string) time.Time {
+	if raw == "" {
+		return time.Time{}
+	}
+	value, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		value, _ = time.Parse(time.RFC3339, raw)
+	}
+	return value
+}
+
 func (s *Store) upsert(parsed ParsedSession, metadata map[string]any) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -364,6 +533,9 @@ func (s *Store) upsert(parsed ParsedSession, metadata map[string]any) error {
 	if sess.Status == "" {
 		sess.Status = "seen"
 	}
+	sess = sanitizeSession(sess)
+	parsed.Session = sess
+	parsed.SearchBlob = redact(parsed.SearchBlob)
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	for _, stmt := range []string{
 		"DELETE FROM codex_session_events WHERE session_id=?",
@@ -376,7 +548,7 @@ func (s *Store) upsert(parsed ParsedSession, metadata map[string]any) error {
 			return err
 		}
 	}
-	j := func(v any) string { b, _ := json.Marshal(v); return string(b) }
+	j := func(v any) string { b, _ := json.Marshal(redactObj(v)); return string(b) }
 	_, err = tx.Exec(`INSERT INTO codex_sessions(id,machine,title,first_user_message,last_agent_message,cwd,source,model_provider,model,cli_version,git_branch,git_origin_url,created_at,updated_at,indexed_at,tokens_used,status,rollout_path,rollout_sha256,event_counts_json,files_touched_json,commands_json,tool_names_json,errors_json,metadata_json)
 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO UPDATE SET machine=excluded.machine,title=excluded.title,first_user_message=excluded.first_user_message,last_agent_message=excluded.last_agent_message,cwd=excluded.cwd,source=excluded.source,model_provider=excluded.model_provider,model=excluded.model,cli_version=excluded.cli_version,git_branch=excluded.git_branch,git_origin_url=excluded.git_origin_url,created_at=excluded.created_at,updated_at=excluded.updated_at,indexed_at=excluded.indexed_at,tokens_used=excluded.tokens_used,status=excluded.status,rollout_path=excluded.rollout_path,rollout_sha256=excluded.rollout_sha256,event_counts_json=excluded.event_counts_json,files_touched_json=excluded.files_touched_json,commands_json=excluded.commands_json,tool_names_json=excluded.tool_names_json,errors_json=excluded.errors_json,metadata_json=excluded.metadata_json`,
@@ -437,34 +609,8 @@ func (s *Store) list(limit int) ([]Session, error) {
 	return out, rows.Err()
 }
 
-func Search(query string, limit int) ([]SearchResult, error) {
-	store, err := Open("")
-	if err != nil {
-		return nil, err
-	}
-	defer store.Close()
-	return store.search(query, limit)
-}
-
-func (s *Store) search(query string, limit int) ([]SearchResult, error) {
-	rows, err := s.db.Query(`SELECT cs.id,cs.machine,cs.title,cs.first_user_message,cs.last_agent_message,cs.cwd,cs.source,cs.model_provider,cs.model,cs.cli_version,cs.git_branch,cs.git_origin_url,cs.created_at,cs.updated_at,cs.tokens_used,cs.status,cs.rollout_path,cs.rollout_sha256,cs.files_touched_json,cs.commands_json,cs.tool_names_json,cs.errors_json, bm25(codex_session_fts) AS rank FROM codex_session_fts JOIN codex_sessions cs ON cs.id=codex_session_fts.session_id WHERE codex_session_fts MATCH ? ORDER BY rank LIMIT ?`, query, limit)
-	if err != nil {
-		quoted := `"` + strings.ReplaceAll(query, `"`, `""`) + `"`
-		rows, err = s.db.Query(`SELECT cs.id,cs.machine,cs.title,cs.first_user_message,cs.last_agent_message,cs.cwd,cs.source,cs.model_provider,cs.model,cs.cli_version,cs.git_branch,cs.git_origin_url,cs.created_at,cs.updated_at,cs.tokens_used,cs.status,cs.rollout_path,cs.rollout_sha256,cs.files_touched_json,cs.commands_json,cs.tool_names_json,cs.errors_json, bm25(codex_session_fts) AS rank FROM codex_session_fts JOIN codex_sessions cs ON cs.id=codex_session_fts.session_id WHERE codex_session_fts MATCH ? ORDER BY rank LIMIT ?`, quoted, limit)
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []SearchResult
-	for rows.Next() {
-		sess, rank, err := scanSessionRank(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, SearchResult{Session: sess, Rank: rank})
-	}
-	return out, rows.Err()
+func (s *Store) listAll() ([]Session, error) {
+	return s.list(1000000)
 }
 
 func Grep(query string, limit int) ([]map[string]any, error) {
@@ -525,7 +671,11 @@ func Show(id string, transcript bool) (Session, []Message, error) {
 }
 
 func StatsRead() (Stats, error) {
-	store, err := Open("")
+	return StatsReadPath("")
+}
+
+func StatsReadPath(path string) (Stats, error) {
+	store, err := Open(path)
 	if err != nil {
 		return Stats{}, err
 	}
@@ -546,6 +696,31 @@ func StatsRead() (Stats, error) {
 		}
 	}
 	return st, nil
+}
+
+func EmbeddingBacklogPath(path, model string) (int, error) {
+	if model == "" {
+		model = DefaultEmbeddingModel
+	}
+	store, err := Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer store.Close()
+	return store.embeddingBacklog(model)
+}
+
+func (s *Store) embeddingBacklog(model string) (int, error) {
+	var count int
+	err := s.db.QueryRow(`SELECT COUNT(*)
+FROM codex_session_chunks c
+LEFT JOIN codex_session_embeddings e
+  ON e.chunk_id = c.id
+ AND e.provider = ?
+ AND e.model = ?
+ AND e.text_sha256 = c.text_sha256
+WHERE e.chunk_id IS NULL`, embeddingProvider(), model).Scan(&count)
+	return count, err
 }
 
 func (s *Store) resolveID(prefix string) (string, error) {
@@ -603,663 +778,6 @@ func scanSessionRank(scanner interface{ Scan(...any) error }) (Session, float64,
 	return s, rank, nil
 }
 
-// Embedding and semantic search.
-func Embed(ctx context.Context, model string, limit, batchSize int) (int, error) {
-	return EmbedSession(ctx, "", model, limit, batchSize)
-}
-
-func EmbedSession(ctx context.Context, sessionID, model string, limit, batchSize int) (int, error) {
-	if model == "" {
-		model = DefaultEmbeddingModel
-	}
-	if batchSize <= 0 {
-		batchSize = 64
-	}
-	if limit <= 0 {
-		limit = 1000000
-	}
-	store, err := Open("")
-	if err != nil {
-		return 0, err
-	}
-	defer store.Close()
-	var rows *sql.Rows
-	if sessionID != "" {
-		resolvedID, err := store.resolveID(sessionID)
-		if err != nil {
-			return 0, err
-		}
-		rows, err = store.db.Query(`SELECT c.id,c.text,c.text_sha256 FROM codex_session_chunks c LEFT JOIN codex_session_embeddings e ON e.chunk_id=c.id AND e.provider='openai' AND e.model=? AND e.text_sha256=c.text_sha256 WHERE e.chunk_id IS NULL AND c.session_id=? ORDER BY c.session_id,c.chunk_index LIMIT ?`, model, resolvedID, limit)
-	} else {
-		rows, err = store.db.Query(`SELECT c.id,c.text,c.text_sha256 FROM codex_session_chunks c LEFT JOIN codex_session_embeddings e ON e.chunk_id=c.id AND e.provider='openai' AND e.model=? AND e.text_sha256=c.text_sha256 WHERE e.chunk_id IS NULL ORDER BY c.session_id,c.chunk_index LIMIT ?`, model, limit)
-	}
-	if err != nil {
-		return 0, err
-	}
-	defer rows.Close()
-	type chunk struct{ id, text, sha string }
-	var chunks []chunk
-	for rows.Next() {
-		var c chunk
-		if err := rows.Scan(&c.id, &c.text, &c.sha); err != nil {
-			return 0, err
-		}
-		chunks = append(chunks, c)
-	}
-	if err := rows.Err(); err != nil {
-		return 0, err
-	}
-	total := 0
-	for i := 0; i < len(chunks); i += batchSize {
-		end := i + batchSize
-		if end > len(chunks) {
-			end = len(chunks)
-		}
-		texts := make([]string, 0, end-i)
-		for _, c := range chunks[i:end] {
-			texts = append(texts, c.text)
-		}
-		vecs, err := embedTexts(ctx, model, texts)
-		if err != nil {
-			return total, err
-		}
-		for j, vec := range vecs {
-			c := chunks[i+j]
-			if _, err := store.db.Exec(`INSERT OR REPLACE INTO codex_session_embeddings(chunk_id,provider,model,dim,vector_blob,text_sha256,embedded_at) VALUES(?,?,?,?,?,?,?)`, c.id, "openai", model, len(vec), packVector(vec), c.sha, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
-				return total, err
-			}
-			total++
-		}
-	}
-	return total, nil
-}
-
-func Semantic(ctx context.Context, query, model string, limit int, sessionsOnly bool) ([]SemanticResult, error) {
-	if model == "" {
-		model = DefaultEmbeddingModel
-	}
-	if limit <= 0 {
-		limit = 10
-	}
-	qvecs, err := embedTexts(ctx, model, []string{query})
-	if err != nil {
-		return nil, err
-	}
-	store, err := Open("")
-	if err != nil {
-		return nil, err
-	}
-	defer store.Close()
-	rows, err := store.db.Query(`SELECT e.vector_blob,c.id,c.session_id,c.kind,c.text,s.title,s.cwd,s.updated_at FROM codex_session_embeddings e JOIN codex_session_chunks c ON c.id=e.chunk_id JOIN codex_sessions s ON s.id=c.session_id WHERE e.provider='openai' AND e.model=?`, model)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var scored []SemanticResult
-	for rows.Next() {
-		var blob []byte
-		var r SemanticResult
-		var text string
-		if err := rows.Scan(&blob, &r.ChunkID, &r.SessionID, &r.Kind, &text, &r.Title, &r.CWD, &r.UpdatedAt); err != nil {
-			return nil, err
-		}
-		r.Score = cosine(qvecs[0], unpackVector(blob))
-		r.Snippet = short(text, 600)
-		scored = append(scored, r)
-	}
-	sort.Slice(scored, func(i, j int) bool { return scored[i].Score > scored[j].Score })
-	seen := map[string]bool{}
-	out := []SemanticResult{}
-	for _, r := range scored {
-		if sessionsOnly && seen[r.SessionID] {
-			continue
-		}
-		seen[r.SessionID] = true
-		out = append(out, r)
-		if len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-func openAIEmbeddings(ctx context.Context, model string, texts []string) ([][]float64, error) {
-	key := os.Getenv("OPENAI_API_KEY")
-	if key == "" {
-		key = os.Getenv("OPENAI_ADMIN_API_KEY")
-	}
-	if key == "" {
-		return nil, errors.New("OPENAI_API_KEY is required for embeddings")
-	}
-	body, _ := json.Marshal(map[string]any{"model": model, "input": texts})
-	var payload []byte
-	var status string
-	for attempt := 0; attempt < 10; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.openai.com/v1/embeddings", bytes.NewReader(body))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Authorization", "Bearer "+key)
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		payload, _ = io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		status = resp.Status
-		if resp.StatusCode < 300 {
-			break
-		}
-		if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
-			return nil, fmt.Errorf("openai embeddings failed: %s: %s", resp.Status, short(string(payload), 500))
-		}
-		wait := retryDelay(resp.Header.Get("Retry-After"), string(payload), attempt)
-		timer := time.NewTimer(wait)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return nil, ctx.Err()
-		case <-timer.C:
-		}
-	}
-	if status == "" || !strings.HasPrefix(status, "2") {
-		return nil, fmt.Errorf("openai embeddings failed: %s: %s", status, short(string(payload), 500))
-	}
-	var decoded struct {
-		Data []struct {
-			Embedding []float64 `json:"embedding"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(payload, &decoded); err != nil {
-		return nil, err
-	}
-	out := make([][]float64, len(decoded.Data))
-	for i, item := range decoded.Data {
-		out[i] = item.Embedding
-	}
-	return out, nil
-}
-
-func retryDelay(retryAfter, payload string, attempt int) time.Duration {
-	if retryAfter != "" {
-		if seconds, err := strconv.ParseFloat(strings.TrimSpace(retryAfter), 64); err == nil && seconds > 0 {
-			return time.Duration(seconds*1000) * time.Millisecond
-		}
-	}
-	re := regexp.MustCompile(`(?i)try again in ([0-9.]+)\s*(ms|s)`)
-	matches := re.FindStringSubmatch(payload)
-	if len(matches) == 3 {
-		if n, err := strconv.ParseFloat(matches[1], 64); err == nil && n > 0 {
-			if strings.EqualFold(matches[2], "ms") {
-				return time.Duration(n) * time.Millisecond
-			}
-			return time.Duration(n*1000) * time.Millisecond
-		}
-	}
-	delay := time.Duration(1<<min(attempt, 5)) * time.Second
-	if delay > 30*time.Second {
-		return 30 * time.Second
-	}
-	return delay
-}
-
-func packVector(vec []float64) []byte {
-	buf := new(bytes.Buffer)
-	for _, v := range vec {
-		_ = binary.Write(buf, binary.LittleEndian, float32(v))
-	}
-	return buf.Bytes()
-}
-func unpackVector(blob []byte) []float64 {
-	out := make([]float64, len(blob)/4)
-	for i := range out {
-		out[i] = float64(math.Float32frombits(binary.LittleEndian.Uint32(blob[i*4:])))
-	}
-	return out
-}
-func cosine(a, b []float64) float64 {
-	if len(a) == 0 || len(a) != len(b) {
-		return -1
-	}
-	var dot, na, nb float64
-	for i := range a {
-		dot += a[i] * b[i]
-		na += a[i] * a[i]
-		nb += b[i] * b[i]
-	}
-	if na == 0 || nb == 0 {
-		return -1
-	}
-	return dot / (math.Sqrt(na) * math.Sqrt(nb))
-}
-
-type chunkRecord struct {
-	ID, SessionID, Kind, Text, TextSHA256 string
-	Index, TokenEstimate                  int
-	Metadata                              map[string]any
-}
-
-func buildChunks(p ParsedSession) []chunkRecord {
-	overview := strings.Join([]string{"Title: " + p.Session.Title, "CWD: " + p.Session.CWD, "Git: " + p.Session.GitOriginURL + " " + p.Session.GitBranch, "First ask: " + p.Session.FirstUserMessage, "Last agent message: " + p.Session.LastAgentMessage, "Files touched:\n" + strings.Join(p.Session.FilesTouched, "\n"), "Commands:\n" + strings.Join(p.Session.Commands, "\n"), "Errors:\n" + strings.Join(p.Session.Errors, "\n")}, "\n")
-	var transcriptParts []string
-	for _, m := range p.Messages {
-		if m.Text != "" {
-			transcriptParts = append(transcriptParts, fmt.Sprintf("[%s/%s line %d]\n%s", m.Role, m.Kind, m.LineNo, m.Text))
-		}
-	}
-	var out []chunkRecord
-	idx := 0
-	for _, piece := range []struct{ kind, text string }{{"overview", overview}, {"transcript", strings.Join(transcriptParts, "\n\n")}} {
-		for _, text := range chunkText(piece.text, 6000, 600) {
-			sha := fmt.Sprintf("%x", sha256.Sum256([]byte(text)))
-			out = append(out, chunkRecord{ID: fmt.Sprintf("%s:%04d", p.Session.ID, idx), SessionID: p.Session.ID, Index: idx, Kind: piece.kind, Text: text, TextSHA256: sha, TokenEstimate: max(1, len(text)/4), Metadata: map[string]any{"session_title": p.Session.Title, "cwd": p.Session.CWD}})
-			idx++
-		}
-	}
-	return out
-}
-func chunkText(text string, maxChars, overlap int) []string {
-	text = strings.TrimSpace(redact(text))
-	if text == "" {
-		return nil
-	}
-	if len(text) <= maxChars {
-		return []string{text}
-	}
-	var chunks []string
-	for start := 0; start < len(text); {
-		end := min(len(text), start+maxChars)
-		chunks = append(chunks, strings.TrimSpace(text[start:end]))
-		if end >= len(text) {
-			break
-		}
-		start = max(0, end-overlap)
-	}
-	return chunks
-}
-
-func parseRollout(path string) (ParsedSession, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return ParsedSession{}, err
-	}
-	if info.Size() > maxParseRolloutBytes {
-		return parseRolloutMetadataOnly(path, info), nil
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return ParsedSession{}, err
-	}
-	defer f.Close()
-	sha, _ := fileSHA(path)
-	p := ParsedSession{EventCounts: map[string]int{}}
-	p.Session.RolloutPath = path
-	p.Session.RolloutSHA256 = sha
-	files := map[string]bool{}
-	tools := map[string]bool{}
-	reader := bufio.NewReader(f)
-	lineNo := 0
-	for {
-		line, err := reader.ReadBytes('\n')
-		if len(line) > 0 {
-			lineNo++
-			var obj map[string]any
-			if json.Unmarshal(line, &obj) == nil {
-				typ := str(obj["type"])
-				if typ == "" {
-					typ = "unknown"
-				}
-				p.EventCounts[typ]++
-				ts := isoAny(obj["timestamp"])
-				if p.Session.CreatedAt == "" {
-					p.Session.CreatedAt = ts
-				}
-				if ts != "" {
-					p.Session.UpdatedAt = ts
-				}
-				payload, _ := obj["payload"].(map[string]any)
-				ptype := str(payload["type"])
-				if len(p.RawEvents) < maxStoredRawEventsPerSession {
-					raw, _ := json.Marshal(obj)
-					rawJSON := string(raw)
-					if len(rawJSON) > maxStoredRawEventJSON {
-						rawJSON = rawJSON[:maxStoredRawEventJSON] + fmt.Sprintf("\n...[truncated raw event from %d bytes]", len(rawJSON))
-					}
-					rawJSON = redact(rawJSON)
-					p.RawEvents = append(p.RawEvents, RawEvent{lineNo, ts, typ, ptype, rawJSON})
-				}
-				switch typ {
-				case "session_meta":
-					p.Session.ID = str(payload["id"])
-					p.Session.CWD = first(p.Session.CWD, str(payload["cwd"]))
-					p.Session.Source = first(p.Session.Source, str(payload["source"]), str(payload["originator"]))
-					p.Session.ModelProvider = first(p.Session.ModelProvider, str(payload["model_provider"]))
-					p.Session.Model = first(p.Session.Model, str(payload["model"]))
-					p.Session.CLIVersion = first(p.Session.CLIVersion, str(payload["cli_version"]))
-				case "turn_context":
-					p.Session.CWD = first(p.Session.CWD, str(payload["cwd"]))
-				case "event_msg":
-					handleEventMessage(&p, payload, lineNo, ts, files)
-				case "response_item":
-					handleResponseItem(&p, payload, lineNo, ts, files, tools)
-				}
-			}
-		}
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return p, err
-		}
-	}
-	if p.Session.ID == "" {
-		p.Session.ID = strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	}
-	for f := range files {
-		p.Session.FilesTouched = append(p.Session.FilesTouched, f)
-	}
-	sort.Strings(p.Session.FilesTouched)
-	for t := range tools {
-		p.Session.ToolNames = append(p.Session.ToolNames, t)
-	}
-	sort.Strings(p.Session.ToolNames)
-	p.Session.Title = short(first(p.Session.FirstUserMessage, p.Session.Title), 240)
-	p.SearchBlob = truncate(strings.Join([]string{p.Session.Title, p.Session.CWD, strings.Join(p.Session.Commands, "\n"), strings.Join(p.Session.FilesTouched, "\n"), messagesText(p.Messages)}, "\n"), maxSearchBlobText)
-	return p, nil
-}
-
-func parseRolloutMetadataOnly(path string, info os.FileInfo) ParsedSession {
-	id := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	p := ParsedSession{EventCounts: map[string]int{"skipped_large_rollout": 1}}
-	p.Session.ID = id
-	p.Session.RolloutPath = path
-	p.Session.UpdatedAt = info.ModTime().UTC().Format(time.RFC3339Nano)
-	p.Session.CreatedAt = p.Session.UpdatedAt
-	p.Session.Status = "skipped_large_rollout"
-	p.Session.Errors = append(p.Session.Errors, fmt.Sprintf("skipped full parse: rollout is %d bytes (> %d byte safety limit)", info.Size(), maxParseRolloutBytes))
-	p.Session.Title = id
-	p.SearchBlob = strings.Join([]string{p.Session.Title, p.Session.RolloutPath, strings.Join(p.Session.Errors, "\n")}, "\n")
-	return p
-}
-
-func parseClaudeTranscript(path string) (ParsedSession, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return ParsedSession{}, err
-	}
-	if info.Size() > maxParseRolloutBytes {
-		p := parseRolloutMetadataOnly(path, info)
-		p.Session.Source = "claude"
-		p.Session.ModelProvider = "anthropic"
-		return p, nil
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return ParsedSession{}, err
-	}
-	defer f.Close()
-	sha, _ := fileSHA(path)
-	p := ParsedSession{EventCounts: map[string]int{}}
-	p.Session.RolloutPath = path
-	p.Session.RolloutSHA256 = sha
-	p.Session.Source = "claude"
-	p.Session.ModelProvider = "anthropic"
-	p.Session.ID = strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	files := map[string]bool{}
-	tools := map[string]bool{}
-	reader := bufio.NewReader(f)
-	lineNo := 0
-	for {
-		line, err := reader.ReadBytes('\n')
-		if len(line) > 0 {
-			lineNo++
-			var obj map[string]any
-			if json.Unmarshal(line, &obj) == nil {
-				handleClaudeLine(&p, obj, lineNo, files, tools)
-			}
-		}
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return p, err
-		}
-	}
-	for f := range files {
-		p.Session.FilesTouched = append(p.Session.FilesTouched, f)
-	}
-	sort.Strings(p.Session.FilesTouched)
-	for t := range tools {
-		p.Session.ToolNames = append(p.Session.ToolNames, t)
-	}
-	sort.Strings(p.Session.ToolNames)
-	p.Session.Title = short(first(p.Session.Title, p.Session.FirstUserMessage, p.Session.ID), 240)
-	p.SearchBlob = truncate(strings.Join([]string{p.Session.Title, p.Session.CWD, strings.Join(p.Session.Commands, "\n"), strings.Join(p.Session.FilesTouched, "\n"), messagesText(p.Messages)}, "\n"), maxSearchBlobText)
-	return p, nil
-}
-
-func handleClaudeLine(p *ParsedSession, obj map[string]any, lineNo int, files, tools map[string]bool) {
-	typ := first(str(obj["type"]), "unknown")
-	p.EventCounts[typ]++
-	ts := isoAny(obj["timestamp"])
-	if p.Session.CreatedAt == "" && ts != "" {
-		p.Session.CreatedAt = ts
-	}
-	if ts != "" {
-		p.Session.UpdatedAt = ts
-	}
-	p.Session.ID = first(str(obj["sessionId"]), p.Session.ID)
-	p.Session.CWD = first(p.Session.CWD, str(obj["cwd"]))
-	p.Session.CLIVersion = first(p.Session.CLIVersion, str(obj["version"]))
-	p.Session.GitBranch = first(p.Session.GitBranch, str(obj["gitBranch"]))
-	p.Session.Title = first(p.Session.Title, str(obj["aiTitle"]))
-	if model := str(obj["model"]); model != "" {
-		p.Session.Model = first(p.Session.Model, model)
-	}
-	if len(p.RawEvents) < maxStoredRawEventsPerSession {
-		raw, _ := json.Marshal(redactObj(obj))
-		rawJSON := string(raw)
-		if len(rawJSON) > maxStoredRawEventJSON {
-			rawJSON = rawJSON[:maxStoredRawEventJSON] + fmt.Sprintf("\n...[truncated raw event from %d bytes]", len(rawJSON))
-		}
-		p.RawEvents = append(p.RawEvents, RawEvent{lineNo, ts, typ, "", rawJSON})
-	}
-	switch typ {
-	case "ai-title":
-		p.Session.Title = first(str(obj["aiTitle"]), p.Session.Title)
-	case "last-prompt", "queue-operation":
-		text := capMessageText(first(str(obj["lastPrompt"]), str(obj["content"])))
-		if text != "" && !isContextNoise(text) && p.Session.FirstUserMessage == "" {
-			p.Session.FirstUserMessage = short(text, maxStoredMessageText)
-		}
-	case "user", "assistant", "system":
-		handleClaudeMessage(p, obj, lineNo, ts, files, tools)
-	}
-}
-
-func handleClaudeMessage(p *ParsedSession, obj map[string]any, lineNo int, ts string, files, tools map[string]bool) {
-	message, _ := obj["message"].(map[string]any)
-	role := first(str(message["role"]), str(obj["type"]))
-	if role == "system" {
-		return
-	}
-	if model := str(message["model"]); model != "" {
-		p.Session.Model = first(p.Session.Model, model)
-	}
-	for i, item := range claudeContentItems(message["content"]) {
-		messageLineNo := lineNo*1000 + i
-		kind := str(item["type"])
-		switch kind {
-		case "", "text", "thinking":
-			text := capMessageText(first(str(item["text"]), str(item["content"])))
-			if text != "" && !isContextNoise(text) {
-				if role == "user" && p.Session.FirstUserMessage == "" {
-					p.Session.FirstUserMessage = short(text, maxStoredMessageText)
-				}
-				if role == "assistant" {
-					p.Session.LastAgentMessage = short(text, maxStoredMessageText)
-				}
-				p.Messages = append(p.Messages, Message{messageLineNo, ts, role, first(kind, "message"), text})
-			}
-		case "tool_use":
-			name := str(item["name"])
-			if name != "" {
-				tools[name] = true
-			}
-			input, _ := item["input"].(map[string]any)
-			cmd := first(str(input["command"]), str(input["cmd"]))
-			path := first(str(input["file_path"]), str(input["path"]), str(input["notebook_path"]))
-			if path != "" {
-				files[path] = true
-			}
-			if cmd != "" {
-				p.Session.Commands = append(p.Session.Commands, cmd)
-				addPaths(files, cmd)
-			}
-			text := capMessageText(first(cmd, path, compactJSON(item["input"])))
-			if text != "" {
-				p.Messages = append(p.Messages, Message{messageLineNo, ts, "tool", name, text})
-			}
-		case "tool_result":
-			text := capMessageText(claudeToolResultText(item["content"]))
-			addPaths(files, text)
-			if regexp.MustCompile(`(?i)(error|traceback|failed|exception|permission denied)`).MatchString(text) {
-				p.Session.Errors = append(p.Session.Errors, short(text, 500))
-			}
-			if text != "" {
-				p.Messages = append(p.Messages, Message{messageLineNo, ts, "tool", "tool_result", text})
-			}
-		}
-	}
-}
-
-func claudeContentItems(v any) []map[string]any {
-	switch x := v.(type) {
-	case string:
-		return []map[string]any{{"type": "text", "text": x}}
-	case []any:
-		items := make([]map[string]any, 0, len(x))
-		for _, it := range x {
-			if m, ok := it.(map[string]any); ok {
-				items = append(items, m)
-			}
-		}
-		return items
-	case map[string]any:
-		return []map[string]any{x}
-	default:
-		return nil
-	}
-}
-
-func claudeToolResultText(v any) string {
-	switch x := v.(type) {
-	case string:
-		return x
-	case []any:
-		var parts []string
-		for _, it := range x {
-			if m, ok := it.(map[string]any); ok {
-				parts = append(parts, first(str(m["text"]), str(m["content"])))
-			}
-		}
-		return strings.Join(parts, "\n")
-	default:
-		return str(v)
-	}
-}
-
-func compactJSON(v any) string {
-	if v == nil {
-		return ""
-	}
-	b, _ := json.Marshal(redactObj(v))
-	return string(b)
-}
-
-func handleEventMessage(p *ParsedSession, payload map[string]any, lineNo int, ts string, files map[string]bool) {
-	ptype := str(payload["type"])
-	switch ptype {
-	case "user_message":
-		text := capMessageText(str(payload["message"]))
-		if text != "" && !isContextNoise(text) {
-			if p.Session.FirstUserMessage == "" {
-				p.Session.FirstUserMessage = short(text, maxStoredMessageText)
-			}
-			p.Messages = append(p.Messages, Message{lineNo, ts, "user", "message", text})
-		}
-	case "agent_message":
-		text := capMessageText(str(payload["message"]))
-		if text != "" {
-			p.Session.LastAgentMessage = short(text, maxStoredMessageText)
-			p.Messages = append(p.Messages, Message{lineNo, ts, "assistant", "message", text})
-		}
-	case "task_complete":
-		p.Session.Status = "complete"
-		text := capMessageText(str(payload["last_agent_message"]))
-		if text != "" {
-			p.Session.LastAgentMessage = short(text, maxStoredMessageText)
-			p.Messages = append(p.Messages, Message{lineNo, ts, "assistant", "task_complete", text})
-		}
-	case "turn_aborted":
-		p.Session.Status = "aborted"
-		if r := str(payload["reason"]); r != "" {
-			p.Session.Errors = append(p.Session.Errors, "aborted: "+r)
-		}
-	case "patch_apply_end":
-		addPaths(files, str(payload["stdout"]))
-		if changes, ok := payload["changes"].(map[string]any); ok {
-			for k := range changes {
-				files[k] = true
-			}
-		}
-	}
-}
-func handleResponseItem(p *ParsedSession, payload map[string]any, lineNo int, ts string, files, mapTools map[string]bool) {
-	ptype := str(payload["type"])
-	switch ptype {
-	case "message":
-		role := str(payload["role"])
-		text := capMessageText(contentText(payload["content"]))
-		if (role == "user" || role == "assistant") && text != "" && !isContextNoise(text) {
-			if role == "user" && p.Session.FirstUserMessage == "" {
-				p.Session.FirstUserMessage = short(text, maxStoredMessageText)
-			}
-			if role == "assistant" {
-				p.Session.LastAgentMessage = short(text, maxStoredMessageText)
-			}
-			p.Messages = append(p.Messages, Message{lineNo, ts, role, "message", text})
-		}
-	case "function_call":
-		name := str(payload["name"])
-		mapTools[name] = true
-		args := parseArgs(payload["arguments"])
-		cmd := str(args["cmd"])
-		if cmd == "" {
-			cmd = str(args["command"])
-		}
-		if cmd != "" {
-			p.Session.Commands = append(p.Session.Commands, cmd)
-			p.Messages = append(p.Messages, Message{lineNo, ts, "tool", name, cmd})
-		}
-	case "custom_tool_call":
-		name := str(payload["name"])
-		mapTools[name] = true
-		input := str(payload["input"])
-		addPatchPaths(files, input)
-		if input != "" {
-			p.Messages = append(p.Messages, Message{lineNo, ts, "tool", name, input})
-		}
-	case "function_call_output", "custom_tool_call_output":
-		out := str(payload["output"])
-		addPaths(files, out)
-		if regexp.MustCompile(`(?i)(error|traceback|failed|exception|permission denied)`).MatchString(out) {
-			p.Session.Errors = append(p.Session.Errors, short(out, 500))
-		}
-	}
-}
-
 func loadStateMetadata(path string) map[string]map[string]any {
 	out := map[string]map[string]any{}
 	db, err := sql.Open("sqlite", path)
@@ -1309,7 +827,7 @@ func mergeState(s *Session, m map[string]any) {
 	}
 }
 
-func findRollouts(root string, include []string) []string {
+func findRollouts(root string, include []string, cutoff time.Time) []string {
 	seen := map[string]bool{}
 	var files []string
 	roots := append([]string{root}, include...)
@@ -1318,12 +836,16 @@ func findRollouts(root string, include []string) []string {
 		if err != nil {
 			continue
 		}
-		if !info.IsDir() && strings.HasSuffix(r, ".jsonl") {
+		if !info.IsDir() && isCodexRolloutPath(r) && fileIsRecentEnough(info, cutoff) {
 			files = append(files, r)
 			continue
 		}
 		filepath.WalkDir(r, func(path string, d os.DirEntry, err error) error {
-			if err == nil && !d.IsDir() && strings.HasPrefix(filepath.Base(path), "rollout-") && strings.HasSuffix(path, ".jsonl") && !seen[path] {
+			if err == nil && !d.IsDir() && isCodexRolloutPath(path) && !seen[path] {
+				info, statErr := d.Info()
+				if statErr != nil || !fileIsRecentEnough(info, cutoff) {
+					return nil
+				}
 				seen[path] = true
 				files = append(files, path)
 			}
@@ -1334,7 +856,12 @@ func findRollouts(root string, include []string) []string {
 	return files
 }
 
-func findClaudeTranscripts(root string, include []string) []string {
+func isCodexRolloutPath(path string) bool {
+	base := filepath.Base(path)
+	return strings.HasPrefix(base, "rollout-") && strings.HasSuffix(base, ".jsonl")
+}
+
+func findClaudeTranscripts(root string, include []string, cutoff time.Time) []string {
 	seen := map[string]bool{}
 	var files []string
 	roots := append([]string{root}, include...)
@@ -1343,12 +870,16 @@ func findClaudeTranscripts(root string, include []string) []string {
 		if err != nil {
 			continue
 		}
-		if !info.IsDir() && isClaudeTranscriptPath(r) {
+		if !info.IsDir() && isClaudeTranscriptPath(r) && fileIsRecentEnough(info, cutoff) {
 			files = append(files, r)
 			continue
 		}
 		filepath.WalkDir(r, func(path string, d os.DirEntry, err error) error {
 			if err == nil && !d.IsDir() && isClaudeTranscriptPath(path) && !seen[path] {
+				info, statErr := d.Info()
+				if statErr != nil || !fileIsRecentEnough(info, cutoff) {
+					return nil
+				}
 				seen[path] = true
 				files = append(files, path)
 			}
@@ -1357,6 +888,10 @@ func findClaudeTranscripts(root string, include []string) []string {
 	}
 	sort.Strings(files)
 	return files
+}
+
+func fileIsRecentEnough(info os.FileInfo, cutoff time.Time) bool {
+	return cutoff.IsZero() || !info.ModTime().Before(cutoff)
 }
 
 func isClaudeTranscriptPath(path string) bool {
@@ -1364,11 +899,16 @@ func isClaudeTranscriptPath(path string) bool {
 	return strings.HasSuffix(base, ".jsonl") && !strings.HasPrefix(base, "rollout-")
 }
 func fileSHA(path string) (string, error) {
-	b, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%x", sha256.Sum256(b)), nil
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }
 func redact(s string) string {
 	out := s
@@ -1377,10 +917,40 @@ func redact(s string) string {
 	}
 	return out
 }
+
+func sanitizeSession(s Session) Session {
+	s.Title = redact(s.Title)
+	s.FirstUserMessage = redact(s.FirstUserMessage)
+	s.LastAgentMessage = redact(s.LastAgentMessage)
+	s.CWD = redact(s.CWD)
+	s.GitBranch = redact(s.GitBranch)
+	s.GitOriginURL = redact(s.GitOriginURL)
+	s.RolloutPath = redact(s.RolloutPath)
+	s.RolloutSHA256 = redact(s.RolloutSHA256)
+	s.FilesTouched = redactStrings(s.FilesTouched)
+	s.Commands = redactStrings(s.Commands)
+	s.ToolNames = redactStrings(s.ToolNames)
+	s.Errors = redactStrings(s.Errors)
+	return s
+}
+
+func redactStrings(values []string) []string {
+	if len(values) == 0 {
+		return values
+	}
+	out := make([]string, len(values))
+	for i, value := range values {
+		out[i] = redact(value)
+	}
+	return out
+}
+
 func redactObj(v any) any {
 	switch x := v.(type) {
 	case string:
 		return redact(x)
+	case []string:
+		return redactStrings(x)
 	case []any:
 		for i := range x {
 			x[i] = redactObj(x[i])

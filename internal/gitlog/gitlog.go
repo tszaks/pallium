@@ -55,6 +55,16 @@ func CurrentCommit(repoRoot string) (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
+func OriginURL(repoRoot string) (string, error) {
+	cmd := exec.Command("git", "-C", repoRoot, "config", "--get", "remote.origin.url")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to read git origin url: %w", err)
+	}
+
+	return strings.TrimSpace(string(output)), nil
+}
+
 func ReadHistory(repoRoot string) ([]Commit, error) {
 	cmd := exec.Command(
 		"git",

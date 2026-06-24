@@ -2,6 +2,7 @@ package gitlog
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -51,9 +52,18 @@ func WorkingTreeChanges(repoRoot string) ([]WorkingTreeFile, error) {
 			path = path[idx+4:]
 		}
 		path = filepath.ToSlash(path)
-		if path == ".pallium.db" || path == ".pallium" || strings.HasPrefix(path, ".pallium/") ||
-			path == ".codex-memory.db" || path == ".codex-memory" || strings.HasPrefix(path, ".codex-memory/") {
+		if ignoredWorkingTreePath(path) {
 			continue
+		}
+		if status == "??" {
+			expanded, err := expandUntrackedDirectory(repoRoot, path)
+			if err != nil {
+				return nil, err
+			}
+			if len(expanded) > 0 {
+				out = append(out, expanded...)
+				continue
+			}
 		}
 		out = append(out, WorkingTreeFile{
 			Path:   path,
@@ -61,4 +71,43 @@ func WorkingTreeChanges(repoRoot string) ([]WorkingTreeFile, error) {
 		})
 	}
 	return out, nil
+}
+
+func expandUntrackedDirectory(repoRoot, path string) ([]WorkingTreeFile, error) {
+	info, err := os.Stat(filepath.Join(repoRoot, filepath.FromSlash(path)))
+	if err != nil || !info.IsDir() {
+		return nil, nil
+	}
+
+	files := make([]WorkingTreeFile, 0)
+	err = filepath.WalkDir(filepath.Join(repoRoot, filepath.FromSlash(path)), func(absPath string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(repoRoot, absPath)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if d.IsDir() {
+			if rel == ".git" || rel == "node_modules" || ignoredWorkingTreePath(rel) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if ignoredWorkingTreePath(rel) {
+			return nil
+		}
+		files = append(files, WorkingTreeFile{Path: rel, Status: "??"})
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("expand untracked directory %s: %w", path, err)
+	}
+	return files, nil
+}
+
+func ignoredWorkingTreePath(path string) bool {
+	return path == ".pallium.db" || path == ".pallium" || strings.HasPrefix(path, ".pallium/") ||
+		path == ".codex-memory.db" || path == ".codex-memory" || strings.HasPrefix(path, ".codex-memory/")
 }
