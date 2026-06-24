@@ -66,6 +66,8 @@ func (a *App) Run(args []string) error {
 		return runTask(a.stdout, filtered[1:], jsonOutput)
 	case "sessions":
 		return runSessions(a.stdout, filtered[1:], jsonOutput)
+	case "console":
+		return runConsole(a.stdout, filtered[1:], jsonOutput)
 	default:
 		a.printHelp()
 		return fmt.Errorf("unknown command: %s", filtered[0])
@@ -92,7 +94,8 @@ Usage:
   pallium task start <goal> [scope-paths...] [--json]
   pallium task show [--json]
   pallium task clear [--json]
-  pallium sessions <live|watch|index|list|search|related|grep|show|embed|semantic|stats> [--json]`)
+	  pallium sessions <live|watch|index|list|search|related|grep|show|embed|semantic|stats> [--json]
+	  pallium console <ls|watch|show|manifest|handoff|claim|action|authority|gate|review> [--json]`)
 }
 
 func requireArg(args []string, field string) (string, error) {
