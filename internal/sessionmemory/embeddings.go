@@ -25,9 +25,8 @@ func Embed(ctx context.Context, model string, limit, batchSize int) (int, error)
 }
 
 func EmbedSession(ctx context.Context, sessionID, model string, limit, batchSize int) (int, error) {
-	if model == "" {
-		model = DefaultEmbeddingModel
-	}
+	model = resolveEmbeddingModel(model)
+	provider := embeddingProvider()
 	if batchSize <= 0 {
 		batchSize = 64
 	}
@@ -45,9 +44,9 @@ func EmbedSession(ctx context.Context, sessionID, model string, limit, batchSize
 		if err != nil {
 			return 0, err
 		}
-		rows, err = store.db.Query(`SELECT c.id,c.text,c.text_sha256 FROM codex_session_chunks c LEFT JOIN codex_session_embeddings e ON e.chunk_id=c.id AND e.provider='openai' AND e.model=? AND e.text_sha256=c.text_sha256 WHERE e.chunk_id IS NULL AND c.session_id=? ORDER BY c.session_id,c.chunk_index LIMIT ?`, model, resolvedID, limit)
+		rows, err = store.db.Query(`SELECT c.id,c.text,c.text_sha256 FROM codex_session_chunks c LEFT JOIN codex_session_embeddings e ON e.chunk_id=c.id AND e.provider=? AND e.model=? AND e.text_sha256=c.text_sha256 WHERE e.chunk_id IS NULL AND c.session_id=? ORDER BY c.session_id,c.chunk_index LIMIT ?`, provider, model, resolvedID, limit)
 	} else {
-		rows, err = store.db.Query(`SELECT c.id,c.text,c.text_sha256 FROM codex_session_chunks c LEFT JOIN codex_session_embeddings e ON e.chunk_id=c.id AND e.provider='openai' AND e.model=? AND e.text_sha256=c.text_sha256 WHERE e.chunk_id IS NULL ORDER BY c.session_id,c.chunk_index LIMIT ?`, model, limit)
+		rows, err = store.db.Query(`SELECT c.id,c.text,c.text_sha256 FROM codex_session_chunks c LEFT JOIN codex_session_embeddings e ON e.chunk_id=c.id AND e.provider=? AND e.model=? AND e.text_sha256=c.text_sha256 WHERE e.chunk_id IS NULL ORDER BY c.session_id,c.chunk_index LIMIT ?`, provider, model, limit)
 	}
 	if err != nil {
 		return 0, err
@@ -81,7 +80,7 @@ func EmbedSession(ctx context.Context, sessionID, model string, limit, batchSize
 		}
 		for j, vec := range vecs {
 			c := chunks[i+j]
-			if _, err := store.db.Exec(`INSERT OR REPLACE INTO codex_session_embeddings(chunk_id,provider,model,dim,vector_blob,text_sha256,embedded_at) VALUES(?,?,?,?,?,?,?)`, c.id, "openai", model, len(vec), packVector(vec), c.sha, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			if _, err := store.db.Exec(`INSERT OR REPLACE INTO codex_session_embeddings(chunk_id,provider,model,dim,vector_blob,text_sha256,embedded_at) VALUES(?,?,?,?,?,?,?)`, c.id, provider, model, len(vec), packVector(vec), c.sha, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 				return total, err
 			}
 			total++
@@ -102,9 +101,8 @@ func EmbedSession(ctx context.Context, sessionID, model string, limit, batchSize
 }
 
 func Semantic(ctx context.Context, query, model string, limit int, sessionsOnly bool) ([]SemanticResult, error) {
-	if model == "" {
-		model = DefaultEmbeddingModel
-	}
+	model = resolveEmbeddingModel(model)
+	provider := embeddingProvider()
 	if limit <= 0 {
 		limit = 10
 	}
@@ -117,7 +115,7 @@ func Semantic(ctx context.Context, query, model string, limit int, sessionsOnly 
 		return nil, err
 	}
 	defer store.Close()
-	rows, err := store.db.Query(`SELECT e.vector_blob,c.id,c.session_id,c.kind,c.text,s.title,s.cwd,s.updated_at FROM codex_session_embeddings e JOIN codex_session_chunks c ON c.id=e.chunk_id JOIN codex_sessions s ON s.id=c.session_id WHERE e.provider='openai' AND e.model=?`, model)
+	rows, err := store.db.Query(`SELECT e.vector_blob,c.id,c.session_id,c.kind,c.text,s.title,s.cwd,s.updated_at FROM codex_session_embeddings e JOIN codex_session_chunks c ON c.id=e.chunk_id JOIN codex_sessions s ON s.id=c.session_id WHERE e.provider=? AND e.model=?`, provider, model)
 	if err != nil {
 		return nil, err
 	}
@@ -150,23 +148,78 @@ func Semantic(ctx context.Context, query, model string, limit int, sessionsOnly 
 	return out, nil
 }
 
-func openAIEmbeddings(ctx context.Context, model string, texts []string) ([][]float64, error) {
-	key := os.Getenv("OPENAI_API_KEY")
-	if key == "" {
-		key = os.Getenv("OPENAI_ADMIN_API_KEY")
+// embeddingSettings is the resolved embedding provider configuration for the current process.
+type embeddingSettings struct {
+	provider string
+	baseURL  string
+	apiKey   string
+}
+
+// resolveEmbeddingSettings reads the active embedding provider from the environment so a user can
+// bring their own key against any OpenAI-compatible host, or run fully local with no key at all.
+// The embedding ecosystem largely standardized on the OpenAI /v1/embeddings wire format (OpenAI,
+// Ollama, LM Studio, llama.cpp, vLLM, Together, Mistral, Jina, OpenRouter, ...), so one
+// configurable client covers "as many models as possible" without a bespoke adapter per provider.
+func resolveEmbeddingSettings() embeddingSettings {
+	provider := strings.TrimSpace(os.Getenv("PALLIUM_EMBED_PROVIDER"))
+	if provider == "" {
+		provider = "openai"
 	}
-	if key == "" {
-		return nil, errors.New("OPENAI_API_KEY is required for embeddings")
+	baseURL := strings.TrimSpace(os.Getenv("PALLIUM_EMBED_BASE_URL"))
+	if baseURL == "" {
+		if provider == "ollama" {
+			baseURL = "http://localhost:11434/v1"
+		} else {
+			baseURL = "https://api.openai.com/v1"
+		}
 	}
+	apiKey := strings.TrimSpace(os.Getenv("PALLIUM_EMBED_API_KEY"))
+	if apiKey == "" && provider == "openai" {
+		apiKey = strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
+		if apiKey == "" {
+			apiKey = strings.TrimSpace(os.Getenv("OPENAI_ADMIN_API_KEY"))
+		}
+	}
+	return embeddingSettings{provider: provider, baseURL: strings.TrimRight(baseURL, "/"), apiKey: apiKey}
+}
+
+// embeddingProvider is the label embeddings are stored and queried under. A similarity search only
+// compares vectors within one (provider, model) space, since embeddings from different models live
+// in different vector spaces and are not comparable. Switching providers/models re-embeds the
+// backlog rather than mixing spaces.
+func embeddingProvider() string { return resolveEmbeddingSettings().provider }
+
+// resolveEmbeddingModel applies the explicit model override, then PALLIUM_EMBED_MODEL, then the
+// built-in default.
+func resolveEmbeddingModel(model string) string {
+	if strings.TrimSpace(model) != "" {
+		return model
+	}
+	if env := strings.TrimSpace(os.Getenv("PALLIUM_EMBED_MODEL")); env != "" {
+		return env
+	}
+	return DefaultEmbeddingModel
+}
+
+// openAICompatibleEmbeddings calls any OpenAI-compatible /v1/embeddings endpoint. The API key is
+// optional, so local runtimes (Ollama, LM Studio, llama.cpp) work without one.
+func openAICompatibleEmbeddings(ctx context.Context, model string, texts []string) ([][]float64, error) {
+	s := resolveEmbeddingSettings()
+	if s.apiKey == "" && strings.Contains(s.baseURL, "api.openai.com") {
+		return nil, errors.New("OpenAI embeddings require OPENAI_API_KEY or PALLIUM_EMBED_API_KEY; set PALLIUM_EMBED_PROVIDER=ollama (or another local provider) to run without a key")
+	}
+	url := s.baseURL + "/embeddings"
 	body, _ := json.Marshal(map[string]any{"model": model, "input": texts})
 	var payload []byte
 	var status string
 	for attempt := 0; attempt < 10; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.openai.com/v1/embeddings", bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("Authorization", "Bearer "+key)
+		if s.apiKey != "" {
+			req.Header.Set("Authorization", "Bearer "+s.apiKey)
+		}
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -179,7 +232,7 @@ func openAIEmbeddings(ctx context.Context, model string, texts []string) ([][]fl
 			break
 		}
 		if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
-			return nil, fmt.Errorf("openai embeddings failed: %s: %s", resp.Status, short(string(payload), 500))
+			return nil, fmt.Errorf("%s embeddings failed: %s: %s", s.provider, resp.Status, short(string(payload), 500))
 		}
 		wait := retryDelay(resp.Header.Get("Retry-After"), string(payload), attempt)
 		timer := time.NewTimer(wait)
@@ -191,7 +244,7 @@ func openAIEmbeddings(ctx context.Context, model string, texts []string) ([][]fl
 		}
 	}
 	if status == "" || !strings.HasPrefix(status, "2") {
-		return nil, fmt.Errorf("openai embeddings failed: %s: %s", status, short(string(payload), 500))
+		return nil, fmt.Errorf("%s embeddings failed: %s: %s", s.provider, status, short(string(payload), 500))
 	}
 	var decoded struct {
 		Data []struct {
