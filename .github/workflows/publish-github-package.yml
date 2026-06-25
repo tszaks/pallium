@@ -16,13 +16,13 @@ jobs:
   publish-github-package:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag }}
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: 24
           registry-url: https://npm.pkg.github.com
           scope: "@tszaks"
 
@@ -30,6 +30,12 @@ jobs:
         run: node scripts/prepare-github-npm-package.mjs
 
       - name: Publish to GitHub Packages
-        run: npm publish ./dist/github-npm --registry=https://npm.pkg.github.com
+        run: |
+          version="$(node -p 'require("./dist/github-npm/package.json").version')"
+          if npm view "@tszaks/pallium@$version" version --registry=https://npm.pkg.github.com >/dev/null 2>&1; then
+            echo "@tszaks/pallium@$version is already published"
+          else
+            npm publish ./dist/github-npm --registry=https://npm.pkg.github.com
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ github.token }}
