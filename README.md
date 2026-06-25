@@ -71,6 +71,30 @@ pallium sessions semantic "find the session where we debugged MCP startup failur
 pallium sessions stats
 ```
 
+## Console Coordination
+
+`pallium console` is an experimental local control plane for agent sessions.
+It can inspect live Codex and Claude Code sessions, coordinate manifests,
+handoffs, file claims, action requests, authority gates, and review gates.
+
+This release also adds Pallium-owned process control. Pallium can spawn a
+foreground or background PTY-backed session, persist its metadata, capture its
+log, read its output later, and interrupt it as a process group.
+
+```bash
+pallium console ls --details
+pallium console run --id owned-demo -- /bin/sh -c 'echo hello'
+pallium console run --background --id owned-worker -- /bin/sh -c 'sleep 30'
+pallium console owned list
+pallium console owned show owned-worker
+pallium console read owned-worker --tail 50
+pallium console interrupt owned-worker
+```
+
+The control boundary is intentionally conservative: this release controls
+sessions that Pallium spawned itself. It does not inject commands into arbitrary
+existing Codex or Claude Code sessions.
+
 Session-memory indexing is incremental by default: unchanged transcript files are skipped using their last indexed timestamp, with a hash check only when the file looks newer. After a global `sessions embed` pass completes and no embedding backlog remains for the model, Pallium records a model-specific embedding cursor. Later `sessions index` runs scan from that cursor minus `--safety-buffer` instead of walking historical session memory every time. This makes scheduled automation cadence-independent: hourly runs should touch about the last hour plus buffer, six-hour runs should touch about six hours plus buffer, and on-demand runs use the same cursor path. Files modified in the last two minutes are skipped so Pallium does not chase active agent logs. Use `--force` only when you intentionally want to rebuild existing session rows after parser or redaction changes.
 
 Session-memory data is stored outside any one repo at `~/.pallium/codex-sessions.sqlite`. If an existing legacy database is present, Pallium falls back to `~/.codex-memory/codex-sessions.sqlite` so older indexed memory keeps working. It includes redacted raw agent events, transcript/tool-call rows, FTS indexes, chunks, OpenAI embeddings, and brute-force cosine semantic search. Use `OPENAI_API_KEY` or `OPENAI_ADMIN_API_KEY` for embedding commands.
