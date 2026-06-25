@@ -151,6 +151,30 @@ func TestOwnedSessionLifecycle(t *testing.T) {
 	}
 }
 
+func TestOwnedSessionRejectsUnsafeID(t *testing.T) {
+	store := openTestStore(t)
+	defer store.Close()
+
+	_, err := store.CreateOwnedSession(OwnedSession{
+		ID:      "../escape",
+		Command: []string{"/bin/echo", "hello"},
+		CWD:     "/tmp",
+		LogPath: "/tmp/owned.log",
+	})
+	if err == nil {
+		t.Fatal("expected unsafe owned session id to fail")
+	}
+}
+
+func TestOwnedSessionUpdateMissingRowFails(t *testing.T) {
+	store := openTestStore(t)
+	defer store.Close()
+
+	if err := store.FinishOwnedSession("missing-owned", 0); err == nil {
+		t.Fatal("expected missing owned session update to fail")
+	}
+}
+
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
 	store, err := Open(filepath.Join(t.TempDir(), "sessions.sqlite"))
