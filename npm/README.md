@@ -4,14 +4,15 @@ NPM installer for the Pallium CLI.
 
 ```bash
 npm install -g pallium
-pallium doctor
+pallium version
 ```
 
-The package installs the matching Pallium release binary from GitHub. If a
-prebuilt binary is unavailable for the current platform, it falls back to:
+The package installs the matching Pallium release binary from GitHub into
+`~/.pallium/npm/<version>/`. If a prebuilt binary is unavailable for the current
+platform, it falls back to:
 
 ```bash
-go install github.com/tszaks/pallium@v0.9.1
+go install github.com/tszaks/pallium@v0.9.2
 ```
 
 Supported prebuilt platforms:
