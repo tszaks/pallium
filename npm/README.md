@@ -12,7 +12,14 @@ The package installs the matching Pallium release binary from GitHub into
 platform, it falls back to:
 
 ```bash
-go install github.com/tszaks/pallium@v0.9.2
+go install github.com/tszaks/pallium@v0.9.3
+```
+
+GitHub Packages mirror:
+
+```bash
+npm config set @tszaks:registry https://npm.pkg.github.com
+npm install -g @tszaks/pallium
 ```
 
 Supported prebuilt platforms:

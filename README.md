@@ -1,5 +1,10 @@
 # pallium
 
+[![npm version](https://img.shields.io/npm/v/pallium.svg)](https://www.npmjs.com/package/pallium)
+[![npm downloads](https://img.shields.io/npm/dm/pallium.svg)](https://www.npmjs.com/package/pallium)
+[![GitHub release](https://img.shields.io/github/v/release/tszaks/pallium?sort=semver)](https://github.com/tszaks/pallium/releases/latest)
+[![GitHub Packages](https://img.shields.io/badge/GitHub%20Packages-%40tszaks%2Fpallium-24292f?logo=github)](https://github.com/tszaks/pallium/pkgs/npm/pallium)
+
 `pallium` is a local-first CLI for AI-powered coding workflows.
 
 It gives an LLM fast repo context before, during, and after edits:
@@ -138,13 +143,22 @@ GitHub Releases.
 If npm registry access is unavailable, install the release tarball directly:
 
 ```bash
-npm install -g https://github.com/tszaks/pallium/releases/download/v0.9.2/pallium-0.9.2.tgz
+npm install -g https://github.com/tszaks/pallium/releases/download/v0.9.3/pallium-0.9.3.tgz
 ```
 
 Or install with Go:
 
 ```bash
 go install github.com/tszaks/pallium@latest
+```
+
+GitHub Packages is also published as `@tszaks/pallium`. GitHub Packages
+requires GitHub npm registry authentication, so this is mainly a backup channel
+for GitHub-authenticated environments:
+
+```bash
+npm config set @tszaks:registry https://npm.pkg.github.com
+npm install -g @tszaks/pallium
 ```
 
 Or from source:
