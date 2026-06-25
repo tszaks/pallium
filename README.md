@@ -124,6 +124,12 @@ pallium verify fast --json
 ## Install
 
 ```bash
+npm install -g pallium
+```
+
+Or install with Go:
+
+```bash
 go install github.com/tszaks/pallium@latest
 ```
 
