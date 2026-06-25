@@ -130,7 +130,7 @@ type OwnedSession struct {
 	StartedAt string   `json:"started_at"`
 	UpdatedAt string   `json:"updated_at"`
 	ExitedAt  string   `json:"exited_at,omitempty"`
-	ExitCode  int      `json:"exit_code,omitempty"`
+	ExitCode  int      `json:"exit_code"`
 }
 
 func Open(path string) (*Store, error) {
@@ -651,6 +651,9 @@ func (s *Store) CreateOwnedSession(sess OwnedSession) (OwnedSession, error) {
 	if sess.ID == "" {
 		sess.ID = newID("owned")
 	}
+	if err := ValidateOwnedSessionID(sess.ID); err != nil {
+		return OwnedSession{}, err
+	}
 	if sess.Status == "" {
 		sess.Status = "starting"
 	}
@@ -728,8 +731,18 @@ func (s *Store) updateOwnedSession(id, status string, runnerPID, childPID int, e
 		args = append(args, exitedAt, exitCode)
 	}
 	args = append(args, id)
-	_, err := s.db.Exec(`UPDATE owned_sessions SET `+strings.Join(sets, ", ")+` WHERE id=?`, args...)
-	return err
+	result, err := s.db.Exec(`UPDATE owned_sessions SET `+strings.Join(sets, ", ")+` WHERE id=?`, args...)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 func (s *Store) conflictingClaimIDs(c Claim) ([]string, error) {
@@ -815,6 +828,30 @@ func scanOwnedSession(row scanner) (OwnedSession, error) {
 	}
 	sess.Command = decodeList(commandJSON)
 	return sess, nil
+}
+
+func ValidateOwnedSessionID(id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fmt.Errorf("owned session id is required")
+	}
+	if len(id) > 120 {
+		return fmt.Errorf("owned session id is too long")
+	}
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '-' || r == '_' || r == '.':
+		default:
+			return fmt.Errorf("owned session id %q contains invalid character %q", id, r)
+		}
+	}
+	if strings.Contains(id, "..") {
+		return fmt.Errorf("owned session id cannot contain '..'")
+	}
+	return nil
 }
 
 func validateSessionKey(key SessionKey) error {

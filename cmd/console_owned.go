@@ -43,11 +43,18 @@ func runConsoleRun(out io.Writer, args []string, jsonOutput bool) error {
 	if *id == "" {
 		*id = ownedSessionID()
 	}
+	if err := console.ValidateOwnedSessionID(*id); err != nil {
+		return err
+	}
 	if *cwd == "" {
 		*cwd, err = os.Getwd()
 		if err != nil {
 			return err
 		}
+	}
+	*cwd, err = resolveOwnedCWD(*cwd)
+	if err != nil {
+		return err
 	}
 	if *logPath == "" {
 		*logPath, err = defaultOwnedLogPath(*id)
@@ -98,6 +105,13 @@ func runConsoleRunner(out io.Writer, args []string) error {
 	}
 	if *id == "" || *cwd == "" || *logPath == "" || len(commandArgs) == 0 {
 		return fmt.Errorf("invalid owned runner invocation")
+	}
+	if err := console.ValidateOwnedSessionID(*id); err != nil {
+		return err
+	}
+	*cwd, err = resolveOwnedCWD(*cwd)
+	if err != nil {
+		return err
 	}
 	store, err := console.Open(*dbPath)
 	if err != nil {
@@ -316,6 +330,10 @@ func startOwnedBackground(out io.Writer, jsonOutput bool, dbPath string, session
 	cmd.Stdin = nil
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
+		if store, openErr := console.Open(dbPath); openErr == nil {
+			_ = store.FailOwnedSession(session.ID, 1)
+			_ = store.Close()
+		}
 		return err
 	}
 	if cmd.Process != nil {
@@ -340,11 +358,29 @@ func splitConsoleRunArgs(args []string) ([]string, []string, error) {
 }
 
 func defaultOwnedLogPath(id string) (string, error) {
+	if err := console.ValidateOwnedSessionID(id); err != nil {
+		return "", err
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
 	return filepath.Join(home, ".pallium", "owned-sessions", id+".log"), nil
+}
+
+func resolveOwnedCWD(cwd string) (string, error) {
+	abs, err := filepath.Abs(cwd)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("owned session cwd %q is not available: %w", cwd, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("owned session cwd %q is not a directory", cwd)
+	}
+	return abs, nil
 }
 
 func ownedSessionID() string {
@@ -363,6 +399,9 @@ func exitCodeFromError(err error) int {
 }
 
 func interruptProcess(pid int) error {
+	if err := syscall.Kill(-pid, syscall.SIGINT); err == nil {
+		return nil
+	}
 	proc, err := os.FindProcess(pid)
 	if err != nil {
 		return err
@@ -379,8 +418,14 @@ func readOwnedLog(path string, tail int) (string, error) {
 		return string(raw), nil
 	}
 	lines := bytes.Split(raw, []byte("\n"))
+	if len(lines) > 0 && len(lines[len(lines)-1]) == 0 {
+		lines = lines[:len(lines)-1]
+	}
 	if len(lines) > tail {
 		lines = lines[len(lines)-tail:]
+	}
+	if bytes.HasSuffix(raw, []byte("\n")) {
+		return string(bytes.Join(lines, []byte("\n"))) + "\n", nil
 	}
 	return string(bytes.Join(lines, []byte("\n"))), nil
 }
