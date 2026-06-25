@@ -123,8 +123,22 @@ pallium verify fast --json
 
 ## Install
 
+The primary install path is npm:
+
 ```bash
 npm install -g pallium
+pallium version
+```
+
+The npm package installs the matching Pallium release binary from GitHub and
+keeps it in `~/.pallium/npm/<version>/`. Release assets include macOS and Linux
+binaries for arm64 and x64, plus a packed npm tarball for direct install from
+GitHub Releases.
+
+If npm registry access is unavailable, install the release tarball directly:
+
+```bash
+npm install -g https://github.com/tszaks/pallium/releases/download/v0.9.2/pallium-0.9.2.tgz
 ```
 
 Or install with Go:
