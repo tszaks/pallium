@@ -1,0 +1,32 @@
+{
+  "name": "pallium",
+  "version": "0.9.1",
+  "description": "Local-first CLI for AI-powered coding workflows.",
+  "license": "MIT",
+  "homepage": "https://github.com/tszaks/pallium#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tszaks/pallium.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tszaks/pallium/issues"
+  },
+  "bin": {
+    "pallium": "bin/pallium.js"
+  },
+  "files": [
+    "bin/",
+    "scripts/",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/install.js",
+    "test": "node scripts/test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

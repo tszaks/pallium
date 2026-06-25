@@ -3,3 +3,4 @@ codex-memory
 *.db
 *.sqlite
 *.sqlite3
+dist/

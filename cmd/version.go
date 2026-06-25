@@ -11,6 +11,8 @@ import (
 	"github.com/tszaks/pallium/internal/output"
 )
 
+var buildVersion = "dev"
+
 type VersionReport struct {
 	Module      string `json:"module"`
 	Version     string `json:"version"`
@@ -23,14 +25,14 @@ type VersionReport struct {
 func runVersion(out io.Writer, jsonOutput bool) error {
 	report := VersionReport{
 		Module:    "github.com/tszaks/pallium",
-		Version:   "dev",
+		Version:   buildVersion,
 		GoVersion: runtime.Version(),
 	}
 	if info, ok := debug.ReadBuildInfo(); ok {
 		if info.Main.Path != "" {
 			report.Module = info.Main.Path
 		}
-		if info.Main.Version != "" && info.Main.Version != "(devel)" {
+		if report.Version == "dev" && info.Main.Version != "" && info.Main.Version != "(devel)" {
 			report.Version = info.Main.Version
 		}
 		for _, setting := range info.Settings {
