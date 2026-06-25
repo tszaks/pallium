@@ -119,6 +119,20 @@ type ReviewCase struct {
 	ClosedAt  string `json:"closed_at,omitempty"`
 }
 
+type OwnedSession struct {
+	ID        string   `json:"id"`
+	Command   []string `json:"command"`
+	CWD       string   `json:"cwd"`
+	LogPath   string   `json:"log_path"`
+	RunnerPID int      `json:"runner_pid,omitempty"`
+	ChildPID  int      `json:"child_pid,omitempty"`
+	Status    string   `json:"status"`
+	StartedAt string   `json:"started_at"`
+	UpdatedAt string   `json:"updated_at"`
+	ExitedAt  string   `json:"exited_at,omitempty"`
+	ExitCode  int      `json:"exit_code,omitempty"`
+}
+
 func Open(path string) (*Store, error) {
 	if path == "" {
 		path = sessionmemory.DefaultDBPath()
@@ -241,6 +255,20 @@ CREATE TABLE IF NOT EXISTS agent_reviews (
   created_at TEXT NOT NULL,
   closed_at TEXT
 );
+CREATE TABLE IF NOT EXISTS owned_sessions (
+  id TEXT PRIMARY KEY,
+  command_json TEXT NOT NULL,
+  cwd TEXT NOT NULL,
+  log_path TEXT NOT NULL,
+  runner_pid INTEGER DEFAULT 0,
+  child_pid INTEGER DEFAULT 0,
+  status TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  exited_at TEXT,
+  exit_code INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_owned_sessions_status ON owned_sessions(status, updated_at);
 `)
 	return err
 }
@@ -613,6 +641,97 @@ func (s *Store) CloseReview(id, decision string) error {
 	return err
 }
 
+func (s *Store) CreateOwnedSession(sess OwnedSession) (OwnedSession, error) {
+	if len(sess.Command) == 0 {
+		return OwnedSession{}, fmt.Errorf("owned session command is required")
+	}
+	if strings.TrimSpace(sess.CWD) == "" || strings.TrimSpace(sess.LogPath) == "" {
+		return OwnedSession{}, fmt.Errorf("owned session cwd and log path are required")
+	}
+	if sess.ID == "" {
+		sess.ID = newID("owned")
+	}
+	if sess.Status == "" {
+		sess.Status = "starting"
+	}
+	if sess.StartedAt == "" {
+		sess.StartedAt = nowString()
+	}
+	if sess.UpdatedAt == "" {
+		sess.UpdatedAt = sess.StartedAt
+	}
+	commandJSON, err := encodeList(sess.Command)
+	if err != nil {
+		return OwnedSession{}, err
+	}
+	_, err = s.db.Exec(`INSERT INTO owned_sessions(id,command_json,cwd,log_path,runner_pid,child_pid,status,started_at,updated_at,exited_at,exit_code)
+VALUES(?,?,?,?,?,?,?,?,?,?,?)`, sess.ID, commandJSON, sess.CWD, sess.LogPath, sess.RunnerPID, sess.ChildPID, sess.Status, sess.StartedAt, sess.UpdatedAt, sess.ExitedAt, sess.ExitCode)
+	if err != nil {
+		return OwnedSession{}, err
+	}
+	return sess, nil
+}
+
+func (s *Store) UpdateOwnedSessionStarted(id string, runnerPID, childPID int) error {
+	return s.updateOwnedSession(id, "running", runnerPID, childPID, "", 0)
+}
+
+func (s *Store) FinishOwnedSession(id string, exitCode int) error {
+	return s.updateOwnedSession(id, "exited", 0, 0, nowString(), exitCode)
+}
+
+func (s *Store) FailOwnedSession(id string, exitCode int) error {
+	return s.updateOwnedSession(id, "failed", 0, 0, nowString(), exitCode)
+}
+
+func (s *Store) OwnedSession(id string) (OwnedSession, error) {
+	row := s.db.QueryRow(`SELECT id,command_json,cwd,log_path,runner_pid,child_pid,status,started_at,updated_at,COALESCE(exited_at,''),exit_code FROM owned_sessions WHERE id=?`, id)
+	return scanOwnedSession(row)
+}
+
+func (s *Store) ListOwnedSessions(limit int) ([]OwnedSession, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.db.Query(`SELECT id,command_json,cwd,log_path,runner_pid,child_pid,status,started_at,updated_at,COALESCE(exited_at,''),exit_code FROM owned_sessions ORDER BY updated_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]OwnedSession, 0)
+	for rows.Next() {
+		sess, err := scanOwnedSession(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sess)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) updateOwnedSession(id, status string, runnerPID, childPID int, exitedAt string, exitCode int) error {
+	if strings.TrimSpace(id) == "" {
+		return fmt.Errorf("owned session id is required")
+	}
+	sets := []string{"status=?", "updated_at=?"}
+	args := []any{status, nowString()}
+	if runnerPID > 0 {
+		sets = append(sets, "runner_pid=?")
+		args = append(args, runnerPID)
+	}
+	if childPID > 0 {
+		sets = append(sets, "child_pid=?")
+		args = append(args, childPID)
+	}
+	if exitedAt != "" {
+		sets = append(sets, "exited_at=?", "exit_code=?")
+		args = append(args, exitedAt, exitCode)
+	}
+	args = append(args, id)
+	_, err := s.db.Exec(`UPDATE owned_sessions SET `+strings.Join(sets, ", ")+` WHERE id=?`, args...)
+	return err
+}
+
 func (s *Store) conflictingClaimIDs(c Claim) ([]string, error) {
 	rows, err := s.db.Query(`SELECT id FROM session_claims WHERE repo_root=? AND target_type=? AND target=? AND status='active' AND lease_until > ? AND NOT (provider=? AND session_id=? AND machine=?)`,
 		c.RepoRoot, c.TargetType, c.Target, nowString(), normalizeToken(c.Provider), c.SessionID, c.Machine)
@@ -685,6 +804,17 @@ func scanClaim(row scanner) (Claim, error) {
 	var c Claim
 	err := row.Scan(&c.ID, &c.Provider, &c.SessionID, &c.Machine, &c.RepoRoot, &c.TargetType, &c.Target, &c.Intent, &c.LeaseUntil, &c.Status, &c.CreatedAt, &c.ReleasedAt)
 	return c, err
+}
+
+func scanOwnedSession(row scanner) (OwnedSession, error) {
+	var sess OwnedSession
+	var commandJSON string
+	err := row.Scan(&sess.ID, &commandJSON, &sess.CWD, &sess.LogPath, &sess.RunnerPID, &sess.ChildPID, &sess.Status, &sess.StartedAt, &sess.UpdatedAt, &sess.ExitedAt, &sess.ExitCode)
+	if err != nil {
+		return OwnedSession{}, err
+	}
+	sess.Command = decodeList(commandJSON)
+	return sess, nil
 }
 
 func validateSessionKey(key SessionKey) error {

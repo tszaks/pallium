@@ -38,6 +38,16 @@ func runConsole(out io.Writer, args []string, jsonOutput bool) error {
 		return nil
 	}
 	switch args[0] {
+	case "run":
+		return runConsoleRun(out, args[1:], jsonOutput)
+	case "read":
+		return runConsoleRead(out, args[1:], jsonOutput)
+	case "interrupt":
+		return runConsoleInterrupt(out, args[1:], jsonOutput)
+	case "owned":
+		return runConsoleOwned(out, args[1:], jsonOutput)
+	case "_runner":
+		return runConsoleRunner(out, args[1:])
 	case "ls", "list":
 		return runConsoleList(out, args[1:], jsonOutput, false)
 	case "watch":
@@ -1125,6 +1135,11 @@ func printConsoleHelp(out io.Writer) {
 
 Usage:
   pallium console ls [--all] [--details] [--db path] [--json]
+  pallium console run [--id id] [--cwd path] [--log path] [--background] [--db path] -- command [args...]
+  pallium console owned list [--limit n] [--db path] [--json]
+  pallium console owned show <owned-session-id> [--db path] [--json]
+  pallium console read <owned-session-id> [--tail n] [--db path] [--json]
+  pallium console interrupt <owned-session-id> [--db path] [--json]
   pallium console watch [--all] [--details] [--db path]
   pallium console show <session-id> [--db path] [--json]
   pallium console manifest set --session id [--goal text] [--step text] [--file path] [--next text] [--risk text] [--blocker text] [--stop text] [--db path] [--json]

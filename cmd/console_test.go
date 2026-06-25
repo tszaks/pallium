@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -68,5 +69,50 @@ func TestConsoleAuthorityDecisionRejectsConflictingFlags(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "choose only one") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestConsoleRunReadAndOwnedList(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	logPath := filepath.Join(tmp, "owned.log")
+	var out bytes.Buffer
+	err := runConsole(&out, []string{
+		"run",
+		"--id", "owned-test",
+		"--db", dbPath,
+		"--cwd", tmp,
+		"--log", logPath,
+		"--",
+		"/bin/sh", "-c", "printf hello-owned",
+	}, false)
+	if err != nil {
+		t.Fatalf("console run failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "hello-owned") {
+		t.Fatalf("expected command output, got %q", out.String())
+	}
+	raw, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "hello-owned") {
+		t.Fatalf("expected log output, got %q", string(raw))
+	}
+
+	out.Reset()
+	if err := runConsole(&out, []string{"read", "owned-test", "--db", dbPath}, false); err != nil {
+		t.Fatalf("console read failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "hello-owned") {
+		t.Fatalf("expected read output, got %q", out.String())
+	}
+
+	out.Reset()
+	if err := runConsole(&out, []string{"owned", "list", "--db", dbPath}, false); err != nil {
+		t.Fatalf("owned list failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "owned-test exited") {
+		t.Fatalf("expected owned list output, got %q", out.String())
 	}
 }
