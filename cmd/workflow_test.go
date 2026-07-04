@@ -215,6 +215,40 @@ func TestWorkflowGenerateSaveByName(t *testing.T) {
 	}
 }
 
+func TestWorkflowToolsAndTemplateCatalog(t *testing.T) {
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{"tools", "list", "--kind", "verification"}, true); err != nil {
+		t.Fatalf("workflow tools list failed: %v", err)
+	}
+	var tools []map[string]any
+	if err := json.Unmarshal(out.Bytes(), &tools); err != nil {
+		t.Fatalf("decode tools json: %v\n%s", err, out.String())
+	}
+	if len(tools) != 1 || tools[0]["name"] != "check" {
+		t.Fatalf("expected verification catalog to contain check only, got %#v", tools)
+	}
+
+	out.Reset()
+	if err := runWorkflow(&out, []string{"template", "list"}, false); err != nil {
+		t.Fatalf("workflow template list failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "test-fix") || !strings.Contains(out.String(), "Requires --test-command") {
+		t.Fatalf("unexpected template list output: %s", out.String())
+	}
+
+	out.Reset()
+	if err := runWorkflow(&out, []string{"template", "show", "fix-until-green"}, true); err != nil {
+		t.Fatalf("workflow template show alias failed: %v", err)
+	}
+	var tmpl map[string]any
+	if err := json.Unmarshal(out.Bytes(), &tmpl); err != nil {
+		t.Fatalf("decode template json: %v\n%s", err, out.String())
+	}
+	if tmpl["name"] != "test-fix" || tmpl["requires_test_command"] != true {
+		t.Fatalf("unexpected template payload: %#v", tmpl)
+	}
+}
+
 func TestWorkflowHelpIsRouted(t *testing.T) {
 	var out bytes.Buffer
 	app := NewApp(&out, &out)
