@@ -180,6 +180,9 @@ Use `await check("test command")` for objective verification loops. It spawns a
 dedicated test agent, runs the command as ground truth, and returns structured
 JSON with `ok`, `summary`, `output_tail`, and `failures`, so scripts can keep
 fixing until checks pass or progress stalls.
+Use `await verify.untilGreen("test command", { maxRounds: 3 })` when the
+workflow should own the full check, fix, re-check loop. It stops when the check
+passes, the round budget is exhausted, or failures stop changing.
 Scripts also get a Pallium-native `pallium` object for repo-grounded workflow
 control: `await pallium.verify("fast")`, `await pallium.review("origin/main")`,
 `await pallium.handoff("origin/main")`, `await pallium.explain(path)`,
