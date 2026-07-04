@@ -20,10 +20,16 @@ func runWorkflow(out io.Writer, args []string, jsonOutput bool) error {
 		return nil
 	}
 	switch args[0] {
+	case "generate":
+		return runWorkflowGenerate(out, args[1:], jsonOutput)
 	case "run":
 		return runWorkflowRun(out, args[1:], jsonOutput)
 	case "list", "ls":
 		return runWorkflowList(out, args[1:], jsonOutput)
+	case "status":
+		return runWorkflowStatus(out, args[1:], jsonOutput)
+	case "inspect":
+		return runWorkflowInspect(out, args[1:], jsonOutput)
 	case "show":
 		return runWorkflowShow(out, args[1:], jsonOutput)
 	case "read":
@@ -206,6 +212,67 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 	})
 }
 
+func runWorkflowGenerate(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("workflow generate")
+	outputPath := fs.String("output", "", "")
+	style := fs.String("style", "auto", "")
+	testCommand := fs.String("test-command", "", "")
+	maxRounds := fs.Int("max-rounds", 3, "")
+	saveName := fs.String("save", "", "")
+	user := fs.Bool("user", false, "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"output": {}, "style": {}, "test-command": {}, "max-rounds": {}, "save": {}}, map[string]struct{}{"user": {}}); err != nil {
+		return err
+	}
+	task := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	if task == "" {
+		return fmt.Errorf("workflow generate requires a task")
+	}
+	script, err := workflow.GenerateScript(workflow.GenerateOptions{
+		Task:        task,
+		Style:       *style,
+		TestCommand: *testCommand,
+		MaxRounds:   *maxRounds,
+	})
+	if err != nil {
+		return err
+	}
+	dest := strings.TrimSpace(*outputPath)
+	if strings.TrimSpace(*saveName) != "" {
+		if err := workflow.ValidateID(*saveName); err != nil {
+			return err
+		}
+		root := filepath.Join(".pallium", "workflows")
+		if *user {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return err
+			}
+			root = filepath.Join(home, ".pallium", "workflows")
+		}
+		dest = filepath.Join(root, *saveName+".js")
+	}
+	if dest != "" {
+		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(dest, []byte(script), 0o644); err != nil {
+			return err
+		}
+	}
+	payload := map[string]string{
+		"task":   task,
+		"style":  *style,
+		"script": script,
+		"path":   dest,
+	}
+	return output.Write(out, payload, jsonOutput, func() string {
+		if dest != "" {
+			return "Workflow generated: " + dest
+		}
+		return script
+	})
+}
+
 func runWorkflowList(out io.Writer, args []string, jsonOutput bool) error {
 	fs := newSessionFlagSet("workflow list")
 	dbPath := fs.String("db", "", "")
@@ -231,6 +298,54 @@ func runWorkflowList(out io.Writer, args []string, jsonOutput bool) error {
 			lines = append(lines, fmt.Sprintf("- %s %s %s", run.ID, run.Status, run.Task))
 		}
 		return strings.Join(lines, "\n")
+	})
+}
+
+func runWorkflowStatus(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("workflow status")
+	dbPath := fs.String("db", "", "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}}, nil); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: pallium workflow status <run-id>")
+	}
+	store, err := workflow.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	snapshot, err := store.Snapshot(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	status := workflowStatusSummary(snapshot)
+	return output.Write(out, status, jsonOutput, func() string {
+		return renderWorkflowStatus(status)
+	})
+}
+
+func runWorkflowInspect(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("workflow inspect")
+	dbPath := fs.String("db", "", "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}}, nil); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: pallium workflow inspect <run-id>")
+	}
+	store, err := workflow.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	snapshot, err := store.Snapshot(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	inspection := workflowInspection(snapshot)
+	return output.Write(out, inspection, jsonOutput, func() string {
+		return renderWorkflowInspection(inspection)
 	})
 }
 
@@ -455,6 +570,145 @@ func renderWorkflowResult(snapshot workflow.Snapshot, result string) string {
 	return text
 }
 
+type workflowStatus struct {
+	ID              string `json:"id"`
+	Task            string `json:"task"`
+	Status          string `json:"status"`
+	PhasesTotal     int    `json:"phases_total"`
+	PhasesCompleted int    `json:"phases_completed"`
+	AgentsTotal     int    `json:"agents_total"`
+	AgentsRunning   int    `json:"agents_running"`
+	AgentsCompleted int    `json:"agents_completed"`
+	AgentsFailed    int    `json:"agents_failed"`
+	UpdatedAt       string `json:"updated_at"`
+	CompletedAt     string `json:"completed_at,omitempty"`
+	Error           string `json:"error,omitempty"`
+}
+
+type workflowInspectionReport struct {
+	Status       workflowStatus        `json:"status"`
+	ScriptPath   string                `json:"script_path"`
+	Result       string                `json:"result,omitempty"`
+	Phases       []workflow.Phase      `json:"phases"`
+	Agents       []workflow.Agent      `json:"agents"`
+	Patches      []string              `json:"patches"`
+	FailedAgents []workflow.Agent      `json:"failed_agents"`
+	ByPhase      map[string]phaseStats `json:"by_phase"`
+}
+
+type phaseStats struct {
+	AgentsCompleted int `json:"agents_completed"`
+	AgentsRunning   int `json:"agents_running"`
+	AgentsFailed    int `json:"agents_failed"`
+}
+
+func workflowStatusSummary(snapshot workflow.Snapshot) workflowStatus {
+	status := workflowStatus{
+		ID:          snapshot.Run.ID,
+		Task:        snapshot.Run.Task,
+		Status:      snapshot.Run.Status,
+		UpdatedAt:   snapshot.Run.UpdatedAt,
+		CompletedAt: snapshot.Run.CompletedAt,
+		Error:       snapshot.Run.Error,
+		PhasesTotal: len(snapshot.Phases),
+		AgentsTotal: len(snapshot.Agents),
+	}
+	for _, phase := range snapshot.Phases {
+		if phase.Status == "completed" {
+			status.PhasesCompleted++
+		}
+	}
+	for _, agent := range snapshot.Agents {
+		switch agent.Status {
+		case "completed":
+			status.AgentsCompleted++
+		case "failed":
+			status.AgentsFailed++
+		case "running":
+			status.AgentsRunning++
+		}
+	}
+	return status
+}
+
+func workflowInspection(snapshot workflow.Snapshot) workflowInspectionReport {
+	report := workflowInspectionReport{
+		Status:     workflowStatusSummary(snapshot),
+		ScriptPath: snapshot.Run.ScriptPath,
+		Result:     snapshot.Run.Result,
+		Phases:     snapshot.Phases,
+		Agents:     snapshot.Agents,
+		ByPhase:    map[string]phaseStats{},
+	}
+	for _, agent := range snapshot.Agents {
+		if agent.PatchPath != "" {
+			report.Patches = append(report.Patches, agent.PatchPath)
+		}
+		if agent.Status == "failed" {
+			report.FailedAgents = append(report.FailedAgents, agent)
+		}
+		stats := report.ByPhase[agent.Phase]
+		switch agent.Status {
+		case "completed":
+			stats.AgentsCompleted++
+		case "failed":
+			stats.AgentsFailed++
+		case "running":
+			stats.AgentsRunning++
+		}
+		report.ByPhase[agent.Phase] = stats
+	}
+	return report
+}
+
+func renderWorkflowStatus(status workflowStatus) string {
+	lines := []string{
+		fmt.Sprintf("Workflow %s: %s", status.ID, status.Status),
+		"Task: " + status.Task,
+		fmt.Sprintf("Phases: %d/%d completed", status.PhasesCompleted, status.PhasesTotal),
+		fmt.Sprintf("Agents: %d completed, %d running, %d failed, %d total", status.AgentsCompleted, status.AgentsRunning, status.AgentsFailed, status.AgentsTotal),
+		"Updated: " + status.UpdatedAt,
+	}
+	if status.CompletedAt != "" {
+		lines = append(lines, "Completed: "+status.CompletedAt)
+	}
+	if status.Error != "" {
+		lines = append(lines, "Error: "+status.Error)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func renderWorkflowInspection(report workflowInspectionReport) string {
+	lines := []string{
+		renderWorkflowStatus(report.Status),
+		"Script: " + report.ScriptPath,
+	}
+	if len(report.ByPhase) > 0 {
+		lines = append(lines, "Phase stats:")
+		for _, phase := range report.Phases {
+			stats := report.ByPhase[phase.Name]
+			lines = append(lines, fmt.Sprintf("- %s: %d completed, %d running, %d failed", phase.Name, stats.AgentsCompleted, stats.AgentsRunning, stats.AgentsFailed))
+		}
+	}
+	if len(report.Patches) > 0 {
+		lines = append(lines, "Patches:")
+		for _, patch := range report.Patches {
+			lines = append(lines, "- "+patch)
+		}
+	}
+	if len(report.FailedAgents) > 0 {
+		lines = append(lines, "Failed agents:")
+		for _, agent := range report.FailedAgents {
+			label := firstNonEmpty(agent.Label, agent.ID)
+			lines = append(lines, fmt.Sprintf("- %s phase=%s error=%s", label, agent.Phase, agent.Error))
+		}
+	}
+	if report.Result != "" {
+		lines = append(lines, "Result recorded: yes")
+	}
+	return strings.Join(lines, "\n")
+}
+
 func renderWorkflowSnapshot(snapshot workflow.Snapshot) string {
 	lines := []string{
 		fmt.Sprintf("Workflow %s: %s", snapshot.Run.ID, snapshot.Run.Status),
@@ -495,9 +749,12 @@ func printWorkflowHelp(out io.Writer) {
 	fmt.Fprintln(out, `pallium workflow
 
 Usage:
+  pallium workflow generate "task" [--style review|test-fix|research] [--output path.js] [--save name] [--json]
   pallium workflow run "task" [--script path.js] [--workflow name] [--background] [--max-concurrent-agents 16] [--json]
   pallium workflow run /saved-name "task input"
   pallium workflow list [--limit n] [--json]
+  pallium workflow status <run-id> [--json]
+  pallium workflow inspect <run-id> [--json]
   pallium workflow show <run-id> [--json]
   pallium workflow read <run-id> [--json]
   pallium workflow watch <run-id>

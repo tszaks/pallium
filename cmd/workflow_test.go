@@ -14,6 +14,14 @@ func TestWorkflowRunShowReadAndSave(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"status":"ok","prompt":"{{PROMPT}}"}`)
 	t.Setenv("HOME", t.TempDir())
 	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
 	dbPath := filepath.Join(tmp, "sessions.sqlite")
 	scriptPath := filepath.Join(tmp, "workflow.js")
 	if err := os.WriteFile(scriptPath, []byte(`export const meta = { name: "test", phases: ["scan"] };
@@ -117,6 +125,93 @@ return result;`), 0o644); err != nil {
 	}
 	if !strings.Contains(out.String(), "saved workflow billing") {
 		t.Fatalf("expected slash workflow output, got %s", out.String())
+	}
+}
+
+func TestWorkflowGenerateStatusAndInspect(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"prompt":"{{PROMPT}}"}`)
+	t.Setenv("PALLIUM_WORKFLOW_PALLIUM_STUB", `{"ok":true,"args":"{{ARGS}}"}`)
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	generatedPath := filepath.Join(tmp, "generated.js")
+
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{
+		"generate",
+		"--style", "test-fix",
+		"--test-command", "go test ./...",
+		"--max-rounds", "2",
+		"--output", generatedPath,
+		"fix tests until green",
+	}, false); err != nil {
+		t.Fatalf("workflow generate failed: %v", err)
+	}
+	raw, err := os.ReadFile(generatedPath)
+	if err != nil {
+		t.Fatalf("expected generated workflow: %v", err)
+	}
+	if !strings.Contains(string(raw), "await check") || !strings.Contains(string(raw), "fix-round-") {
+		t.Fatalf("generated workflow missing test-fix loop:\n%s", string(raw))
+	}
+
+	out.Reset()
+	if err := runWorkflow(&out, []string{
+		"run",
+		"--id", "wf-generated",
+		"--db", dbPath,
+		"--cwd", tmp,
+		"--script", generatedPath,
+		"generated run",
+	}, false); err != nil {
+		t.Fatalf("generated workflow run failed: %v", err)
+	}
+
+	out.Reset()
+	if err := runWorkflow(&out, []string{"status", "wf-generated", "--db", dbPath}, false); err != nil {
+		t.Fatalf("workflow status failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "Workflow wf-generated: completed") || !strings.Contains(out.String(), "Agents:") {
+		t.Fatalf("unexpected status output: %s", out.String())
+	}
+
+	out.Reset()
+	if err := runWorkflow(&out, []string{"inspect", "wf-generated", "--db", dbPath}, true); err != nil {
+		t.Fatalf("workflow inspect failed: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("decode inspect json: %v\n%s", err, out.String())
+	}
+	if payload["script_path"] == "" || payload["status"] == nil {
+		t.Fatalf("inspect payload missing fields: %#v", payload)
+	}
+}
+
+func TestWorkflowGenerateSaveByName(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	t.Chdir(tmp)
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{
+		"generate",
+		"--style", "review",
+		"--save", "review-generated",
+		"review this branch",
+	}, false); err != nil {
+		t.Fatalf("workflow generate save failed: %v", err)
+	}
+	path := filepath.Join(".pallium", "workflows", "review-generated.js")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected saved generated workflow at %s: %v", path, err)
 	}
 }
 
