@@ -173,6 +173,9 @@ session alive.
 recent workflow runs, active runs, triggers, and running/paused/failed workers.
 Agent options accept `provider: "codex"` today, and the provider is stored on
 agent records and reports so future mixed-provider routing has a stable shape.
+Agent options also accept `repo: "/path/to/other/repo"` for multi-repo
+workflows. Edit agents still use isolated worktrees, and their patches apply
+back to that agent repo rather than the parent workflow cwd.
 `workflow serve` exposes the local workflow control plane over HTTP for other
 tools: `GET /healthz`, `GET /workflows/fleet`, `GET /workflows/runs/{id}`, and
 `POST /workflows/run`.
