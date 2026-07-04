@@ -46,6 +46,8 @@ func runWorkflow(out io.Writer, args []string, jsonOutput bool) error {
 		return runWorkflowGate(out, args[1:], jsonOutput)
 	case "serve":
 		return runWorkflowServe(out, args[1:], jsonOutput)
+	case "mcp":
+		return runWorkflowMCP(out, args[1:], jsonOutput)
 	case "run":
 		return runWorkflowRun(out, args[1:], jsonOutput)
 	case "list", "ls":
@@ -2059,6 +2061,7 @@ Usage:
   pallium workflow gate list <run-id> [--json]
   pallium workflow gate approve <run-id> <name> [--json]
   pallium workflow serve [--addr 127.0.0.1:8765]
+  pallium workflow mcp [--db path]
   pallium workflow run "task" [--script path.js] [--workflow name] [--background] [--max-concurrent-agents 16] [--json]
   pallium workflow run /saved-name "task input"
   pallium workflow list [--limit n] [--json]
