@@ -132,6 +132,7 @@ pallium workflow analytics
 pallium workflow gate list <run-id>
 pallium workflow gate approve <run-id> approve-patches
 pallium workflow serve --addr 127.0.0.1:8765
+pallium workflow mcp
 pallium workflow run --script .pallium/workflows/review.js "review this branch"
 pallium workflow run --workflow review-branch "review this branch"
 pallium workflow run /review-branch "review this branch"
@@ -225,6 +226,10 @@ tools: `GET /healthz`, `GET /workflows/fleet`, `GET /workflows/analytics`,
 `GET /workflows/library`, `GET /workflows/library/{name}`,
 `POST /workflows/library/install`, `GET /workflows/runs/{id}`, and
 `POST /workflows/run`.
+The Go SDK in `pkg/workflowclient` wraps that HTTP API for embedded tools.
+`workflow mcp` exposes the same local workflow control plane over stdio JSON-RPC
+for MCP clients, with tools for run, status, fleet, analytics, and library pack
+operations.
 Use `await check("test command")` for objective verification loops. It spawns a
 dedicated test agent, runs the command as ground truth, and returns structured
 JSON with `ok`, `summary`, `output_tail`, and `failures`, so scripts can keep
