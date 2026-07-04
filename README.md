@@ -128,6 +128,7 @@ pallium workflow status <run-id>
 pallium workflow inspect <run-id>
 pallium workflow show <run-id>
 pallium workflow read <run-id>
+pallium workflow report <run-id>
 pallium workflow watch <run-id>
 pallium workflow pause <run-id>
 pallium workflow resume <run-id>
@@ -174,6 +175,9 @@ agent needs to discover the available primitives and workflow styles before
 generating or running a script automatically.
 Use `workflow validate <path.js>` before running agent-written scripts; it
 performs a compile-only goja check and does not execute agents or touch files.
+Use `workflow report <run-id> --json` as the structured handoff between
+workflow versions or follow-up agents; it extracts findings, risks, next steps,
+patches, and per-agent summaries from the stored run.
 
 Session-memory indexing is incremental by default: unchanged transcript files are skipped using their last indexed timestamp, with a hash check only when the file looks newer. After a global `sessions embed` pass completes and no embedding backlog remains for the model, Pallium records a model-specific embedding cursor. Later `sessions index` runs scan from that cursor minus `--safety-buffer` instead of walking historical session memory every time. This makes scheduled automation cadence-independent: hourly runs should touch about the last hour plus buffer, six-hour runs should touch about six hours plus buffer, and on-demand runs use the same cursor path. Files modified in the last two minutes are skipped so Pallium does not chase active agent logs. Use `--force` only when you intentionally want to rebuild existing session rows after parser or redaction changes.
 

@@ -247,6 +247,39 @@ func TestWorkflowValidateScript(t *testing.T) {
 	}
 }
 
+func TestWorkflowReportSummarizesAgentOutputs(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"reviewed auth","observations":["auth flow is covered"],"risks":["missing edge test"],"next_steps":["add edge test"]}`)
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	scriptPath := filepath.Join(tmp, "workflow.js")
+	if err := os.WriteFile(scriptPath, []byte(`phase("review");
+const result = await agent("review auth", { label: "auth-review" });
+return result;`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{"run", "--id", "wf-report", "--db", dbPath, "--cwd", tmp, "--script", scriptPath, "report test"}, false); err != nil {
+		t.Fatalf("workflow run failed: %v", err)
+	}
+	out.Reset()
+	if err := runWorkflow(&out, []string{"report", "wf-report", "--db", dbPath}, true); err != nil {
+		t.Fatalf("workflow report failed: %v", err)
+	}
+	var report map[string]any
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatalf("decode report json: %v\n%s", err, out.String())
+	}
+	if report["status"] != "completed" {
+		t.Fatalf("expected completed report, got %#v", report)
+	}
+	findings := report["findings"].([]any)
+	risks := report["risks"].([]any)
+	nextSteps := report["next_steps"].([]any)
+	if findings[0] != "auth flow is covered" || risks[0] != "missing edge test" || nextSteps[0] != "add edge test" {
+		t.Fatalf("unexpected report extraction: %#v", report)
+	}
+}
+
 func TestWorkflowToolsAndTemplateCatalog(t *testing.T) {
 	var out bytes.Buffer
 	if err := runWorkflow(&out, []string{"tools", "list", "--kind", "verification"}, true); err != nil {
