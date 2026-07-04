@@ -51,9 +51,10 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 	argsJSON := fs.String("args", "", "")
 	codexBinary := fs.String("codex", "codex", "")
 	maxAgents := fs.Int("max-agents", 1000, "")
+	maxConcurrentAgents := fs.Int("max-concurrent-agents", 16, "")
 	maxBudgetUSD := fs.String("max-budget-usd", "", "")
 	background := fs.Bool("background", false, "")
-	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "cwd": {}, "id": {}, "script": {}, "args": {}, "codex": {}, "max-agents": {}, "max-budget-usd": {}}, map[string]struct{}{"background": {}}); err != nil {
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "cwd": {}, "id": {}, "script": {}, "args": {}, "codex": {}, "max-agents": {}, "max-concurrent-agents": {}, "max-budget-usd": {}}, map[string]struct{}{"background": {}}); err != nil {
 		return err
 	}
 	task := strings.TrimSpace(strings.Join(fs.Args(), " "))
@@ -129,6 +130,7 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 			"--script", runScriptPath,
 			"--codex", *codexBinary,
 			"--max-agents", fmt.Sprintf("%d", *maxAgents),
+			"--max-concurrent-agents", fmt.Sprintf("%d", *maxConcurrentAgents),
 		)
 		if *dbPath != "" {
 			cmdArgs = append(cmdArgs, "--db", *dbPath)
@@ -164,11 +166,12 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 	}
 	defer store.Close()
 	runner := workflow.Runner{
-		Store:        store,
-		Run:          run,
-		MaxAgents:    *maxAgents,
-		MaxBudgetUSD: *maxBudgetUSD,
-		CodexBinary:  *codexBinary,
+		Store:               store,
+		Run:                 run,
+		MaxAgents:           *maxAgents,
+		MaxConcurrentAgents: *maxConcurrentAgents,
+		MaxBudgetUSD:        *maxBudgetUSD,
+		CodexBinary:         *codexBinary,
 	}
 	result, err := runner.Execute(context.Background(), script, inputArgs)
 	if err != nil {
@@ -472,7 +475,7 @@ func printWorkflowHelp(out io.Writer) {
 	fmt.Fprintln(out, `pallium workflow
 
 Usage:
-  pallium workflow run "task" [--script path.js] [--background] [--json]
+  pallium workflow run "task" [--script path.js] [--background] [--max-concurrent-agents 16] [--json]
   pallium workflow list [--limit n] [--json]
   pallium workflow show <run-id> [--json]
   pallium workflow read <run-id> [--json]
