@@ -119,4 +119,7 @@ curl -fsS "http://127.0.0.1:$port/workflows/fleet" | grep -q '"runs_total"'
 curl -fsS "http://127.0.0.1:$port/workflows/analytics" | grep -q '"agents_by_provider"'
 curl -fsS "http://127.0.0.1:$port/workflows/library" | grep -q '"security-audit"'
 
+printf '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n' |
+  "$PALLIUM_BIN" workflow mcp --db "$db" | grep -q 'pallium_workflow_run'
+
 echo "workflow acceptance passed"
