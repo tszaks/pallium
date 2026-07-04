@@ -517,6 +517,26 @@ func (r *Runner) jsPallium(ctx context.Context, vm *goja.Runtime) map[string]any
 			}
 			return call(args...)
 		},
+		"decisions": map[string]any{
+			"record": func(title string, body string, tags ...string) goja.Value {
+				decision, err := r.Store.RecordDecision(r.Run.ID, title, body, tags)
+				if err != nil {
+					panic(vm.ToValue(err.Error()))
+				}
+				return vm.ToValue(decision)
+			},
+			"search": func(query string, limit ...int) goja.Value {
+				max := 10
+				if len(limit) > 0 && limit[0] > 0 {
+					max = limit[0]
+				}
+				decisions, err := r.Store.SearchDecisions(query, max)
+				if err != nil {
+					panic(vm.ToValue(err.Error()))
+				}
+				return vm.ToValue(decisions)
+			},
+		},
 		"task": map[string]any{
 			"start": func(goal string, scopePaths ...string) goja.Value {
 				args := []string{"task", "start", strings.TrimSpace(goal)}
