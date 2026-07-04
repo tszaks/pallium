@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -33,10 +34,14 @@ func runWorkflow(out io.Writer, args []string, jsonOutput bool) error {
 		return runWorkflowTools(out, args[1:], jsonOutput)
 	case "template", "templates":
 		return runWorkflowTemplates(out, args[1:], jsonOutput)
+	case "library", "libraries", "pack", "packs":
+		return runWorkflowLibrary(out, args[1:], jsonOutput)
 	case "trigger", "triggers":
 		return runWorkflowTrigger(out, args[1:], jsonOutput)
 	case "fleet":
 		return runWorkflowFleet(out, args[1:], jsonOutput)
+	case "analytics":
+		return runWorkflowAnalytics(out, args[1:], jsonOutput)
 	case "gate", "gates":
 		return runWorkflowGate(out, args[1:], jsonOutput)
 	case "serve":
@@ -202,6 +207,123 @@ func runWorkflowTemplateShow(out io.Writer, args []string, jsonOutput bool) erro
 	})
 }
 
+func runWorkflowLibrary(out io.Writer, args []string, jsonOutput bool) error {
+	if len(args) == 0 || hasHelpArg(args) {
+		return runWorkflowLibraryList(out, nil, jsonOutput)
+	}
+	switch args[0] {
+	case "list", "ls":
+		return runWorkflowLibraryList(out, args[1:], jsonOutput)
+	case "show":
+		return runWorkflowLibraryShow(out, args[1:], jsonOutput)
+	case "install":
+		return runWorkflowLibraryInstall(out, args[1:], jsonOutput)
+	default:
+		if pack, ok := workflow.WorkflowPack(args[0]); ok {
+			return output.Write(out, pack, jsonOutput, func() string {
+				return renderWorkflowPack(pack)
+			})
+		}
+		return fmt.Errorf("unknown workflow library pack: %s", args[0])
+	}
+}
+
+func runWorkflowLibraryList(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("workflow library list")
+	if err := parseSessionFlags(fs, args, nil, nil); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("usage: pallium workflow library list")
+	}
+	packs := workflow.WorkflowPacks()
+	return output.Write(out, packs, jsonOutput, func() string {
+		lines := []string{"Workflow library packs:"}
+		for _, pack := range packs {
+			lines = append(lines, fmt.Sprintf("- %s@%s installs as /%s: %s", pack.Name, pack.Version, pack.InstallsAs, pack.Description))
+		}
+		return strings.Join(lines, "\n")
+	})
+}
+
+func runWorkflowLibraryShow(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("workflow library show")
+	if err := parseSessionFlags(fs, args, nil, nil); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: pallium workflow library show <pack>")
+	}
+	pack, ok := workflow.WorkflowPack(fs.Arg(0))
+	if !ok {
+		return fmt.Errorf("unknown workflow library pack: %s", fs.Arg(0))
+	}
+	return output.Write(out, pack, jsonOutput, func() string {
+		return renderWorkflowPack(pack)
+	})
+}
+
+type workflowLibraryInstallResult struct {
+	Pack      workflow.PackInfo `json:"pack"`
+	Path      string            `json:"path"`
+	Workflow  string            `json:"workflow"`
+	Installed bool              `json:"installed"`
+}
+
+func runWorkflowLibraryInstall(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("workflow library install")
+	cwd := fs.String("cwd", "", "")
+	name := fs.String("name", "", "")
+	force := fs.Bool("force", false, "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"cwd": {}, "name": {}}, map[string]struct{}{"force": {}}); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: pallium workflow library install <pack> [--name workflow-name] [--cwd repo-path] [--force]")
+	}
+	if *cwd == "" {
+		var err error
+		*cwd, err = os.Getwd()
+		if err != nil {
+			return err
+		}
+	}
+	absCWD, err := filepath.Abs(*cwd)
+	if err != nil {
+		return err
+	}
+	pack, ok := workflow.WorkflowPack(fs.Arg(0))
+	if !ok {
+		return fmt.Errorf("unknown workflow library pack: %s", fs.Arg(0))
+	}
+	script, err := workflow.WorkflowPackScript(pack.Name)
+	if err != nil {
+		return err
+	}
+	workflowName := strings.TrimSpace(*name)
+	if workflowName == "" {
+		workflowName = pack.InstallsAs
+	}
+	target := filepath.Join(absCWD, ".pallium", "workflows", workflowName+".js")
+	if !*force {
+		if _, err := os.Stat(target); err == nil {
+			return fmt.Errorf("workflow %q already exists at %s; pass --force to overwrite", workflowName, target)
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(target, []byte(script), 0o644); err != nil {
+		return err
+	}
+	result := workflowLibraryInstallResult{Pack: pack, Path: target, Workflow: workflowName, Installed: true}
+	return output.Write(out, result, jsonOutput, func() string {
+		return fmt.Sprintf("Installed workflow pack %s as /%s at %s", pack.Name, workflowName, target)
+	})
+}
+
 func runWorkflowTrigger(out io.Writer, args []string, jsonOutput bool) error {
 	if len(args) == 0 || hasHelpArg(args) {
 		return fmt.Errorf("usage: pallium workflow trigger <add|list|show|run>")
@@ -215,6 +337,8 @@ func runWorkflowTrigger(out io.Writer, args []string, jsonOutput bool) error {
 		return runWorkflowTriggerShow(out, args[1:], jsonOutput)
 	case "run":
 		return runWorkflowTriggerRun(out, args[1:], jsonOutput)
+	case "watch":
+		return runWorkflowTriggerWatch(out, args[1:], jsonOutput)
 	default:
 		return fmt.Errorf("unknown workflow trigger subcommand: %s", args[0])
 	}
@@ -392,6 +516,127 @@ func runWorkflowTriggerRun(out io.Writer, args []string, jsonOutput bool) error 
 	return runWorkflowRun(out, runArgs[1:], jsonOutput)
 }
 
+type workflowTriggerWatchResult struct {
+	Checked    int              `json:"checked"`
+	Started    int              `json:"started"`
+	Skipped    int              `json:"skipped"`
+	Errors     int              `json:"errors"`
+	Kind       string           `json:"kind"`
+	Results    []map[string]any `json:"results,omitempty"`
+	CheckedAt  string           `json:"checked_at"`
+	NextCheck  string           `json:"next_check,omitempty"`
+	Background bool             `json:"background"`
+}
+
+func runWorkflowTriggerWatch(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("workflow trigger watch")
+	dbPath := fs.String("db", "", "")
+	kind := fs.String("kind", "on-changed", "")
+	intervalText := fs.String("interval", "30s", "")
+	once := fs.Bool("once", false, "")
+	background := fs.Bool("background", false, "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "kind": {}, "interval": {}}, map[string]struct{}{"once": {}, "background": {}}); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("usage: pallium workflow trigger watch [--kind on-changed|all] [--interval 30s] [--once] [--background]")
+	}
+	interval, err := time.ParseDuration(*intervalText)
+	if err != nil || interval <= 0 {
+		return fmt.Errorf("invalid trigger watch interval %q", *intervalText)
+	}
+	for {
+		result, err := runWorkflowTriggerWatchCycle(*dbPath, *kind, *background)
+		if err != nil {
+			return err
+		}
+		if !*once {
+			result.NextCheck = time.Now().UTC().Add(interval).Format(time.RFC3339)
+		}
+		if *once || jsonOutput {
+			if err := output.Write(out, result, jsonOutput, func() string {
+				return renderWorkflowTriggerWatchResult(result)
+			}); err != nil {
+				return err
+			}
+		} else {
+			fmt.Fprintln(out, renderWorkflowTriggerWatchResult(result))
+		}
+		if *once {
+			return nil
+		}
+		time.Sleep(interval)
+	}
+}
+
+func runWorkflowTriggerWatchCycle(dbPath, kind string, background bool) (workflowTriggerWatchResult, error) {
+	store, err := workflow.Open(dbPath)
+	if err != nil {
+		return workflowTriggerWatchResult{}, err
+	}
+	triggers, err := store.ListTriggers()
+	_ = store.Close()
+	if err != nil {
+		return workflowTriggerWatchResult{}, err
+	}
+	filterKind := strings.TrimSpace(kind)
+	if filterKind == "" {
+		filterKind = "on-changed"
+	}
+	result := workflowTriggerWatchResult{
+		Kind:       filterKind,
+		CheckedAt:  time.Now().UTC().Format(time.RFC3339),
+		Background: background,
+	}
+	for _, trigger := range triggers {
+		if !trigger.Enabled {
+			continue
+		}
+		if filterKind != "all" && trigger.Kind != filterKind {
+			continue
+		}
+		if trigger.Kind == "manual" && filterKind != "all" {
+			continue
+		}
+		result.Checked++
+		runArgs := []string{trigger.Name, "--db", dbPath}
+		if background {
+			runArgs = append(runArgs, "--background")
+		}
+		var buf bytes.Buffer
+		if err := runWorkflowTriggerRun(&buf, runArgs, true); err != nil {
+			result.Errors++
+			result.Results = append(result.Results, map[string]any{
+				"name":  trigger.Name,
+				"error": err.Error(),
+			})
+			continue
+		}
+		item := parseWorkflowJSONMap(buf.String())
+		if len(item) == 0 {
+			item = map[string]any{"name": trigger.Name, "output": strings.TrimSpace(buf.String())}
+		}
+		if _, ok := item["name"]; !ok {
+			item["name"] = trigger.Name
+		}
+		if skipped, _ := item["skipped"].(bool); skipped {
+			result.Skipped++
+		} else {
+			result.Started++
+		}
+		result.Results = append(result.Results, item)
+	}
+	return result, nil
+}
+
+func parseWorkflowJSONMap(text string) map[string]any {
+	var item map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(text)), &item); err != nil {
+		return nil
+	}
+	return item
+}
+
 func runWorkflowFleet(out io.Writer, args []string, jsonOutput bool) error {
 	if len(args) == 0 || hasHelpArg(args) {
 		return runWorkflowFleetStatus(out, nil, jsonOutput)
@@ -439,6 +684,99 @@ func runWorkflowFleetStatus(out io.Writer, args []string, jsonOutput bool) error
 	return output.Write(out, status, jsonOutput, func() string {
 		return renderWorkflowFleetStatus(status)
 	})
+}
+
+type workflowAnalytics struct {
+	RunsTotal           int            `json:"runs_total"`
+	CompletionRate      float64        `json:"completion_rate"`
+	RunsByStatus        map[string]int `json:"runs_by_status"`
+	AgentsTotal         int            `json:"agents_total"`
+	AgentsByStatus      map[string]int `json:"agents_by_status"`
+	AgentsByProvider    map[string]int `json:"agents_by_provider"`
+	AgentsByMode        map[string]int `json:"agents_by_mode"`
+	PatchesProduced     int            `json:"patches_produced"`
+	AverageAgentsPerRun float64        `json:"average_agents_per_run"`
+	TriggersTotal       int            `json:"triggers_total"`
+	EnabledTriggers     int            `json:"enabled_triggers"`
+	MostRecentRunID     string         `json:"most_recent_run_id,omitempty"`
+	UpdatedAt           string         `json:"updated_at"`
+}
+
+func runWorkflowAnalytics(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("workflow analytics")
+	dbPath := fs.String("db", "", "")
+	limit := fs.Int("limit", 500, "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "limit": {}}, nil); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("usage: pallium workflow analytics [--limit n]")
+	}
+	store, err := workflow.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	analytics, err := buildWorkflowAnalytics(store, *limit)
+	if err != nil {
+		return err
+	}
+	return output.Write(out, analytics, jsonOutput, func() string {
+		return renderWorkflowAnalytics(analytics)
+	})
+}
+
+func buildWorkflowAnalytics(store *workflow.Store, limit int) (workflowAnalytics, error) {
+	runs, err := store.ListRuns(limit)
+	if err != nil {
+		return workflowAnalytics{}, err
+	}
+	triggers, err := store.ListTriggers()
+	if err != nil {
+		return workflowAnalytics{}, err
+	}
+	analytics := workflowAnalytics{
+		RunsTotal:        len(runs),
+		RunsByStatus:     map[string]int{},
+		AgentsByStatus:   map[string]int{},
+		AgentsByProvider: map[string]int{},
+		AgentsByMode:     map[string]int{},
+		TriggersTotal:    len(triggers),
+		UpdatedAt:        time.Now().UTC().Format(time.RFC3339),
+	}
+	if len(runs) > 0 {
+		analytics.MostRecentRunID = runs[0].ID
+	}
+	for _, trigger := range triggers {
+		if trigger.Enabled {
+			analytics.EnabledTriggers++
+		}
+	}
+	completed := 0
+	for _, run := range runs {
+		analytics.RunsByStatus[run.Status]++
+		if run.Status == "completed" {
+			completed++
+		}
+		agents, err := store.ListAgents(run.ID)
+		if err != nil {
+			return workflowAnalytics{}, err
+		}
+		for _, agent := range agents {
+			analytics.AgentsTotal++
+			analytics.AgentsByStatus[agent.Status]++
+			analytics.AgentsByProvider[firstNonEmpty(agent.Provider, "codex")]++
+			analytics.AgentsByMode[firstNonEmpty(agent.Mode, "read-only")]++
+			if strings.TrimSpace(agent.PatchPath) != "" {
+				analytics.PatchesProduced++
+			}
+		}
+	}
+	if analytics.RunsTotal > 0 {
+		analytics.CompletionRate = float64(completed) / float64(analytics.RunsTotal)
+		analytics.AverageAgentsPerRun = float64(analytics.AgentsTotal) / float64(analytics.RunsTotal)
+	}
+	return analytics, nil
 }
 
 func buildWorkflowFleetStatus(store *workflow.Store, limit int) (workflowFleetStatus, error) {
@@ -1509,6 +1847,38 @@ func renderWorkflowTrigger(trigger workflow.Trigger) string {
 	return strings.Join(lines, "\n")
 }
 
+func renderWorkflowTriggerWatchResult(result workflowTriggerWatchResult) string {
+	lines := []string{
+		"Workflow trigger watch",
+		"Kind: " + result.Kind,
+		fmt.Sprintf("Checked: %d, started: %d, skipped: %d, errors: %d", result.Checked, result.Started, result.Skipped, result.Errors),
+	}
+	if result.NextCheck != "" {
+		lines = append(lines, "Next check: "+result.NextCheck)
+	}
+	for _, item := range result.Results {
+		name, _ := item["name"].(string)
+		if name == "" {
+			name, _ = item["trigger"].(string)
+		}
+		if name == "" {
+			continue
+		}
+		if skipped, _ := item["skipped"].(bool); skipped {
+			lines = append(lines, "- "+name+" skipped")
+			continue
+		}
+		if runID, _ := item["id"].(string); runID != "" {
+			lines = append(lines, "- "+name+" started "+runID)
+			continue
+		}
+		if errText, _ := item["error"].(string); errText != "" {
+			lines = append(lines, "- "+name+" error: "+errText)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 func renderWorkflowFleetStatus(status workflowFleetStatus) string {
 	lines := []string{
 		"Workflow fleet status",
@@ -1529,6 +1899,51 @@ func renderWorkflowFleetStatus(status workflowFleetStatus) string {
 		for _, run := range status.ActiveRuns {
 			lines = append(lines, fmt.Sprintf("- %s %s %s", run.ID, run.Status, run.Task))
 		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func renderWorkflowAnalytics(analytics workflowAnalytics) string {
+	lines := []string{
+		"Workflow analytics",
+		fmt.Sprintf("Runs: %d completion=%.1f%%", analytics.RunsTotal, analytics.CompletionRate*100),
+		fmt.Sprintf("Agents: %d avg/run=%.2f patches=%d", analytics.AgentsTotal, analytics.AverageAgentsPerRun, analytics.PatchesProduced),
+		fmt.Sprintf("Triggers: %d enabled / %d total", analytics.EnabledTriggers, analytics.TriggersTotal),
+	}
+	if len(analytics.RunsByStatus) > 0 {
+		lines = append(lines, "Runs by status:")
+		for _, key := range []string{"queued", "running", "paused", "completed", "failed", "stopped"} {
+			if count := analytics.RunsByStatus[key]; count > 0 {
+				lines = append(lines, fmt.Sprintf("- %s: %d", key, count))
+			}
+		}
+	}
+	if len(analytics.AgentsByProvider) > 0 {
+		lines = append(lines, "Agents by provider:")
+		for provider, count := range analytics.AgentsByProvider {
+			lines = append(lines, fmt.Sprintf("- %s: %d", provider, count))
+		}
+	}
+	if len(analytics.AgentsByMode) > 0 {
+		lines = append(lines, "Agents by mode:")
+		for mode, count := range analytics.AgentsByMode {
+			lines = append(lines, fmt.Sprintf("- %s: %d", mode, count))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func renderWorkflowPack(pack workflow.PackInfo) string {
+	lines := []string{
+		fmt.Sprintf("%s@%s", pack.Name, pack.Version),
+		pack.Description,
+		"Installs as: /" + pack.InstallsAs,
+	}
+	if len(pack.Phases) > 0 {
+		lines = append(lines, "Phases: "+strings.Join(pack.Phases, ", "))
+	}
+	if len(pack.Tags) > 0 {
+		lines = append(lines, "Tags: "+strings.Join(pack.Tags, ", "))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -1631,11 +2046,16 @@ Usage:
   pallium workflow tools list [--kind control|agent|verification|pallium] [--json]
   pallium workflow template list [--json]
   pallium workflow template show <name> [--json]
+  pallium workflow library list [--json]
+  pallium workflow library show <pack> [--json]
+  pallium workflow library install <pack> [--name workflow-name] [--json]
   pallium workflow trigger add <name> "task" [--workflow name|--script path] [--cwd repo-path] [--json]
   pallium workflow trigger list [--json]
   pallium workflow trigger show <name> [--json]
   pallium workflow trigger run <name> [--background] [--json]
+  pallium workflow trigger watch [--kind on-changed|all] [--interval 30s] [--once] [--json]
   pallium workflow fleet status [--limit n] [--json]
+  pallium workflow analytics [--limit n] [--json]
   pallium workflow gate list <run-id> [--json]
   pallium workflow gate approve <run-id> <name> [--json]
   pallium workflow serve [--addr 127.0.0.1:8765]

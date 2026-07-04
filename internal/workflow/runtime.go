@@ -1176,9 +1176,6 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent Agent, opts AgentOpt
 		return strings.ReplaceAll(stub, "{{PROMPT}}", agent.Prompt), patchPath, worktree, nil
 	}
 	provider := firstNonEmpty(agent.Provider, opts.Provider, "codex")
-	if provider != "codex" {
-		return "", "", "", fmt.Errorf("workflow agent provider %q is not configured; available provider: codex", provider)
-	}
 	cwd := firstNonEmpty(agent.Repo, r.Run.CWD)
 	worktree := ""
 	if agent.Mode == "edit" || agent.Isolation == "worktree" {
@@ -1196,6 +1193,24 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent Agent, opts AgentOpt
 	}
 	defer os.RemoveAll(tmpDir)
 	outFile := filepath.Join(tmpDir, "last-message.txt")
+	if provider != "codex" {
+		command := strings.TrimSpace(os.Getenv(providerCommandEnvName(provider)))
+		if command == "" {
+			return "", "", worktree, fmt.Errorf("workflow agent provider %q is not configured; set %s", provider, providerCommandEnvName(provider))
+		}
+		output, err := r.runConfiguredProviderCommand(ctx, command, tmpDir, outFile, cwd, agent, opts)
+		if err != nil {
+			return output, "", worktree, err
+		}
+		patchPath := ""
+		if worktree != "" {
+			patchPath, err = r.writeWorktreePatch(agent.ID, worktree)
+			if err != nil {
+				return output, "", worktree, err
+			}
+		}
+		return output, patchPath, worktree, nil
+	}
 	cmdArgs := []string{"exec", "--cd", cwd, "--output-last-message", outFile}
 	if agent.Mode == "edit" || agent.Mode == "test" || agent.Mode == "check" {
 		cmdArgs = append(cmdArgs, "--sandbox", "workspace-write")
@@ -1238,6 +1253,65 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent Agent, opts AgentOpt
 		}
 	}
 	return output, patchPath, worktree, nil
+}
+
+func (r *Runner) runConfiguredProviderCommand(ctx context.Context, command, tmpDir, outFile, cwd string, agent Agent, opts AgentOptions) (string, error) {
+	promptFile := filepath.Join(tmpDir, "prompt.txt")
+	if err := os.WriteFile(promptFile, []byte(agent.Prompt), 0o600); err != nil {
+		return "", err
+	}
+	schemaFile := ""
+	if len(opts.Schema) > 0 {
+		schemaFile = filepath.Join(tmpDir, "schema.json")
+		normalizedSchema := normalizeSchema(opts.Schema)
+		raw, err := json.MarshalIndent(normalizedSchema, "", "  ")
+		if err != nil {
+			return "", err
+		}
+		if err := os.WriteFile(schemaFile, raw, 0o600); err != nil {
+			return "", err
+		}
+	}
+	cmd := exec.CommandContext(ctx, "sh", "-c", command)
+	cmd.Dir = cwd
+	cmd.Env = append(os.Environ(),
+		"PALLIUM_WORKFLOW_RUN_ID="+r.Run.ID,
+		"PALLIUM_WORKFLOW_AGENT_ID="+agent.ID,
+		"PALLIUM_WORKFLOW_PROVIDER="+agent.Provider,
+		"PALLIUM_WORKFLOW_LABEL="+agent.Label,
+		"PALLIUM_WORKFLOW_MODE="+agent.Mode,
+		"PALLIUM_WORKFLOW_MODEL="+agent.Model,
+		"PALLIUM_WORKFLOW_REPO="+agent.Repo,
+		"PALLIUM_WORKFLOW_CWD="+cwd,
+		"PALLIUM_WORKFLOW_PROMPT="+agent.Prompt,
+		"PALLIUM_WORKFLOW_PROMPT_FILE="+promptFile,
+		"PALLIUM_WORKFLOW_OUTPUT_FILE="+outFile,
+		"PALLIUM_WORKFLOW_SCHEMA_FILE="+schemaFile,
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return strings.TrimSpace(stdout.String()), fmt.Errorf("workflow provider %q failed: %w: %s", agent.Provider, err, strings.TrimSpace(stderr.String()))
+	}
+	raw, readErr := os.ReadFile(outFile)
+	output := strings.TrimSpace(string(raw))
+	if readErr != nil || output == "" {
+		output = strings.TrimSpace(stdout.String())
+	}
+	if output == "" {
+		return "", fmt.Errorf("workflow provider %q produced no output", agent.Provider)
+	}
+	return output, nil
+}
+
+func providerCommandEnvName(provider string) string {
+	normalized := regexp.MustCompile(`[^A-Za-z0-9]+`).ReplaceAllString(strings.ToUpper(strings.TrimSpace(provider)), "_")
+	normalized = strings.Trim(normalized, "_")
+	if normalized == "" {
+		normalized = "DEFAULT"
+	}
+	return "PALLIUM_WORKFLOW_PROVIDER_" + normalized + "_COMMAND"
 }
 
 func normalizeSchema(value any) any {
