@@ -128,6 +128,8 @@ pallium workflow inspect <run-id>
 pallium workflow show <run-id>
 pallium workflow read <run-id>
 pallium workflow watch <run-id>
+pallium workflow pause <run-id>
+pallium workflow resume <run-id>
 pallium workflow save <run-id> --name review-branch
 pallium workflow apply <run-id>
 ```
@@ -145,9 +147,12 @@ Workflow scripts run as async JavaScript, matching Claude's saved workflow
 shape: top-level `await` is supported, `pipeline()` fans one worker per item in
 parallel for each stage, and completed agents are reused when the same run id is
 relaunched. Runs default to 16 concurrent agents and 1,000 total agents.
-`workflow stop <run-id>` is cooperative for foreground runs: it marks the run
-stopped in Pallium's database, the active runtime observes that state, cancels
-live worker commands, and records stopped agents instead of completing the run.
+`workflow pause <run-id>` and `workflow stop <run-id>` are cooperative for
+foreground runs: they mark the run state in Pallium's database, the active
+runtime observes that state, cancels live worker commands, and records paused
+or stopped agents instead of completing the run. `workflow resume <run-id>`
+reloads the saved script, args, and cwd, then continues with completed-agent
+cache reuse so finished work is not repeated.
 Use `await check("test command")` for objective verification loops. It spawns a
 dedicated test agent, runs the command as ground truth, and returns structured
 JSON with `ok`, `summary`, `output_tail`, and `failures`, so scripts can keep
