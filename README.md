@@ -123,6 +123,8 @@ pallium workflow preflight "review workflow changes" --scope cmd/workflow.go --j
 pallium workflow trigger add daily-review "review workflow changes" --cwd .
 pallium workflow trigger run daily-review
 pallium workflow fleet status
+pallium workflow gate list <run-id>
+pallium workflow gate approve <run-id> approve-patches
 pallium workflow serve --addr 127.0.0.1:8765
 pallium workflow run --script .pallium/workflows/review.js "review this branch"
 pallium workflow run --workflow review-branch "review this branch"
@@ -161,6 +163,8 @@ Scripts can call `await workflow("saved-name", args)` to compose one saved
 workflow from `.pallium/workflows/`, `.claude/workflows/`, or user workflow
 folders. Composition is capped at one nested level so generated scripts remain
 inspectable and do not recurse indefinitely.
+Scripts can call `await gate("name", "message")` to pause until a human runs
+`pallium workflow gate approve <run-id> <name>` and then resumes the workflow.
 `workflow pause <run-id>` and `workflow stop <run-id>` are cooperative for
 foreground runs: they mark the run state in Pallium's database, the active
 runtime observes that state, cancels live worker commands, and records paused

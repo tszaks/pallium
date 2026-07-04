@@ -92,6 +92,15 @@ func WorkflowTools() []ToolInfo {
 			Notes:       []string{"Composition is intentionally limited to one nested level."},
 		},
 		{
+			Name:        "gate",
+			Signature:   `await gate(name, message?)`,
+			Kind:        "control",
+			Description: "Pauses the workflow until a human approves the named gate.",
+			Returns:     "Approved gate JSON after resume.",
+			Example:     `await gate("approve-patches", "Review generated patches before applying")`,
+			Notes:       []string{"Approve with pallium workflow gate approve <run-id> <name>, then resume the run."},
+		},
+		{
 			Name:        "pallium.verify",
 			Signature:   `await pallium.verify("fast")`,
 			Kind:        "pallium",
