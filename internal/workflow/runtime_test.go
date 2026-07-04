@@ -458,6 +458,24 @@ return { ok: true };`
 	if string(rootRaw) != "original\n" || string(otherRaw) != "changed\n" {
 		t.Fatalf("patch applied to wrong repo: root=%q other=%q", string(rootRaw), string(otherRaw))
 	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reverted, err := RevertPatches(context.Background(), snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reverted) != 1 {
+		t.Fatalf("expected one reverted patch, got %#v", reverted)
+	}
+	otherRaw, err = os.ReadFile(filepath.Join(otherRepo, "target.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(otherRaw) != "original\n" {
+		t.Fatalf("expected reverted other repo, got %q", string(otherRaw))
+	}
 }
 
 func TestParallelRunsAgentsConcurrently(t *testing.T) {

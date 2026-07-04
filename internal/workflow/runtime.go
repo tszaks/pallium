@@ -1455,6 +1455,25 @@ func ApplyPatches(ctx context.Context, snapshot Snapshot) ([]string, error) {
 	return applied, nil
 }
 
+func RevertPatches(ctx context.Context, snapshot Snapshot) ([]string, error) {
+	reverted := []string{}
+	for i := len(snapshot.Agents) - 1; i >= 0; i-- {
+		agent := snapshot.Agents[i]
+		if agent.PatchPath == "" {
+			continue
+		}
+		targetRepo := firstNonEmpty(agent.Repo, snapshot.Run.CWD)
+		didRevert, err := revertPatch(ctx, targetRepo, agent.PatchPath)
+		if err != nil {
+			return reverted, err
+		}
+		if didRevert {
+			reverted = append(reverted, agent.PatchPath)
+		}
+	}
+	return reverted, nil
+}
+
 func applyPatch(ctx context.Context, cwd, patchPath string) (bool, error) {
 	raw, err := os.ReadFile(patchPath)
 	if err != nil {
@@ -1475,6 +1494,30 @@ func applyPatch(ctx context.Context, cwd, patchPath string) (bool, error) {
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		return false, fmt.Errorf("apply %s: %w: %s", patchPath, err, strings.TrimSpace(stderr.String()))
+	}
+	return true, nil
+}
+
+func revertPatch(ctx context.Context, cwd, patchPath string) (bool, error) {
+	raw, err := os.ReadFile(patchPath)
+	if err != nil {
+		return false, err
+	}
+	if strings.TrimSpace(string(raw)) == "" {
+		return false, nil
+	}
+	if err := runGitApplyCheck(ctx, cwd, patchPath, true); err != nil {
+		if forwardErr := runGitApplyCheck(ctx, cwd, patchPath, false); forwardErr == nil {
+			return false, nil
+		}
+		return false, err
+	}
+	cmd := exec.CommandContext(ctx, "git", "apply", "--reverse", "--3way", patchPath)
+	cmd.Dir = cwd
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return false, fmt.Errorf("git apply --reverse %s: %w: %s", patchPath, err, strings.TrimSpace(stderr.String()))
 	}
 	return true, nil
 }

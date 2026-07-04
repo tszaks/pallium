@@ -63,6 +63,8 @@ func runWorkflow(out io.Writer, args []string, jsonOutput bool) error {
 		return runWorkflowSave(out, args[1:], jsonOutput)
 	case "apply":
 		return runWorkflowApply(out, args[1:], jsonOutput)
+	case "revert":
+		return runWorkflowRevert(out, args[1:], jsonOutput)
 	default:
 		printWorkflowHelp(out)
 		return fmt.Errorf("unknown workflow subcommand: %s", args[0])
@@ -1075,6 +1077,36 @@ func runWorkflowApply(out io.Writer, args []string, jsonOutput bool) error {
 	})
 }
 
+func runWorkflowRevert(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("workflow revert")
+	dbPath := fs.String("db", "", "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}}, nil); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: pallium workflow revert <run-id>")
+	}
+	store, err := workflow.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	snapshot, err := store.Snapshot(fs.Arg(0))
+	_ = store.Close()
+	if err != nil {
+		return err
+	}
+	reverted, err := workflow.RevertPatches(context.Background(), snapshot)
+	if err != nil {
+		return err
+	}
+	return output.Write(out, map[string]any{"id": snapshot.Run.ID, "reverted": reverted}, jsonOutput, func() string {
+		if len(reverted) == 0 {
+			return "No workflow patches to revert."
+		}
+		return "Reverted workflow patches:\n- " + strings.Join(reverted, "\n- ")
+	})
+}
+
 func renderWorkflowResult(snapshot workflow.Snapshot, result string) string {
 	text := renderWorkflowSnapshot(snapshot)
 	if result != "" {
@@ -1469,7 +1501,8 @@ Usage:
   pallium workflow resume <run-id> [--background] [--json]
   pallium workflow stop <run-id> [--json]
   pallium workflow save <run-id> --name name [--user] [--json]
-  pallium workflow apply <run-id> [--json]`)
+  pallium workflow apply <run-id> [--json]
+  pallium workflow revert <run-id> [--json]`)
 }
 
 func latestWorkflowRun(store *workflow.Store) (workflow.Run, error) {
