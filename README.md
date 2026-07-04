@@ -139,6 +139,7 @@ pallium workflow pause <run-id>
 pallium workflow resume <run-id>
 pallium workflow save <run-id> --name review-branch
 pallium workflow apply <run-id>
+pallium workflow revert <run-id>
 ```
 
 Workers run through `codex exec`. Read-only agents use a read-only sandbox;
@@ -149,6 +150,8 @@ retry command for older or interrupted runs. `workflow save` is the only command
 in this group that intentionally writes a reusable workflow into the target
 repo. Set `PALLIUM_WORKFLOW_AGENT_STUB` in tests to return deterministic worker
 output without launching Codex.
+Use `workflow revert <run-id>` to reverse patches produced by a workflow; this
+also respects multi-repo agent targets.
 
 Workflow scripts run as async JavaScript, matching Claude's saved workflow
 shape: top-level `await` is supported, `pipeline()` fans one worker per item in
