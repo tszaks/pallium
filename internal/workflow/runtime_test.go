@@ -82,6 +82,41 @@ return { prompt: result.prompt };`
 	}
 }
 
+func TestRunnerSupportsCheckHelper(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"command":"go test ./...","summary":"passed","output_tail":"","failures":[]}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("verify");
+const result = await check("go test ./...", { label: "unit-tests" });
+return { ok: result.ok, command: result.command };`
+	scriptPath, err := WriteRunScript("wf-check", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-check", Task: "check", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"ok": true`) || !strings.Contains(result, "go test ./...") {
+		t.Fatalf("unexpected result: %s", result)
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Agents) != 1 || snapshot.Agents[0].Mode != "test" {
+		t.Fatalf("expected one test agent, got %+v", snapshot.Agents)
+	}
+}
+
 func TestRunnerStopsAtMaxAgents(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
 	tmp := t.TempDir()
@@ -140,6 +175,44 @@ return { count: results.length, prompts: results.map(result => result.prompt) };
 		t.Fatalf("parallel agents appear sequential, elapsed=%s result=%s", elapsed, result)
 	}
 	if !strings.Contains(result, `"count": 4`) || !strings.Contains(result, "inspect d") {
+		t.Fatalf("unexpected result: %s", result)
+	}
+}
+
+func TestParallelRunsChecksConcurrently(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"command":"stub","summary":"passed","output_tail":"","failures":[]}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_DELAY_MS", "250")
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("checks");
+const results = parallel([
+  () => check("npm test", { label: "npm" }),
+  () => check("go test ./...", { label: "go" }),
+  () => check("pytest", { label: "pytest" })
+]);
+return { count: results.length, ok: results.every(result => result.ok) };`
+	scriptPath, err := WriteRunScript("wf-parallel-checks", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-parallel-checks", Task: "parallel checks", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	if elapsed >= 800*time.Millisecond {
+		t.Fatalf("parallel checks appear sequential, elapsed=%s result=%s", elapsed, result)
+	}
+	if !strings.Contains(result, `"count": 3`) || !strings.Contains(result, `"ok": true`) {
 		t.Fatalf("unexpected result: %s", result)
 	}
 }
