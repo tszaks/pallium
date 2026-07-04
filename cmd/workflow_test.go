@@ -114,7 +114,7 @@ func TestWorkflowStopMarksForegroundRunStopped(t *testing.T) {
 	}
 }
 
-func TestWorkflowEditAgentCreatesPatchAndApplyAppliesIt(t *testing.T) {
+func TestWorkflowEditAgentAutoAppliesPatch(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"status":"edited"}`)
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_WRITE_FILE", "note.txt")
@@ -148,16 +148,16 @@ return result;`), 0o644); err != nil {
 	if err != nil {
 		t.Fatalf("workflow run failed: %v", err)
 	}
-	if got := readFile(t, filepath.Join(tmp, "note.txt")); got != "original\n" {
-		t.Fatalf("main worktree changed before apply: %q", got)
+	if got := readFile(t, filepath.Join(tmp, "note.txt")); got != "changed by workflow\n" {
+		t.Fatalf("expected workflow run to auto-apply patch, got %q", got)
 	}
 
 	out.Reset()
 	if err := runWorkflow(&out, []string{"apply", "wf-edit", "--db", dbPath}, false); err != nil {
-		t.Fatalf("workflow apply failed: %v", err)
+		t.Fatalf("workflow apply should be idempotent after auto-apply: %v", err)
 	}
-	if got := readFile(t, filepath.Join(tmp, "note.txt")); got != "changed by workflow\n" {
-		t.Fatalf("expected applied patch, got %q", got)
+	if !strings.Contains(out.String(), "No workflow patches to apply.") {
+		t.Fatalf("expected idempotent apply message, got %s", out.String())
 	}
 }
 

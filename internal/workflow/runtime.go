@@ -9,7 +9,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/dop251/goja"
 )
@@ -21,8 +24,10 @@ type Runner struct {
 	MaxBudgetUSD string
 	CodexBinary  string
 
+	mu           sync.Mutex
 	currentPhase string
 	agentCount   int
+	capture      *parallelCapture
 }
 
 type AgentOptions struct {
@@ -32,6 +37,17 @@ type AgentOptions struct {
 	Schema    map[string]any `json:"schema,omitempty"`
 	Model     string         `json:"model,omitempty"`
 }
+
+type parallelAgentCall struct {
+	Prompt string
+	Opts   AgentOptions
+}
+
+type parallelCapture struct {
+	Calls []parallelAgentCall
+}
+
+const parallelAgentMarkerKey = "__pallium_parallel_agent__"
 
 func (r *Runner) Execute(ctx context.Context, script string, args any) (string, error) {
 	if r.Store == nil {
@@ -62,7 +78,7 @@ func (r *Runner) Execute(ctx context.Context, script string, args any) (string, 
 	if err := vm.Set("agent", r.jsAgent(ctx, vm)); err != nil {
 		return "", err
 	}
-	if err := vm.Set("parallel", r.jsParallel(vm)); err != nil {
+	if err := vm.Set("parallel", r.jsParallel(ctx, vm)); err != nil {
 		return "", err
 	}
 	if err := vm.Set("pipeline", r.jsPipeline(vm)); err != nil {
@@ -80,6 +96,10 @@ func (r *Runner) Execute(ctx context.Context, script string, args any) (string, 
 		r.currentPhase = ""
 	}
 	if err != nil {
+		_ = r.Store.SetRunStatus(r.Run.ID, "failed", "", err.Error())
+		return "", err
+	}
+	if _, err := r.ApplyPatches(ctx); err != nil {
 		_ = r.Store.SetRunStatus(r.Run.ID, "failed", "", err.Error())
 		return "", err
 	}
@@ -139,24 +159,31 @@ func (r *Runner) jsAgent(ctx context.Context, vm *goja.Runtime) func(goja.Functi
 				panic(vm.ToValue(err.Error()))
 			}
 		}
+		if r.capture != nil {
+			index := len(r.capture.Calls)
+			r.capture.Calls = append(r.capture.Calls, parallelAgentCall{Prompt: prompt, Opts: opts})
+			return vm.ToValue(map[string]any{parallelAgentMarkerKey: index})
+		}
 		output, err := r.RunAgent(ctx, prompt, opts)
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
-		var structured any
-		if json.Unmarshal([]byte(output), &structured) == nil {
-			return vm.ToValue(structured)
-		}
-		return vm.ToValue(output)
+		return vm.ToValue(parseAgentOutput(output))
 	}
 }
 
-func (r *Runner) jsParallel(vm *goja.Runtime) func(goja.FunctionCall) goja.Value {
+func (r *Runner) jsParallel(ctx context.Context, vm *goja.Runtime) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		items := call.Argument(0).ToObject(vm)
 		lengthValue := items.Get("length")
 		length := int(lengthValue.ToInteger())
-		results := make([]any, 0, length)
+		rawResults := make([]any, 0, length)
+		capture := &parallelCapture{}
+		previousCapture := r.capture
+		r.capture = capture
+		defer func() {
+			r.capture = previousCapture
+		}()
 		for i := 0; i < length; i++ {
 			item := items.Get(fmt.Sprintf("%d", i))
 			if fn, ok := goja.AssertFunction(item); ok {
@@ -164,10 +191,20 @@ func (r *Runner) jsParallel(vm *goja.Runtime) func(goja.FunctionCall) goja.Value
 				if err != nil {
 					panic(err)
 				}
-				results = append(results, value.Export())
+				rawResults = append(rawResults, value.Export())
 			} else {
-				results = append(results, item.Export())
+				rawResults = append(rawResults, item.Export())
 			}
+		}
+		r.capture = previousCapture
+
+		agentResults, err := r.runParallelAgentCalls(ctx, capture.Calls)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		results := make([]any, 0, len(rawResults))
+		for _, result := range rawResults {
+			results = append(results, replaceParallelAgentMarkers(result, agentResults))
 		}
 		return vm.ToValue(results)
 	}
@@ -198,17 +235,21 @@ func (r *Runner) jsPipeline(vm *goja.Runtime) func(goja.FunctionCall) goja.Value
 }
 
 func (r *Runner) RunAgent(ctx context.Context, prompt string, opts AgentOptions) (string, error) {
+	r.mu.Lock()
 	if r.agentCount >= r.MaxAgents {
+		r.mu.Unlock()
 		return "", fmt.Errorf("workflow exceeded max agents: %d", r.MaxAgents)
 	}
 	r.agentCount++
+	phase := r.currentPhase
+	r.mu.Unlock()
 	mode := strings.TrimSpace(opts.Mode)
 	if mode == "" {
 		mode = "read-only"
 	}
 	agent := Agent{
 		RunID:     r.Run.ID,
-		Phase:     r.currentPhase,
+		Phase:     phase,
 		Label:     opts.Label,
 		Prompt:    prompt,
 		Mode:      mode,
@@ -219,8 +260,8 @@ func (r *Runner) RunAgent(ctx context.Context, prompt string, opts AgentOptions)
 		return "", err
 	}
 	agent = created
-	if r.currentPhase != "" {
-		_ = r.Store.IncrementPhaseAgentCount(r.Run.ID, r.currentPhase)
+	if phase != "" {
+		_ = r.Store.IncrementPhaseAgentCount(r.Run.ID, phase)
 	}
 
 	output, patchPath, worktree, err := r.runAgentCommand(ctx, agent, opts)
@@ -236,8 +277,102 @@ func (r *Runner) RunAgent(ctx context.Context, prompt string, opts AgentOptions)
 	return output, nil
 }
 
+func (r *Runner) runParallelAgentCalls(ctx context.Context, calls []parallelAgentCall) ([]any, error) {
+	if len(calls) == 0 {
+		return nil, nil
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	results := make([]any, len(calls))
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var firstErr error
+
+	for i, call := range calls {
+		i, call := i, call
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			output, err := r.RunAgent(ctx, call.Prompt, call.Opts)
+			if err != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+					cancel()
+				}
+				errMu.Unlock()
+				return
+			}
+			results[i] = parseAgentOutput(output)
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return results, nil
+}
+
+func parseAgentOutput(output string) any {
+	var structured any
+	if json.Unmarshal([]byte(output), &structured) == nil {
+		return structured
+	}
+	return output
+}
+
+func replaceParallelAgentMarkers(value any, agentResults []any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		if rawIndex, ok := typed[parallelAgentMarkerKey]; ok {
+			index, ok := numberToInt(rawIndex)
+			if ok && index >= 0 && index < len(agentResults) {
+				return agentResults[index]
+			}
+		}
+		out := make(map[string]any, len(typed))
+		for key, child := range typed {
+			out[key] = replaceParallelAgentMarkers(child, agentResults)
+		}
+		return out
+	case []any:
+		out := make([]any, 0, len(typed))
+		for _, child := range typed {
+			out = append(out, replaceParallelAgentMarkers(child, agentResults))
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func numberToInt(value any) (int, bool) {
+	switch typed := value.(type) {
+	case int:
+		return typed, true
+	case int64:
+		return int(typed), true
+	case float64:
+		return int(typed), typed == float64(int(typed))
+	default:
+		return 0, false
+	}
+}
+
 func (r *Runner) runAgentCommand(ctx context.Context, agent Agent, opts AgentOptions) (string, string, string, error) {
 	if stub := os.Getenv("PALLIUM_WORKFLOW_AGENT_STUB"); stub != "" {
+		if delay := os.Getenv("PALLIUM_WORKFLOW_AGENT_STUB_DELAY_MS"); delay != "" {
+			ms, err := strconv.Atoi(delay)
+			if err != nil {
+				return "", "", "", err
+			}
+			select {
+			case <-time.After(time.Duration(ms) * time.Millisecond):
+			case <-ctx.Done():
+				return "", "", "", ctx.Err()
+			}
+		}
 		cwd := r.Run.CWD
 		worktree := ""
 		if agent.Mode == "edit" || agent.Isolation == "worktree" {
@@ -482,4 +617,69 @@ func ParseArgsJSON(raw string) (any, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+func (r *Runner) ApplyPatches(ctx context.Context) ([]string, error) {
+	snapshot, err := r.Store.Snapshot(r.Run.ID)
+	if err != nil {
+		return nil, err
+	}
+	return ApplyPatches(ctx, snapshot)
+}
+
+func ApplyPatches(ctx context.Context, snapshot Snapshot) ([]string, error) {
+	applied := []string{}
+	for _, agent := range snapshot.Agents {
+		if agent.PatchPath == "" {
+			continue
+		}
+		didApply, err := applyPatch(ctx, snapshot.Run.CWD, agent.PatchPath)
+		if err != nil {
+			return applied, err
+		}
+		if didApply {
+			applied = append(applied, agent.PatchPath)
+		}
+	}
+	return applied, nil
+}
+
+func applyPatch(ctx context.Context, cwd, patchPath string) (bool, error) {
+	raw, err := os.ReadFile(patchPath)
+	if err != nil {
+		return false, err
+	}
+	if strings.TrimSpace(string(raw)) == "" {
+		return false, nil
+	}
+	if err := runGitApplyCheck(ctx, cwd, patchPath, false); err != nil {
+		if reverseErr := runGitApplyCheck(ctx, cwd, patchPath, true); reverseErr == nil {
+			return false, nil
+		}
+		return false, err
+	}
+	cmd := exec.CommandContext(ctx, "git", "apply", "--3way", patchPath)
+	cmd.Dir = cwd
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return false, fmt.Errorf("apply %s: %w: %s", patchPath, err, strings.TrimSpace(stderr.String()))
+	}
+	return true, nil
+}
+
+func runGitApplyCheck(ctx context.Context, cwd, patchPath string, reverse bool) error {
+	args := []string{"apply", "--check"}
+	if reverse {
+		args = append(args, "--reverse")
+	}
+	args = append(args, patchPath)
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = cwd
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("check apply %s: %w: %s", patchPath, err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
 }

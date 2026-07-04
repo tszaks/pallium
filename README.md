@@ -125,10 +125,12 @@ pallium workflow apply <run-id>
 
 Workers run through `codex exec`. Read-only agents use a read-only sandbox;
 edit agents run in isolated git worktrees under `~/.pallium/workflow-runs/` and
-produce patches that are applied explicitly with `workflow apply`. `workflow
-save` is the only command in this group that intentionally writes a reusable
-workflow into the target repo. Set `PALLIUM_WORKFLOW_AGENT_STUB` in tests to
-return deterministic worker output without launching Codex.
+produce patches that are applied back to the target checkout automatically when
+the workflow completes successfully. `workflow apply` remains as an idempotent
+retry command for older or interrupted runs. `workflow save` is the only command
+in this group that intentionally writes a reusable workflow into the target
+repo. Set `PALLIUM_WORKFLOW_AGENT_STUB` in tests to return deterministic worker
+output without launching Codex.
 
 Session-memory indexing is incremental by default: unchanged transcript files are skipped using their last indexed timestamp, with a hash check only when the file looks newer. After a global `sessions embed` pass completes and no embedding backlog remains for the model, Pallium records a model-specific embedding cursor. Later `sessions index` runs scan from that cursor minus `--safety-buffer` instead of walking historical session memory every time. This makes scheduled automation cadence-independent: hourly runs should touch about the last hour plus buffer, six-hour runs should touch about six hours plus buffer, and on-demand runs use the same cursor path. Files modified in the last two minutes are skipped so Pallium does not chase active agent logs. Use `--force` only when you intentionally want to rebuild existing session rows after parser or redaction changes.
 
@@ -214,7 +216,7 @@ go run . --help
 - `task`: stores the current goal and planned scope so drift shows up in review and handoff
 - `sessions related`: ranks prior sessions by current repo, git origin, touched files, query terms, and recency
 - `sessions search --hybrid`: mixes lexical search with repo and file-aware ranking
-- `workflow`: runs Codex dynamic workflows with tracked phases, clean-context workers, saved scripts, and explicit patch apply
+- `workflow`: runs Codex dynamic workflows with tracked phases, clean-context workers, saved scripts, real parallel agents, and automatic edit application
 
 It also handles brand-new files better now by inferring likely related files and tests even before they have indexed history, adds lightweight Go, JS/TS, and Python dependency signals including nested `tsconfig` aliases and Python `src/` layouts, prefers real repo verification commands when they exist across `package.json`, Python project files, and common `Makefile` targets, and surfaces boundary warnings for areas like auth, config, DB, API, payments, and jobs.
 
