@@ -211,6 +211,88 @@ return { count: results.length, prompts: results.map(result => result.prompt) };
 	}
 }
 
+func TestParallelSupportsItemCallback(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"prompt":"{{PROMPT}}"}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_DELAY_MS", "250")
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("parallel");
+const results = await parallel(["a", "b", "c", "d"], (item, index) =>
+  agent("inspect " + item + " #" + index, { label: item })
+);
+return { count: results.length, prompts: results.map(result => result.prompt) };`
+	scriptPath, err := WriteRunScript("wf-parallel-callback", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-parallel-callback", Task: "parallel callback", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	if elapsed >= 800*time.Millisecond {
+		t.Fatalf("parallel callback agents appear sequential, elapsed=%s result=%s", elapsed, result)
+	}
+	if !strings.Contains(result, `"count": 4`) || !strings.Contains(result, "inspect d #3") {
+		t.Fatalf("unexpected result: %s", result)
+	}
+}
+
+func TestPhaseCallbackKeepsAwaitedAgentsScoped(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"prompt":"{{PROMPT}}"}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `const inside = await phase("inside", async () => {
+  const result = await agent("inside awaited", { label: "inside-agent" });
+  return result;
+});
+phase("outside");
+const outside = await agent("outside awaited", { label: "outside-agent" });
+return { inside: inside.prompt, outside: outside.prompt };`
+	scriptPath, err := WriteRunScript("wf-phase-async", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-phase-async", Task: "phase async", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, "inside awaited") || !strings.Contains(result, "outside awaited") {
+		t.Fatalf("unexpected result: %s", result)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byLabel := map[string]string{}
+	for _, agent := range agents {
+		byLabel[agent.Label] = agent.Phase
+	}
+	if byLabel["inside-agent"] != "inside" {
+		t.Fatalf("expected inside-agent in inside phase, got phases %#v", byLabel)
+	}
+	if byLabel["outside-agent"] != "outside" {
+		t.Fatalf("expected outside-agent in outside phase, got phases %#v", byLabel)
+	}
+}
+
 func TestParallelRunsChecksConcurrently(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"command":"stub","summary":"passed","output_tail":"","failures":[]}`)
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_DELAY_MS", "250")
