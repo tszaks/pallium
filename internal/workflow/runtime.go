@@ -3,6 +3,8 @@ package workflow
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,6 +38,8 @@ type Runner struct {
 	currentPhase string
 	agentCount   int
 	capture      *parallelCapture
+	scriptHash   string
+	argsHash     string
 }
 
 type AgentOptions struct {
@@ -85,6 +89,8 @@ func (r *Runner) Execute(ctx context.Context, script string, args any) (string, 
 	if err := r.Store.SetRunStatus(r.Run.ID, "running", "", ""); err != nil {
 		return "", err
 	}
+	r.scriptHash = stableHash(script)
+	r.argsHash = stableHash(args)
 	if err := r.ensureNotStopped(ctx); err != nil {
 		return "", err
 	}
@@ -481,7 +487,8 @@ func (r *Runner) RunAgent(ctx context.Context, prompt string, opts AgentOptions)
 	if mode == "" {
 		mode = "read-only"
 	}
-	if cached, ok, err := r.Store.CompletedAgent(r.Run.ID, phase, opts.Label, prompt, mode, opts.Isolation); err != nil {
+	schemaHash := agentSchemaHash(opts.Schema)
+	if cached, ok, err := r.Store.CompletedAgent(r.Run.ID, phase, opts.Label, prompt, mode, opts.Isolation, opts.Model, schemaHash, r.scriptHash, r.argsHash); err != nil {
 		return "", err
 	} else if ok {
 		if phase != "" {
@@ -499,12 +506,16 @@ func (r *Runner) RunAgent(ctx context.Context, prompt string, opts AgentOptions)
 	r.mu.Unlock()
 
 	agent := Agent{
-		RunID:     r.Run.ID,
-		Phase:     phase,
-		Label:     opts.Label,
-		Prompt:    prompt,
-		Mode:      mode,
-		Isolation: opts.Isolation,
+		RunID:      r.Run.ID,
+		Phase:      phase,
+		Label:      opts.Label,
+		Prompt:     prompt,
+		Mode:       mode,
+		Isolation:  opts.Isolation,
+		Model:      opts.Model,
+		SchemaHash: schemaHash,
+		ScriptHash: r.scriptHash,
+		ArgsHash:   r.argsHash,
 	}
 	created, err := r.Store.CreateAgent(agent)
 	if err != nil {
@@ -707,6 +718,22 @@ func parseAgentOutput(output string) any {
 		return structured
 	}
 	return output
+}
+
+func agentSchemaHash(schema map[string]any) string {
+	if len(schema) == 0 {
+		return ""
+	}
+	return stableHash(normalizeSchema(schema))
+}
+
+func stableHash(value any) string {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		raw = []byte(fmt.Sprintf("%#v", value))
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
 }
 
 func buildCheckPrompt(command string) string {
