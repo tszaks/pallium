@@ -143,6 +143,11 @@ Use `await check("test command")` for objective verification loops. It spawns a
 dedicated test agent, runs the command as ground truth, and returns structured
 JSON with `ok`, `summary`, `output_tail`, and `failures`, so scripts can keep
 fixing until checks pass or progress stalls.
+Scripts also get a Pallium-native `pallium` object for repo-grounded workflow
+control: `await pallium.verify("fast")`, `await pallium.review("origin/main")`,
+`await pallium.handoff("origin/main")`, `await pallium.explain(path)`,
+`await pallium.safe(path)`, `await pallium.plan(path)`,
+`await pallium.changedNow()`, and `await pallium.task.start(goal, ...scopes)`.
 Saved workflows resolve by name from the nearest `.pallium/workflows/` or
 `.claude/workflows/` directory while walking up from the current working
 directory, then from `~/.pallium/workflows/` or `~/.claude/workflows/`.

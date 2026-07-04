@@ -117,6 +117,38 @@ return { ok: result.ok, command: result.command };`
 	}
 }
 
+func TestRunnerSupportsPalliumPrimitives(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PALLIUM_STUB", `{"ok":true,"args":"{{ARGS}}"}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("pallium");
+const verify = await pallium.verify("fast");
+const explain = await pallium.explain("README.md");
+const task = await pallium.task.start("tighten auth", "src/auth");
+return { verify: verify.args, explain: explain.args, task: task.args };`
+	scriptPath, err := WriteRunScript("wf-pallium", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-pallium", Task: "pallium", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"verify fast", "explain README.md", "task start tighten auth src/auth"} {
+		if !strings.Contains(result, want) {
+			t.Fatalf("expected %q in result: %s", want, result)
+		}
+	}
+}
+
 func TestRunnerStopsAtMaxAgents(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
 	tmp := t.TempDir()

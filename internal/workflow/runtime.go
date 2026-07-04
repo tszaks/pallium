@@ -24,6 +24,7 @@ type Runner struct {
 	MaxBudgetUSD        string
 	CodexBinary         string
 	MaxConcurrentAgents int
+	PalliumBinary       string
 
 	mu           sync.Mutex
 	currentPhase string
@@ -72,6 +73,9 @@ func (r *Runner) Execute(ctx context.Context, script string, args any) (string, 
 	if r.CodexBinary == "" {
 		r.CodexBinary = "codex"
 	}
+	if r.PalliumBinary == "" {
+		r.PalliumBinary = "pallium"
+	}
 	if err := r.Store.SetRunStatus(r.Run.ID, "running", "", ""); err != nil {
 		return "", err
 	}
@@ -89,6 +93,9 @@ func (r *Runner) Execute(ctx context.Context, script string, args any) (string, 
 		return "", err
 	}
 	if err := vm.Set("check", r.jsCheck(ctx, vm)); err != nil {
+		return "", err
+	}
+	if err := vm.Set("pallium", r.jsPallium(ctx, vm)); err != nil {
 		return "", err
 	}
 	if err := vm.Set("parallel", r.jsParallel(ctx, vm)); err != nil {
@@ -229,6 +236,64 @@ func (r *Runner) jsCheck(ctx context.Context, vm *goja.Runtime) func(goja.Functi
 	}
 }
 
+func (r *Runner) jsPallium(ctx context.Context, vm *goja.Runtime) map[string]any {
+	call := func(args ...string) goja.Value {
+		value, err := r.runPalliumCommand(ctx, args...)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		return vm.ToValue(value)
+	}
+	return map[string]any{
+		"verify": func(tier string) goja.Value {
+			return call("verify", strings.TrimSpace(tier))
+		},
+		"review": func(baseRef ...string) goja.Value {
+			args := []string{"review"}
+			if len(baseRef) > 0 && strings.TrimSpace(baseRef[0]) != "" {
+				args = append(args, strings.TrimSpace(baseRef[0]))
+			}
+			return call(args...)
+		},
+		"handoff": func(baseRef ...string) goja.Value {
+			args := []string{"handoff"}
+			if len(baseRef) > 0 && strings.TrimSpace(baseRef[0]) != "" {
+				args = append(args, strings.TrimSpace(baseRef[0]))
+			}
+			return call(args...)
+		},
+		"explain": func(path string) goja.Value {
+			return call("explain", strings.TrimSpace(path))
+		},
+		"safe": func(path string) goja.Value {
+			return call("safe", strings.TrimSpace(path))
+		},
+		"plan": func(path string) goja.Value {
+			return call("plan", strings.TrimSpace(path))
+		},
+		"changedNow": func() goja.Value {
+			return call("changed-now")
+		},
+		"task": map[string]any{
+			"start": func(goal string, scopePaths ...string) goja.Value {
+				args := []string{"task", "start", strings.TrimSpace(goal)}
+				for _, scope := range scopePaths {
+					if strings.TrimSpace(scope) != "" {
+						args = append(args, strings.TrimSpace(scope))
+					}
+				}
+				return call(args...)
+			},
+			"show": func() goja.Value {
+				return call("task", "show")
+			},
+			"clear": func() goja.Value {
+				return call("task", "clear")
+			},
+		},
+	}
+}
+
 func (r *Runner) jsParallel(ctx context.Context, vm *goja.Runtime) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		items := call.Argument(0).ToObject(vm)
@@ -309,6 +374,32 @@ func (r *Runner) jsPipeline(ctx context.Context, vm *goja.Runtime) func(goja.Fun
 		}
 		return vm.ToValue(results)
 	}
+}
+
+func (r *Runner) runPalliumCommand(ctx context.Context, args ...string) (any, error) {
+	if stub := os.Getenv("PALLIUM_WORKFLOW_PALLIUM_STUB"); stub != "" {
+		return parseAgentOutput(strings.ReplaceAll(stub, "{{ARGS}}", strings.Join(args, " "))), nil
+	}
+	cleanArgs := make([]string, 0, len(args)+1)
+	for _, arg := range args {
+		if strings.TrimSpace(arg) != "" {
+			cleanArgs = append(cleanArgs, arg)
+		}
+	}
+	cleanArgs = append(cleanArgs, "--json")
+	cmd := exec.CommandContext(ctx, r.PalliumBinary, cleanArgs...)
+	cmd.Dir = r.Run.CWD
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("pallium %s failed: %w: %s", strings.Join(cleanArgs, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	text := strings.TrimSpace(stdout.String())
+	if text == "" {
+		return map[string]any{}, nil
+	}
+	return parseAgentOutput(text), nil
 }
 
 func (r *Runner) RunAgent(ctx context.Context, prompt string, opts AgentOptions) (string, error) {
