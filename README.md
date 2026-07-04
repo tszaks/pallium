@@ -163,8 +163,9 @@ Use `workflow revert <run-id>` to reverse patches produced by a workflow; this
 also respects multi-repo agent targets.
 Use `scripts/workflow-acceptance.sh` as the installed-CLI acceptance gate. It
 exercises validation, parallel agents, edit/apply/revert, on-changed triggers,
-approval gates, provider commands, workflow library packs, analytics, reports,
-fleet status, and the local HTTP API with stubbed workers.
+approval gates, provider commands, coordinator replanning, workflow library
+packs, analytics, reports, fleet status, and the local HTTP API with stubbed
+workers.
 
 Workflow scripts run as async JavaScript, matching Claude's saved workflow
 shape: top-level `await` is supported, `pipeline()` fans one worker per item in
@@ -174,6 +175,10 @@ Scripts can call `await workflow("saved-name", args)` to compose one saved
 workflow from `.pallium/workflows/`, `.claude/workflows/`, or user workflow
 folders. Composition is capped at one nested level so generated scripts remain
 inspectable and do not recurse indefinitely.
+Scripts can call `await coordinator.replan(goal, options)` to spawn a read-only
+coordinator worker with the current run snapshot. Use this when a verifier or
+worker finds new information and the workflow should adapt by returning a
+decision, next steps, and optional new spawn prompts.
 Scripts can call `await gate("name", "message")` to pause until a human runs
 `pallium workflow gate approve <run-id> <name>` and then resumes the workflow.
 `workflow pause <run-id>` and `workflow stop <run-id>` are cooperative for

@@ -111,6 +111,18 @@ func WorkflowTools() []ToolInfo {
 			Notes:       []string{"Approve with pallium workflow gate approve <run-id> <name>, then resume the run."},
 		},
 		{
+			Name:        "coordinator.replan",
+			Signature:   `await coordinator.replan(goal, options)`,
+			Kind:        "control",
+			Description: "Spawns a coordinator worker with the current workflow snapshot so the script can adapt the remaining plan mid-run.",
+			Returns:     "{ decision, next_steps, spawn, stop_reason } by default.",
+			Example:     `const plan = await coordinator.replan("adjust after verifier findings", { label: "replan" })`,
+			Notes: []string{
+				"Coordinator workers run read-only and see the current run, phase, agent, provider, patch, and error state.",
+				"Use returned spawn prompts with parallel() when the workflow should branch dynamically.",
+			},
+		},
+		{
 			Name:        "pallium.verify",
 			Signature:   `await pallium.verify("fast")`,
 			Kind:        "pallium",

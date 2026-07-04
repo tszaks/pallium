@@ -165,6 +165,9 @@ func (r *Runner) executeScript(ctx context.Context, script string, args any, top
 	}); err != nil {
 		return "", err
 	}
+	if err := vm.Set("coordinator", r.jsCoordinator(ctx, vm)); err != nil {
+		return "", err
+	}
 	if err := vm.Set("gate", func(name string, message ...string) goja.Value {
 		text := ""
 		if len(message) > 0 {
@@ -485,6 +488,62 @@ func (r *Runner) runUntilGreen(ctx context.Context, command string, options map[
 		roundRecord["fix"] = parseAgentOutput(fixOutput)
 	}
 	return map[string]any{"ok": false, "command": command, "rounds": rounds, "stalled": stalled}, nil
+}
+
+func (r *Runner) jsCoordinator(ctx context.Context, vm *goja.Runtime) map[string]any {
+	return map[string]any{
+		"replan": func(goal string, rawOptions ...any) goja.Value {
+			options := AgentOptions{}
+			if len(rawOptions) > 0 && rawOptions[0] != nil {
+				raw, err := json.Marshal(rawOptions[0])
+				if err != nil {
+					panic(vm.ToValue(err.Error()))
+				}
+				if err := json.Unmarshal(raw, &options); err != nil {
+					panic(vm.ToValue(err.Error()))
+				}
+			}
+			result, err := r.runCoordinatorReplan(ctx, goal, options)
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			return vm.ToValue(parseAgentOutput(result))
+		},
+	}
+}
+
+func (r *Runner) runCoordinatorReplan(ctx context.Context, goal string, opts AgentOptions) (string, error) {
+	goal = strings.TrimSpace(goal)
+	if goal == "" {
+		return "", fmt.Errorf("coordinator.replan goal is required")
+	}
+	snapshot, err := r.Store.Snapshot(r.Run.ID)
+	if err != nil {
+		return "", err
+	}
+	rawSnapshot, err := json.Marshal(snapshot)
+	if err != nil {
+		return "", err
+	}
+	if opts.Label == "" {
+		opts.Label = "coordinator-replan"
+	}
+	opts.Mode = "read-only"
+	opts.Isolation = ""
+	if len(opts.Schema) == 0 {
+		opts.Schema = map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"decision":    map[string]any{"type": "string"},
+				"next_steps":  map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"spawn":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"stop_reason": map[string]any{"type": "string"},
+			},
+			"required": []any{"decision", "next_steps"},
+		}
+	}
+	prompt := "You are the coordinator for a Pallium dynamic workflow. Replan from current run state without repeating completed work.\nGoal: " + goal + "\nWorkflow snapshot JSON: " + string(rawSnapshot) + "\nReturn the next decision, next_steps, optional spawn prompts, and stop_reason if the workflow should stop."
+	return r.RunAgent(ctx, prompt, opts)
 }
 
 func (r *Runner) jsPallium(ctx context.Context, vm *goja.Runtime) map[string]any {

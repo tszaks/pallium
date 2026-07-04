@@ -55,6 +55,15 @@ JS
 PALLIUM_WORKFLOW_PROVIDER_FAKE_COMMAND="$ROOT/fake-provider.sh" \
   "$PALLIUM_BIN" workflow run --id wf-accept-provider --db "$db" --cwd "$repo" --script "$ROOT/provider.js" "provider acceptance" --json | grep -q '"provider": "fake"'
 
+cat > "$ROOT/coordinator.js" <<'JS'
+phase("inspect");
+await agent("initial coordinator context", { label: "initial" });
+const plan = await coordinator.replan("adapt the remaining work", { label: "coordinator" });
+return plan;
+JS
+PALLIUM_WORKFLOW_AGENT_STUB='{"decision":"continue","next_steps":["inspect deeper"]}' \
+  "$PALLIUM_BIN" workflow run --id wf-accept-coordinator --db "$db" --cwd "$repo" --script "$ROOT/coordinator.js" "coordinator acceptance" --json | grep -q '"label": "coordinator"'
+
 cat > "$ROOT/edit.js" <<'JS'
 phase("edit");
 return agent("edit note", { label: "editor", mode: "edit", isolation: "worktree" });
