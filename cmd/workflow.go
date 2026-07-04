@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -413,24 +412,9 @@ func runWorkflowApply(out io.Writer, args []string, jsonOutput bool) error {
 	if err != nil {
 		return err
 	}
-	applied := []string{}
-	for _, agent := range snapshot.Agents {
-		if agent.PatchPath == "" {
-			continue
-		}
-		raw, err := os.ReadFile(agent.PatchPath)
-		if err != nil {
-			return err
-		}
-		if strings.TrimSpace(string(raw)) == "" {
-			continue
-		}
-		cmd := exec.Command("git", "apply", agent.PatchPath)
-		cmd.Dir = snapshot.Run.CWD
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("apply %s: %w", agent.PatchPath, err)
-		}
-		applied = append(applied, agent.PatchPath)
+	applied, err := workflow.ApplyPatches(context.Background(), snapshot)
+	if err != nil {
+		return err
 	}
 	return output.Write(out, map[string]any{"id": snapshot.Run.ID, "applied": applied}, jsonOutput, func() string {
 		if len(applied) == 0 {

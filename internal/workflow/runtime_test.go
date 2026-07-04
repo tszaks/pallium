@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRunnerExecutesScriptAndRecordsAgents(t *testing.T) {
@@ -73,6 +74,45 @@ func TestRunnerStopsAtMaxAgents(t *testing.T) {
 	_, err = (&Runner{Store: store, Run: run, MaxAgents: 1}).Execute(context.Background(), script, nil)
 	if err == nil || !strings.Contains(err.Error(), "exceeded max agents") {
 		t.Fatalf("expected max agents error, got %v", err)
+	}
+}
+
+func TestParallelRunsAgentsConcurrently(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"prompt":"{{PROMPT}}"}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_DELAY_MS", "250")
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("parallel");
+const results = parallel([
+  () => agent("inspect a", { label: "a" }),
+  () => agent("inspect b", { label: "b" }),
+  () => agent("inspect c", { label: "c" }),
+  () => agent("inspect d", { label: "d" })
+]);
+return { count: results.length, prompts: results.map(result => result.prompt) };`
+	scriptPath, err := WriteRunScript("wf-parallel", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-parallel", Task: "parallel", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	if elapsed >= 800*time.Millisecond {
+		t.Fatalf("parallel agents appear sequential, elapsed=%s result=%s", elapsed, result)
+	}
+	if !strings.Contains(result, `"count": 4`) || !strings.Contains(result, "inspect d") {
+		t.Fatalf("unexpected result: %s", result)
 	}
 }
 
