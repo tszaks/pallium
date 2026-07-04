@@ -35,6 +35,26 @@ PALLIUM_WORKFLOW_AGENT_STUB='{"ok":true}' \
 PALLIUM_WORKFLOW_AGENT_STUB_DELAY_MS=200 \
   "$PALLIUM_BIN" workflow run --id wf-accept-parallel --db "$db" --cwd "$repo" --script "$ROOT/parallel.js" "parallel acceptance" --json >/dev/null
 
+"$PALLIUM_BIN" workflow library list --json | grep -q '"name": "security-audit"'
+"$PALLIUM_BIN" workflow library install security-audit --cwd "$repo" --json | grep -q '"installed": true'
+test -f "$repo/.pallium/workflows/security-audit.js"
+
+cat > "$ROOT/fake-provider.sh" <<'SH'
+#!/usr/bin/env sh
+if [ ! -s "$PALLIUM_WORKFLOW_PROMPT_FILE" ]; then
+  echo "missing prompt file" >&2
+  exit 1
+fi
+printf '{"ok":true,"provider":"%s","label":"%s"}' "$PALLIUM_WORKFLOW_PROVIDER" "$PALLIUM_WORKFLOW_LABEL" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+SH
+chmod +x "$ROOT/fake-provider.sh"
+cat > "$ROOT/provider.js" <<'JS'
+phase("provider");
+return agent("fake provider worker", { label: "fake-provider", provider: "fake" });
+JS
+PALLIUM_WORKFLOW_PROVIDER_FAKE_COMMAND="$ROOT/fake-provider.sh" \
+  "$PALLIUM_BIN" workflow run --id wf-accept-provider --db "$db" --cwd "$repo" --script "$ROOT/provider.js" "provider acceptance" --json | grep -q '"provider": "fake"'
+
 cat > "$ROOT/edit.js" <<'JS'
 phase("edit");
 return agent("edit note", { label: "editor", mode: "edit", isolation: "worktree" });
@@ -52,6 +72,7 @@ grep -q '^original$' "$repo/note.txt"
 PALLIUM_WORKFLOW_AGENT_STUB='{"summary":"trigger"}' \
   "$PALLIUM_BIN" workflow trigger run changed-review --id wf-accept-trigger-1 --db "$db" --json >/dev/null
 "$PALLIUM_BIN" workflow trigger run changed-review --db "$db" --json | grep -q '"skipped": true'
+"$PALLIUM_BIN" workflow trigger watch --once --db "$db" --json | grep -q '"skipped": 1'
 
 cat > "$ROOT/gate.js" <<'JS'
 phase("gate");
@@ -74,6 +95,7 @@ PALLIUM_WORKFLOW_AGENT_STUB='{"ok":true}' \
 
 "$PALLIUM_BIN" workflow report wf-accept-parallel --db "$db" --json | grep -q '"status": "completed"'
 "$PALLIUM_BIN" workflow fleet status --db "$db" --json | grep -q '"runs_total"'
+"$PALLIUM_BIN" workflow analytics --db "$db" --json | grep -q '"agents_by_provider"'
 
 port="${PALLIUM_WORKFLOW_ACCEPTANCE_PORT:-18766}"
 "$PALLIUM_BIN" workflow serve --db "$db" --addr "127.0.0.1:$port" >/tmp/pallium-workflow-acceptance-api.log 2>&1 &
@@ -85,5 +107,7 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 curl -fsS "http://127.0.0.1:$port/workflows/fleet" | grep -q '"runs_total"'
+curl -fsS "http://127.0.0.1:$port/workflows/analytics" | grep -q '"agents_by_provider"'
+curl -fsS "http://127.0.0.1:$port/workflows/library" | grep -q '"security-audit"'
 
 echo "workflow acceptance passed"

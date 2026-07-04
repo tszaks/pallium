@@ -120,11 +120,15 @@ pallium workflow validate fix.workflow.js
 pallium workflow tools list
 pallium workflow template list
 pallium workflow template show test-fix
+pallium workflow library list
+pallium workflow library install security-audit
 pallium workflow preflight "review workflow changes" --scope cmd/workflow.go --json
 pallium workflow trigger add daily-review "review workflow changes" --cwd .
 pallium workflow trigger add changed-review "review workflow changes" --kind on-changed --cwd .
 pallium workflow trigger run daily-review
+pallium workflow trigger watch --once
 pallium workflow fleet status
+pallium workflow analytics
 pallium workflow gate list <run-id>
 pallium workflow gate approve <run-id> approve-patches
 pallium workflow serve --addr 127.0.0.1:8765
@@ -159,8 +163,8 @@ Use `workflow revert <run-id>` to reverse patches produced by a workflow; this
 also respects multi-repo agent targets.
 Use `scripts/workflow-acceptance.sh` as the installed-CLI acceptance gate. It
 exercises validation, parallel agents, edit/apply/revert, on-changed triggers,
-approval gates, reports, fleet status, and the local HTTP API with stubbed
-workers.
+approval gates, provider commands, workflow library packs, analytics, reports,
+fleet status, and the local HTTP API with stubbed workers.
 
 Workflow scripts run as async JavaScript, matching Claude's saved workflow
 shape: top-level `await` is supported, `pipeline()` fans one worker per item in
@@ -183,16 +187,38 @@ Pallium's workflow database. `workflow trigger run <name>` starts the saved
 workflow with the normal runner, records the resulting run id on the trigger,
 and can be called by cron, launchd, or another agent without keeping the chat
 session alive. Use `--kind on-changed` to skip trigger runs until the repo HEAD
-or working tree status changes.
+or working tree status changes. `workflow trigger watch` polls enabled triggers
+and runs changed ones automatically; use `--once` for launchd/cron-style checks
+or leave it running as a local watcher.
 `workflow fleet status` gives agents and humans a compact control-plane view of
 recent workflow runs, active runs, triggers, and running/paused/failed workers.
-Agent options accept `provider: "codex"` today, and the provider is stored on
-agent records and reports so future mixed-provider routing has a stable shape.
+`workflow analytics` summarizes completion rate, agent status/provider/mode
+mix, patch production, trigger count, and average agents per run from the local
+workflow store so background workflow behavior can be judged from evidence.
+`workflow library list/show/install` exposes built-in reusable workflow packs
+such as `security-audit`, `migration-assistant`, and `test-gap-finder`; install
+puts a saved script in `.pallium/workflows/` so agents can invoke it later with
+`pallium workflow run /name "task"`.
+Agent options accept `provider: "codex"` for the native Codex worker and any
+other provider configured with
+`PALLIUM_WORKFLOW_PROVIDER_<NAME>_COMMAND`. Provider names are uppercased and
+non-alphanumeric characters become underscores, so `claude-code` uses
+`PALLIUM_WORKFLOW_PROVIDER_CLAUDE_CODE_COMMAND`. Configured provider commands
+run in the worker cwd through `sh -c` and receive
+`PALLIUM_WORKFLOW_PROMPT_FILE`, `PALLIUM_WORKFLOW_OUTPUT_FILE`,
+`PALLIUM_WORKFLOW_SCHEMA_FILE`, `PALLIUM_WORKFLOW_PROVIDER`,
+`PALLIUM_WORKFLOW_LABEL`, `PALLIUM_WORKFLOW_MODE`,
+`PALLIUM_WORKFLOW_MODEL`, `PALLIUM_WORKFLOW_REPO`, and
+`PALLIUM_WORKFLOW_CWD`. The command should write the final worker message to
+`PALLIUM_WORKFLOW_OUTPUT_FILE`; stdout is used as a fallback. Provider, model,
+repo, schema hash, and script hash are part of the completed-agent cache key.
 Agent options also accept `repo: "/path/to/other/repo"` for multi-repo
 workflows. Edit agents still use isolated worktrees, and their patches apply
 back to that agent repo rather than the parent workflow cwd.
 `workflow serve` exposes the local workflow control plane over HTTP for other
-tools: `GET /healthz`, `GET /workflows/fleet`, `GET /workflows/runs/{id}`, and
+tools: `GET /healthz`, `GET /workflows/fleet`, `GET /workflows/analytics`,
+`GET /workflows/library`, `GET /workflows/library/{name}`,
+`POST /workflows/library/install`, `GET /workflows/runs/{id}`, and
 `POST /workflows/run`.
 Use `await check("test command")` for objective verification loops. It spawns a
 dedicated test agent, runs the command as ground truth, and returns structured
