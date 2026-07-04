@@ -21,15 +21,16 @@ type Report struct {
 }
 
 type AgentReport struct {
-	Label    string   `json:"label"`
-	Phase    string   `json:"phase,omitempty"`
-	Provider string   `json:"provider,omitempty"`
-	Repo     string   `json:"repo,omitempty"`
-	Mode     string   `json:"mode"`
-	Status   string   `json:"status"`
-	Summary  string   `json:"summary,omitempty"`
-	Risks    []string `json:"risks,omitempty"`
-	Error    string   `json:"error,omitempty"`
+	Label            string   `json:"label"`
+	Phase            string   `json:"phase,omitempty"`
+	Provider         string   `json:"provider,omitempty"`
+	Repo             string   `json:"repo,omitempty"`
+	Mode             string   `json:"mode"`
+	Status           string   `json:"status"`
+	EstimatedCostUSD float64  `json:"estimated_cost_usd,omitempty"`
+	Summary          string   `json:"summary,omitempty"`
+	Risks            []string `json:"risks,omitempty"`
+	Error            string   `json:"error,omitempty"`
 }
 
 func BuildReport(snapshot Snapshot) Report {
@@ -47,13 +48,14 @@ func BuildReport(snapshot Snapshot) Report {
 		}
 		parsed := parseJSONish(agent.Output)
 		agentReport := AgentReport{
-			Label:    firstNonEmpty(agent.Label, agent.ID),
-			Phase:    agent.Phase,
-			Provider: agent.Provider,
-			Repo:     agent.Repo,
-			Mode:     agent.Mode,
-			Status:   agent.Status,
-			Error:    agent.Error,
+			Label:            firstNonEmpty(agent.Label, agent.ID),
+			Phase:            agent.Phase,
+			Provider:         agent.Provider,
+			Repo:             agent.Repo,
+			Mode:             agent.Mode,
+			Status:           agent.Status,
+			EstimatedCostUSD: agent.EstimatedCostUSD,
+			Error:            agent.Error,
 		}
 		for _, value := range collectStrings(parsed, "summary", "decision", "verdict") {
 			if agentReport.Summary == "" {

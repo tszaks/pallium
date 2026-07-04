@@ -321,6 +321,9 @@ func TestRunnerEnforcesBudget(t *testing.T) {
 	if len(agents) != 1 {
 		t.Fatalf("expected one agent before budget stop, got %+v", agents)
 	}
+	if agents[0].EstimatedCostUSD != 0.01 {
+		t.Fatalf("expected persisted estimated cost, got %+v", agents[0])
+	}
 }
 
 func TestRunnerComposesSavedWorkflow(t *testing.T) {

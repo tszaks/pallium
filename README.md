@@ -204,8 +204,11 @@ or leave it running as a local watcher.
 `workflow fleet status` gives agents and humans a compact control-plane view of
 recent workflow runs, active runs, triggers, and running/paused/failed workers.
 `workflow analytics` summarizes completion rate, agent status/provider/mode
-mix, patch production, trigger count, and average agents per run from the local
-workflow store so background workflow behavior can be judged from evidence.
+mix, patch production, trigger count, average agents per run, and estimated
+agent cost from the local workflow store so background workflow behavior can be
+judged from evidence. Use `PALLIUM_WORKFLOW_AGENT_COST_USD` to tune the local
+per-agent estimate and `--max-budget-usd` to stop a run before it exceeds that
+budget.
 `workflow library list/show/install` exposes built-in reusable workflow packs
 such as `security-audit`, `migration-assistant`, and `test-gap-finder`; install
 puts a saved script in `.pallium/workflows/` so agents can invoke it later with

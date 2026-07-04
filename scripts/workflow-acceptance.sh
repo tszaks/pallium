@@ -123,7 +123,7 @@ PALLIUM_WORKFLOW_AGENT_STUB='{"ok":true}' \
 
 "$PALLIUM_BIN" workflow report wf-accept-parallel --db "$db" --json | grep -q '"status": "completed"'
 "$PALLIUM_BIN" workflow fleet status --db "$db" --json | grep -q '"runs_total"'
-"$PALLIUM_BIN" workflow analytics --db "$db" --json | grep -q '"agents_by_provider"'
+"$PALLIUM_BIN" workflow analytics --db "$db" --json | grep -q '"estimated_cost_usd"'
 
 port="${PALLIUM_WORKFLOW_ACCEPTANCE_PORT:-18766}"
 "$PALLIUM_BIN" workflow serve --db "$db" --addr "127.0.0.1:$port" >/tmp/pallium-workflow-acceptance-api.log 2>&1 &
@@ -135,7 +135,7 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 curl -fsS "http://127.0.0.1:$port/workflows/fleet" | grep -q '"runs_total"'
-curl -fsS "http://127.0.0.1:$port/workflows/analytics" | grep -q '"agents_by_provider"'
+curl -fsS "http://127.0.0.1:$port/workflows/analytics" | grep -q '"estimated_cost_usd"'
 curl -fsS "http://127.0.0.1:$port/workflows/library" | grep -q '"security-audit"'
 
 printf '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n' |

@@ -697,6 +697,7 @@ type workflowAnalytics struct {
 	AgentsByProvider    map[string]int `json:"agents_by_provider"`
 	AgentsByMode        map[string]int `json:"agents_by_mode"`
 	PatchesProduced     int            `json:"patches_produced"`
+	EstimatedCostUSD    float64        `json:"estimated_cost_usd"`
 	AverageAgentsPerRun float64        `json:"average_agents_per_run"`
 	TriggersTotal       int            `json:"triggers_total"`
 	EnabledTriggers     int            `json:"enabled_triggers"`
@@ -772,6 +773,7 @@ func buildWorkflowAnalytics(store *workflow.Store, limit int) (workflowAnalytics
 			if strings.TrimSpace(agent.PatchPath) != "" {
 				analytics.PatchesProduced++
 			}
+			analytics.EstimatedCostUSD += agent.EstimatedCostUSD
 		}
 	}
 	if analytics.RunsTotal > 0 {
@@ -1909,7 +1911,7 @@ func renderWorkflowAnalytics(analytics workflowAnalytics) string {
 	lines := []string{
 		"Workflow analytics",
 		fmt.Sprintf("Runs: %d completion=%.1f%%", analytics.RunsTotal, analytics.CompletionRate*100),
-		fmt.Sprintf("Agents: %d avg/run=%.2f patches=%d", analytics.AgentsTotal, analytics.AverageAgentsPerRun, analytics.PatchesProduced),
+		fmt.Sprintf("Agents: %d avg/run=%.2f patches=%d estimated_cost=$%.4f", analytics.AgentsTotal, analytics.AverageAgentsPerRun, analytics.PatchesProduced, analytics.EstimatedCostUSD),
 		fmt.Sprintf("Triggers: %d enabled / %d total", analytics.EnabledTriggers, analytics.TriggersTotal),
 	}
 	if len(analytics.RunsByStatus) > 0 {
