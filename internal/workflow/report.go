@@ -10,6 +10,7 @@ type Report struct {
 	ID        string        `json:"id"`
 	Task      string        `json:"task"`
 	Status    string        `json:"status"`
+	OwnedID   string        `json:"owned_session_id,omitempty"`
 	Summary   string        `json:"summary"`
 	Findings  []string      `json:"findings,omitempty"`
 	Risks     []string      `json:"risks,omitempty"`
@@ -36,6 +37,7 @@ func BuildReport(snapshot Snapshot) Report {
 		ID:      snapshot.Run.ID,
 		Task:    snapshot.Run.Task,
 		Status:  snapshot.Run.Status,
+		OwnedID: snapshot.Run.OwnedID,
 		Error:   snapshot.Run.Error,
 		Summary: defaultReportSummary(snapshot),
 	}
