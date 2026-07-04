@@ -115,6 +115,7 @@ repository.
 ```bash
 pallium workflow run "review this branch for correctness issues"
 pallium workflow generate "fix tests until green" --style test-fix --test-command "go test ./..." --output fix.workflow.js
+pallium workflow validate fix.workflow.js
 pallium workflow tools list
 pallium workflow template list
 pallium workflow template show test-fix
@@ -171,6 +172,8 @@ and `workflow inspect` for phase, agent, patch, and failure detail.
 Use `workflow tools list --json` and `workflow template list --json` when an
 agent needs to discover the available primitives and workflow styles before
 generating or running a script automatically.
+Use `workflow validate <path.js>` before running agent-written scripts; it
+performs a compile-only goja check and does not execute agents or touch files.
 
 Session-memory indexing is incremental by default: unchanged transcript files are skipped using their last indexed timestamp, with a hash check only when the file looks newer. After a global `sessions embed` pass completes and no embedding backlog remains for the model, Pallium records a model-specific embedding cursor. Later `sessions index` runs scan from that cursor minus `--safety-buffer` instead of walking historical session memory every time. This makes scheduled automation cadence-independent: hourly runs should touch about the last hour plus buffer, six-hour runs should touch about six hours plus buffer, and on-demand runs use the same cursor path. Files modified in the last two minutes are skipped so Pallium does not chase active agent logs. Use `--force` only when you intentionally want to rebuild existing session rows after parser or redaction changes.
 

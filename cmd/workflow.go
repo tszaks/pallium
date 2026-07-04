@@ -22,6 +22,8 @@ func runWorkflow(out io.Writer, args []string, jsonOutput bool) error {
 	switch args[0] {
 	case "generate":
 		return runWorkflowGenerate(out, args[1:], jsonOutput)
+	case "validate":
+		return runWorkflowValidate(out, args[1:], jsonOutput)
 	case "tools":
 		return runWorkflowTools(out, args[1:], jsonOutput)
 	case "template", "templates":
@@ -345,6 +347,9 @@ func runWorkflowGenerate(out io.Writer, args []string, jsonOutput bool) error {
 	if err != nil {
 		return err
 	}
+	if validation := workflow.ValidateScript(script); !validation.Valid {
+		return fmt.Errorf("generated workflow is invalid: %s", validation.Error)
+	}
 	dest := strings.TrimSpace(*outputPath)
 	if strings.TrimSpace(*saveName) != "" {
 		if err := workflow.ValidateID(*saveName); err != nil {
@@ -379,6 +384,34 @@ func runWorkflowGenerate(out io.Writer, args []string, jsonOutput bool) error {
 			return "Workflow generated: " + dest
 		}
 		return script
+	})
+}
+
+func runWorkflowValidate(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("workflow validate")
+	scriptPath := fs.String("script", "", "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"script": {}}, nil); err != nil {
+		return err
+	}
+	if *scriptPath == "" && fs.NArg() == 1 {
+		*scriptPath = fs.Arg(0)
+	}
+	if strings.TrimSpace(*scriptPath) == "" {
+		return fmt.Errorf("usage: pallium workflow validate <path.js>")
+	}
+	raw, err := os.ReadFile(*scriptPath)
+	if err != nil {
+		return err
+	}
+	result := workflow.ValidateScript(string(raw))
+	if !result.Valid && !jsonOutput {
+		return fmt.Errorf("workflow script is invalid: %s", result.Error)
+	}
+	return output.Write(out, result, jsonOutput, func() string {
+		if result.Valid {
+			return "Workflow script valid: " + *scriptPath
+		}
+		return "Workflow script invalid: " + result.Error
 	})
 }
 
@@ -947,6 +980,7 @@ func printWorkflowHelp(out io.Writer) {
 
 Usage:
   pallium workflow generate "task" [--style review|test-fix|research] [--output path.js] [--save name] [--json]
+  pallium workflow validate <path.js> [--json]
   pallium workflow tools list [--kind control|agent|verification|pallium] [--json]
   pallium workflow template list [--json]
   pallium workflow template show <name> [--json]
