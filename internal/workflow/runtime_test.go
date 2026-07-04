@@ -585,6 +585,46 @@ return { ok: true };`
 	}
 }
 
+func TestRunnerPatchIncludesNewFiles(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"new file"}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_WRITE_FILE", "created.txt")
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_WRITE_CONTENT", "created by workflow\n")
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("edit"); return agent("create file", { label: "creator", mode: "edit", isolation: "worktree" });`
+	scriptPath, err := WriteRunScript("wf-new-file", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-new-file", Task: "new file", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(tmp, "created.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != "created by workflow\n" {
+		t.Fatalf("unexpected new file content: %q", string(raw))
+	}
+}
+
 func TestParallelRunsAgentsConcurrently(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"prompt":"{{PROMPT}}"}`)
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_DELAY_MS", "250")
@@ -1131,6 +1171,85 @@ func TestNormalizeSchemaAddsAdditionalPropertiesFalse(t *testing.T) {
 	items := props["items"].(map[string]any)["items"].(map[string]any)
 	if items["additionalProperties"] != false {
 		t.Fatalf("nested object missing additionalProperties=false: %#v", items)
+	}
+}
+
+func TestScanPatchPolicyFindsAddedSecrets(t *testing.T) {
+	patch := []byte(`diff --git a/config.env b/config.env
+index 1111111..2222222 100644
+--- a/config.env
++++ b/config.env
+@@ -1 +1,2 @@
+ SAFE=value
++OPENAI_API_KEY=sk-1234567890abcdefghijklmnop
+`)
+	findings := ScanPatchPolicy(patch)
+	if len(findings) == 0 || findings[0].Kind != "openai-key" {
+		t.Fatalf("expected openai-key finding, got %+v", findings)
+	}
+}
+
+func TestApplyPatchBlocksSecretAdditions(t *testing.T) {
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "config.env"), []byte("SAFE=value\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "config.env")
+	runGit(t, tmp, "commit", "-m", "initial")
+	patchPath := filepath.Join(tmp, "secret.patch")
+	patch := `diff --git a/config.env b/config.env
+index 00ba9f1..9a46df0 100644
+--- a/config.env
++++ b/config.env
+@@ -1 +1,2 @@
+ SAFE=value
++OPENAI_API_KEY=sk-1234567890abcdefghijklmnop
+`
+	if err := os.WriteFile(patchPath, []byte(patch), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := applyPatch(context.Background(), tmp, patchPath)
+	if err == nil || !strings.Contains(err.Error(), "workflow patch policy blocked") {
+		t.Fatalf("expected policy block, applied=%t err=%v", applied, err)
+	}
+	raw, err := os.ReadFile(filepath.Join(tmp, "config.env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "OPENAI_API_KEY") {
+		t.Fatalf("secret patch should not have been applied: %s", string(raw))
+	}
+}
+
+func TestApplyPatchSecretBypassIsExplicit(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_ALLOW_SECRET_PATCH", "1")
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "config.env"), []byte("SAFE=value\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "config.env")
+	runGit(t, tmp, "commit", "-m", "initial")
+	patchPath := filepath.Join(tmp, "secret.patch")
+	patch := `diff --git a/config.env b/config.env
+index 00ba9f1..9a46df0 100644
+--- a/config.env
++++ b/config.env
+@@ -1 +1,2 @@
+ SAFE=value
++OPENAI_API_KEY=sk-1234567890abcdefghijklmnop
+`
+	if err := os.WriteFile(patchPath, []byte(patch), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := applyPatch(context.Background(), tmp, patchPath)
+	if err != nil || !applied {
+		t.Fatalf("expected explicit bypass to apply, applied=%t err=%v", applied, err)
 	}
 }
 

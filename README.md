@@ -160,6 +160,11 @@ retry command for older or interrupted runs. `workflow save` is the only command
 in this group that intentionally writes a reusable workflow into the target
 repo. Set `PALLIUM_WORKFLOW_AGENT_STUB` in tests to return deterministic worker
 output without launching Codex.
+Before any workflow patch is applied, Pallium scans added lines for common
+secret patterns such as API keys, tokens, passwords, OpenAI-style keys, and AWS
+access keys. A matching patch is blocked before it reaches the target checkout;
+`PALLIUM_WORKFLOW_ALLOW_SECRET_PATCH=1` is the explicit local bypass for rare
+false positives.
 Use `workflow revert <run-id>` to reverse patches produced by a workflow; this
 also respects multi-repo agent targets.
 Use `scripts/workflow-acceptance.sh` as the installed-CLI acceptance gate. It
