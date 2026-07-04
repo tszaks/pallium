@@ -144,6 +144,7 @@ pallium workflow resume <run-id>
 pallium workflow save <run-id> --name review-branch
 pallium workflow apply <run-id>
 pallium workflow revert <run-id>
+scripts/workflow-acceptance.sh
 ```
 
 Workers run through `codex exec`. Read-only agents use a read-only sandbox;
@@ -156,6 +157,10 @@ repo. Set `PALLIUM_WORKFLOW_AGENT_STUB` in tests to return deterministic worker
 output without launching Codex.
 Use `workflow revert <run-id>` to reverse patches produced by a workflow; this
 also respects multi-repo agent targets.
+Use `scripts/workflow-acceptance.sh` as the installed-CLI acceptance gate. It
+exercises validation, parallel agents, edit/apply/revert, on-changed triggers,
+approval gates, reports, fleet status, and the local HTTP API with stubbed
+workers.
 
 Workflow scripts run as async JavaScript, matching Claude's saved workflow
 shape: top-level `await` is supported, `pipeline()` fans one worker per item in
