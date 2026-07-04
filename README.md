@@ -106,10 +106,11 @@ existing Codex or Claude Code sessions.
 
 `pallium workflow` is a local Codex workflow runner inspired by Claude Code
 dynamic workflows. A workflow is a JavaScript file with a `meta` block plus
-helpers such as `phase()`, `await agent()`, `parallel()`, and `await pipeline()`. The
-runtime stores the run, phases, worker outputs, generated script, and patches in
-Pallium's local control-plane database and `~/.pallium/workflow-runs/`, so
-normal workflow runs do not dirty the target repository.
+helpers such as `phase()`, `await agent()`, `await check()`, `parallel()`, and
+`await pipeline()`. The runtime stores the run, phases, worker outputs,
+generated script, and patches in Pallium's local control-plane database and
+`~/.pallium/workflow-runs/`, so normal workflow runs do not dirty the target
+repository.
 
 ```bash
 pallium workflow run "review this branch for correctness issues"
@@ -136,6 +137,10 @@ Workflow scripts run as async JavaScript, matching Claude's saved workflow
 shape: top-level `await` is supported, `pipeline()` fans one worker per item in
 parallel for each stage, and completed agents are reused when the same run id is
 relaunched. Runs default to 16 concurrent agents and 1,000 total agents.
+Use `await check("test command")` for objective verification loops. It spawns a
+dedicated test agent, runs the command as ground truth, and returns structured
+JSON with `ok`, `summary`, `output_tail`, and `failures`, so scripts can keep
+fixing until checks pass or progress stalls.
 
 Session-memory indexing is incremental by default: unchanged transcript files are skipped using their last indexed timestamp, with a hash check only when the file looks newer. After a global `sessions embed` pass completes and no embedding backlog remains for the model, Pallium records a model-specific embedding cursor. Later `sessions index` runs scan from that cursor minus `--safety-buffer` instead of walking historical session memory every time. This makes scheduled automation cadence-independent: hourly runs should touch about the last hour plus buffer, six-hour runs should touch about six hours plus buffer, and on-demand runs use the same cursor path. Files modified in the last two minutes are skipped so Pallium does not chase active agent logs. Use `--force` only when you intentionally want to rebuild existing session rows after parser or redaction changes.
 
