@@ -100,13 +100,13 @@ func (r *Runner) Execute(ctx context.Context, script string, args any) (string, 
 	if r.PalliumBinary == "" {
 		r.PalliumBinary = "pallium"
 	}
+	r.agentCostUSD = workflowAgentCostUSD()
 	if strings.TrimSpace(r.MaxBudgetUSD) != "" {
 		limit, err := strconv.ParseFloat(strings.TrimSpace(r.MaxBudgetUSD), 64)
 		if err != nil || limit < 0 {
 			return "", fmt.Errorf("invalid max budget usd %q", r.MaxBudgetUSD)
 		}
 		r.budgetLimit = limit
-		r.agentCostUSD = workflowAgentCostUSD()
 	}
 	if err := r.Store.SetRunStatus(r.Run.ID, "running", "", ""); err != nil {
 		return "", err
@@ -810,18 +810,19 @@ func (r *Runner) RunAgent(ctx context.Context, prompt string, opts AgentOptions)
 	r.mu.Unlock()
 
 	agent := Agent{
-		RunID:      r.Run.ID,
-		Phase:      phase,
-		Label:      opts.Label,
-		Prompt:     prompt,
-		Provider:   provider,
-		Repo:       absRepo,
-		Mode:       mode,
-		Isolation:  opts.Isolation,
-		Model:      opts.Model,
-		SchemaHash: schemaHash,
-		ScriptHash: r.scriptHash,
-		ArgsHash:   r.argsHash,
+		RunID:            r.Run.ID,
+		Phase:            phase,
+		Label:            opts.Label,
+		Prompt:           prompt,
+		Provider:         provider,
+		Repo:             absRepo,
+		Mode:             mode,
+		Isolation:        opts.Isolation,
+		Model:            opts.Model,
+		SchemaHash:       schemaHash,
+		ScriptHash:       r.scriptHash,
+		ArgsHash:         r.argsHash,
+		EstimatedCostUSD: r.agentCostUSD,
 	}
 	created, err := r.Store.CreateAgent(agent)
 	if err != nil {
