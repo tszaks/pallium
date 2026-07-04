@@ -77,6 +77,25 @@ grep -q 'changed by workflow' "$repo/note.txt"
 "$PALLIUM_BIN" workflow revert wf-accept-edit --db "$db" --json >/dev/null
 grep -q '^original$' "$repo/note.txt"
 
+cat > "$ROOT/secret.js" <<'JS'
+phase("secret");
+return agent("write secret", { label: "secret", mode: "edit", isolation: "worktree" });
+JS
+set +e
+PALLIUM_WORKFLOW_AGENT_STUB='{"summary":"secret"}' \
+PALLIUM_WORKFLOW_AGENT_STUB_WRITE_FILE=secret.env \
+PALLIUM_WORKFLOW_AGENT_STUB_WRITE_CONTENT='OPENAI_API_KEY=sk-1234567890abcdefghijklmnop
+' \
+  "$PALLIUM_BIN" workflow run --id wf-accept-secret-policy --db "$db" --cwd "$repo" --script "$ROOT/secret.js" "secret policy acceptance" >/tmp/pallium-accept-secret.out 2>&1
+secret_status=$?
+set -e
+if [[ "$secret_status" -eq 0 ]]; then
+  echo "expected secret patch policy to block" >&2
+  exit 1
+fi
+grep -q 'workflow patch policy blocked' /tmp/pallium-accept-secret.out
+test ! -f "$repo/secret.env"
+
 "$PALLIUM_BIN" workflow trigger add changed-review "review changes" --kind on-changed --db "$db" --cwd "$repo" --json >/dev/null
 PALLIUM_WORKFLOW_AGENT_STUB='{"summary":"trigger"}' \
   "$PALLIUM_BIN" workflow trigger run changed-review --id wf-accept-trigger-1 --db "$db" --json >/dev/null
