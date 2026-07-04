@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/tszaks/pallium/internal/workflow"
@@ -19,6 +20,13 @@ type workflowRunRequest struct {
 	WorkflowName string         `json:"workflow_name,omitempty"`
 	Args         map[string]any `json:"args,omitempty"`
 	ArgsJSON     string         `json:"args_json,omitempty"`
+}
+
+type workflowLibraryInstallRequest struct {
+	Pack  string `json:"pack"`
+	CWD   string `json:"cwd,omitempty"`
+	Name  string `json:"name,omitempty"`
+	Force bool   `json:"force,omitempty"`
 }
 
 func runWorkflowServe(out io.Writer, args []string, jsonOutput bool) error {
@@ -54,6 +62,60 @@ func newWorkflowHTTPHandler(dbPath string) http.Handler {
 			return
 		}
 		writeJSON(w, status)
+	})
+	mux.HandleFunc("GET /workflows/analytics", func(w http.ResponseWriter, r *http.Request) {
+		limit := 500
+		if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed <= 0 {
+				http.Error(w, "invalid limit", http.StatusBadRequest)
+				return
+			}
+			limit = parsed
+		}
+		store, err := workflow.Open(dbPath)
+		if err != nil {
+			writeHTTPError(w, err)
+			return
+		}
+		defer store.Close()
+		analytics, err := buildWorkflowAnalytics(store, limit)
+		if err != nil {
+			writeHTTPError(w, err)
+			return
+		}
+		writeJSON(w, analytics)
+	})
+	mux.HandleFunc("GET /workflows/library", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, workflow.WorkflowPacks())
+	})
+	mux.HandleFunc("GET /workflows/library/{name}", func(w http.ResponseWriter, r *http.Request) {
+		pack, ok := workflow.WorkflowPack(r.PathValue("name"))
+		if !ok {
+			http.Error(w, "unknown workflow library pack", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, pack)
+	})
+	mux.HandleFunc("POST /workflows/library/install", func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var req workflowLibraryInstallRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		runArgs, err := workflowLibraryInstallRequestArgs(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		var out bytes.Buffer
+		if err := runWorkflowLibraryInstall(&out, runArgs, true); err != nil {
+			writeHTTPError(w, err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(out.Bytes())
 	})
 	mux.HandleFunc("GET /workflows/runs/{id}", func(w http.ResponseWriter, r *http.Request) {
 		store, err := workflow.Open(dbPath)
@@ -124,6 +186,23 @@ func workflowRunRequestArgs(dbPath string, req workflowRunRequest) ([]string, er
 		args = append(args, "--args", argsJSON)
 	}
 	args = append(args, req.Task)
+	return args, nil
+}
+
+func workflowLibraryInstallRequestArgs(req workflowLibraryInstallRequest) ([]string, error) {
+	if strings.TrimSpace(req.Pack) == "" {
+		return nil, fmt.Errorf("pack is required")
+	}
+	args := []string{req.Pack}
+	if req.CWD != "" {
+		args = append(args, "--cwd", req.CWD)
+	}
+	if req.Name != "" {
+		args = append(args, "--name", req.Name)
+	}
+	if req.Force {
+		args = append(args, "--force")
+	}
 	return args, nil
 }
 

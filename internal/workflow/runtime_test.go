@@ -183,14 +183,25 @@ return { ok: true };`
 	}
 }
 
-func TestRunnerRejectsUnsupportedProvider(t *testing.T) {
+func TestRunnerUsesConfiguredProviderCommand(t *testing.T) {
 	tmp := t.TempDir()
+	providerScript := filepath.Join(tmp, "fake-provider.sh")
+	if err := os.WriteFile(providerScript, []byte(`#!/bin/sh
+if [ ! -s "$PALLIUM_WORKFLOW_PROMPT_FILE" ]; then
+  echo "missing prompt file" >&2
+  exit 1
+fi
+printf '{"ok":true,"provider":"%s","label":"%s","mode":"%s"}' "$PALLIUM_WORKFLOW_PROVIDER" "$PALLIUM_WORKFLOW_LABEL" "$PALLIUM_WORKFLOW_MODE" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_FAKE_COMMAND", providerScript)
 	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	script := `await agent("claude provider", { label: "claude-worker", provider: "claude" });`
+	script := `const result = await agent("fake provider", { label: "fake-worker", provider: "fake", mode: "read-only" }); return result;`
 	scriptPath, err := WriteRunScript("wf-provider-fail", tmp, script)
 	if err != nil {
 		t.Fatal(err)
@@ -199,9 +210,19 @@ func TestRunnerRejectsUnsupportedProvider(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
-	if err == nil || !strings.Contains(err.Error(), "provider \"claude\" is not configured") {
-		t.Fatalf("expected unsupported provider error, got %v", err)
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"provider": "fake"`) || !strings.Contains(result, `"label": "fake-worker"`) {
+		t.Fatalf("unexpected provider result: %s", result)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].Provider != "fake" {
+		t.Fatalf("expected fake provider agent, got %+v", agents)
 	}
 }
 

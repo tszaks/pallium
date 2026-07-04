@@ -388,6 +388,17 @@ func TestWorkflowTriggerOnChangedSkipsUnchangedRepo(t *testing.T) {
 	if skipped["skipped"] != true || skipped["reason"] != "unchanged" {
 		t.Fatalf("expected unchanged skip, got %#v", skipped)
 	}
+	out.Reset()
+	if err := runWorkflow(&out, []string{"trigger", "watch", "--once", "--db", dbPath}, true); err != nil {
+		t.Fatalf("trigger watch failed: %v", err)
+	}
+	var watched map[string]any
+	if err := json.Unmarshal(out.Bytes(), &watched); err != nil {
+		t.Fatalf("decode trigger watch: %v\n%s", err, out.String())
+	}
+	if watched["checked"].(float64) != 1 || watched["skipped"].(float64) != 1 {
+		t.Fatalf("expected watch to check and skip unchanged trigger, got %#v", watched)
+	}
 	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("changed\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -465,6 +476,38 @@ func TestWorkflowHTTPAPI(t *testing.T) {
 	}
 	if fleet["runs_total"].(float64) == 0 {
 		t.Fatalf("expected fleet to include api run, got %#v", fleet)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/workflows/analytics", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("analytics failed: %d %s", rec.Code, rec.Body.String())
+	}
+	var analytics map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &analytics); err != nil {
+		t.Fatalf("decode analytics response: %v\n%s", err, rec.Body.String())
+	}
+	if analytics["runs_total"].(float64) == 0 {
+		t.Fatalf("expected analytics to include api run, got %#v", analytics)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/workflows/library", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "security-audit") {
+		t.Fatalf("library failed: %d %s", rec.Code, rec.Body.String())
+	}
+	rawBody, err = json.Marshal(map[string]any{"pack": "security-audit", "cwd": tmp, "name": "api-security"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/workflows/library/install", bytes.NewReader(rawBody))
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("library install failed: %d %s", rec.Code, rec.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(tmp, ".pallium", "workflows", "api-security.js")); err != nil {
+		t.Fatalf("expected api-installed workflow: %v", err)
 	}
 }
 
@@ -736,6 +779,70 @@ return agent("after gate", { label: "after" });`), 0o644); err != nil {
 	run := snapshot["run"].(map[string]any)
 	if run["status"] != "completed" {
 		t.Fatalf("expected completed run after gate approval, got %#v", snapshot)
+	}
+}
+
+func TestWorkflowLibraryInstallAndAnalytics(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{"library", "list"}, true); err != nil {
+		t.Fatalf("library list failed: %v", err)
+	}
+	if !strings.Contains(out.String(), `"name": "security-audit"`) {
+		t.Fatalf("expected security-audit pack, got %s", out.String())
+	}
+	out.Reset()
+	if err := runWorkflow(&out, []string{"library", "install", "test-gap-finder", "--cwd", tmp}, true); err != nil {
+		t.Fatalf("library install failed: %v", err)
+	}
+	installedPath := filepath.Join(tmp, ".pallium", "workflows", "test-gap-finder.js")
+	if _, err := os.Stat(installedPath); err != nil {
+		t.Fatalf("expected installed workflow: %v", err)
+	}
+
+	scriptPath := filepath.Join(tmp, "workflow.js")
+	if err := os.WriteFile(scriptPath, []byte(`phase("inspect");
+await agent("inspect", { label: "inspect", mode: "read-only", provider: "codex" });
+return { ok: true };`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := runWorkflow(&out, []string{"run", "--id", "wf-analytics", "--db", dbPath, "--cwd", tmp, "--script", scriptPath, "analytics"}, true); err != nil {
+		t.Fatalf("workflow run failed: %v", err)
+	}
+	out.Reset()
+	if err := runWorkflow(&out, []string{"trigger", "add", "analytics-trigger", "analytics task", "--db", dbPath, "--cwd", tmp}, true); err != nil {
+		t.Fatalf("trigger add failed: %v", err)
+	}
+	out.Reset()
+	if err := runWorkflow(&out, []string{"analytics", "--db", dbPath}, true); err != nil {
+		t.Fatalf("analytics failed: %v", err)
+	}
+	var analytics map[string]any
+	if err := json.Unmarshal(out.Bytes(), &analytics); err != nil {
+		t.Fatalf("decode analytics: %v\n%s", err, out.String())
+	}
+	if analytics["runs_total"].(float64) != 1 {
+		t.Fatalf("expected one run, got %#v", analytics)
+	}
+	providers := analytics["agents_by_provider"].(map[string]any)
+	if providers["codex"].(float64) != 1 {
+		t.Fatalf("expected codex provider count, got %#v", analytics)
+	}
+	if analytics["triggers_total"].(float64) != 1 {
+		t.Fatalf("expected one trigger, got %#v", analytics)
 	}
 }
 

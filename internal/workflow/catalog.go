@@ -22,6 +22,15 @@ type TemplateInfo struct {
 	Example             string   `json:"example"`
 }
 
+type PackInfo struct {
+	Name        string   `json:"name"`
+	Version     string   `json:"version"`
+	Description string   `json:"description"`
+	Tags        []string `json:"tags,omitempty"`
+	InstallsAs  string   `json:"installs_as"`
+	Phases      []string `json:"phases"`
+}
+
 func WorkflowTools() []ToolInfo {
 	return []ToolInfo{
 		{
@@ -37,13 +46,14 @@ func WorkflowTools() []ToolInfo {
 			Name:        "agent",
 			Signature:   `await agent(prompt, options)`,
 			Kind:        "agent",
-			Description: "Spawns one Codex subagent with read-only, test, or edit behavior.",
+			Description: "Spawns one provider-backed subagent with read-only, test, or edit behavior.",
 			Returns:     "Parsed JSON when possible, otherwise text.",
 			Example:     `await agent("Review auth routes for missing checks", { label: "auth-review", mode: "read-only" })`,
 			Notes: []string{
 				"Edit agents run in isolated worktrees and auto-apply patches after successful workflow completion.",
 				"Completed matching agents are reused when the same run id is relaunched.",
-				"Use provider: \"codex\" for the current worker provider. Other providers must be configured before use.",
+				"Use provider: \"codex\" for the native worker or configure another provider with PALLIUM_WORKFLOW_PROVIDER_<NAME>_COMMAND.",
+				"Configured provider commands receive PALLIUM_WORKFLOW_PROMPT_FILE, PALLIUM_WORKFLOW_OUTPUT_FILE, PALLIUM_WORKFLOW_SCHEMA_FILE, and workflow metadata environment variables.",
 				"Use repo: \"/path/to/repo\" to run a worker against another checkout.",
 			},
 		},
@@ -256,6 +266,159 @@ func TemplateNames() []string {
 		names = append(names, tmpl.Name)
 	}
 	return names
+}
+
+func WorkflowPacks() []PackInfo {
+	return []PackInfo{
+		{
+			Name:        "security-audit",
+			Version:     "1.0.0",
+			Description: "Repo-grounded security audit with parallel auth, data, dependency, and secret-review workers.",
+			Tags:        []string{"security", "review", "parallel"},
+			InstallsAs:  "security-audit",
+			Phases:      []string{"scope", "audit", "synthesize"},
+		},
+		{
+			Name:        "migration-assistant",
+			Version:     "1.0.0",
+			Description: "Migration planner that maps blast radius, ports work in isolated edit agents, then runs a verification loop.",
+			Tags:        []string{"migration", "edit", "verification"},
+			InstallsAs:  "migration-assistant",
+			Phases:      []string{"scope", "plan", "implement", "verify"},
+		},
+		{
+			Name:        "test-gap-finder",
+			Version:     "1.0.0",
+			Description: "Finds missing or weak tests from changed files, risk context, and parallel coverage-review workers.",
+			Tags:        []string{"tests", "coverage", "review"},
+			InstallsAs:  "test-gap-finder",
+			Phases:      []string{"scope", "inspect", "report"},
+		},
+	}
+}
+
+func WorkflowPack(name string) (PackInfo, bool) {
+	for _, pack := range WorkflowPacks() {
+		if pack.Name == name || pack.InstallsAs == name {
+			return pack, true
+		}
+	}
+	return PackInfo{}, false
+}
+
+func WorkflowPackScript(name string) (string, error) {
+	pack, ok := WorkflowPack(name)
+	if !ok {
+		return "", fmt.Errorf("unknown workflow pack %q", name)
+	}
+	switch pack.Name {
+	case "security-audit":
+		return `export const meta = {
+  name: "security-audit",
+  description: "Repo-grounded security audit workflow",
+  phases: ["scope", "audit", "synthesize"]
+};
+
+const task = args && args.task ? args.task : "Audit this repo for security risk";
+
+phase("scope");
+const preflight = await pallium.preflight(task);
+const changed = await pallium.changedNow();
+
+phase("audit");
+const angles = ["auth-and-access-control", "data-and-secrets", "dependency-and-supply-chain", "test-and-regression-risk"];
+const reports = await parallel(angles, angle =>
+  agent("Security audit angle: " + angle + "\nTask: " + task + "\nPreflight: " + JSON.stringify(preflight) + "\nChanged files: " + JSON.stringify(changed) + "\nReturn JSON with findings, risks, evidence, next_steps.", {
+    label: "security-" + angle,
+    mode: "read-only",
+    schema: {
+      type: "object",
+      properties: {
+        findings: { type: "array", items: { type: "string" } },
+        risks: { type: "array", items: { type: "string" } },
+        evidence: { type: "array", items: { type: "string" } },
+        next_steps: { type: "array", items: { type: "string" } }
+      },
+      required: ["findings", "risks", "evidence", "next_steps"]
+    }
+  })
+);
+
+phase("synthesize");
+const summary = await agent("Synthesize security audit reports into ranked findings with exact evidence and smallest safe next actions. Reports: " + JSON.stringify(reports), {
+  label: "security-synthesis",
+  mode: "read-only"
+});
+return { task, preflight, changed, reports, summary };
+`, nil
+	case "migration-assistant":
+		return `export const meta = {
+  name: "migration-assistant",
+  description: "Repo-grounded migration workflow",
+  phases: ["scope", "plan", "implement", "verify"]
+};
+
+const task = args && args.task ? args.task : "Plan and execute the migration safely";
+const testCommand = args && args.testCommand ? args.testCommand : "pallium verify fast";
+
+phase("scope");
+await pallium.task.start(task);
+const preflight = await pallium.preflight(task);
+await pallium.decisions.record("Migration scope", "Use Pallium preflight and isolated edit worktrees before applying patches.", "migration", "workflow");
+
+phase("plan");
+const plan = await agent("Create a migration plan from this Pallium preflight context. Task: " + task + "\nPreflight: " + JSON.stringify(preflight), {
+  label: "migration-plan",
+  mode: "read-only"
+});
+
+phase("implement");
+const workers = ["mechanical-changes", "tests-and-fixtures", "docs-and-handoff"];
+const edits = await parallel(workers, worker =>
+  agent("Implement migration worker " + worker + ". Task: " + task + "\nPlan: " + JSON.stringify(plan) + "\nKeep the change focused and safe.", {
+    label: "migration-" + worker,
+    mode: worker === "docs-and-handoff" ? "read-only" : "edit",
+    isolation: worker === "docs-and-handoff" ? "" : "worktree"
+  })
+);
+
+phase("verify");
+const verification = await verify.untilGreen(testCommand, { label: "migration-verify", maxRounds: 3 });
+const handoff = await pallium.handoff("HEAD~1");
+return { task, preflight, plan, edits, verification, handoff };
+`, nil
+	case "test-gap-finder":
+		return `export const meta = {
+  name: "test-gap-finder",
+  description: "Repo-grounded test gap finder",
+  phases: ["scope", "inspect", "report"]
+};
+
+const task = args && args.task ? args.task : "Find missing or weak tests";
+
+phase("scope");
+const preflight = await pallium.preflight(task);
+const changed = await pallium.changedNow();
+
+phase("inspect");
+const angles = ["changed-files", "risky-neighbors", "missing-assertions", "verification-plan"];
+const reports = await parallel(angles, angle =>
+  agent("Find test gaps from angle " + angle + ". Task: " + task + "\nPreflight: " + JSON.stringify(preflight) + "\nChanged: " + JSON.stringify(changed) + "\nReturn JSON with gaps, suggested_tests, confidence.", {
+    label: "test-gap-" + angle,
+    mode: "read-only"
+  })
+);
+
+phase("report");
+const synthesis = await agent("Rank the test gaps by regression risk and give exact test files or commands to add. Reports: " + JSON.stringify(reports), {
+  label: "test-gap-synthesis",
+  mode: "read-only"
+});
+return { task, preflight, changed, reports, synthesis };
+`, nil
+	default:
+		return "", fmt.Errorf("unknown workflow pack %q", name)
+	}
 }
 
 func UnknownTemplateError(name string) error {
