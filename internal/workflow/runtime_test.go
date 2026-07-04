@@ -600,6 +600,102 @@ return result;`
 	}
 }
 
+func TestRunnerInvalidatesCompletedAgentCacheOnFingerprintChange(t *testing.T) {
+	cases := []struct {
+		name       string
+		first      string
+		second     string
+		firstArgs  any
+		secondArgs any
+	}{
+		{
+			name: "script",
+			first: `phase("scan");
+const result = await agent("stable prompt", { label: "stable" });
+return result;`,
+			second: `phase("scan");
+const result = await agent("stable prompt", { label: "stable" });
+return { source: result.source, changed_script: true };`,
+		},
+		{
+			name: "args",
+			first: `phase("scan");
+const result = await agent("stable prompt", { label: "stable" });
+return { source: result.source, topic: args.topic };`,
+			second: `phase("scan");
+const result = await agent("stable prompt", { label: "stable" });
+return { source: result.source, topic: args.topic };`,
+			firstArgs:  map[string]any{"topic": "one"},
+			secondArgs: map[string]any{"topic": "two"},
+		},
+		{
+			name: "schema",
+			first: `phase("scan");
+const result = await agent("stable prompt", {
+  label: "stable",
+  schema: { type: "object", properties: { source: { type: "string" } }, required: ["source"] }
+});
+return result;`,
+			second: `phase("scan");
+const result = await agent("stable prompt", {
+  label: "stable",
+  schema: { type: "object", properties: { source: { type: "string" }, changed: { type: "boolean" } }, required: ["source", "changed"] }
+});
+return result;`,
+		},
+		{
+			name: "model",
+			first: `phase("scan");
+const result = await agent("stable prompt", { label: "stable", model: "model-a" });
+return result;`,
+			second: `phase("scan");
+const result = await agent("stable prompt", { label: "stable", model: "model-b" });
+return result;`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			scriptPath, err := WriteRunScript("wf-cache-"+tc.name, tmp, tc.first)
+			if err != nil {
+				t.Fatal(err)
+			}
+			run, err := store.CreateRun(Run{ID: "wf-cache-" + tc.name, Task: "cache invalidation", CWD: tmp, ScriptPath: scriptPath})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"source":"first","prompt":"{{PROMPT}}","changed":false}`)
+			first, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), tc.first, tc.firstArgs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(first, `"source": "first"`) {
+				t.Fatalf("unexpected first result: %s", first)
+			}
+			t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"source":"second","prompt":"{{PROMPT}}","changed":true}`)
+			second, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), tc.second, tc.secondArgs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(second, `"source": "second"`) {
+				t.Fatalf("expected cache miss after %s fingerprint change, got %s", tc.name, second)
+			}
+			agents, err := store.ListAgents(run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(agents) != 2 {
+				t.Fatalf("expected two agent records after cache miss, got %+v", agents)
+			}
+		})
+	}
+}
+
 func TestNormalizeSchemaAddsAdditionalPropertiesFalse(t *testing.T) {
 	raw := map[string]any{
 		"type": "object",
