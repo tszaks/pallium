@@ -179,6 +179,17 @@ CREATE TABLE IF NOT EXISTS workflow_decisions (
 );
 CREATE INDEX IF NOT EXISTS idx_workflow_decisions_created ON workflow_decisions(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_workflow_decisions_run ON workflow_decisions(run_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS workflow_gates (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  message TEXT,
+  status TEXT NOT NULL,
+  opened_at TEXT NOT NULL,
+  approved_at TEXT,
+  UNIQUE(run_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_gates_run ON workflow_gates(run_id, opened_at DESC);
 `)
 	if err != nil {
 		return err

@@ -35,6 +35,8 @@ func runWorkflow(out io.Writer, args []string, jsonOutput bool) error {
 		return runWorkflowTrigger(out, args[1:], jsonOutput)
 	case "fleet":
 		return runWorkflowFleet(out, args[1:], jsonOutput)
+	case "gate", "gates":
+		return runWorkflowGate(out, args[1:], jsonOutput)
 	case "serve":
 		return runWorkflowServe(out, args[1:], jsonOutput)
 	case "run":
@@ -457,6 +459,73 @@ func buildWorkflowFleetStatus(store *workflow.Store, limit int) (workflowFleetSt
 		status.FailedAgents += summary.AgentsFailed
 	}
 	return status, nil
+}
+
+func runWorkflowGate(out io.Writer, args []string, jsonOutput bool) error {
+	if len(args) == 0 || hasHelpArg(args) {
+		return fmt.Errorf("usage: pallium workflow gate <list|approve>")
+	}
+	switch args[0] {
+	case "list", "ls":
+		return runWorkflowGateList(out, args[1:], jsonOutput)
+	case "approve":
+		return runWorkflowGateApprove(out, args[1:], jsonOutput)
+	default:
+		return fmt.Errorf("unknown workflow gate subcommand: %s", args[0])
+	}
+}
+
+func runWorkflowGateList(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("workflow gate list")
+	dbPath := fs.String("db", "", "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}}, nil); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: pallium workflow gate list <run-id>")
+	}
+	store, err := workflow.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	gates, err := store.ListGates(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	return output.Write(out, gates, jsonOutput, func() string {
+		if len(gates) == 0 {
+			return "No workflow gates found."
+		}
+		lines := []string{"Workflow gates:"}
+		for _, gate := range gates {
+			lines = append(lines, fmt.Sprintf("- %s %s %s", gate.Name, gate.Status, gate.Message))
+		}
+		return strings.Join(lines, "\n")
+	})
+}
+
+func runWorkflowGateApprove(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("workflow gate approve")
+	dbPath := fs.String("db", "", "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}}, nil); err != nil {
+		return err
+	}
+	if fs.NArg() != 2 {
+		return fmt.Errorf("usage: pallium workflow gate approve <run-id> <name>")
+	}
+	store, err := workflow.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	gate, err := store.ApproveGate(fs.Arg(0), fs.Arg(1))
+	if err != nil {
+		return err
+	}
+	return output.Write(out, gate, jsonOutput, func() string {
+		return fmt.Sprintf("Approved workflow gate %s for %s", gate.Name, gate.RunID)
+	})
 }
 
 func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
@@ -1487,6 +1556,8 @@ Usage:
   pallium workflow trigger show <name> [--json]
   pallium workflow trigger run <name> [--background] [--json]
   pallium workflow fleet status [--limit n] [--json]
+  pallium workflow gate list <run-id> [--json]
+  pallium workflow gate approve <run-id> <name> [--json]
   pallium workflow serve [--addr 127.0.0.1:8765]
   pallium workflow run "task" [--script path.js] [--workflow name] [--background] [--max-concurrent-agents 16] [--json]
   pallium workflow run /saved-name "task input"

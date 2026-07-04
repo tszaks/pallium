@@ -620,6 +620,59 @@ return result;`), 0o644); err != nil {
 	}
 }
 
+func TestWorkflowGateApproveAndResume(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	scriptPath := filepath.Join(tmp, "workflow.js")
+	if err := os.WriteFile(scriptPath, []byte(`phase("gate");
+gate("approve", "approve before worker");
+return agent("after gate", { label: "after" });`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	err := runWorkflow(&out, []string{"run", "--id", "wf-gate-cli", "--db", dbPath, "--cwd", tmp, "--script", scriptPath, "gate"}, false)
+	if err == nil || !strings.Contains(err.Error(), "workflow paused") {
+		t.Fatalf("expected paused run, got %v", err)
+	}
+	out.Reset()
+	if err := runWorkflow(&out, []string{"gate", "list", "wf-gate-cli", "--db", dbPath}, true); err != nil {
+		t.Fatalf("gate list failed: %v", err)
+	}
+	var gates []map[string]any
+	if err := json.Unmarshal(out.Bytes(), &gates); err != nil {
+		t.Fatalf("decode gates: %v\n%s", err, out.String())
+	}
+	if len(gates) != 1 || gates[0]["status"] != "open" {
+		t.Fatalf("expected open gate, got %#v", gates)
+	}
+	out.Reset()
+	if err := runWorkflow(&out, []string{"gate", "approve", "wf-gate-cli", "approve", "--db", dbPath}, true); err != nil {
+		t.Fatalf("gate approve failed: %v", err)
+	}
+	out.Reset()
+	if err := runWorkflow(&out, []string{"resume", "wf-gate-cli", "--db", dbPath}, true); err != nil {
+		t.Fatalf("resume after gate failed: %v", err)
+	}
+	var snapshot map[string]any
+	if err := json.Unmarshal(out.Bytes(), &snapshot); err != nil {
+		t.Fatalf("decode resumed snapshot: %v\n%s", err, out.String())
+	}
+	run := snapshot["run"].(map[string]any)
+	if run["status"] != "completed" {
+		t.Fatalf("expected completed run after gate approval, got %#v", snapshot)
+	}
+}
+
 func runGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)

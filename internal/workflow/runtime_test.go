@@ -412,6 +412,49 @@ return { count: decisions.length, title: decisions[0].title };`
 	}
 }
 
+func TestRunnerGatePausesUntilApproved(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("gate");
+gate("approve-patches", "review before continuing");
+const result = agent("after gate", { label: "after" });
+return result;`
+	scriptPath, err := WriteRunScript("wf-gate", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-gate", Task: "gate", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if !errors.Is(err, ErrWorkflowPaused) {
+		t.Fatalf("expected workflow paused, got %v", err)
+	}
+	gates, err := store.ListGates(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gates) != 1 || gates[0].Status != "open" {
+		t.Fatalf("expected open gate, got %+v", gates)
+	}
+	if _, err := store.ApproveGate(run.ID, "approve-patches"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"ok": true`) {
+		t.Fatalf("expected run after approved gate, got %s", result)
+	}
+}
+
 func TestRunnerAppliesPatchToAgentRepo(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"changed other repo"}`)
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_WRITE_FILE", "target.txt")
