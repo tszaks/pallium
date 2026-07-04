@@ -1539,6 +1539,9 @@ func renderWorkflowReport(report workflow.Report) string {
 		"Task: " + report.Task,
 		"Summary: " + report.Summary,
 	}
+	if report.OwnedID != "" {
+		lines = append(lines, "Owned session: "+report.OwnedID)
+	}
 	if len(report.Findings) > 0 {
 		lines = append(lines, "Findings:")
 		for _, finding := range report.Findings {
