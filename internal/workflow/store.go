@@ -268,8 +268,22 @@ func (s *Store) StartPhase(runID, name string) (Phase, error) {
 		name = "default"
 	}
 	now := nowString()
+	var existing Phase
+	err := s.db.QueryRow(`SELECT id,run_id,name,status,agent_count,created_at,updated_at,COALESCE(completed_at,'') FROM workflow_phases WHERE run_id=? AND name=? ORDER BY created_at DESC LIMIT 1`, runID, name).
+		Scan(&existing.ID, &existing.RunID, &existing.Name, &existing.Status, &existing.AgentCount, &existing.CreatedAt, &existing.UpdatedAt, &existing.CompletedAt)
+	if err == nil {
+		existing.Status = "running"
+		existing.AgentCount = 0
+		existing.UpdatedAt = now
+		existing.CompletedAt = ""
+		_, err := s.db.Exec(`UPDATE workflow_phases SET status=?,agent_count=0,updated_at=?,completed_at='' WHERE id=?`, existing.Status, existing.UpdatedAt, existing.ID)
+		return existing, err
+	}
+	if err != sql.ErrNoRows {
+		return Phase{}, err
+	}
 	phase := Phase{ID: NewID("phase"), RunID: runID, Name: name, Status: "running", CreatedAt: now, UpdatedAt: now}
-	_, err := s.db.Exec(`INSERT INTO workflow_phases(id,run_id,name,status,agent_count,created_at,updated_at,completed_at) VALUES(?,?,?,?,?,?,?,?)`,
+	_, err = s.db.Exec(`INSERT INTO workflow_phases(id,run_id,name,status,agent_count,created_at,updated_at,completed_at) VALUES(?,?,?,?,?,?,?,?)`,
 		phase.ID, phase.RunID, phase.Name, phase.Status, phase.AgentCount, phase.CreatedAt, phase.UpdatedAt, phase.CompletedAt)
 	return phase, err
 }
@@ -335,6 +349,20 @@ func (s *Store) FinishAgent(agent Agent, outputText, errorText string) error {
 	_, err := s.db.Exec(`UPDATE workflow_agents SET status=?,output=?,error=?,patch_path=?,worktree=?,updated_at=?,completed_at=? WHERE id=?`,
 		status, outputText, errorText, agent.PatchPath, agent.Worktree, nowString(), nowString(), agent.ID)
 	return err
+}
+
+func (s *Store) CompletedAgent(runID, phase, label, prompt, mode, isolation string) (Agent, bool, error) {
+	row := s.db.QueryRow(`SELECT id,run_id,COALESCE(phase,''),COALESCE(label,''),prompt,mode,COALESCE(isolation,''),status,COALESCE(output,''),COALESCE(error,''),COALESCE(patch_path,''),COALESCE(worktree,''),created_at,updated_at,COALESCE(completed_at,'') FROM workflow_agents WHERE run_id=? AND COALESCE(phase,'')=? AND COALESCE(label,'')=? AND prompt=? AND mode=? AND COALESCE(isolation,'')=? AND status='completed' ORDER BY completed_at DESC, updated_at DESC LIMIT 1`,
+		runID, phase, label, prompt, mode, isolation)
+	var agent Agent
+	err := row.Scan(&agent.ID, &agent.RunID, &agent.Phase, &agent.Label, &agent.Prompt, &agent.Mode, &agent.Isolation, &agent.Status, &agent.Output, &agent.Error, &agent.PatchPath, &agent.Worktree, &agent.CreatedAt, &agent.UpdatedAt, &agent.CompletedAt)
+	if err == sql.ErrNoRows {
+		return Agent{}, false, nil
+	}
+	if err != nil {
+		return Agent{}, false, err
+	}
+	return agent, true, nil
 }
 
 func (s *Store) ListAgents(runID string) ([]Agent, error) {
