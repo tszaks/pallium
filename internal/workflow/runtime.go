@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,6 +17,8 @@ import (
 
 	"github.com/dop251/goja"
 )
+
+var ErrWorkflowStopped = errors.New("workflow stopped")
 
 type Runner struct {
 	Store               *Store
@@ -79,6 +82,9 @@ func (r *Runner) Execute(ctx context.Context, script string, args any) (string, 
 	if err := r.Store.SetRunStatus(r.Run.ID, "running", "", ""); err != nil {
 		return "", err
 	}
+	if err := r.ensureNotStopped(ctx); err != nil {
+		return "", err
+	}
 
 	body := stripMeta(script)
 	vm := goja.New()
@@ -116,16 +122,36 @@ func (r *Runner) Execute(ctx context.Context, script string, args any) (string, 
 		r.currentPhase = ""
 	}
 	if err != nil {
+		if isWorkflowStoppedError(err) {
+			_ = r.Store.SetRunStatus(r.Run.ID, "stopped", "", ErrWorkflowStopped.Error())
+			return "", ErrWorkflowStopped
+		}
 		_ = r.Store.SetRunStatus(r.Run.ID, "failed", "", err.Error())
 		return "", err
 	}
 	value, err = awaitPromiseValue(value)
 	if err != nil {
+		if isWorkflowStoppedError(err) {
+			_ = r.Store.SetRunStatus(r.Run.ID, "stopped", "", ErrWorkflowStopped.Error())
+			return "", ErrWorkflowStopped
+		}
 		_ = r.Store.SetRunStatus(r.Run.ID, "failed", "", err.Error())
 		return "", err
 	}
+	if err := r.ensureNotStopped(ctx); err != nil {
+		_ = r.Store.SetRunStatus(r.Run.ID, "stopped", "", ErrWorkflowStopped.Error())
+		return "", err
+	}
 	if _, err := r.ApplyPatches(ctx); err != nil {
+		if errors.Is(err, ErrWorkflowStopped) {
+			_ = r.Store.SetRunStatus(r.Run.ID, "stopped", "", ErrWorkflowStopped.Error())
+			return "", err
+		}
 		_ = r.Store.SetRunStatus(r.Run.ID, "failed", "", err.Error())
+		return "", err
+	}
+	if err := r.ensureNotStopped(ctx); err != nil {
+		_ = r.Store.SetRunStatus(r.Run.ID, "stopped", "", ErrWorkflowStopped.Error())
 		return "", err
 	}
 	result := value.Export()
@@ -434,6 +460,9 @@ func (r *Runner) runPalliumCommand(ctx context.Context, args ...string) (any, er
 }
 
 func (r *Runner) RunAgent(ctx context.Context, prompt string, opts AgentOptions) (string, error) {
+	if err := r.ensureNotStopped(ctx); err != nil {
+		return "", err
+	}
 	r.mu.Lock()
 	phase := r.currentPhase
 	r.mu.Unlock()
@@ -475,11 +504,21 @@ func (r *Runner) RunAgent(ctx context.Context, prompt string, opts AgentOptions)
 		_ = r.Store.IncrementPhaseAgentCount(r.Run.ID, phase)
 	}
 
-	output, patchPath, worktree, err := r.runAgentCommand(ctx, agent, opts)
+	agentCtx, stopWatching := r.contextWithStoredStop(ctx)
+	defer stopWatching()
+	output, patchPath, worktree, err := r.runAgentCommand(agentCtx, agent, opts)
 	agent.PatchPath = patchPath
 	agent.Worktree = worktree
 	if err != nil {
+		if normalized := r.normalizeStopError(agentCtx, err); errors.Is(normalized, ErrWorkflowStopped) {
+			_ = r.Store.FinishAgentStatus(agent, "stopped", output, normalized.Error())
+			return "", normalized
+		}
 		_ = r.Store.FinishAgent(agent, output, err.Error())
+		return "", err
+	}
+	if err := r.ensureNotStopped(ctx); err != nil {
+		_ = r.Store.FinishAgentStatus(agent, "stopped", output, err.Error())
 		return "", err
 	}
 	if err := r.Store.FinishAgent(agent, output, ""); err != nil {
@@ -539,6 +578,70 @@ func (r *Runner) runParallelAgentCalls(ctx context.Context, calls []parallelAgen
 		return nil, firstErr
 	}
 	return results, nil
+}
+
+func isWorkflowStoppedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, ErrWorkflowStopped) || strings.TrimSpace(err.Error()) == ErrWorkflowStopped.Error()
+}
+
+func (r *Runner) ensureNotStopped(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	run, err := r.Store.Run(r.Run.ID)
+	if err != nil {
+		return err
+	}
+	if run.Status == "stopped" {
+		return ErrWorkflowStopped
+	}
+	return nil
+}
+
+func (r *Runner) contextWithStoredStop(ctx context.Context) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				run, err := r.Store.Run(r.Run.ID)
+				if err == nil && run.Status == "stopped" {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return ctx, func() {
+		cancel()
+		<-done
+	}
+}
+
+func (r *Runner) normalizeStopError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrWorkflowStopped) {
+		return err
+	}
+	if ctx.Err() != nil {
+		if run, runErr := r.Store.Run(r.Run.ID); runErr == nil && run.Status == "stopped" {
+			return ErrWorkflowStopped
+		}
+	}
+	return err
 }
 
 func awaitPromiseValue(value goja.Value) (goja.Value, error) {
@@ -951,6 +1054,9 @@ func ParseArgsJSON(raw string) (any, error) {
 }
 
 func (r *Runner) ApplyPatches(ctx context.Context) ([]string, error) {
+	if err := r.ensureNotStopped(ctx); err != nil {
+		return nil, err
+	}
 	snapshot, err := r.Store.Snapshot(r.Run.ID)
 	if err != nil {
 		return nil, err

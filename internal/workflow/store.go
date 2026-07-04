@@ -346,6 +346,10 @@ func (s *Store) FinishAgent(agent Agent, outputText, errorText string) error {
 	if errorText != "" {
 		status = "failed"
 	}
+	return s.FinishAgentStatus(agent, status, outputText, errorText)
+}
+
+func (s *Store) FinishAgentStatus(agent Agent, status, outputText, errorText string) error {
 	_, err := s.db.Exec(`UPDATE workflow_agents SET status=?,output=?,error=?,patch_path=?,worktree=?,updated_at=?,completed_at=? WHERE id=?`,
 		status, outputText, errorText, agent.PatchPath, agent.Worktree, nowString(), nowString(), agent.ID)
 	return err
