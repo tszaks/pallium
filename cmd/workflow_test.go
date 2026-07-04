@@ -604,6 +604,20 @@ return result;`), 0o644); err != nil {
 	if !strings.Contains(out.String(), "No workflow patches to apply.") {
 		t.Fatalf("expected idempotent apply message, got %s", out.String())
 	}
+	out.Reset()
+	if err := runWorkflow(&out, []string{"revert", "wf-edit", "--db", dbPath}, false); err != nil {
+		t.Fatalf("workflow revert failed: %v", err)
+	}
+	if got := readFile(t, filepath.Join(tmp, "note.txt")); got != "original\n" {
+		t.Fatalf("expected workflow revert to restore original file, got %q", got)
+	}
+	out.Reset()
+	if err := runWorkflow(&out, []string{"revert", "wf-edit", "--db", dbPath}, false); err != nil {
+		t.Fatalf("workflow revert should be idempotent: %v", err)
+	}
+	if !strings.Contains(out.String(), "No workflow patches to revert.") {
+		t.Fatalf("expected idempotent revert message, got %s", out.String())
+	}
 }
 
 func runGit(t *testing.T, dir string, args ...string) {
