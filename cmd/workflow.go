@@ -35,6 +35,8 @@ func runWorkflow(out io.Writer, args []string, jsonOutput bool) error {
 		return runWorkflowTrigger(out, args[1:], jsonOutput)
 	case "fleet":
 		return runWorkflowFleet(out, args[1:], jsonOutput)
+	case "serve":
+		return runWorkflowServe(out, args[1:], jsonOutput)
 	case "run":
 		return runWorkflowRun(out, args[1:], jsonOutput)
 	case "list", "ls":
@@ -408,13 +410,23 @@ func runWorkflowFleetStatus(out io.Writer, args []string, jsonOutput bool) error
 		return err
 	}
 	defer store.Close()
-	runs, err := store.ListRuns(*limit)
+	status, err := buildWorkflowFleetStatus(store, *limit)
 	if err != nil {
 		return err
 	}
+	return output.Write(out, status, jsonOutput, func() string {
+		return renderWorkflowFleetStatus(status)
+	})
+}
+
+func buildWorkflowFleetStatus(store *workflow.Store, limit int) (workflowFleetStatus, error) {
+	runs, err := store.ListRuns(limit)
+	if err != nil {
+		return workflowFleetStatus{}, err
+	}
 	triggers, err := store.ListTriggers()
 	if err != nil {
-		return err
+		return workflowFleetStatus{}, err
 	}
 	status := workflowFleetStatus{
 		RunsTotal:     len(runs),
@@ -442,9 +454,7 @@ func runWorkflowFleetStatus(out io.Writer, args []string, jsonOutput bool) error
 		status.PausedAgents += summary.AgentsPaused
 		status.FailedAgents += summary.AgentsFailed
 	}
-	return output.Write(out, status, jsonOutput, func() string {
-		return renderWorkflowFleetStatus(status)
-	})
+	return status, nil
 }
 
 func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
@@ -1445,6 +1455,7 @@ Usage:
   pallium workflow trigger show <name> [--json]
   pallium workflow trigger run <name> [--background] [--json]
   pallium workflow fleet status [--limit n] [--json]
+  pallium workflow serve [--addr 127.0.0.1:8765]
   pallium workflow run "task" [--script path.js] [--workflow name] [--background] [--max-concurrent-agents 16] [--json]
   pallium workflow run /saved-name "task input"
   pallium workflow list [--limit n] [--json]

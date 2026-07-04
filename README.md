@@ -123,6 +123,7 @@ pallium workflow preflight "review workflow changes" --scope cmd/workflow.go --j
 pallium workflow trigger add daily-review "review workflow changes" --cwd .
 pallium workflow trigger run daily-review
 pallium workflow fleet status
+pallium workflow serve --addr 127.0.0.1:8765
 pallium workflow run --script .pallium/workflows/review.js "review this branch"
 pallium workflow run --workflow review-branch "review this branch"
 pallium workflow run /review-branch "review this branch"
@@ -168,6 +169,9 @@ session alive.
 recent workflow runs, active runs, triggers, and running/paused/failed workers.
 Agent options accept `provider: "codex"` today, and the provider is stored on
 agent records and reports so future mixed-provider routing has a stable shape.
+`workflow serve` exposes the local workflow control plane over HTTP for other
+tools: `GET /healthz`, `GET /workflows/fleet`, `GET /workflows/runs/{id}`, and
+`POST /workflows/run`.
 Use `await check("test command")` for objective verification loops. It spawns a
 dedicated test agent, runs the command as ground truth, and returns structured
 JSON with `ok`, `summary`, `output_tail`, and `failures`, so scripts can keep
