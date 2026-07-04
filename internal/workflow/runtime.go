@@ -44,6 +44,7 @@ type Runner struct {
 
 type AgentOptions struct {
 	Label     string         `json:"label,omitempty"`
+	Provider  string         `json:"provider,omitempty"`
 	Mode      string         `json:"mode,omitempty"`
 	Isolation string         `json:"isolation,omitempty"`
 	Schema    map[string]any `json:"schema,omitempty"`
@@ -51,9 +52,10 @@ type AgentOptions struct {
 }
 
 type CheckOptions struct {
-	Label  string         `json:"label,omitempty"`
-	Model  string         `json:"model,omitempty"`
-	Schema map[string]any `json:"schema,omitempty"`
+	Label    string         `json:"label,omitempty"`
+	Provider string         `json:"provider,omitempty"`
+	Model    string         `json:"model,omitempty"`
+	Schema   map[string]any `json:"schema,omitempty"`
 }
 
 type parallelAgentCall struct {
@@ -274,10 +276,11 @@ func (r *Runner) jsCheck(ctx context.Context, vm *goja.Runtime) func(goja.Functi
 			}
 		}
 		agentOpts := AgentOptions{
-			Label:  firstNonEmpty(opts.Label, "check: "+command),
-			Mode:   "test",
-			Model:  opts.Model,
-			Schema: opts.Schema,
+			Label:    firstNonEmpty(opts.Label, "check: "+command),
+			Provider: opts.Provider,
+			Mode:     "test",
+			Model:    opts.Model,
+			Schema:   opts.Schema,
 		}
 		if len(agentOpts.Schema) == 0 {
 			agentOpts.Schema = defaultCheckSchema()
@@ -496,8 +499,12 @@ func (r *Runner) RunAgent(ctx context.Context, prompt string, opts AgentOptions)
 	if mode == "" {
 		mode = "read-only"
 	}
+	provider := strings.TrimSpace(opts.Provider)
+	if provider == "" || provider == "default" {
+		provider = "codex"
+	}
 	schemaHash := agentSchemaHash(opts.Schema)
-	if cached, ok, err := r.Store.CompletedAgent(r.Run.ID, phase, opts.Label, prompt, mode, opts.Isolation, opts.Model, schemaHash, r.scriptHash, r.argsHash); err != nil {
+	if cached, ok, err := r.Store.CompletedAgent(r.Run.ID, phase, opts.Label, prompt, provider, mode, opts.Isolation, opts.Model, schemaHash, r.scriptHash, r.argsHash); err != nil {
 		return "", err
 	} else if ok {
 		if phase != "" {
@@ -519,6 +526,7 @@ func (r *Runner) RunAgent(ctx context.Context, prompt string, opts AgentOptions)
 		Phase:      phase,
 		Label:      opts.Label,
 		Prompt:     prompt,
+		Provider:   provider,
 		Mode:       mode,
 		Isolation:  opts.Isolation,
 		Model:      opts.Model,
@@ -867,6 +875,10 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent Agent, opts AgentOpt
 			}
 		}
 		return strings.ReplaceAll(stub, "{{PROMPT}}", agent.Prompt), patchPath, worktree, nil
+	}
+	provider := firstNonEmpty(agent.Provider, opts.Provider, "codex")
+	if provider != "codex" {
+		return "", "", "", fmt.Errorf("workflow agent provider %q is not configured; available provider: codex", provider)
 	}
 	cwd := r.Run.CWD
 	worktree := ""
