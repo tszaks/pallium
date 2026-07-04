@@ -31,6 +31,8 @@ func runWorkflow(out io.Writer, args []string, jsonOutput bool) error {
 		return runWorkflowTools(out, args[1:], jsonOutput)
 	case "template", "templates":
 		return runWorkflowTemplates(out, args[1:], jsonOutput)
+	case "trigger", "triggers":
+		return runWorkflowTrigger(out, args[1:], jsonOutput)
 	case "run":
 		return runWorkflowRun(out, args[1:], jsonOutput)
 	case "list", "ls":
@@ -188,6 +190,180 @@ func runWorkflowTemplateShow(out io.Writer, args []string, jsonOutput bool) erro
 	return output.Write(out, tmpl, jsonOutput, func() string {
 		return renderWorkflowTemplate(tmpl)
 	})
+}
+
+func runWorkflowTrigger(out io.Writer, args []string, jsonOutput bool) error {
+	if len(args) == 0 || hasHelpArg(args) {
+		return fmt.Errorf("usage: pallium workflow trigger <add|list|show|run>")
+	}
+	switch args[0] {
+	case "add", "set":
+		return runWorkflowTriggerAdd(out, args[1:], jsonOutput)
+	case "list", "ls":
+		return runWorkflowTriggerList(out, args[1:], jsonOutput)
+	case "show":
+		return runWorkflowTriggerShow(out, args[1:], jsonOutput)
+	case "run":
+		return runWorkflowTriggerRun(out, args[1:], jsonOutput)
+	default:
+		return fmt.Errorf("unknown workflow trigger subcommand: %s", args[0])
+	}
+}
+
+func runWorkflowTriggerAdd(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("workflow trigger add")
+	dbPath := fs.String("db", "", "")
+	cwd := fs.String("cwd", "", "")
+	kind := fs.String("kind", "manual", "")
+	workflowName := fs.String("workflow", "", "")
+	scriptPath := fs.String("script", "", "")
+	argsJSON := fs.String("args", "", "")
+	disabled := fs.Bool("disabled", false, "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "cwd": {}, "kind": {}, "workflow": {}, "script": {}, "args": {}}, map[string]struct{}{"disabled": {}}); err != nil {
+		return err
+	}
+	if fs.NArg() < 2 {
+		return fmt.Errorf("usage: pallium workflow trigger add <name> <task> [--workflow name|--script path] [--cwd repo-path]")
+	}
+	if *workflowName != "" && *scriptPath != "" {
+		return fmt.Errorf("use either --workflow or --script, not both")
+	}
+	if *cwd == "" {
+		var err error
+		*cwd, err = os.Getwd()
+		if err != nil {
+			return err
+		}
+	}
+	absCWD, err := filepath.Abs(*cwd)
+	if err != nil {
+		return err
+	}
+	store, err := workflow.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	trigger, err := store.UpsertTrigger(workflow.Trigger{
+		Name:         fs.Arg(0),
+		Kind:         *kind,
+		Task:         strings.TrimSpace(strings.Join(fs.Args()[1:], " ")),
+		CWD:          absCWD,
+		WorkflowName: *workflowName,
+		ScriptPath:   *scriptPath,
+		ArgsJSON:     *argsJSON,
+		Enabled:      !*disabled,
+	})
+	if err != nil {
+		return err
+	}
+	return output.Write(out, trigger, jsonOutput, func() string {
+		return renderWorkflowTrigger(trigger)
+	})
+}
+
+func runWorkflowTriggerList(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("workflow trigger list")
+	dbPath := fs.String("db", "", "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}}, nil); err != nil {
+		return err
+	}
+	store, err := workflow.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	triggers, err := store.ListTriggers()
+	if err != nil {
+		return err
+	}
+	return output.Write(out, triggers, jsonOutput, func() string {
+		if len(triggers) == 0 {
+			return "No workflow triggers found."
+		}
+		lines := []string{"Workflow triggers:"}
+		for _, trigger := range triggers {
+			lines = append(lines, fmt.Sprintf("- %s [%s] enabled=%t task=%s", trigger.Name, trigger.Kind, trigger.Enabled, trigger.Task))
+		}
+		return strings.Join(lines, "\n")
+	})
+}
+
+func runWorkflowTriggerShow(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("workflow trigger show")
+	dbPath := fs.String("db", "", "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}}, nil); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: pallium workflow trigger show <name>")
+	}
+	store, err := workflow.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	trigger, err := store.Trigger(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	return output.Write(out, trigger, jsonOutput, func() string {
+		return renderWorkflowTrigger(trigger)
+	})
+}
+
+func runWorkflowTriggerRun(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("workflow trigger run")
+	dbPath := fs.String("db", "", "")
+	runID := fs.String("id", "", "")
+	background := fs.Bool("background", false, "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "id": {}}, map[string]struct{}{"background": {}}); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: pallium workflow trigger run <name> [--background]")
+	}
+	store, err := workflow.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	trigger, err := store.Trigger(fs.Arg(0))
+	if err != nil {
+		_ = store.Close()
+		return err
+	}
+	if !trigger.Enabled {
+		_ = store.Close()
+		return fmt.Errorf("workflow trigger %q is disabled", trigger.Name)
+	}
+	if *runID == "" {
+		*runID = workflow.NewID("wf-" + trigger.Name)
+	}
+	if err := workflow.ValidateID(*runID); err != nil {
+		_ = store.Close()
+		return err
+	}
+	if err := store.SetTriggerRun(trigger.Name, *runID); err != nil {
+		_ = store.Close()
+		return err
+	}
+	_ = store.Close()
+
+	runArgs := []string{"run", "--id", *runID, "--db", *dbPath, "--cwd", trigger.CWD}
+	if *background {
+		runArgs = append(runArgs, "--background")
+	}
+	if trigger.WorkflowName != "" {
+		runArgs = append(runArgs, "--workflow", trigger.WorkflowName)
+	}
+	if trigger.ScriptPath != "" {
+		runArgs = append(runArgs, "--script", trigger.ScriptPath)
+	}
+	if trigger.ArgsJSON != "" {
+		runArgs = append(runArgs, "--args", trigger.ArgsJSON)
+	}
+	runArgs = append(runArgs, trigger.Task)
+	return runWorkflowRun(out, runArgs[1:], jsonOutput)
 }
 
 func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
@@ -1039,6 +1215,31 @@ func renderWorkflowPreflight(report analysis.WorkflowPreflightReport) string {
 	return strings.Join(lines, "\n")
 }
 
+func renderWorkflowTrigger(trigger workflow.Trigger) string {
+	lines := []string{
+		fmt.Sprintf("Workflow trigger %s [%s]", trigger.Name, trigger.Kind),
+		"Enabled: " + fmt.Sprintf("%t", trigger.Enabled),
+		"Task: " + trigger.Task,
+		"CWD: " + trigger.CWD,
+	}
+	if trigger.WorkflowName != "" {
+		lines = append(lines, "Workflow: "+trigger.WorkflowName)
+	}
+	if trigger.ScriptPath != "" {
+		lines = append(lines, "Script: "+trigger.ScriptPath)
+	}
+	if trigger.ArgsJSON != "" {
+		lines = append(lines, "Args: "+trigger.ArgsJSON)
+	}
+	if trigger.LastRunID != "" {
+		lines = append(lines, "Last run: "+trigger.LastRunID)
+	}
+	if trigger.LastRanAt != "" {
+		lines = append(lines, "Last ran: "+trigger.LastRanAt)
+	}
+	return strings.Join(lines, "\n")
+}
+
 func renderWorkflowReport(report workflow.Report) string {
 	lines := []string{
 		fmt.Sprintf("Workflow report %s: %s", report.ID, report.Status),
@@ -1133,6 +1334,10 @@ Usage:
   pallium workflow tools list [--kind control|agent|verification|pallium] [--json]
   pallium workflow template list [--json]
   pallium workflow template show <name> [--json]
+  pallium workflow trigger add <name> "task" [--workflow name|--script path] [--cwd repo-path] [--json]
+  pallium workflow trigger list [--json]
+  pallium workflow trigger show <name> [--json]
+  pallium workflow trigger run <name> [--background] [--json]
   pallium workflow run "task" [--script path.js] [--workflow name] [--background] [--max-concurrent-agents 16] [--json]
   pallium workflow run /saved-name "task input"
   pallium workflow list [--limit n] [--json]

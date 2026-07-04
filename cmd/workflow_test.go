@@ -283,6 +283,49 @@ func TestWorkflowPreflightCommand(t *testing.T) {
 	}
 }
 
+func TestWorkflowTriggerAddShowRun(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"triggered"}`)
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{"trigger", "add", "daily-review", "review repo", "--db", dbPath, "--cwd", tmp}, true); err != nil {
+		t.Fatalf("trigger add failed: %v", err)
+	}
+	out.Reset()
+	if err := runWorkflow(&out, []string{"trigger", "run", "daily-review", "--id", "wf-triggered", "--db", dbPath}, true); err != nil {
+		t.Fatalf("trigger run failed: %v", err)
+	}
+	var status map[string]any
+	if err := json.Unmarshal(out.Bytes(), &status); err != nil {
+		t.Fatalf("decode trigger run status: %v\n%s", err, out.String())
+	}
+	run := status["run"].(map[string]any)
+	if run["id"] != "wf-triggered" || run["status"] != "completed" {
+		t.Fatalf("expected completed triggered run, got %#v", status)
+	}
+	out.Reset()
+	if err := runWorkflow(&out, []string{"trigger", "show", "daily-review", "--db", dbPath}, true); err != nil {
+		t.Fatalf("trigger show failed: %v", err)
+	}
+	var trigger map[string]any
+	if err := json.Unmarshal(out.Bytes(), &trigger); err != nil {
+		t.Fatalf("decode trigger: %v\n%s", err, out.String())
+	}
+	if trigger["last_run_id"] != "wf-triggered" {
+		t.Fatalf("expected trigger last_run_id, got %#v", trigger)
+	}
+}
+
 func TestWorkflowReportSummarizesAgentOutputs(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"reviewed auth","observations":["auth flow is covered"],"risks":["missing edge test"],"next_steps":["add edge test"]}`)
 	tmp := t.TempDir()
