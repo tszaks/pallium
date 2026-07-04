@@ -165,6 +165,22 @@ func (r *Runner) executeScript(ctx context.Context, script string, args any, top
 	}); err != nil {
 		return "", err
 	}
+	if err := vm.Set("gate", func(name string, message ...string) goja.Value {
+		text := ""
+		if len(message) > 0 {
+			text = message[0]
+		}
+		gate, err := r.Store.EnsureGate(r.Run.ID, name, text)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		if gate.Status == "approved" {
+			return vm.ToValue(gate)
+		}
+		panic(vm.ToValue(ErrWorkflowPaused.Error()))
+	}); err != nil {
+		return "", err
+	}
 
 	value, err := vm.RunString("(async function(){\n" + body + "\n})()")
 	if r.currentPhase != "" {
