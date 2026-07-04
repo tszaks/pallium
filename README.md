@@ -120,6 +120,8 @@ pallium workflow tools list
 pallium workflow template list
 pallium workflow template show test-fix
 pallium workflow preflight "review workflow changes" --scope cmd/workflow.go --json
+pallium workflow trigger add daily-review "review workflow changes" --cwd .
+pallium workflow trigger run daily-review
 pallium workflow run --script .pallium/workflows/review.js "review this branch"
 pallium workflow run --workflow review-branch "review this branch"
 pallium workflow run /review-branch "review this branch"
@@ -156,6 +158,11 @@ runtime observes that state, cancels live worker commands, and records paused
 or stopped agents instead of completing the run. `workflow resume <run-id>`
 reloads the saved script, args, and cwd, then continues with completed-agent
 cache reuse so finished work is not repeated.
+`workflow trigger add <name> "task"` stores a local automation definition in
+Pallium's workflow database. `workflow trigger run <name>` starts the saved
+workflow with the normal runner, records the resulting run id on the trigger,
+and can be called by cron, launchd, or another agent without keeping the chat
+session alive.
 Use `await check("test command")` for objective verification loops. It spawns a
 dedicated test agent, runs the command as ground truth, and returns structured
 JSON with `ok`, `summary`, `output_tail`, and `failures`, so scripts can keep
