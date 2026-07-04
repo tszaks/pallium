@@ -412,6 +412,54 @@ return { count: decisions.length, title: decisions[0].title };`
 	}
 }
 
+func TestRunnerAppliesPatchToAgentRepo(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"changed other repo"}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_WRITE_FILE", "target.txt")
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_WRITE_CONTENT", "changed\n")
+	rootRepo := t.TempDir()
+	otherRepo := t.TempDir()
+	for _, repo := range []string{rootRepo, otherRepo} {
+		runGit(t, repo, "init")
+		runGit(t, repo, "config", "user.email", "test@example.com")
+		runGit(t, repo, "config", "user.name", "Test User")
+		if err := os.WriteFile(filepath.Join(repo, "target.txt"), []byte("original\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, repo, "add", "target.txt")
+		runGit(t, repo, "commit", "-m", "initial")
+	}
+	store, err := Open(filepath.Join(rootRepo, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("multi-repo");
+agent("change other repo", { label: "other", mode: "edit", isolation: "worktree", repo: args.otherRepo });
+return { ok: true };`
+	scriptPath, err := WriteRunScript("wf-multi-repo", rootRepo, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-multi-repo", Task: "multi repo", CWD: rootRepo, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, map[string]any{"otherRepo": otherRepo}); err != nil {
+		t.Fatal(err)
+	}
+	rootRaw, err := os.ReadFile(filepath.Join(rootRepo, "target.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherRaw, err := os.ReadFile(filepath.Join(otherRepo, "target.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(rootRaw) != "original\n" || string(otherRaw) != "changed\n" {
+		t.Fatalf("patch applied to wrong repo: root=%q other=%q", string(rootRaw), string(otherRaw))
+	}
+}
+
 func TestParallelRunsAgentsConcurrently(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"prompt":"{{PROMPT}}"}`)
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_DELAY_MS", "250")

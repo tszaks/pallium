@@ -50,6 +50,7 @@ type Runner struct {
 type AgentOptions struct {
 	Label     string         `json:"label,omitempty"`
 	Provider  string         `json:"provider,omitempty"`
+	Repo      string         `json:"repo,omitempty"`
 	Mode      string         `json:"mode,omitempty"`
 	Isolation string         `json:"isolation,omitempty"`
 	Schema    map[string]any `json:"schema,omitempty"`
@@ -694,8 +695,16 @@ func (r *Runner) RunAgent(ctx context.Context, prompt string, opts AgentOptions)
 	if provider == "" || provider == "default" {
 		provider = "codex"
 	}
+	repo := strings.TrimSpace(opts.Repo)
+	if repo == "" {
+		repo = r.Run.CWD
+	}
+	absRepo, err := filepath.Abs(repo)
+	if err != nil {
+		return "", err
+	}
 	schemaHash := agentSchemaHash(opts.Schema)
-	if cached, ok, err := r.Store.CompletedAgent(r.Run.ID, phase, opts.Label, prompt, provider, mode, opts.Isolation, opts.Model, schemaHash, r.scriptHash, r.argsHash); err != nil {
+	if cached, ok, err := r.Store.CompletedAgent(r.Run.ID, phase, opts.Label, prompt, provider, absRepo, mode, opts.Isolation, opts.Model, schemaHash, r.scriptHash, r.argsHash); err != nil {
 		return "", err
 	} else if ok {
 		if phase != "" {
@@ -725,6 +734,7 @@ func (r *Runner) RunAgent(ctx context.Context, prompt string, opts AgentOptions)
 		Label:      opts.Label,
 		Prompt:     prompt,
 		Provider:   provider,
+		Repo:       absRepo,
 		Mode:       mode,
 		Isolation:  opts.Isolation,
 		Model:      opts.Model,
@@ -1119,11 +1129,11 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent Agent, opts AgentOpt
 				return "", "", "", ctx.Err()
 			}
 		}
-		cwd := r.Run.CWD
+		cwd := firstNonEmpty(agent.Repo, r.Run.CWD)
 		worktree := ""
 		if agent.Mode == "edit" || agent.Isolation == "worktree" {
 			var err error
-			worktree, err = r.createWorktree(agent.ID)
+			worktree, err = r.createWorktree(agent.ID, cwd)
 			if err != nil {
 				return "", "", "", err
 			}
@@ -1153,11 +1163,11 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent Agent, opts AgentOpt
 	if provider != "codex" {
 		return "", "", "", fmt.Errorf("workflow agent provider %q is not configured; available provider: codex", provider)
 	}
-	cwd := r.Run.CWD
+	cwd := firstNonEmpty(agent.Repo, r.Run.CWD)
 	worktree := ""
 	if agent.Mode == "edit" || agent.Isolation == "worktree" {
 		var err error
-		worktree, err = r.createWorktree(agent.ID)
+		worktree, err = r.createWorktree(agent.ID, cwd)
 		if err != nil {
 			return "", "", "", err
 		}
@@ -1238,7 +1248,7 @@ func normalizeSchema(value any) any {
 	}
 }
 
-func (r *Runner) createWorktree(agentID string) (string, error) {
+func (r *Runner) createWorktree(agentID, repoRoot string) (string, error) {
 	root, err := RunArtifactDir(r.Run.ID, "worktrees")
 	if err != nil {
 		return "", err
@@ -1248,7 +1258,7 @@ func (r *Runner) createWorktree(agentID string) (string, error) {
 	}
 	path := filepath.Join(root, agentID)
 	cmd := exec.Command("git", "worktree", "add", "--detach", path, "HEAD")
-	cmd.Dir = r.Run.CWD
+	cmd.Dir = repoRoot
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -1433,7 +1443,8 @@ func ApplyPatches(ctx context.Context, snapshot Snapshot) ([]string, error) {
 		if agent.PatchPath == "" {
 			continue
 		}
-		didApply, err := applyPatch(ctx, snapshot.Run.CWD, agent.PatchPath)
+		targetRepo := firstNonEmpty(agent.Repo, snapshot.Run.CWD)
+		didApply, err := applyPatch(ctx, targetRepo, agent.PatchPath)
 		if err != nil {
 			return applied, err
 		}

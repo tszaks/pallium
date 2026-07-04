@@ -23,6 +23,7 @@ type AgentReport struct {
 	Label    string   `json:"label"`
 	Phase    string   `json:"phase,omitempty"`
 	Provider string   `json:"provider,omitempty"`
+	Repo     string   `json:"repo,omitempty"`
 	Mode     string   `json:"mode"`
 	Status   string   `json:"status"`
 	Summary  string   `json:"summary,omitempty"`
@@ -47,6 +48,7 @@ func BuildReport(snapshot Snapshot) Report {
 			Label:    firstNonEmpty(agent.Label, agent.ID),
 			Phase:    agent.Phase,
 			Provider: agent.Provider,
+			Repo:     agent.Repo,
 			Mode:     agent.Mode,
 			Status:   agent.Status,
 			Error:    agent.Error,
