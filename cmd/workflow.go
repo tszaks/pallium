@@ -22,6 +22,10 @@ func runWorkflow(out io.Writer, args []string, jsonOutput bool) error {
 	switch args[0] {
 	case "generate":
 		return runWorkflowGenerate(out, args[1:], jsonOutput)
+	case "tools":
+		return runWorkflowTools(out, args[1:], jsonOutput)
+	case "template", "templates":
+		return runWorkflowTemplates(out, args[1:], jsonOutput)
 	case "run":
 		return runWorkflowRun(out, args[1:], jsonOutput)
 	case "list", "ls":
@@ -46,6 +50,107 @@ func runWorkflow(out io.Writer, args []string, jsonOutput bool) error {
 		printWorkflowHelp(out)
 		return fmt.Errorf("unknown workflow subcommand: %s", args[0])
 	}
+}
+
+func runWorkflowTools(out io.Writer, args []string, jsonOutput bool) error {
+	if len(args) == 0 || hasHelpArg(args) {
+		return runWorkflowToolsList(out, nil, jsonOutput)
+	}
+	switch args[0] {
+	case "list", "ls":
+		return runWorkflowToolsList(out, args[1:], jsonOutput)
+	default:
+		return fmt.Errorf("unknown workflow tools subcommand: %s", args[0])
+	}
+}
+
+func runWorkflowToolsList(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("workflow tools list")
+	kind := fs.String("kind", "", "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"kind": {}}, nil); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("usage: pallium workflow tools list [--kind control|agent|verification|pallium]")
+	}
+	tools := workflow.WorkflowTools()
+	if strings.TrimSpace(*kind) != "" {
+		filtered := tools[:0]
+		for _, tool := range tools {
+			if tool.Kind == *kind {
+				filtered = append(filtered, tool)
+			}
+		}
+		tools = filtered
+	}
+	return output.Write(out, tools, jsonOutput, func() string {
+		if len(tools) == 0 {
+			return "No workflow tools found."
+		}
+		lines := []string{"Workflow tools:"}
+		for _, tool := range tools {
+			lines = append(lines, fmt.Sprintf("- %s %s [%s]: %s", tool.Name, tool.Signature, tool.Kind, tool.Description))
+		}
+		return strings.Join(lines, "\n")
+	})
+}
+
+func runWorkflowTemplates(out io.Writer, args []string, jsonOutput bool) error {
+	if len(args) == 0 || hasHelpArg(args) {
+		return runWorkflowTemplateList(out, nil, jsonOutput)
+	}
+	switch args[0] {
+	case "list", "ls":
+		return runWorkflowTemplateList(out, args[1:], jsonOutput)
+	case "show":
+		return runWorkflowTemplateShow(out, args[1:], jsonOutput)
+	default:
+		if tmpl, ok := workflow.WorkflowTemplate(args[0]); ok {
+			return output.Write(out, tmpl, jsonOutput, func() string {
+				return renderWorkflowTemplate(tmpl)
+			})
+		}
+		return workflow.UnknownTemplateError(args[0])
+	}
+}
+
+func runWorkflowTemplateList(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("workflow template list")
+	if err := parseSessionFlags(fs, args, nil, nil); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("usage: pallium workflow template list")
+	}
+	templates := workflow.WorkflowTemplates()
+	return output.Write(out, templates, jsonOutput, func() string {
+		lines := []string{"Workflow templates:"}
+		for _, tmpl := range templates {
+			line := fmt.Sprintf("- %s [%s]: %s", tmpl.Name, tmpl.Style, tmpl.Description)
+			if tmpl.RequiresTestCommand {
+				line += " Requires --test-command."
+			}
+			lines = append(lines, line)
+		}
+		return strings.Join(lines, "\n")
+	})
+}
+
+func runWorkflowTemplateShow(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("workflow template show")
+	if err := parseSessionFlags(fs, args, nil, nil); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: pallium workflow template show <name>")
+	}
+	tmpl, ok := workflow.WorkflowTemplate(fs.Arg(0))
+	if !ok {
+		return workflow.UnknownTemplateError(fs.Arg(0))
+	}
+	return output.Write(out, tmpl, jsonOutput, func() string {
+		return renderWorkflowTemplate(tmpl)
+	})
 }
 
 func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
@@ -709,6 +814,24 @@ func renderWorkflowInspection(report workflowInspectionReport) string {
 	return strings.Join(lines, "\n")
 }
 
+func renderWorkflowTemplate(tmpl workflow.TemplateInfo) string {
+	lines := []string{
+		fmt.Sprintf("Workflow template %s [%s]", tmpl.Name, tmpl.Style),
+		tmpl.Description,
+		"Phases: " + strings.Join(tmpl.Phases, ", "),
+	}
+	if len(tmpl.Aliases) > 0 {
+		lines = append(lines, "Aliases: "+strings.Join(tmpl.Aliases, ", "))
+	}
+	if tmpl.RequiresTestCommand {
+		lines = append(lines, "Requires: --test-command")
+	}
+	if tmpl.Example != "" {
+		lines = append(lines, "Example: "+tmpl.Example)
+	}
+	return strings.Join(lines, "\n")
+}
+
 func renderWorkflowSnapshot(snapshot workflow.Snapshot) string {
 	lines := []string{
 		fmt.Sprintf("Workflow %s: %s", snapshot.Run.ID, snapshot.Run.Status),
@@ -750,6 +873,9 @@ func printWorkflowHelp(out io.Writer) {
 
 Usage:
   pallium workflow generate "task" [--style review|test-fix|research] [--output path.js] [--save name] [--json]
+  pallium workflow tools list [--kind control|agent|verification|pallium] [--json]
+  pallium workflow template list [--json]
+  pallium workflow template show <name> [--json]
   pallium workflow run "task" [--script path.js] [--workflow name] [--background] [--max-concurrent-agents 16] [--json]
   pallium workflow run /saved-name "task input"
   pallium workflow list [--limit n] [--json]
