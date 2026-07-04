@@ -119,6 +119,49 @@ return { ok: result.ok, command: result.command };`
 	}
 }
 
+func TestRunnerSupportsCoordinatorReplan(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_SEQUENCE", `[
+		"{\"summary\":\"initial\"}",
+		"{\"decision\":\"continue\",\"next_steps\":[\"inspect deeper\"]}"
+	]`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"fallback"}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("inspect");
+await agent("initial inspection", { label: "initial" });
+const plan = await coordinator.replan("adjust the remaining plan", { label: "coordinator" });
+return { decision: plan.decision, next_steps: plan.next_steps };`
+	scriptPath, err := WriteRunScript("wf-coordinator", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-coordinator", Task: "coordinator", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"decision": "continue"`) || !strings.Contains(result, "inspect deeper") {
+		t.Fatalf("unexpected coordinator result: %s", result)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 2 || agents[1].Label != "coordinator" {
+		t.Fatalf("expected initial and coordinator agents, got %+v", agents)
+	}
+	if !strings.Contains(agents[1].Prompt, "initial inspection") {
+		t.Fatalf("expected coordinator prompt to include snapshot with initial work, got %s", agents[1].Prompt)
+	}
+}
+
 func TestRunnerSupportsPalliumPrimitives(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_PALLIUM_STUB", `{"ok":true,"args":"{{ARGS}}"}`)
 	tmp := t.TempDir()
