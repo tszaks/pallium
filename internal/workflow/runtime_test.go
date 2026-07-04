@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -402,6 +403,78 @@ return { count: results.length };`
 	elapsed := time.Since(start)
 	if elapsed < 550*time.Millisecond || elapsed >= 1100*time.Millisecond {
 		t.Fatalf("expected capped execution near three waves, elapsed=%s result=%s", elapsed, result)
+	}
+}
+
+func TestRunnerStopsWhenRunIsMarkedStopped(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"prompt":"{{PROMPT}}"}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_DELAY_MS", "2000")
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("parallel");
+const results = await parallel(["a", "b", "c", "d"], item =>
+  agent("inspect " + item, { label: item })
+);
+return { count: results.length };`
+	scriptPath, err := WriteRunScript("wf-stop-cooperative", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-stop-cooperative", Task: "stop cooperative", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := (&Runner{Store: store, Run: run, MaxAgents: 10, MaxConcurrentAgents: 4}).Execute(context.Background(), script, nil)
+		errCh <- err
+	}()
+
+	deadline := time.After(2 * time.Second)
+	for {
+		agents, err := store.ListAgents(run.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(agents) == 4 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for running agents, got %d", len(agents))
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if err := store.SetRunStatus(run.ID, "stopped", "", "test stop"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, ErrWorkflowStopped) {
+			t.Fatalf("expected ErrWorkflowStopped, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runner did not stop after run status changed to stopped")
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Run.Status != "stopped" {
+		t.Fatalf("expected stopped run, got %+v", snapshot.Run)
+	}
+	stoppedAgents := 0
+	for _, agent := range snapshot.Agents {
+		if agent.Status == "stopped" {
+			stoppedAgents++
+		}
+	}
+	if stoppedAgents == 0 {
+		t.Fatalf("expected at least one stopped agent, got %+v", snapshot.Agents)
 	}
 }
 
