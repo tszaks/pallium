@@ -150,6 +150,21 @@ CREATE TABLE IF NOT EXISTS workflow_agents (
   completed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_workflow_agents_run ON workflow_agents(run_id, created_at);
+CREATE TABLE IF NOT EXISTS workflow_triggers (
+  name TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  task TEXT NOT NULL,
+  cwd TEXT NOT NULL,
+  workflow_name TEXT,
+  script_path TEXT,
+  args_json TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  last_run_id TEXT,
+  last_ran_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_triggers_updated ON workflow_triggers(updated_at DESC);
 `)
 	if err != nil {
 		return err
