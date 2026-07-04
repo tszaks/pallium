@@ -121,6 +121,7 @@ pallium workflow template list
 pallium workflow template show test-fix
 pallium workflow preflight "review workflow changes" --scope cmd/workflow.go --json
 pallium workflow trigger add daily-review "review workflow changes" --cwd .
+pallium workflow trigger add changed-review "review workflow changes" --kind on-changed --cwd .
 pallium workflow trigger run daily-review
 pallium workflow fleet status
 pallium workflow gate list <run-id>
@@ -175,7 +176,8 @@ cache reuse so finished work is not repeated.
 Pallium's workflow database. `workflow trigger run <name>` starts the saved
 workflow with the normal runner, records the resulting run id on the trigger,
 and can be called by cron, launchd, or another agent without keeping the chat
-session alive.
+session alive. Use `--kind on-changed` to skip trigger runs until the repo HEAD
+or working tree status changes.
 `workflow fleet status` gives agents and humans a compact control-plane view of
 recent workflow runs, active runs, triggers, and running/paused/failed workers.
 Agent options accept `provider: "codex"` today, and the provider is stored on

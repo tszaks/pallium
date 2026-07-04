@@ -165,6 +165,7 @@ CREATE TABLE IF NOT EXISTS workflow_triggers (
   enabled INTEGER NOT NULL DEFAULT 1,
   last_run_id TEXT,
   last_ran_at TEXT,
+  last_fingerprint TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -201,6 +202,7 @@ CREATE INDEX IF NOT EXISTS idx_workflow_gates_run ON workflow_gates(run_id, open
 		"ALTER TABLE workflow_agents ADD COLUMN schema_hash TEXT",
 		"ALTER TABLE workflow_agents ADD COLUMN script_hash TEXT",
 		"ALTER TABLE workflow_agents ADD COLUMN args_hash TEXT",
+		"ALTER TABLE workflow_triggers ADD COLUMN last_fingerprint TEXT",
 	} {
 		if _, alterErr := s.db.Exec(stmt); alterErr != nil && !strings.Contains(alterErr.Error(), "duplicate column name") {
 			return alterErr

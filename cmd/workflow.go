@@ -344,6 +344,22 @@ func runWorkflowTriggerRun(out io.Writer, args []string, jsonOutput bool) error 
 		_ = store.Close()
 		return fmt.Errorf("workflow trigger %q is disabled", trigger.Name)
 	}
+	fingerprint := ""
+	if trigger.Kind == "on-changed" {
+		var err error
+		fingerprint, err = workflow.RepoFingerprint(trigger.CWD)
+		if err != nil {
+			_ = store.Close()
+			return err
+		}
+		if trigger.LastFingerprint == fingerprint {
+			_ = store.Close()
+			result := map[string]any{"name": trigger.Name, "skipped": true, "reason": "unchanged", "last_run_id": trigger.LastRunID}
+			return output.Write(out, result, jsonOutput, func() string {
+				return fmt.Sprintf("Workflow trigger %s skipped: unchanged", trigger.Name)
+			})
+		}
+	}
 	if *runID == "" {
 		*runID = workflow.NewID("wf-" + trigger.Name)
 	}
@@ -351,7 +367,7 @@ func runWorkflowTriggerRun(out io.Writer, args []string, jsonOutput bool) error 
 		_ = store.Close()
 		return err
 	}
-	if err := store.SetTriggerRun(trigger.Name, *runID); err != nil {
+	if err := store.SetTriggerRun(trigger.Name, *runID, fingerprint); err != nil {
 		_ = store.Close()
 		return err
 	}
