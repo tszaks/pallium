@@ -114,11 +114,14 @@ repository.
 
 ```bash
 pallium workflow run "review this branch for correctness issues"
+pallium workflow generate "fix tests until green" --style test-fix --test-command "go test ./..." --output fix.workflow.js
 pallium workflow run --script .pallium/workflows/review.js "review this branch"
 pallium workflow run --workflow review-branch "review this branch"
 pallium workflow run /review-branch "review this branch"
 pallium workflow run --background "audit route handlers for missing auth"
 pallium workflow list
+pallium workflow status <run-id>
+pallium workflow inspect <run-id>
 pallium workflow show <run-id>
 pallium workflow read <run-id>
 pallium workflow watch <run-id>
@@ -151,6 +154,9 @@ control: `await pallium.verify("fast")`, `await pallium.review("origin/main")`,
 Saved workflows resolve by name from the nearest `.pallium/workflows/` or
 `.claude/workflows/` directory while walking up from the current working
 directory, then from `~/.pallium/workflows/` or `~/.claude/workflows/`.
+`workflow generate` emits deterministic Claude-shaped JS workflows for review,
+research, and test-fix loops. Use `workflow status` for a compact progress view
+and `workflow inspect` for phase, agent, patch, and failure detail.
 
 Session-memory indexing is incremental by default: unchanged transcript files are skipped using their last indexed timestamp, with a hash check only when the file looks newer. After a global `sessions embed` pass completes and no embedding backlog remains for the model, Pallium records a model-specific embedding cursor. Later `sessions index` runs scan from that cursor minus `--safety-buffer` instead of walking historical session memory every time. This makes scheduled automation cadence-independent: hourly runs should touch about the last hour plus buffer, six-hour runs should touch about six hours plus buffer, and on-demand runs use the same cursor path. Files modified in the last two minutes are skipped so Pallium does not chase active agent logs. Use `--force` only when you intentionally want to rebuild existing session rows after parser or redaction changes.
 
