@@ -104,6 +104,14 @@ func WorkflowTools() []ToolInfo {
 			Example:     `const changed = await pallium.changedNow()`,
 		},
 		{
+			Name:        "pallium.preflight",
+			Signature:   `await pallium.preflight(task, ...scopePaths)`,
+			Kind:        "pallium",
+			Description: "Builds repo-native workflow scope, risk, inspection, and verification guidance before spawning workers.",
+			Returns:     "Workflow preflight JSON with scope_paths, safe reports, test_commands, and agent_instructions.",
+			Example:     `const preflight = await pallium.preflight("fix auth tests", "cmd/workflow.go")`,
+		},
+		{
 			Name:        "pallium.explain",
 			Signature:   `await pallium.explain(path)`,
 			Kind:        "pallium",

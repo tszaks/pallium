@@ -247,6 +247,45 @@ func TestChangedNow(t *testing.T) {
 	}
 }
 
+func TestWorkflowPreflight(t *testing.T) {
+	repo := indexRepo(t)
+	store, err := index.OpenStore(repo)
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+	defer store.Close()
+
+	if _, err := index.New(store).Run(); err != nil {
+		t.Fatalf("index run failed: %v", err)
+	}
+
+	writeFile(t, filepath.Join(repo, "main.go"), "package main\n\nfunc main() { println(\"changed\") }\n")
+
+	report, err := WorkflowPreflight(store, "tighten workflow tests", []string{"main.go"})
+	if err != nil {
+		t.Fatalf("WorkflowPreflight failed: %v", err)
+	}
+
+	if report.Task != "tighten workflow tests" {
+		t.Fatalf("expected task, got %#v", report.Task)
+	}
+	if len(report.ScopePaths) == 0 || report.ScopePaths[0] != "main.go" {
+		t.Fatalf("expected main.go scope, got %#v", report.ScopePaths)
+	}
+	if len(report.Safe) == 0 {
+		t.Fatalf("expected safe reports")
+	}
+	if len(report.FilesToInspect) == 0 {
+		t.Fatalf("expected files to inspect")
+	}
+	if len(report.TestCommands) == 0 {
+		t.Fatalf("expected test commands")
+	}
+	if len(report.AgentInstructions) == 0 {
+		t.Fatalf("expected agent instructions")
+	}
+}
+
 func TestHandoff(t *testing.T) {
 	repo := indexRepo(t)
 	store, err := index.OpenStore(repo)

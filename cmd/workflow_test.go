@@ -247,6 +247,42 @@ func TestWorkflowValidateScript(t *testing.T) {
 	}
 }
 
+func TestWorkflowPreflightCommand(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "main.go")
+	runGit(t, tmp, "commit", "-m", "initial")
+
+	var out bytes.Buffer
+	if err := runIndex(&out, []string{tmp}, false); err != nil {
+		t.Fatalf("index failed: %v", err)
+	}
+	out.Reset()
+	if err := runWorkflow(&out, []string{"preflight", "tighten workflow", "--cwd", tmp, "--scope", "main.go"}, true); err != nil {
+		t.Fatalf("workflow preflight failed: %v", err)
+	}
+	var report map[string]any
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatalf("decode preflight: %v\n%s", err, out.String())
+	}
+	if report["task"] != "tighten workflow" {
+		t.Fatalf("expected task in preflight, got %#v", report)
+	}
+	scope := report["scope_paths"].([]any)
+	if len(scope) == 0 || scope[0] != "main.go" {
+		t.Fatalf("expected main.go scope, got %#v", report)
+	}
+	if len(report["agent_instructions"].([]any)) == 0 {
+		t.Fatalf("expected agent instructions, got %#v", report)
+	}
+}
+
 func TestWorkflowReportSummarizesAgentOutputs(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"reviewed auth","observations":["auth flow is covered"],"risks":["missing edge test"],"next_steps":["add edge test"]}`)
 	tmp := t.TempDir()

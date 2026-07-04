@@ -129,8 +129,9 @@ func TestRunnerSupportsPalliumPrimitives(t *testing.T) {
 	script := `phase("pallium");
 const verify = await pallium.verify("fast");
 const explain = await pallium.explain("README.md");
+const preflight = await pallium.preflight("tighten auth", "src/auth");
 const task = await pallium.task.start("tighten auth", "src/auth");
-return { verify: verify.args, explain: explain.args, task: task.args };`
+return { verify: verify.args, explain: explain.args, preflight: preflight.args, task: task.args };`
 	scriptPath, err := WriteRunScript("wf-pallium", tmp, script)
 	if err != nil {
 		t.Fatal(err)
@@ -143,7 +144,7 @@ return { verify: verify.args, explain: explain.args, task: task.args };`
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"verify fast", "explain README.md", "task start tighten auth src/auth"} {
+	for _, want := range []string{"verify fast", "explain README.md", "workflow preflight tighten auth --scope src/auth", "task start tighten auth src/auth"} {
 		if !strings.Contains(result, want) {
 			t.Fatalf("expected %q in result: %s", want, result)
 		}

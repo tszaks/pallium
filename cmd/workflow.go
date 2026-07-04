@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tszaks/pallium/internal/analysis"
 	"github.com/tszaks/pallium/internal/output"
 	"github.com/tszaks/pallium/internal/workflow"
 )
@@ -22,6 +23,8 @@ func runWorkflow(out io.Writer, args []string, jsonOutput bool) error {
 	switch args[0] {
 	case "generate":
 		return runWorkflowGenerate(out, args[1:], jsonOutput)
+	case "preflight":
+		return runWorkflowPreflight(out, args[1:], jsonOutput)
 	case "validate":
 		return runWorkflowValidate(out, args[1:], jsonOutput)
 	case "tools":
@@ -58,6 +61,32 @@ func runWorkflow(out io.Writer, args []string, jsonOutput bool) error {
 		printWorkflowHelp(out)
 		return fmt.Errorf("unknown workflow subcommand: %s", args[0])
 	}
+}
+
+func runWorkflowPreflight(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("workflow preflight")
+	repoPath := fs.String("cwd", "", "")
+	var scopes multiStringFlag
+	fs.Var(&scopes, "scope", "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"cwd": {}, "scope": {}}, nil); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
+		return fmt.Errorf("usage: pallium workflow preflight <task> [--scope path] [--cwd repo-path]")
+	}
+	task := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	indexer, err := openIndexedStore(firstNonEmpty(*repoPath, "."))
+	if err != nil {
+		return err
+	}
+	defer indexer.Store.Close()
+	report, err := analysis.WorkflowPreflight(indexer.Store, task, scopes)
+	if err != nil {
+		return err
+	}
+	return output.Write(out, report, jsonOutput, func() string {
+		return renderWorkflowPreflight(report)
+	})
 }
 
 func runWorkflowTools(out io.Writer, args []string, jsonOutput bool) error {
@@ -965,6 +994,51 @@ func renderWorkflowTemplate(tmpl workflow.TemplateInfo) string {
 	return strings.Join(lines, "\n")
 }
 
+func renderWorkflowPreflight(report analysis.WorkflowPreflightReport) string {
+	lines := []string{
+		"Workflow preflight",
+		"Task: " + report.Task,
+		"Summary: " + report.Summary,
+	}
+	if len(report.ScopePaths) > 0 {
+		lines = append(lines, "Scope:")
+		for _, path := range report.ScopePaths {
+			lines = append(lines, "- "+path)
+		}
+	}
+	if len(report.RiskSummary) > 0 {
+		lines = append(lines, "Risk:")
+		for _, risk := range report.RiskSummary {
+			lines = append(lines, "- "+risk)
+		}
+	}
+	if len(report.FilesToInspect) > 0 {
+		lines = append(lines, "Inspect:")
+		for _, path := range report.FilesToInspect {
+			lines = append(lines, "- "+path)
+		}
+	}
+	if len(report.TestCommands) > 0 {
+		lines = append(lines, "Verification:")
+		for _, command := range report.TestCommands {
+			lines = append(lines, "- "+command)
+		}
+	}
+	if len(report.AgentInstructions) > 0 {
+		lines = append(lines, "Agent instructions:")
+		for _, item := range report.AgentInstructions {
+			lines = append(lines, "- "+item)
+		}
+	}
+	if len(report.NextActions) > 0 {
+		lines = append(lines, "Next actions:")
+		for _, item := range report.NextActions {
+			lines = append(lines, "- "+item)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 func renderWorkflowReport(report workflow.Report) string {
 	lines := []string{
 		fmt.Sprintf("Workflow report %s: %s", report.ID, report.Status),
@@ -1053,6 +1127,7 @@ func printWorkflowHelp(out io.Writer) {
 	fmt.Fprintln(out, `pallium workflow
 
 Usage:
+  pallium workflow preflight "task" [--scope path] [--cwd repo-path] [--json]
   pallium workflow generate "task" [--style review|test-fix|research] [--output path.js] [--save name] [--json]
   pallium workflow validate <path.js> [--json]
   pallium workflow tools list [--kind control|agent|verification|pallium] [--json]

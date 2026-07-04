@@ -334,6 +334,15 @@ func (r *Runner) jsPallium(ctx context.Context, vm *goja.Runtime) map[string]any
 		"changedNow": func() goja.Value {
 			return call("changed-now")
 		},
+		"preflight": func(task string, scopePaths ...string) goja.Value {
+			args := []string{"workflow", "preflight", strings.TrimSpace(task)}
+			for _, scope := range scopePaths {
+				if strings.TrimSpace(scope) != "" {
+					args = append(args, "--scope", strings.TrimSpace(scope))
+				}
+			}
+			return call(args...)
+		},
 		"task": map[string]any{
 			"start": func(goal string, scopePaths ...string) goja.Value {
 				args := []string{"task", "start", strings.TrimSpace(goal)}
