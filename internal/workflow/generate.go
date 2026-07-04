@@ -160,40 +160,13 @@ phase("scope");
 await pallium.task.start(task);
 const baselineContext = await pallium.preflight(task);
 
-phase("baseline");
-let checkResult = await check(testCommand, { label: "baseline-check" });
-let rounds = [];
-
 phase("fix-loop");
-for (let round = 1; round <= maxRounds && !checkResult.ok; round++) {
-  const previous = JSON.stringify(checkResult);
-  const fix = await agent("Fix the failing verification for this task.\nTask: " + task + "\nCommand: " + testCommand + "\nFailure JSON: " + previous + "\nMake the smallest correct code change. Do not hide, skip, or weaken tests.", {
-    label: "fix-round-" + round,
-    mode: "edit",
-    isolation: "worktree",
-    schema: {
-      type: "object",
-      properties: {
-        summary: { type: "string" },
-        files_changed: { type: "array", items: { type: "string" } },
-        confidence: { type: "string" }
-      },
-      required: ["summary", "files_changed", "confidence"]
-    }
-  });
-  const review = await pallium.review();
-  const nextCheck = await check(testCommand, { label: "check-round-" + round });
-  rounds.push({ round, fix, review, check: nextCheck });
-  if (JSON.stringify(nextCheck.failures) === JSON.stringify(checkResult.failures) && !nextCheck.ok) {
-    break;
-  }
-  checkResult = nextCheck;
-}
+const verification = await verify.untilGreen(testCommand, { label: "fix-loop", maxRounds });
 
 phase("finalize");
 const finalReview = await pallium.review();
 const handoff = await pallium.handoff("HEAD~1");
-return { task, baselineContext, final: checkResult, rounds, finalReview, handoff };
+return { task, baselineContext, verification, finalReview, handoff };
 `
 }
 

@@ -73,6 +73,15 @@ func WorkflowTools() []ToolInfo {
 			Notes:       []string{"The orchestration script does not run shell commands directly. The test subagent does."},
 		},
 		{
+			Name:        "verify.untilGreen",
+			Signature:   `await verify.untilGreen(command, { maxRounds, label })`,
+			Kind:        "verification",
+			Description: "Runs an objective check/fix loop until the command passes, max rounds are reached, or failures stop changing.",
+			Returns:     `{ ok, command, rounds, stalled }`,
+			Example:     `const result = await verify.untilGreen("go test ./...", { maxRounds: 3, label: "tests" })`,
+			Notes:       []string{"Fix workers run in edit/worktree mode and do not weaken or skip tests."},
+		},
+		{
 			Name:        "workflow",
 			Signature:   `await workflow(name, args)`,
 			Kind:        "control",
