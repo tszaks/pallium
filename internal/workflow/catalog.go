@@ -43,6 +43,7 @@ func WorkflowTools() []ToolInfo {
 			Notes: []string{
 				"Edit agents run in isolated worktrees and auto-apply patches after successful workflow completion.",
 				"Completed matching agents are reused when the same run id is relaunched.",
+				"Use provider: \"codex\" for the current worker provider. Other providers must be configured before use.",
 			},
 		},
 		{

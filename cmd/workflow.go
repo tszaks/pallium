@@ -33,6 +33,8 @@ func runWorkflow(out io.Writer, args []string, jsonOutput bool) error {
 		return runWorkflowTemplates(out, args[1:], jsonOutput)
 	case "trigger", "triggers":
 		return runWorkflowTrigger(out, args[1:], jsonOutput)
+	case "fleet":
+		return runWorkflowFleet(out, args[1:], jsonOutput)
 	case "run":
 		return runWorkflowRun(out, args[1:], jsonOutput)
 	case "list", "ls":
@@ -364,6 +366,85 @@ func runWorkflowTriggerRun(out io.Writer, args []string, jsonOutput bool) error 
 	}
 	runArgs = append(runArgs, trigger.Task)
 	return runWorkflowRun(out, runArgs[1:], jsonOutput)
+}
+
+func runWorkflowFleet(out io.Writer, args []string, jsonOutput bool) error {
+	if len(args) == 0 || hasHelpArg(args) {
+		return runWorkflowFleetStatus(out, nil, jsonOutput)
+	}
+	switch args[0] {
+	case "status":
+		return runWorkflowFleetStatus(out, args[1:], jsonOutput)
+	default:
+		return fmt.Errorf("unknown workflow fleet subcommand: %s", args[0])
+	}
+}
+
+type workflowFleetStatus struct {
+	RunsTotal       int              `json:"runs_total"`
+	RunsByStatus    map[string]int   `json:"runs_by_status"`
+	ActiveRuns      []workflow.Run   `json:"active_runs,omitempty"`
+	TriggersTotal   int              `json:"triggers_total"`
+	EnabledTriggers int              `json:"enabled_triggers"`
+	RunningAgents   int              `json:"running_agents"`
+	PausedAgents    int              `json:"paused_agents"`
+	FailedAgents    int              `json:"failed_agents"`
+	UpdatedAt       string           `json:"updated_at"`
+	RecentRuns      []workflowStatus `json:"recent_runs,omitempty"`
+}
+
+func runWorkflowFleetStatus(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("workflow fleet status")
+	dbPath := fs.String("db", "", "")
+	limit := fs.Int("limit", 50, "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "limit": {}}, nil); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("usage: pallium workflow fleet status [--limit n]")
+	}
+	store, err := workflow.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	runs, err := store.ListRuns(*limit)
+	if err != nil {
+		return err
+	}
+	triggers, err := store.ListTriggers()
+	if err != nil {
+		return err
+	}
+	status := workflowFleetStatus{
+		RunsTotal:     len(runs),
+		RunsByStatus:  map[string]int{},
+		TriggersTotal: len(triggers),
+		UpdatedAt:     time.Now().UTC().Format(time.RFC3339),
+	}
+	for _, trigger := range triggers {
+		if trigger.Enabled {
+			status.EnabledTriggers++
+		}
+	}
+	for _, run := range runs {
+		status.RunsByStatus[run.Status]++
+		if run.Status == "queued" || run.Status == "running" || run.Status == "paused" {
+			status.ActiveRuns = append(status.ActiveRuns, run)
+		}
+		snapshot, err := store.Snapshot(run.ID)
+		if err != nil {
+			continue
+		}
+		summary := workflowStatusSummary(snapshot)
+		status.RecentRuns = append(status.RecentRuns, summary)
+		status.RunningAgents += summary.AgentsRunning
+		status.PausedAgents += summary.AgentsPaused
+		status.FailedAgents += summary.AgentsFailed
+	}
+	return output.Write(out, status, jsonOutput, func() string {
+		return renderWorkflowFleetStatus(status)
+	})
 }
 
 func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
@@ -1240,6 +1321,30 @@ func renderWorkflowTrigger(trigger workflow.Trigger) string {
 	return strings.Join(lines, "\n")
 }
 
+func renderWorkflowFleetStatus(status workflowFleetStatus) string {
+	lines := []string{
+		"Workflow fleet status",
+		fmt.Sprintf("Runs: %d", status.RunsTotal),
+		fmt.Sprintf("Triggers: %d enabled / %d total", status.EnabledTriggers, status.TriggersTotal),
+		fmt.Sprintf("Agents: %d running, %d paused, %d failed", status.RunningAgents, status.PausedAgents, status.FailedAgents),
+	}
+	if len(status.RunsByStatus) > 0 {
+		lines = append(lines, "Runs by status:")
+		for _, key := range []string{"queued", "running", "paused", "completed", "failed", "stopped"} {
+			if count := status.RunsByStatus[key]; count > 0 {
+				lines = append(lines, fmt.Sprintf("- %s: %d", key, count))
+			}
+		}
+	}
+	if len(status.ActiveRuns) > 0 {
+		lines = append(lines, "Active runs:")
+		for _, run := range status.ActiveRuns {
+			lines = append(lines, fmt.Sprintf("- %s %s %s", run.ID, run.Status, run.Task))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 func renderWorkflowReport(report workflow.Report) string {
 	lines := []string{
 		fmt.Sprintf("Workflow report %s: %s", report.ID, report.Status),
@@ -1273,7 +1378,8 @@ func renderWorkflowReport(report workflow.Report) string {
 	if len(report.Agents) > 0 {
 		lines = append(lines, "Agents:")
 		for _, agent := range report.Agents {
-			lines = append(lines, fmt.Sprintf("- %s %s mode=%s phase=%s", agent.Label, agent.Status, agent.Mode, agent.Phase))
+			provider := firstNonEmpty(agent.Provider, "codex")
+			lines = append(lines, fmt.Sprintf("- %s %s provider=%s mode=%s phase=%s", agent.Label, agent.Status, provider, agent.Mode, agent.Phase))
 			if agent.Summary != "" {
 				lines = append(lines, "  summary: "+agent.Summary)
 			}
@@ -1338,6 +1444,7 @@ Usage:
   pallium workflow trigger list [--json]
   pallium workflow trigger show <name> [--json]
   pallium workflow trigger run <name> [--background] [--json]
+  pallium workflow fleet status [--limit n] [--json]
   pallium workflow run "task" [--script path.js] [--workflow name] [--background] [--max-concurrent-agents 16] [--json]
   pallium workflow run /saved-name "task input"
   pallium workflow list [--limit n] [--json]

@@ -151,6 +151,59 @@ return { verify: verify.args, explain: explain.args, preflight: preflight.args, 
 	}
 }
 
+func TestRunnerRecordsAgentProvider(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("providers");
+await agent("codex provider", { label: "codex-worker", provider: "codex" });
+return { ok: true };`
+	scriptPath, err := WriteRunScript("wf-provider", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-provider", Task: "provider", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil); err != nil {
+		t.Fatal(err)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].Provider != "codex" {
+		t.Fatalf("expected codex provider, got %+v", agents)
+	}
+}
+
+func TestRunnerRejectsUnsupportedProvider(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `await agent("claude provider", { label: "claude-worker", provider: "claude" });`
+	scriptPath, err := WriteRunScript("wf-provider-fail", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-provider-fail", Task: "provider", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), "provider \"claude\" is not configured") {
+		t.Fatalf("expected unsupported provider error, got %v", err)
+	}
+}
+
 func TestRunnerStopsAtMaxAgents(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
 	tmp := t.TempDir()

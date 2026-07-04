@@ -324,6 +324,17 @@ func TestWorkflowTriggerAddShowRun(t *testing.T) {
 	if trigger["last_run_id"] != "wf-triggered" {
 		t.Fatalf("expected trigger last_run_id, got %#v", trigger)
 	}
+	out.Reset()
+	if err := runWorkflow(&out, []string{"fleet", "status", "--db", dbPath}, true); err != nil {
+		t.Fatalf("fleet status failed: %v", err)
+	}
+	var fleet map[string]any
+	if err := json.Unmarshal(out.Bytes(), &fleet); err != nil {
+		t.Fatalf("decode fleet: %v\n%s", err, out.String())
+	}
+	if fleet["runs_total"].(float64) == 0 || fleet["triggers_total"].(float64) != 1 {
+		t.Fatalf("expected fleet run and trigger counts, got %#v", fleet)
+	}
 }
 
 func TestWorkflowReportSummarizesAgentOutputs(t *testing.T) {

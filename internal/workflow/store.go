@@ -50,6 +50,7 @@ type Agent struct {
 	Phase       string `json:"phase,omitempty"`
 	Label       string `json:"label,omitempty"`
 	Prompt      string `json:"prompt"`
+	Provider    string `json:"provider,omitempty"`
 	Mode        string `json:"mode"`
 	Isolation   string `json:"isolation,omitempty"`
 	Model       string `json:"model,omitempty"`
@@ -134,6 +135,7 @@ CREATE TABLE IF NOT EXISTS workflow_agents (
   phase TEXT,
   label TEXT,
   prompt TEXT NOT NULL,
+  provider TEXT,
   mode TEXT NOT NULL,
   isolation TEXT,
   model TEXT,
@@ -171,6 +173,7 @@ CREATE INDEX IF NOT EXISTS idx_workflow_triggers_updated ON workflow_triggers(up
 	}
 	for _, stmt := range []string{
 		"ALTER TABLE workflow_agents ADD COLUMN model TEXT",
+		"ALTER TABLE workflow_agents ADD COLUMN provider TEXT",
 		"ALTER TABLE workflow_agents ADD COLUMN schema_hash TEXT",
 		"ALTER TABLE workflow_agents ADD COLUMN script_hash TEXT",
 		"ALTER TABLE workflow_agents ADD COLUMN args_hash TEXT",
@@ -372,8 +375,8 @@ func (s *Store) CreateAgent(agent Agent) (Agent, error) {
 	if agent.UpdatedAt == "" {
 		agent.UpdatedAt = agent.CreatedAt
 	}
-	_, err := s.db.Exec(`INSERT INTO workflow_agents(id,run_id,phase,label,prompt,mode,isolation,model,schema_hash,script_hash,args_hash,status,output,error,patch_path,worktree,created_at,updated_at,completed_at)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, agent.ID, agent.RunID, agent.Phase, agent.Label, agent.Prompt, agent.Mode, agent.Isolation, agent.Model, agent.SchemaHash, agent.ScriptHash, agent.ArgsHash, agent.Status, agent.Output, agent.Error, agent.PatchPath, agent.Worktree, agent.CreatedAt, agent.UpdatedAt, agent.CompletedAt)
+	_, err := s.db.Exec(`INSERT INTO workflow_agents(id,run_id,phase,label,prompt,provider,mode,isolation,model,schema_hash,script_hash,args_hash,status,output,error,patch_path,worktree,created_at,updated_at,completed_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, agent.ID, agent.RunID, agent.Phase, agent.Label, agent.Prompt, agent.Provider, agent.Mode, agent.Isolation, agent.Model, agent.SchemaHash, agent.ScriptHash, agent.ArgsHash, agent.Status, agent.Output, agent.Error, agent.PatchPath, agent.Worktree, agent.CreatedAt, agent.UpdatedAt, agent.CompletedAt)
 	return agent, err
 }
 
@@ -391,11 +394,11 @@ func (s *Store) FinishAgentStatus(agent Agent, status, outputText, errorText str
 	return err
 }
 
-func (s *Store) CompletedAgent(runID, phase, label, prompt, mode, isolation, model, schemaHash, scriptHash, argsHash string) (Agent, bool, error) {
-	row := s.db.QueryRow(`SELECT id,run_id,COALESCE(phase,''),COALESCE(label,''),prompt,mode,COALESCE(isolation,''),COALESCE(model,''),COALESCE(schema_hash,''),COALESCE(script_hash,''),COALESCE(args_hash,''),status,COALESCE(output,''),COALESCE(error,''),COALESCE(patch_path,''),COALESCE(worktree,''),created_at,updated_at,COALESCE(completed_at,'') FROM workflow_agents WHERE run_id=? AND COALESCE(phase,'')=? AND COALESCE(label,'')=? AND prompt=? AND mode=? AND COALESCE(isolation,'')=? AND COALESCE(model,'')=? AND COALESCE(schema_hash,'')=? AND COALESCE(script_hash,'')=? AND COALESCE(args_hash,'')=? AND status='completed' ORDER BY completed_at DESC, updated_at DESC LIMIT 1`,
-		runID, phase, label, prompt, mode, isolation, model, schemaHash, scriptHash, argsHash)
+func (s *Store) CompletedAgent(runID, phase, label, prompt, provider, mode, isolation, model, schemaHash, scriptHash, argsHash string) (Agent, bool, error) {
+	row := s.db.QueryRow(`SELECT id,run_id,COALESCE(phase,''),COALESCE(label,''),prompt,COALESCE(provider,''),mode,COALESCE(isolation,''),COALESCE(model,''),COALESCE(schema_hash,''),COALESCE(script_hash,''),COALESCE(args_hash,''),status,COALESCE(output,''),COALESCE(error,''),COALESCE(patch_path,''),COALESCE(worktree,''),created_at,updated_at,COALESCE(completed_at,'') FROM workflow_agents WHERE run_id=? AND COALESCE(phase,'')=? AND COALESCE(label,'')=? AND prompt=? AND COALESCE(provider,'')=? AND mode=? AND COALESCE(isolation,'')=? AND COALESCE(model,'')=? AND COALESCE(schema_hash,'')=? AND COALESCE(script_hash,'')=? AND COALESCE(args_hash,'')=? AND status='completed' ORDER BY completed_at DESC, updated_at DESC LIMIT 1`,
+		runID, phase, label, prompt, provider, mode, isolation, model, schemaHash, scriptHash, argsHash)
 	var agent Agent
-	err := row.Scan(&agent.ID, &agent.RunID, &agent.Phase, &agent.Label, &agent.Prompt, &agent.Mode, &agent.Isolation, &agent.Model, &agent.SchemaHash, &agent.ScriptHash, &agent.ArgsHash, &agent.Status, &agent.Output, &agent.Error, &agent.PatchPath, &agent.Worktree, &agent.CreatedAt, &agent.UpdatedAt, &agent.CompletedAt)
+	err := row.Scan(&agent.ID, &agent.RunID, &agent.Phase, &agent.Label, &agent.Prompt, &agent.Provider, &agent.Mode, &agent.Isolation, &agent.Model, &agent.SchemaHash, &agent.ScriptHash, &agent.ArgsHash, &agent.Status, &agent.Output, &agent.Error, &agent.PatchPath, &agent.Worktree, &agent.CreatedAt, &agent.UpdatedAt, &agent.CompletedAt)
 	if err == sql.ErrNoRows {
 		return Agent{}, false, nil
 	}
@@ -406,7 +409,7 @@ func (s *Store) CompletedAgent(runID, phase, label, prompt, mode, isolation, mod
 }
 
 func (s *Store) ListAgents(runID string) ([]Agent, error) {
-	rows, err := s.db.Query(`SELECT id,run_id,COALESCE(phase,''),COALESCE(label,''),prompt,mode,COALESCE(isolation,''),COALESCE(model,''),COALESCE(schema_hash,''),COALESCE(script_hash,''),COALESCE(args_hash,''),status,COALESCE(output,''),COALESCE(error,''),COALESCE(patch_path,''),COALESCE(worktree,''),created_at,updated_at,COALESCE(completed_at,'') FROM workflow_agents WHERE run_id=? ORDER BY created_at`, runID)
+	rows, err := s.db.Query(`SELECT id,run_id,COALESCE(phase,''),COALESCE(label,''),prompt,COALESCE(provider,''),mode,COALESCE(isolation,''),COALESCE(model,''),COALESCE(schema_hash,''),COALESCE(script_hash,''),COALESCE(args_hash,''),status,COALESCE(output,''),COALESCE(error,''),COALESCE(patch_path,''),COALESCE(worktree,''),created_at,updated_at,COALESCE(completed_at,'') FROM workflow_agents WHERE run_id=? ORDER BY created_at`, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -414,7 +417,7 @@ func (s *Store) ListAgents(runID string) ([]Agent, error) {
 	var agents []Agent
 	for rows.Next() {
 		var agent Agent
-		if err := rows.Scan(&agent.ID, &agent.RunID, &agent.Phase, &agent.Label, &agent.Prompt, &agent.Mode, &agent.Isolation, &agent.Model, &agent.SchemaHash, &agent.ScriptHash, &agent.ArgsHash, &agent.Status, &agent.Output, &agent.Error, &agent.PatchPath, &agent.Worktree, &agent.CreatedAt, &agent.UpdatedAt, &agent.CompletedAt); err != nil {
+		if err := rows.Scan(&agent.ID, &agent.RunID, &agent.Phase, &agent.Label, &agent.Prompt, &agent.Provider, &agent.Mode, &agent.Isolation, &agent.Model, &agent.SchemaHash, &agent.ScriptHash, &agent.ArgsHash, &agent.Status, &agent.Output, &agent.Error, &agent.PatchPath, &agent.Worktree, &agent.CreatedAt, &agent.UpdatedAt, &agent.CompletedAt); err != nil {
 			return nil, err
 		}
 		agents = append(agents, agent)
