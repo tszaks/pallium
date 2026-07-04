@@ -685,6 +685,7 @@ type workflowStatus struct {
 	AgentsRunning   int    `json:"agents_running"`
 	AgentsCompleted int    `json:"agents_completed"`
 	AgentsFailed    int    `json:"agents_failed"`
+	AgentsStopped   int    `json:"agents_stopped"`
 	UpdatedAt       string `json:"updated_at"`
 	CompletedAt     string `json:"completed_at,omitempty"`
 	Error           string `json:"error,omitempty"`
@@ -705,6 +706,7 @@ type phaseStats struct {
 	AgentsCompleted int `json:"agents_completed"`
 	AgentsRunning   int `json:"agents_running"`
 	AgentsFailed    int `json:"agents_failed"`
+	AgentsStopped   int `json:"agents_stopped"`
 }
 
 func workflowStatusSummary(snapshot workflow.Snapshot) workflowStatus {
@@ -731,6 +733,8 @@ func workflowStatusSummary(snapshot workflow.Snapshot) workflowStatus {
 			status.AgentsFailed++
 		case "running":
 			status.AgentsRunning++
+		case "stopped":
+			status.AgentsStopped++
 		}
 	}
 	return status
@@ -760,6 +764,8 @@ func workflowInspection(snapshot workflow.Snapshot) workflowInspectionReport {
 			stats.AgentsFailed++
 		case "running":
 			stats.AgentsRunning++
+		case "stopped":
+			stats.AgentsStopped++
 		}
 		report.ByPhase[agent.Phase] = stats
 	}
@@ -771,7 +777,7 @@ func renderWorkflowStatus(status workflowStatus) string {
 		fmt.Sprintf("Workflow %s: %s", status.ID, status.Status),
 		"Task: " + status.Task,
 		fmt.Sprintf("Phases: %d/%d completed", status.PhasesCompleted, status.PhasesTotal),
-		fmt.Sprintf("Agents: %d completed, %d running, %d failed, %d total", status.AgentsCompleted, status.AgentsRunning, status.AgentsFailed, status.AgentsTotal),
+		fmt.Sprintf("Agents: %d completed, %d running, %d failed, %d stopped, %d total", status.AgentsCompleted, status.AgentsRunning, status.AgentsFailed, status.AgentsStopped, status.AgentsTotal),
 		"Updated: " + status.UpdatedAt,
 	}
 	if status.CompletedAt != "" {
@@ -792,7 +798,7 @@ func renderWorkflowInspection(report workflowInspectionReport) string {
 		lines = append(lines, "Phase stats:")
 		for _, phase := range report.Phases {
 			stats := report.ByPhase[phase.Name]
-			lines = append(lines, fmt.Sprintf("- %s: %d completed, %d running, %d failed", phase.Name, stats.AgentsCompleted, stats.AgentsRunning, stats.AgentsFailed))
+			lines = append(lines, fmt.Sprintf("- %s: %d completed, %d running, %d failed, %d stopped", phase.Name, stats.AgentsCompleted, stats.AgentsRunning, stats.AgentsFailed, stats.AgentsStopped))
 		}
 	}
 	if len(report.Patches) > 0 {

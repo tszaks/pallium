@@ -145,6 +145,9 @@ Workflow scripts run as async JavaScript, matching Claude's saved workflow
 shape: top-level `await` is supported, `pipeline()` fans one worker per item in
 parallel for each stage, and completed agents are reused when the same run id is
 relaunched. Runs default to 16 concurrent agents and 1,000 total agents.
+`workflow stop <run-id>` is cooperative for foreground runs: it marks the run
+stopped in Pallium's database, the active runtime observes that state, cancels
+live worker commands, and records stopped agents instead of completing the run.
 Use `await check("test command")` for objective verification loops. It spawns a
 dedicated test agent, runs the command as ground truth, and returns structured
 JSON with `ok`, `summary`, `output_tail`, and `failures`, so scripts can keep
