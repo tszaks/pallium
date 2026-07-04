@@ -131,6 +131,22 @@ func WorkflowTools() []ToolInfo {
 			Example:     `const preflight = await pallium.preflight("fix auth tests", "cmd/workflow.go")`,
 		},
 		{
+			Name:        "pallium.decisions.record",
+			Signature:   `await pallium.decisions.record(title, body, ...tags)`,
+			Kind:        "pallium",
+			Description: "Records a durable workflow decision for future runs and reports.",
+			Returns:     "Recorded decision JSON.",
+			Example:     `await pallium.decisions.record("Use worktrees", "Parallel edit agents must isolate patches.", "workflow")`,
+		},
+		{
+			Name:        "pallium.decisions.search",
+			Signature:   `await pallium.decisions.search(query, limit?)`,
+			Kind:        "pallium",
+			Description: "Searches prior workflow decisions stored in the local workflow database.",
+			Returns:     "Array of matching decisions.",
+			Example:     `const prior = await pallium.decisions.search("auth", 5)`,
+		},
+		{
 			Name:        "pallium.explain",
 			Signature:   `await pallium.explain(path)`,
 			Kind:        "pallium",

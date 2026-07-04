@@ -189,6 +189,9 @@ control: `await pallium.verify("fast")`, `await pallium.review("origin/main")`,
 `await pallium.safe(path)`, `await pallium.plan(path)`,
 `await pallium.changedNow()`, `await pallium.preflight(task, ...scopes)`, and
 `await pallium.task.start(goal, ...scopes)`.
+Workflows can persist decisions with
+`await pallium.decisions.record(title, body, ...tags)` and recall prior choices
+with `await pallium.decisions.search(query, limit)`.
 Saved workflows resolve by name from the nearest `.pallium/workflows/` or
 `.claude/workflows/` directory while walking up from the current working
 directory, then from `~/.pallium/workflows/` or `~/.claude/workflows/`.

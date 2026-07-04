@@ -167,6 +167,16 @@ CREATE TABLE IF NOT EXISTS workflow_triggers (
   updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_workflow_triggers_updated ON workflow_triggers(updated_at DESC);
+CREATE TABLE IF NOT EXISTS workflow_decisions (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  body TEXT,
+  tags TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_decisions_created ON workflow_decisions(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_workflow_decisions_run ON workflow_decisions(run_id, created_at DESC);
 `)
 	if err != nil {
 		return err

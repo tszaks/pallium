@@ -371,6 +371,47 @@ return result;`
 	}
 }
 
+func TestRunnerRecordsAndSearchesDecisions(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	firstScript := `phase("decide");
+const decision = pallium.decisions.record("Use workflow decisions", "Carry durable choices across runs.", "workflow", "memory");
+return decision;`
+	firstPath, err := WriteRunScript("wf-decision-one", tmp, firstScript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRun, err := store.CreateRun(Run{ID: "wf-decision-one", Task: "decision", CWD: tmp, ScriptPath: firstPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Runner{Store: store, Run: firstRun, MaxAgents: 10}).Execute(context.Background(), firstScript, nil); err != nil {
+		t.Fatal(err)
+	}
+	secondScript := `phase("recall");
+const decisions = pallium.decisions.search("durable", 5);
+return { count: decisions.length, title: decisions[0].title };`
+	secondPath, err := WriteRunScript("wf-decision-two", tmp, secondScript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRun, err := store.CreateRun(Run{ID: "wf-decision-two", Task: "decision", CWD: tmp, ScriptPath: secondPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: secondRun, MaxAgents: 10}).Execute(context.Background(), secondScript, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, "Use workflow decisions") {
+		t.Fatalf("expected prior decision in result, got %s", result)
+	}
+}
+
 func TestParallelRunsAgentsConcurrently(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"prompt":"{{PROMPT}}"}`)
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_DELAY_MS", "250")
