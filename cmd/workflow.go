@@ -1,11 +1,13 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -715,8 +717,10 @@ func runWorkflowGenerate(out io.Writer, args []string, jsonOutput bool) error {
 	testCommand := fs.String("test-command", "", "")
 	maxRounds := fs.Int("max-rounds", 3, "")
 	saveName := fs.String("save", "", "")
+	codexBinary := fs.String("codex", "codex", "")
+	llm := fs.Bool("llm", false, "")
 	user := fs.Bool("user", false, "")
-	if err := parseSessionFlags(fs, args, map[string]struct{}{"output": {}, "style": {}, "test-command": {}, "max-rounds": {}, "save": {}}, map[string]struct{}{"user": {}}); err != nil {
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"output": {}, "style": {}, "test-command": {}, "max-rounds": {}, "save": {}, "codex": {}}, map[string]struct{}{"user": {}, "llm": {}}); err != nil {
 		return err
 	}
 	task := strings.TrimSpace(strings.Join(fs.Args(), " "))
@@ -729,6 +733,9 @@ func runWorkflowGenerate(out io.Writer, args []string, jsonOutput bool) error {
 		TestCommand: *testCommand,
 		MaxRounds:   *maxRounds,
 	})
+	if *llm {
+		script, err = generateWorkflowWithLLM(task, *style, *testCommand, *maxRounds, *codexBinary, script)
+	}
 	if err != nil {
 		return err
 	}
@@ -770,6 +777,60 @@ func runWorkflowGenerate(out io.Writer, args []string, jsonOutput bool) error {
 		}
 		return script
 	})
+}
+
+func generateWorkflowWithLLM(task, style, testCommand string, maxRounds int, codexBinary, fallback string) (string, error) {
+	if stub := strings.TrimSpace(os.Getenv("PALLIUM_WORKFLOW_GENERATE_STUB")); stub != "" {
+		return stub, nil
+	}
+	tools := workflow.WorkflowTools()
+	templates := workflow.WorkflowTemplates()
+	prompt := fmt.Sprintf(`Write a Pallium dynamic workflow JavaScript script for this task.
+
+Task: %s
+Requested style: %s
+Test command: %s
+Max rounds: %d
+
+Available tools: %s
+Available templates: %s
+
+Return only executable JavaScript. Use top-level await. Prefer phase(), parallel(), workflow(), gate(), verify.untilGreen(), and pallium.preflight() when useful. Do not wrap the script in markdown.
+
+Deterministic fallback script for reference:
+%s`, task, style, testCommand, maxRounds, workflow.MarshalJSON(tools), workflow.MarshalJSON(templates), fallback)
+	tmpDir, err := os.MkdirTemp("", "pallium-workflow-generate-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(tmpDir)
+	outFile := filepath.Join(tmpDir, "workflow.js")
+	cmd := exec.Command(codexBinary, "exec", "--output-last-message", outFile, "--sandbox", "read-only", prompt)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("codex workflow generation failed: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	raw, err := os.ReadFile(outFile)
+	if err != nil {
+		return "", err
+	}
+	return stripMarkdownFence(strings.TrimSpace(string(raw))), nil
+}
+
+func stripMarkdownFence(text string) string {
+	text = strings.TrimSpace(text)
+	if !strings.HasPrefix(text, "```") {
+		return text
+	}
+	lines := strings.Split(text, "\n")
+	if len(lines) >= 2 {
+		lines = lines[1:]
+		if strings.HasPrefix(strings.TrimSpace(lines[len(lines)-1]), "```") {
+			lines = lines[:len(lines)-1]
+		}
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
 }
 
 func runWorkflowValidate(out io.Writer, args []string, jsonOutput bool) error {
@@ -1562,7 +1623,7 @@ func printWorkflowHelp(out io.Writer) {
 
 Usage:
   pallium workflow preflight "task" [--scope path] [--cwd repo-path] [--json]
-  pallium workflow generate "task" [--style review|test-fix|research] [--output path.js] [--save name] [--json]
+  pallium workflow generate "task" [--style review|test-fix|research] [--llm] [--output path.js] [--save name] [--json]
   pallium workflow validate <path.js> [--json]
   pallium workflow tools list [--kind control|agent|verification|pallium] [--json]
   pallium workflow template list [--json]

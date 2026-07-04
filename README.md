@@ -115,6 +115,7 @@ repository.
 ```bash
 pallium workflow run "review this branch for correctness issues"
 pallium workflow generate "fix tests until green" --style test-fix --test-command "go test ./..." --output fix.workflow.js
+pallium workflow generate "custom migration workflow" --llm --output custom.workflow.js
 pallium workflow validate fix.workflow.js
 pallium workflow tools list
 pallium workflow template list
@@ -210,6 +211,9 @@ directory, then from `~/.pallium/workflows/` or `~/.claude/workflows/`.
 `workflow generate` emits deterministic Claude-shaped JS workflows for review,
 research, and test-fix loops. Use `workflow status` for a compact progress view
 and `workflow inspect` for phase, agent, patch, and failure detail.
+Add `--llm` to let Codex write a custom orchestration script from the current
+tool catalog and templates; Pallium validates the generated JavaScript before
+saving it.
 Use `workflow tools list --json` and `workflow template list --json` when an
 agent needs to discover the available primitives and workflow styles before
 generating or running a script automatically.

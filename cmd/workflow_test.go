@@ -217,6 +217,23 @@ func TestWorkflowGenerateSaveByName(t *testing.T) {
 	}
 }
 
+func TestWorkflowGenerateLLMValidatesScript(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_GENERATE_STUB", "phase(\"llm\");\nreturn { ok: true };")
+	tmp := t.TempDir()
+	outputPath := filepath.Join(tmp, "llm.workflow.js")
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{"generate", "--llm", "--output", outputPath, "write custom workflow"}, true); err != nil {
+		t.Fatalf("llm generate failed: %v", err)
+	}
+	raw, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `phase("llm")`) {
+		t.Fatalf("expected stubbed llm script, got %s", string(raw))
+	}
+}
+
 func TestWorkflowValidateScript(t *testing.T) {
 	tmp := t.TempDir()
 	validPath := filepath.Join(tmp, "valid.js")
