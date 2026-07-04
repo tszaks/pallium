@@ -73,6 +73,15 @@ func WorkflowTools() []ToolInfo {
 			Notes:       []string{"The orchestration script does not run shell commands directly. The test subagent does."},
 		},
 		{
+			Name:        "workflow",
+			Signature:   `await workflow(name, args)`,
+			Kind:        "control",
+			Description: "Runs one saved workflow by name from .pallium/workflows, .claude/workflows, or user workflow folders.",
+			Returns:     "Parsed JSON result when possible, otherwise text.",
+			Example:     `const review = await workflow("review-branch", { base: "origin/main" })`,
+			Notes:       []string{"Composition is intentionally limited to one nested level."},
+		},
+		{
 			Name:        "pallium.verify",
 			Signature:   `await pallium.verify("fast")`,
 			Kind:        "pallium",

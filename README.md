@@ -154,6 +154,10 @@ Workflow scripts run as async JavaScript, matching Claude's saved workflow
 shape: top-level `await` is supported, `pipeline()` fans one worker per item in
 parallel for each stage, and completed agents are reused when the same run id is
 relaunched. Runs default to 16 concurrent agents and 1,000 total agents.
+Scripts can call `await workflow("saved-name", args)` to compose one saved
+workflow from `.pallium/workflows/`, `.claude/workflows/`, or user workflow
+folders. Composition is capped at one nested level so generated scripts remain
+inspectable and do not recurse indefinitely.
 `workflow pause <run-id>` and `workflow stop <run-id>` are cooperative for
 foreground runs: they mark the run state in Pallium's database, the active
 runtime observes that state, cancels live worker commands, and records paused

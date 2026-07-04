@@ -34,15 +34,16 @@ type Runner struct {
 	MaxConcurrentAgents int
 	PalliumBinary       string
 
-	mu           sync.Mutex
-	currentPhase string
-	agentCount   int
-	budgetLimit  float64
-	budgetSpent  float64
-	agentCostUSD float64
-	capture      *parallelCapture
-	scriptHash   string
-	argsHash     string
+	mu            sync.Mutex
+	currentPhase  string
+	agentCount    int
+	budgetLimit   float64
+	budgetSpent   float64
+	agentCostUSD  float64
+	workflowDepth int
+	capture       *parallelCapture
+	scriptHash    string
+	argsHash      string
 }
 
 type AgentOptions struct {
@@ -102,6 +103,16 @@ func (r *Runner) Execute(ctx context.Context, script string, args any) (string, 
 	if err := r.Store.SetRunStatus(r.Run.ID, "running", "", ""); err != nil {
 		return "", err
 	}
+	return r.executeScript(ctx, script, args, true)
+}
+
+func (r *Runner) executeScript(ctx context.Context, script string, args any, topLevel bool) (string, error) {
+	previousScriptHash := r.scriptHash
+	previousArgsHash := r.argsHash
+	defer func() {
+		r.scriptHash = previousScriptHash
+		r.argsHash = previousArgsHash
+	}()
 	r.scriptHash = stableHash(script)
 	r.argsHash = stableHash(args)
 	if err := r.ensureNotStopped(ctx); err != nil {
@@ -132,8 +143,20 @@ func (r *Runner) Execute(ctx context.Context, script string, args any) (string, 
 	if err := vm.Set("pipeline", r.jsPipeline(ctx, vm)); err != nil {
 		return "", err
 	}
-	if err := vm.Set("workflow", func(name string, input any) any {
-		panic(vm.ToValue(fmt.Sprintf("nested workflow %q is not supported in this v1 runtime", name)))
+	if err := vm.Set("workflow", func(call goja.FunctionCall) goja.Value {
+		name := strings.TrimSpace(call.Argument(0).String())
+		if name == "" {
+			panic(vm.ToValue("workflow name is required"))
+		}
+		var input any
+		if len(call.Arguments) > 1 && !goja.IsUndefined(call.Argument(1)) && !goja.IsNull(call.Argument(1)) {
+			input = call.Argument(1).Export()
+		}
+		result, err := r.executeSavedWorkflow(ctx, name, input)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		return vm.ToValue(parseAgentOutput(result))
 	}); err != nil {
 		return "", err
 	}
@@ -145,51 +168,90 @@ func (r *Runner) Execute(ctx context.Context, script string, args any) (string, 
 	}
 	if err != nil {
 		if isWorkflowStoppedError(err) {
-			_ = r.Store.SetRunStatus(r.Run.ID, "stopped", "", ErrWorkflowStopped.Error())
+			if topLevel {
+				_ = r.Store.SetRunStatus(r.Run.ID, "stopped", "", ErrWorkflowStopped.Error())
+			}
 			return "", ErrWorkflowStopped
 		}
 		if isWorkflowPausedError(err) {
-			_ = r.Store.SetRunStatus(r.Run.ID, "paused", "", ErrWorkflowPaused.Error())
+			if topLevel {
+				_ = r.Store.SetRunStatus(r.Run.ID, "paused", "", ErrWorkflowPaused.Error())
+			}
 			return "", ErrWorkflowPaused
 		}
-		_ = r.Store.SetRunStatus(r.Run.ID, "failed", "", err.Error())
+		if topLevel {
+			_ = r.Store.SetRunStatus(r.Run.ID, "failed", "", err.Error())
+		}
 		return "", err
 	}
 	value, err = awaitPromiseValue(value)
 	if err != nil {
 		if isWorkflowStoppedError(err) {
-			_ = r.Store.SetRunStatus(r.Run.ID, "stopped", "", ErrWorkflowStopped.Error())
+			if topLevel {
+				_ = r.Store.SetRunStatus(r.Run.ID, "stopped", "", ErrWorkflowStopped.Error())
+			}
 			return "", ErrWorkflowStopped
 		}
 		if isWorkflowPausedError(err) {
-			_ = r.Store.SetRunStatus(r.Run.ID, "paused", "", ErrWorkflowPaused.Error())
+			if topLevel {
+				_ = r.Store.SetRunStatus(r.Run.ID, "paused", "", ErrWorkflowPaused.Error())
+			}
 			return "", ErrWorkflowPaused
 		}
-		_ = r.Store.SetRunStatus(r.Run.ID, "failed", "", err.Error())
+		if topLevel {
+			_ = r.Store.SetRunStatus(r.Run.ID, "failed", "", err.Error())
+		}
 		return "", err
 	}
 	if err := r.ensureNotStopped(ctx); err != nil {
-		_ = r.Store.SetRunStatus(r.Run.ID, interruptedStatus(err), "", interruptedMessage(err))
+		if topLevel {
+			_ = r.Store.SetRunStatus(r.Run.ID, interruptedStatus(err), "", interruptedMessage(err))
+		}
 		return "", err
 	}
-	if _, err := r.ApplyPatches(ctx); err != nil {
-		if isWorkflowInterruptedError(err) {
-			_ = r.Store.SetRunStatus(r.Run.ID, interruptedStatus(err), "", interruptedMessage(err))
+	if topLevel {
+		if _, err := r.ApplyPatches(ctx); err != nil {
+			if isWorkflowInterruptedError(err) {
+				_ = r.Store.SetRunStatus(r.Run.ID, interruptedStatus(err), "", interruptedMessage(err))
+				return "", err
+			}
+			_ = r.Store.SetRunStatus(r.Run.ID, "failed", "", err.Error())
 			return "", err
 		}
-		_ = r.Store.SetRunStatus(r.Run.ID, "failed", "", err.Error())
-		return "", err
 	}
 	if err := r.ensureNotStopped(ctx); err != nil {
-		_ = r.Store.SetRunStatus(r.Run.ID, interruptedStatus(err), "", interruptedMessage(err))
+		if topLevel {
+			_ = r.Store.SetRunStatus(r.Run.ID, interruptedStatus(err), "", interruptedMessage(err))
+		}
 		return "", err
 	}
 	result := value.Export()
 	resultText := stringifyResult(result)
-	if err := r.Store.SetRunStatus(r.Run.ID, "completed", resultText, ""); err != nil {
-		return "", err
+	if topLevel {
+		if err := r.Store.SetRunStatus(r.Run.ID, "completed", resultText, ""); err != nil {
+			return "", err
+		}
 	}
 	return resultText, nil
+}
+
+func (r *Runner) executeSavedWorkflow(ctx context.Context, name string, input any) (string, error) {
+	if r.workflowDepth >= 1 {
+		return "", fmt.Errorf("nested workflow depth exceeded while running %q", name)
+	}
+	path, err := ResolveSavedWorkflow(r.Run.CWD, name)
+	if err != nil {
+		return "", err
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	r.workflowDepth++
+	defer func() {
+		r.workflowDepth--
+	}()
+	return r.executeScript(ctx, string(raw), input, false)
 }
 
 func (r *Runner) jsPhase(vm *goja.Runtime) func(goja.FunctionCall) goja.Value {

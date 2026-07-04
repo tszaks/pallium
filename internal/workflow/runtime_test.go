@@ -258,6 +258,70 @@ func TestRunnerEnforcesBudget(t *testing.T) {
 	}
 }
 
+func TestRunnerComposesSavedWorkflow(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"prompt":"{{PROMPT}}"}`)
+	tmp := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmp, ".pallium", "workflows"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, ".pallium", "workflows", "inner.js"), []byte(`phase("inner");
+const result = agent("inner " + args.topic, { label: "inner" });
+return { inner: result.prompt };`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("outer");
+const result = workflow("inner", { topic: "compose" });
+return { composed: result.inner };`
+	scriptPath, err := WriteRunScript("wf-compose", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-compose", Task: "compose", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, "inner compose") {
+		t.Fatalf("expected nested workflow result, got %s", result)
+	}
+}
+
+func TestRunnerRejectsDeepNestedWorkflow(t *testing.T) {
+	tmp := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmp, ".pallium", "workflows"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, ".pallium", "workflows", "inner.js"), []byte(`return workflow("inner", {});`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `return workflow("inner", {});`
+	scriptPath, err := WriteRunScript("wf-compose-depth", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-compose-depth", Task: "compose", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), "nested workflow depth exceeded") {
+		t.Fatalf("expected depth error, got %v", err)
+	}
+}
+
 func TestParallelRunsAgentsConcurrently(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"prompt":"{{PROMPT}}"}`)
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_DELAY_MS", "250")
