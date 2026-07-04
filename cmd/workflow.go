@@ -40,6 +40,10 @@ func runWorkflow(out io.Writer, args []string, jsonOutput bool) error {
 		return runWorkflowRead(out, args[1:], jsonOutput)
 	case "watch":
 		return runWorkflowWatch(out, args[1:])
+	case "pause":
+		return runWorkflowPause(out, args[1:], jsonOutput)
+	case "resume":
+		return runWorkflowResume(out, args[1:], jsonOutput)
 	case "stop":
 		return runWorkflowStop(out, args[1:], jsonOutput)
 	case "save":
@@ -530,21 +534,29 @@ func runWorkflowWatch(out io.Writer, args []string) error {
 			fmt.Fprint(out, "\033[H\033[2J")
 		}
 		fmt.Fprintln(out, renderWorkflowSnapshot(snapshot))
-		if snapshot.Run.Status == "completed" || snapshot.Run.Status == "failed" || snapshot.Run.Status == "stopped" {
+		if isWorkflowTerminalOrPaused(snapshot.Run.Status) {
 			return nil
 		}
 		time.Sleep(2 * time.Second)
 	}
 }
 
+func runWorkflowPause(out io.Writer, args []string, jsonOutput bool) error {
+	return runWorkflowInterruptStatus(out, args, jsonOutput, "pause", "paused")
+}
+
 func runWorkflowStop(out io.Writer, args []string, jsonOutput bool) error {
-	fs := newSessionFlagSet("workflow stop")
+	return runWorkflowInterruptStatus(out, args, jsonOutput, "stop", "stopped")
+}
+
+func runWorkflowInterruptStatus(out io.Writer, args []string, jsonOutput bool, commandName, status string) error {
+	fs := newSessionFlagSet("workflow " + commandName)
 	dbPath := fs.String("db", "", "")
 	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}}, nil); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: pallium workflow stop <run-id>")
+		return fmt.Errorf("usage: pallium workflow %s <run-id>", commandName)
 	}
 	store, err := workflow.Open(*dbPath)
 	if err != nil {
@@ -556,11 +568,12 @@ func runWorkflowStop(out io.Writer, args []string, jsonOutput bool) error {
 		return err
 	}
 	if run.OwnedID == "" {
-		if err := storeWorkflowStatus(*dbPath, run.ID, run.Result, "stopped without owned session"); err != nil {
+		message := status + " without owned session"
+		if err := storeWorkflowStatus(*dbPath, run.ID, status, run.Result, message); err != nil {
 			return err
 		}
-		return output.Write(out, map[string]string{"id": run.ID, "status": "stopped"}, jsonOutput, func() string {
-			return "Workflow marked stopped: " + run.ID
+		return output.Write(out, map[string]string{"id": run.ID, "status": status}, jsonOutput, func() string {
+			return fmt.Sprintf("Workflow marked %s: %s", status, run.ID)
 		})
 	}
 	var buf strings.Builder
@@ -573,21 +586,61 @@ func runWorkflowStop(out io.Writer, args []string, jsonOutput bool) error {
 	}
 	store, err = workflow.Open(*dbPath)
 	if err == nil {
-		_ = store.SetRunStatus(run.ID, "stopped", run.Result, "interrupted")
+		_ = store.SetRunStatus(run.ID, status, run.Result, "interrupted")
 		_ = store.Close()
 	}
-	return output.Write(out, map[string]string{"id": run.ID, "status": "stopped"}, jsonOutput, func() string {
-		return "Workflow stopped: " + run.ID
+	return output.Write(out, map[string]string{"id": run.ID, "status": status}, jsonOutput, func() string {
+		return fmt.Sprintf("Workflow %s: %s", status, run.ID)
 	})
 }
 
-func storeWorkflowStatus(dbPath, runID, result, errorText string) error {
+func storeWorkflowStatus(dbPath, runID, status, result, errorText string) error {
 	store, err := workflow.Open(dbPath)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
-	return store.SetRunStatus(runID, "stopped", result, errorText)
+	return store.SetRunStatus(runID, status, result, errorText)
+}
+
+func runWorkflowResume(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("workflow resume")
+	dbPath := fs.String("db", "", "")
+	codexBinary := fs.String("codex", "codex", "")
+	maxAgents := fs.Int("max-agents", 1000, "")
+	maxConcurrentAgents := fs.Int("max-concurrent-agents", 16, "")
+	maxBudgetUSD := fs.String("max-budget-usd", "", "")
+	background := fs.Bool("background", false, "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "codex": {}, "max-agents": {}, "max-concurrent-agents": {}, "max-budget-usd": {}}, map[string]struct{}{"background": {}}); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: pallium workflow resume <run-id>")
+	}
+	store, err := workflow.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	run, err := store.Run(fs.Arg(0))
+	_ = store.Close()
+	if err != nil {
+		return err
+	}
+	runArgs := []string{"run", "--id", run.ID, "--cwd", run.CWD, "--script", run.ScriptPath, "--codex", *codexBinary, "--max-agents", fmt.Sprintf("%d", *maxAgents), "--max-concurrent-agents", fmt.Sprintf("%d", *maxConcurrentAgents)}
+	if *dbPath != "" {
+		runArgs = append(runArgs, "--db", *dbPath)
+	}
+	if run.ArgsJSON != "" {
+		runArgs = append(runArgs, "--args", run.ArgsJSON)
+	}
+	if *maxBudgetUSD != "" {
+		runArgs = append(runArgs, "--max-budget-usd", *maxBudgetUSD)
+	}
+	if *background {
+		runArgs = append(runArgs, "--background")
+	}
+	runArgs = append(runArgs, run.Task)
+	return runWorkflowRun(out, runArgs[1:], jsonOutput)
 }
 
 func runWorkflowSave(out io.Writer, args []string, jsonOutput bool) error {
@@ -675,6 +728,15 @@ func renderWorkflowResult(snapshot workflow.Snapshot, result string) string {
 	return text
 }
 
+func isWorkflowTerminalOrPaused(status string) bool {
+	switch status {
+	case "completed", "failed", "stopped", "paused":
+		return true
+	default:
+		return false
+	}
+}
+
 type workflowStatus struct {
 	ID              string `json:"id"`
 	Task            string `json:"task"`
@@ -686,6 +748,7 @@ type workflowStatus struct {
 	AgentsCompleted int    `json:"agents_completed"`
 	AgentsFailed    int    `json:"agents_failed"`
 	AgentsStopped   int    `json:"agents_stopped"`
+	AgentsPaused    int    `json:"agents_paused"`
 	UpdatedAt       string `json:"updated_at"`
 	CompletedAt     string `json:"completed_at,omitempty"`
 	Error           string `json:"error,omitempty"`
@@ -707,6 +770,7 @@ type phaseStats struct {
 	AgentsRunning   int `json:"agents_running"`
 	AgentsFailed    int `json:"agents_failed"`
 	AgentsStopped   int `json:"agents_stopped"`
+	AgentsPaused    int `json:"agents_paused"`
 }
 
 func workflowStatusSummary(snapshot workflow.Snapshot) workflowStatus {
@@ -735,6 +799,8 @@ func workflowStatusSummary(snapshot workflow.Snapshot) workflowStatus {
 			status.AgentsRunning++
 		case "stopped":
 			status.AgentsStopped++
+		case "paused":
+			status.AgentsPaused++
 		}
 	}
 	return status
@@ -766,6 +832,8 @@ func workflowInspection(snapshot workflow.Snapshot) workflowInspectionReport {
 			stats.AgentsRunning++
 		case "stopped":
 			stats.AgentsStopped++
+		case "paused":
+			stats.AgentsPaused++
 		}
 		report.ByPhase[agent.Phase] = stats
 	}
@@ -777,7 +845,7 @@ func renderWorkflowStatus(status workflowStatus) string {
 		fmt.Sprintf("Workflow %s: %s", status.ID, status.Status),
 		"Task: " + status.Task,
 		fmt.Sprintf("Phases: %d/%d completed", status.PhasesCompleted, status.PhasesTotal),
-		fmt.Sprintf("Agents: %d completed, %d running, %d failed, %d stopped, %d total", status.AgentsCompleted, status.AgentsRunning, status.AgentsFailed, status.AgentsStopped, status.AgentsTotal),
+		fmt.Sprintf("Agents: %d completed, %d running, %d failed, %d paused, %d stopped, %d total", status.AgentsCompleted, status.AgentsRunning, status.AgentsFailed, status.AgentsPaused, status.AgentsStopped, status.AgentsTotal),
 		"Updated: " + status.UpdatedAt,
 	}
 	if status.CompletedAt != "" {
@@ -798,7 +866,7 @@ func renderWorkflowInspection(report workflowInspectionReport) string {
 		lines = append(lines, "Phase stats:")
 		for _, phase := range report.Phases {
 			stats := report.ByPhase[phase.Name]
-			lines = append(lines, fmt.Sprintf("- %s: %d completed, %d running, %d failed, %d stopped", phase.Name, stats.AgentsCompleted, stats.AgentsRunning, stats.AgentsFailed, stats.AgentsStopped))
+			lines = append(lines, fmt.Sprintf("- %s: %d completed, %d running, %d failed, %d paused, %d stopped", phase.Name, stats.AgentsCompleted, stats.AgentsRunning, stats.AgentsFailed, stats.AgentsPaused, stats.AgentsStopped))
 		}
 	}
 	if len(report.Patches) > 0 {
@@ -890,6 +958,8 @@ Usage:
   pallium workflow show <run-id> [--json]
   pallium workflow read <run-id> [--json]
   pallium workflow watch <run-id>
+  pallium workflow pause <run-id> [--json]
+  pallium workflow resume <run-id> [--background] [--json]
   pallium workflow stop <run-id> [--json]
   pallium workflow save <run-id> --name name [--user] [--json]
   pallium workflow apply <run-id> [--json]`)

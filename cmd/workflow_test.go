@@ -291,6 +291,54 @@ func TestWorkflowStopMarksForegroundRunStopped(t *testing.T) {
 	}
 }
 
+func TestWorkflowPauseAndResumeReusesCompletedAgents(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"source":"first","prompt":"{{PROMPT}}"}`)
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	scriptPath := filepath.Join(tmp, "workflow.js")
+	if err := os.WriteFile(scriptPath, []byte(`phase("scan");
+const result = await agent("stable prompt", { label: "stable" });
+return result;`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{"run", "--id", "wf-pause-resume", "--db", dbPath, "--cwd", tmp, "--script", scriptPath, "pause resume test"}, false); err != nil {
+		t.Fatalf("workflow run failed: %v", err)
+	}
+	out.Reset()
+	if err := runWorkflow(&out, []string{"pause", "wf-pause-resume", "--db", dbPath}, false); err != nil {
+		t.Fatalf("workflow pause failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "paused") {
+		t.Fatalf("expected pause output, got %s", out.String())
+	}
+
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"source":"second","prompt":"{{PROMPT}}"}`)
+	out.Reset()
+	if err := runWorkflow(&out, []string{"resume", "wf-pause-resume", "--db", dbPath}, false); err != nil {
+		t.Fatalf("workflow resume failed: %v", err)
+	}
+	if !strings.Contains(out.String(), `"source": "first"`) {
+		t.Fatalf("expected resume to reuse completed agent output, got %s", out.String())
+	}
+
+	out.Reset()
+	if err := runWorkflow(&out, []string{"status", "wf-pause-resume", "--db", dbPath}, true); err != nil {
+		t.Fatalf("workflow status failed: %v", err)
+	}
+	var status map[string]any
+	if err := json.Unmarshal(out.Bytes(), &status); err != nil {
+		t.Fatalf("decode status json: %v\n%s", err, out.String())
+	}
+	if status["status"] != "completed" {
+		t.Fatalf("expected completed status after resume, got %#v", status)
+	}
+	if got := int(status["agents_completed"].(float64)); got != 1 {
+		t.Fatalf("expected one completed agent after cached resume, got %#v", status)
+	}
+}
+
 func TestWorkflowEditAgentAutoAppliesPatch(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"status":"edited"}`)
