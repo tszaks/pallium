@@ -64,6 +64,12 @@ type CheckOptions struct {
 	Schema   map[string]any `json:"schema,omitempty"`
 }
 
+type PolicyFinding struct {
+	Kind    string `json:"kind"`
+	Line    int    `json:"line"`
+	Message string `json:"message"`
+}
+
 type parallelAgentCall struct {
 	Prompt string
 	Opts   AgentOptions
@@ -1417,6 +1423,13 @@ func (r *Runner) createWorktree(agentID, repoRoot string) (string, error) {
 }
 
 func (r *Runner) writeWorktreePatch(agentID, worktree string) (string, error) {
+	addIntent := exec.Command("git", "add", "-N", "--", ".")
+	addIntent.Dir = worktree
+	var addStderr bytes.Buffer
+	addIntent.Stderr = &addStderr
+	if err := addIntent.Run(); err != nil {
+		return "", fmt.Errorf("prepare worktree patch: %w: %s", err, strings.TrimSpace(addStderr.String()))
+	}
 	cmd := exec.Command("git", "diff", "--binary")
 	cmd.Dir = worktree
 	raw, err := cmd.Output()
@@ -1631,6 +1644,11 @@ func applyPatch(ctx context.Context, cwd, patchPath string) (bool, error) {
 	if strings.TrimSpace(string(raw)) == "" {
 		return false, nil
 	}
+	if os.Getenv("PALLIUM_WORKFLOW_ALLOW_SECRET_PATCH") != "1" {
+		if findings := ScanPatchPolicy(raw); len(findings) > 0 {
+			return false, fmt.Errorf("workflow patch policy blocked %s: %s", patchPath, renderPolicyFindings(findings))
+		}
+	}
 	if err := runGitApplyCheck(ctx, cwd, patchPath, false); err != nil {
 		if reverseErr := runGitApplyCheck(ctx, cwd, patchPath, true); reverseErr == nil {
 			return false, nil
@@ -1645,6 +1663,39 @@ func applyPatch(ctx context.Context, cwd, patchPath string) (bool, error) {
 		return false, fmt.Errorf("apply %s: %w: %s", patchPath, err, strings.TrimSpace(stderr.String()))
 	}
 	return true, nil
+}
+
+func ScanPatchPolicy(raw []byte) []PolicyFinding {
+	patterns := []struct {
+		kind string
+		re   *regexp.Regexp
+		msg  string
+	}{
+		{kind: "openai-key", re: regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{20,}\b`), msg: "added line looks like an OpenAI-style API key"},
+		{kind: "aws-access-key", re: regexp.MustCompile(`\bA(KIA|SIA)[A-Z0-9]{16}\b`), msg: "added line looks like an AWS access key"},
+		{kind: "generic-secret", re: regexp.MustCompile(`(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*['"]?[A-Za-z0-9_./+=-]{16,}`), msg: "added line looks like a hard-coded secret"},
+	}
+	var findings []PolicyFinding
+	for index, line := range strings.Split(string(raw), "\n") {
+		if !strings.HasPrefix(line, "+") || strings.HasPrefix(line, "+++") {
+			continue
+		}
+		added := strings.TrimPrefix(line, "+")
+		for _, pattern := range patterns {
+			if pattern.re.MatchString(added) {
+				findings = append(findings, PolicyFinding{Kind: pattern.kind, Line: index + 1, Message: pattern.msg})
+			}
+		}
+	}
+	return findings
+}
+
+func renderPolicyFindings(findings []PolicyFinding) string {
+	parts := make([]string, 0, len(findings))
+	for _, finding := range findings {
+		parts = append(parts, fmt.Sprintf("%s at patch line %d", finding.Kind, finding.Line))
+	}
+	return strings.Join(parts, "; ")
 }
 
 func revertPatch(ctx context.Context, cwd, patchPath string) (bool, error) {
