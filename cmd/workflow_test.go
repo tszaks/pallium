@@ -72,6 +72,54 @@ return { result };`), 0o644); err != nil {
 	}
 }
 
+func TestWorkflowRunSavedWorkflowByName(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"status":"ok","prompt":"{{PROMPT}}"}`)
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	workflowDir := filepath.Join(tmp, ".pallium", "workflows")
+	if err := os.MkdirAll(workflowDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workflowDir, "saved-review.js"), []byte(`phase("scan");
+const result = await agent("saved workflow " + args.topic, { label: "saved" });
+return result;`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{
+		"run",
+		"--id", "wf-saved-name",
+		"--db", dbPath,
+		"--cwd", tmp,
+		"--workflow", "saved-review",
+		"--args", `{"topic":"auth"}`,
+		"saved task",
+	}, false); err != nil {
+		t.Fatalf("workflow run by name failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "saved workflow auth") {
+		t.Fatalf("expected saved workflow output, got %s", out.String())
+	}
+
+	out.Reset()
+	if err := runWorkflow(&out, []string{
+		"run",
+		"--id", "wf-saved-slash",
+		"--db", dbPath,
+		"--cwd", tmp,
+		"--args", `{"topic":"billing"}`,
+		"/saved-review",
+		"slash task",
+	}, false); err != nil {
+		t.Fatalf("workflow run by slash name failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "saved workflow billing") {
+		t.Fatalf("expected slash workflow output, got %s", out.String())
+	}
+}
+
 func TestWorkflowHelpIsRouted(t *testing.T) {
 	var out bytes.Buffer
 	app := NewApp(&out, &out)

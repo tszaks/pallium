@@ -755,6 +755,53 @@ func WriteRunScript(runID, cwd, script string) (string, error) {
 	return path, os.WriteFile(path, []byte(script), 0o644)
 }
 
+func ResolveSavedWorkflow(cwd, name string) (string, error) {
+	name = strings.TrimSpace(strings.TrimPrefix(name, "/"))
+	name = strings.TrimSuffix(name, ".js")
+	if err := ValidateID(name); err != nil {
+		return "", err
+	}
+	if cwd == "" {
+		var err error
+		cwd, err = os.Getwd()
+		if err != nil {
+			return "", err
+		}
+	}
+	abs, err := filepath.Abs(cwd)
+	if err != nil {
+		return "", err
+	}
+	for {
+		for _, dir := range []string{".pallium", ".claude"} {
+			candidate := filepath.Join(abs, dir, "workflows", name+".js")
+			if isFile(candidate) {
+				return candidate, nil
+			}
+		}
+		parent := filepath.Dir(abs)
+		if parent == abs {
+			break
+		}
+		abs = parent
+	}
+	home, err := os.UserHomeDir()
+	if err == nil {
+		for _, dir := range []string{".pallium", ".claude"} {
+			candidate := filepath.Join(home, dir, "workflows", name+".js")
+			if isFile(candidate) {
+				return candidate, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("saved workflow %q not found", name)
+}
+
+func isFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
 func RunArtifactDir(runID, child string) (string, error) {
 	if err := ValidateID(runID); err != nil {
 		return "", err
