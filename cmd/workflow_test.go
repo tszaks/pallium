@@ -215,6 +215,38 @@ func TestWorkflowGenerateSaveByName(t *testing.T) {
 	}
 }
 
+func TestWorkflowValidateScript(t *testing.T) {
+	tmp := t.TempDir()
+	validPath := filepath.Join(tmp, "valid.js")
+	if err := os.WriteFile(validPath, []byte(`phase("scan"); return { ok: true };`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	invalidPath := filepath.Join(tmp, "invalid.js")
+	if err := os.WriteFile(invalidPath, []byte(`phase("scan"; return { ok: true };`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{"validate", validPath}, false); err != nil {
+		t.Fatalf("workflow validate failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "Workflow script valid") {
+		t.Fatalf("unexpected valid output: %s", out.String())
+	}
+
+	out.Reset()
+	if err := runWorkflow(&out, []string{"validate", invalidPath}, true); err != nil {
+		t.Fatalf("workflow validate json should not error on invalid script: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("decode validation json: %v\n%s", err, out.String())
+	}
+	if payload["valid"] != false || payload["error"] == "" {
+		t.Fatalf("expected invalid validation payload, got %#v", payload)
+	}
+}
+
 func TestWorkflowToolsAndTemplateCatalog(t *testing.T) {
 	var out bytes.Buffer
 	if err := runWorkflow(&out, []string{"tools", "list", "--kind", "verification"}, true); err != nil {
