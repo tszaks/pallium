@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -319,6 +320,54 @@ func TestRunnerRejectsDeepNestedWorkflow(t *testing.T) {
 	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
 	if err == nil || !strings.Contains(err.Error(), "nested workflow depth exceeded") {
 		t.Fatalf("expected depth error, got %v", err)
+	}
+}
+
+func TestRunnerVerifyUntilGreenFixLoop(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_SEQUENCE", `[
+		"{\"ok\":false,\"command\":\"go test ./...\",\"summary\":\"failed\",\"output_tail\":\"boom\",\"failures\":[{\"name\":\"TestOne\",\"message\":\"boom\"}]}",
+		"{\"summary\":\"fixed\",\"files_changed\":[\"main.go\"],\"confidence\":\"high\"}",
+		"{\"ok\":true,\"command\":\"go test ./...\",\"summary\":\"passed\",\"output_tail\":\"ok\",\"failures\":[]}"
+	]`)
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("verify");
+const result = verify.untilGreen("go test ./...", { label: "green", maxRounds: 2 });
+return result;`
+	scriptPath, err := WriteRunScript("wf-until-green", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-until-green", Task: "until green", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"ok": true`) || !strings.Contains(result, `"fixed": true`) {
+		t.Fatalf("expected successful fix loop, got %s", result)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 3 || agents[1].Mode != "edit" {
+		t.Fatalf("expected check/fix/check agents, got %+v", agents)
 	}
 }
 
@@ -887,5 +936,15 @@ func TestRunArtifactDirUsesHomePalliumDirectory(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(home, ".pallium")); !os.IsNotExist(err) {
 		t.Fatalf("RunArtifactDir should not create dirs, stat err=%v", err)
+	}
+}
+
+func runGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
 	}
 }

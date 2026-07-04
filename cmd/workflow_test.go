@@ -161,7 +161,7 @@ func TestWorkflowGenerateStatusAndInspect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected generated workflow: %v", err)
 	}
-	if !strings.Contains(string(raw), "await check") || !strings.Contains(string(raw), "fix-round-") {
+	if !strings.Contains(string(raw), "verify.untilGreen") || !strings.Contains(string(raw), "maxRounds") {
 		t.Fatalf("generated workflow missing test-fix loop:\n%s", string(raw))
 	}
 
@@ -444,8 +444,8 @@ func TestWorkflowToolsAndTemplateCatalog(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &tools); err != nil {
 		t.Fatalf("decode tools json: %v\n%s", err, out.String())
 	}
-	if len(tools) != 1 || tools[0]["name"] != "check" {
-		t.Fatalf("expected verification catalog to contain check only, got %#v", tools)
+	if len(tools) != 2 || tools[0]["name"] != "check" || tools[1]["name"] != "verify.untilGreen" {
+		t.Fatalf("expected verification catalog to contain check and verify.untilGreen, got %#v", tools)
 	}
 
 	out.Reset()

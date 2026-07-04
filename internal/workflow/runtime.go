@@ -41,6 +41,7 @@ type Runner struct {
 	budgetSpent   float64
 	agentCostUSD  float64
 	workflowDepth int
+	stubIndex     int
 	capture       *parallelCapture
 	scriptHash    string
 	argsHash      string
@@ -132,6 +133,9 @@ func (r *Runner) executeScript(ctx context.Context, script string, args any, top
 		return "", err
 	}
 	if err := vm.Set("check", r.jsCheck(ctx, vm)); err != nil {
+		return "", err
+	}
+	if err := vm.Set("verify", r.jsVerify(ctx, vm)); err != nil {
 		return "", err
 	}
 	if err := vm.Set("pallium", r.jsPallium(ctx, vm)); err != nil {
@@ -370,6 +374,100 @@ func (r *Runner) jsCheck(ctx context.Context, vm *goja.Runtime) func(goja.Functi
 		}
 		return vm.ToValue(parseAgentOutput(output))
 	}
+}
+
+func (r *Runner) jsVerify(ctx context.Context, vm *goja.Runtime) map[string]any {
+	return map[string]any{
+		"untilGreen": func(command string, rawOptions ...any) goja.Value {
+			options := map[string]any{}
+			if len(rawOptions) > 0 && rawOptions[0] != nil {
+				raw, err := json.Marshal(rawOptions[0])
+				if err != nil {
+					panic(vm.ToValue(err.Error()))
+				}
+				if err := json.Unmarshal(raw, &options); err != nil {
+					panic(vm.ToValue(err.Error()))
+				}
+			}
+			result, err := r.runUntilGreen(ctx, strings.TrimSpace(command), options)
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			return vm.ToValue(result)
+		},
+	}
+}
+
+func (r *Runner) runUntilGreen(ctx context.Context, command string, options map[string]any) (map[string]any, error) {
+	if command == "" {
+		return nil, fmt.Errorf("verify.untilGreen command is required")
+	}
+	maxRounds := optionInt(options, "maxRounds", 3)
+	if value := optionInt(options, "max_rounds", 0); value > 0 {
+		maxRounds = value
+	}
+	if maxRounds <= 0 {
+		maxRounds = 3
+	}
+	label := optionString(options, "label", "until-green")
+	testModel := optionString(options, "model", "")
+	fixModel := optionString(options, "fix_model", testModel)
+	var rounds []map[string]any
+	lastSignature := ""
+	stalled := false
+	for round := 0; round <= maxRounds; round++ {
+		checkOutput, err := r.RunAgent(ctx, buildCheckPrompt(command), AgentOptions{
+			Label:  fmt.Sprintf("%s-check-%d", label, round+1),
+			Mode:   "test",
+			Model:  testModel,
+			Schema: defaultCheckSchema(),
+		})
+		if err != nil {
+			return nil, err
+		}
+		checkResult := parseAgentOutput(checkOutput)
+		roundRecord := map[string]any{
+			"round":   round + 1,
+			"check":   checkResult,
+			"fixed":   false,
+			"command": command,
+		}
+		rounds = append(rounds, roundRecord)
+		if checkOK(checkResult) {
+			return map[string]any{"ok": true, "command": command, "rounds": rounds, "stalled": false}, nil
+		}
+		signature := stableHash(checkResult)
+		if round > 0 && signature == lastSignature {
+			stalled = true
+			break
+		}
+		lastSignature = signature
+		if round == maxRounds {
+			break
+		}
+		fixPrompt := "Fix the failing verification for this workflow.\nCommand: " + command + "\nFailure JSON: " + stringifyResult(checkResult) + "\nMake the smallest correct code change. Do not skip, weaken, or hide tests."
+		fixOutput, err := r.RunAgent(ctx, fixPrompt, AgentOptions{
+			Label:     fmt.Sprintf("%s-fix-%d", label, round+1),
+			Mode:      "edit",
+			Isolation: "worktree",
+			Model:     fixModel,
+			Schema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"summary":       map[string]any{"type": "string"},
+					"files_changed": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+					"confidence":    map[string]any{"type": "string"},
+				},
+				"required": []any{"summary"},
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+		roundRecord["fixed"] = true
+		roundRecord["fix"] = parseAgentOutput(fixOutput)
+	}
+	return map[string]any{"ok": false, "command": command, "rounds": rounds, "stalled": stalled}, nil
 }
 
 func (r *Runner) jsPallium(ctx context.Context, vm *goja.Runtime) map[string]any {
@@ -845,6 +943,53 @@ func workflowAgentCostUSD() float64 {
 	return value
 }
 
+func optionInt(options map[string]any, key string, fallback int) int {
+	value, ok := options[key]
+	if !ok {
+		return fallback
+	}
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	case json.Number:
+		parsed, err := typed.Int64()
+		if err == nil {
+			return int(parsed)
+		}
+	case string:
+		parsed, err := strconv.Atoi(strings.TrimSpace(typed))
+		if err == nil {
+			return parsed
+		}
+	}
+	return fallback
+}
+
+func optionString(options map[string]any, key, fallback string) string {
+	value, ok := options[key]
+	if !ok {
+		return fallback
+	}
+	text, ok := value.(string)
+	if !ok || strings.TrimSpace(text) == "" {
+		return fallback
+	}
+	return strings.TrimSpace(text)
+}
+
+func checkOK(value any) bool {
+	typed, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	okValue, ok := typed["ok"].(bool)
+	return ok && okValue
+}
+
 func buildCheckPrompt(command string) string {
 	rawCommand, _ := json.Marshal(command)
 	return "Run this verification command exactly once in the target repo: " + string(rawCommand) + "\n" +
@@ -927,6 +1072,22 @@ func numberToInt(value any) (int, bool) {
 
 func (r *Runner) runAgentCommand(ctx context.Context, agent Agent, opts AgentOptions) (string, string, string, error) {
 	if stub := os.Getenv("PALLIUM_WORKFLOW_AGENT_STUB"); stub != "" {
+		if sequence := strings.TrimSpace(os.Getenv("PALLIUM_WORKFLOW_AGENT_STUB_SEQUENCE")); sequence != "" {
+			var values []string
+			if err := json.Unmarshal([]byte(sequence), &values); err != nil {
+				return "", "", "", err
+			}
+			if len(values) > 0 {
+				r.mu.Lock()
+				index := r.stubIndex
+				r.stubIndex++
+				r.mu.Unlock()
+				if index >= len(values) {
+					index = len(values) - 1
+				}
+				stub = values[index]
+			}
+		}
 		if delay := os.Getenv("PALLIUM_WORKFLOW_AGENT_STUB_DELAY_MS"); delay != "" {
 			ms, err := strconv.Atoi(delay)
 			if err != nil {
