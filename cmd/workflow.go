@@ -40,6 +40,8 @@ func runWorkflow(out io.Writer, args []string, jsonOutput bool) error {
 		return runWorkflowShow(out, args[1:], jsonOutput)
 	case "read":
 		return runWorkflowRead(out, args[1:], jsonOutput)
+	case "report":
+		return runWorkflowReport(out, args[1:], jsonOutput)
 	case "watch":
 		return runWorkflowWatch(out, args[1:])
 	case "pause":
@@ -544,6 +546,30 @@ func runWorkflowRead(out io.Writer, args []string, jsonOutput bool) error {
 	})
 }
 
+func runWorkflowReport(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("workflow report")
+	dbPath := fs.String("db", "", "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}}, nil); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: pallium workflow report <run-id>")
+	}
+	store, err := workflow.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	snapshot, err := store.Snapshot(fs.Arg(0))
+	_ = store.Close()
+	if err != nil {
+		return err
+	}
+	report := workflow.BuildReport(snapshot)
+	return output.Write(out, report, jsonOutput, func() string {
+		return renderWorkflowReport(report)
+	})
+}
+
 func runWorkflowWatch(out io.Writer, args []string) error {
 	fs := newSessionFlagSet("workflow watch")
 	dbPath := fs.String("db", "", "")
@@ -939,6 +965,54 @@ func renderWorkflowTemplate(tmpl workflow.TemplateInfo) string {
 	return strings.Join(lines, "\n")
 }
 
+func renderWorkflowReport(report workflow.Report) string {
+	lines := []string{
+		fmt.Sprintf("Workflow report %s: %s", report.ID, report.Status),
+		"Task: " + report.Task,
+		"Summary: " + report.Summary,
+	}
+	if len(report.Findings) > 0 {
+		lines = append(lines, "Findings:")
+		for _, finding := range report.Findings {
+			lines = append(lines, "- "+finding)
+		}
+	}
+	if len(report.Risks) > 0 {
+		lines = append(lines, "Risks:")
+		for _, risk := range report.Risks {
+			lines = append(lines, "- "+risk)
+		}
+	}
+	if len(report.NextSteps) > 0 {
+		lines = append(lines, "Next steps:")
+		for _, next := range report.NextSteps {
+			lines = append(lines, "- "+next)
+		}
+	}
+	if len(report.Patches) > 0 {
+		lines = append(lines, "Patches:")
+		for _, patch := range report.Patches {
+			lines = append(lines, "- "+patch)
+		}
+	}
+	if len(report.Agents) > 0 {
+		lines = append(lines, "Agents:")
+		for _, agent := range report.Agents {
+			lines = append(lines, fmt.Sprintf("- %s %s mode=%s phase=%s", agent.Label, agent.Status, agent.Mode, agent.Phase))
+			if agent.Summary != "" {
+				lines = append(lines, "  summary: "+agent.Summary)
+			}
+			if agent.Error != "" {
+				lines = append(lines, "  error: "+agent.Error)
+			}
+		}
+	}
+	if report.Error != "" {
+		lines = append(lines, "Error: "+report.Error)
+	}
+	return strings.Join(lines, "\n")
+}
+
 func renderWorkflowSnapshot(snapshot workflow.Snapshot) string {
 	lines := []string{
 		fmt.Sprintf("Workflow %s: %s", snapshot.Run.ID, snapshot.Run.Status),
@@ -991,6 +1065,7 @@ Usage:
   pallium workflow inspect <run-id> [--json]
   pallium workflow show <run-id> [--json]
   pallium workflow read <run-id> [--json]
+  pallium workflow report <run-id> [--json]
   pallium workflow watch <run-id>
   pallium workflow pause <run-id> [--json]
   pallium workflow resume <run-id> [--background] [--json]
