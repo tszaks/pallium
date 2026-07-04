@@ -26,11 +26,12 @@ func WorkflowTools() []ToolInfo {
 	return []ToolInfo{
 		{
 			Name:        "phase",
-			Signature:   `phase(name)`,
+			Signature:   `phase(name, callback?)`,
 			Kind:        "control",
 			Description: "Marks the active workflow phase and records progress.",
-			Returns:     "void",
-			Example:     `phase("inspect")`,
+			Returns:     "Callback result when a callback is supplied, otherwise void.",
+			Example:     `await phase("inspect", async () => agent("inspect auth", { label: "auth" }))`,
+			Notes:       []string{"Async callback phases remain open until the callback promise settles."},
 		},
 		{
 			Name:        "agent",

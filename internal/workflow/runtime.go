@@ -156,12 +156,29 @@ func (r *Runner) jsPhase(vm *goja.Runtime) func(goja.FunctionCall) goja.Value {
 			if !ok {
 				panic(vm.ToValue("phase callback must be a function"))
 			}
+			closePhase := func() {
+				_ = r.Store.FinishPhase(r.Run.ID, name)
+				r.currentPhase = previous
+			}
 			value, err := fn(goja.Undefined())
-			_ = r.Store.FinishPhase(r.Run.ID, name)
-			r.currentPhase = previous
 			if err != nil {
+				closePhase()
 				panic(err)
 			}
+			if _, ok := value.Export().(*goja.Promise); ok {
+				finallyFn, ok := goja.AssertFunction(value.ToObject(vm).Get("finally"))
+				if !ok {
+					closePhase()
+					panic(vm.ToValue("phase callback promise does not support finally"))
+				}
+				next, err := finallyFn(value, vm.ToValue(closePhase))
+				if err != nil {
+					closePhase()
+					panic(err)
+				}
+				return next
+			}
+			closePhase()
 			return value
 		}
 		return goja.Undefined()
@@ -299,6 +316,14 @@ func (r *Runner) jsParallel(ctx context.Context, vm *goja.Runtime) func(goja.Fun
 		items := call.Argument(0).ToObject(vm)
 		lengthValue := items.Get("length")
 		length := int(lengthValue.ToInteger())
+		var mapper func(goja.Value, ...goja.Value) (goja.Value, error)
+		if len(call.Arguments) > 1 && !goja.IsUndefined(call.Argument(1)) && !goja.IsNull(call.Argument(1)) {
+			fn, ok := goja.AssertFunction(call.Argument(1))
+			if !ok {
+				panic(vm.ToValue("parallel callback must be a function"))
+			}
+			mapper = fn
+		}
 		rawResults := make([]any, 0, length)
 		capture := &parallelCapture{}
 		previousCapture := r.capture
@@ -308,7 +333,13 @@ func (r *Runner) jsParallel(ctx context.Context, vm *goja.Runtime) func(goja.Fun
 		}()
 		for i := 0; i < length; i++ {
 			item := items.Get(fmt.Sprintf("%d", i))
-			if fn, ok := goja.AssertFunction(item); ok {
+			if mapper != nil {
+				value, err := mapper(goja.Undefined(), item, vm.ToValue(i))
+				if err != nil {
+					panic(err)
+				}
+				rawResults = append(rawResults, value.Export())
+			} else if fn, ok := goja.AssertFunction(item); ok {
 				value, err := fn(goja.Undefined())
 				if err != nil {
 					panic(err)

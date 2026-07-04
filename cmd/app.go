@@ -98,7 +98,7 @@ Usage:
   pallium task clear [--json]
 	  pallium sessions <live|watch|index|list|search|related|grep|show|embed|semantic|stats> [--json]
 	  pallium console <ls|watch|show|manifest|handoff|claim|action|authority|gate|review> [--json]
-	  pallium workflow <run|list|show|read|watch|stop|save|apply> [--json]`)
+	  pallium workflow <generate|tools|template|run|list|status|inspect|show|read|watch|stop|save|apply> [--json]`)
 }
 
 func requireArg(args []string, field string) (string, error) {
