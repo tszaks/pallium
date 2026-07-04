@@ -18,7 +18,10 @@ import (
 	"github.com/dop251/goja"
 )
 
-var ErrWorkflowStopped = errors.New("workflow stopped")
+var (
+	ErrWorkflowStopped = errors.New("workflow stopped")
+	ErrWorkflowPaused  = errors.New("workflow paused")
+)
 
 type Runner struct {
 	Store               *Store
@@ -126,6 +129,10 @@ func (r *Runner) Execute(ctx context.Context, script string, args any) (string, 
 			_ = r.Store.SetRunStatus(r.Run.ID, "stopped", "", ErrWorkflowStopped.Error())
 			return "", ErrWorkflowStopped
 		}
+		if isWorkflowPausedError(err) {
+			_ = r.Store.SetRunStatus(r.Run.ID, "paused", "", ErrWorkflowPaused.Error())
+			return "", ErrWorkflowPaused
+		}
 		_ = r.Store.SetRunStatus(r.Run.ID, "failed", "", err.Error())
 		return "", err
 	}
@@ -135,23 +142,27 @@ func (r *Runner) Execute(ctx context.Context, script string, args any) (string, 
 			_ = r.Store.SetRunStatus(r.Run.ID, "stopped", "", ErrWorkflowStopped.Error())
 			return "", ErrWorkflowStopped
 		}
+		if isWorkflowPausedError(err) {
+			_ = r.Store.SetRunStatus(r.Run.ID, "paused", "", ErrWorkflowPaused.Error())
+			return "", ErrWorkflowPaused
+		}
 		_ = r.Store.SetRunStatus(r.Run.ID, "failed", "", err.Error())
 		return "", err
 	}
 	if err := r.ensureNotStopped(ctx); err != nil {
-		_ = r.Store.SetRunStatus(r.Run.ID, "stopped", "", ErrWorkflowStopped.Error())
+		_ = r.Store.SetRunStatus(r.Run.ID, interruptedStatus(err), "", interruptedMessage(err))
 		return "", err
 	}
 	if _, err := r.ApplyPatches(ctx); err != nil {
-		if errors.Is(err, ErrWorkflowStopped) {
-			_ = r.Store.SetRunStatus(r.Run.ID, "stopped", "", ErrWorkflowStopped.Error())
+		if isWorkflowInterruptedError(err) {
+			_ = r.Store.SetRunStatus(r.Run.ID, interruptedStatus(err), "", interruptedMessage(err))
 			return "", err
 		}
 		_ = r.Store.SetRunStatus(r.Run.ID, "failed", "", err.Error())
 		return "", err
 	}
 	if err := r.ensureNotStopped(ctx); err != nil {
-		_ = r.Store.SetRunStatus(r.Run.ID, "stopped", "", ErrWorkflowStopped.Error())
+		_ = r.Store.SetRunStatus(r.Run.ID, interruptedStatus(err), "", interruptedMessage(err))
 		return "", err
 	}
 	result := value.Export()
@@ -510,15 +521,15 @@ func (r *Runner) RunAgent(ctx context.Context, prompt string, opts AgentOptions)
 	agent.PatchPath = patchPath
 	agent.Worktree = worktree
 	if err != nil {
-		if normalized := r.normalizeStopError(agentCtx, err); errors.Is(normalized, ErrWorkflowStopped) {
-			_ = r.Store.FinishAgentStatus(agent, "stopped", output, normalized.Error())
+		if normalized := r.normalizeInterruptError(agentCtx, err); isWorkflowInterruptedError(normalized) {
+			_ = r.Store.FinishAgentStatus(agent, interruptedStatus(normalized), output, interruptedMessage(normalized))
 			return "", normalized
 		}
 		_ = r.Store.FinishAgent(agent, output, err.Error())
 		return "", err
 	}
 	if err := r.ensureNotStopped(ctx); err != nil {
-		_ = r.Store.FinishAgentStatus(agent, "stopped", output, err.Error())
+		_ = r.Store.FinishAgentStatus(agent, interruptedStatus(err), output, interruptedMessage(err))
 		return "", err
 	}
 	if err := r.Store.FinishAgent(agent, output, ""); err != nil {
@@ -587,6 +598,31 @@ func isWorkflowStoppedError(err error) bool {
 	return errors.Is(err, ErrWorkflowStopped) || strings.TrimSpace(err.Error()) == ErrWorkflowStopped.Error()
 }
 
+func isWorkflowPausedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, ErrWorkflowPaused) || strings.TrimSpace(err.Error()) == ErrWorkflowPaused.Error()
+}
+
+func isWorkflowInterruptedError(err error) bool {
+	return isWorkflowStoppedError(err) || isWorkflowPausedError(err)
+}
+
+func interruptedStatus(err error) string {
+	if isWorkflowPausedError(err) {
+		return "paused"
+	}
+	return "stopped"
+}
+
+func interruptedMessage(err error) string {
+	if isWorkflowPausedError(err) {
+		return ErrWorkflowPaused.Error()
+	}
+	return ErrWorkflowStopped.Error()
+}
+
 func (r *Runner) ensureNotStopped(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
@@ -599,6 +635,9 @@ func (r *Runner) ensureNotStopped(ctx context.Context) error {
 	}
 	if run.Status == "stopped" {
 		return ErrWorkflowStopped
+	}
+	if run.Status == "paused" {
+		return ErrWorkflowPaused
 	}
 	return nil
 }
@@ -616,7 +655,7 @@ func (r *Runner) contextWithStoredStop(ctx context.Context) (context.Context, fu
 				return
 			case <-ticker.C:
 				run, err := r.Store.Run(r.Run.ID)
-				if err == nil && run.Status == "stopped" {
+				if err == nil && (run.Status == "stopped" || run.Status == "paused") {
 					cancel()
 					return
 				}
@@ -629,16 +668,19 @@ func (r *Runner) contextWithStoredStop(ctx context.Context) (context.Context, fu
 	}
 }
 
-func (r *Runner) normalizeStopError(ctx context.Context, err error) error {
+func (r *Runner) normalizeInterruptError(ctx context.Context, err error) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, ErrWorkflowStopped) {
+	if isWorkflowInterruptedError(err) {
 		return err
 	}
 	if ctx.Err() != nil {
 		if run, runErr := r.Store.Run(r.Run.ID); runErr == nil && run.Status == "stopped" {
 			return ErrWorkflowStopped
+		}
+		if run, runErr := r.Store.Run(r.Run.ID); runErr == nil && run.Status == "paused" {
+			return ErrWorkflowPaused
 		}
 	}
 	return err

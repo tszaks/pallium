@@ -478,6 +478,78 @@ return { count: results.length };`
 	}
 }
 
+func TestRunnerPausesWhenRunIsMarkedPaused(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"prompt":"{{PROMPT}}"}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_DELAY_MS", "2000")
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("parallel");
+const results = await parallel(["a", "b", "c", "d"], item =>
+  agent("inspect " + item, { label: item })
+);
+return { count: results.length };`
+	scriptPath, err := WriteRunScript("wf-pause-cooperative", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-pause-cooperative", Task: "pause cooperative", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := (&Runner{Store: store, Run: run, MaxAgents: 10, MaxConcurrentAgents: 4}).Execute(context.Background(), script, nil)
+		errCh <- err
+	}()
+
+	deadline := time.After(2 * time.Second)
+	for {
+		agents, err := store.ListAgents(run.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(agents) == 4 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for running agents, got %d", len(agents))
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if err := store.SetRunStatus(run.ID, "paused", "", "test pause"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, ErrWorkflowPaused) {
+			t.Fatalf("expected ErrWorkflowPaused, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runner did not pause after run status changed to paused")
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Run.Status != "paused" {
+		t.Fatalf("expected paused run, got %+v", snapshot.Run)
+	}
+	pausedAgents := 0
+	for _, agent := range snapshot.Agents {
+		if agent.Status == "paused" {
+			pausedAgents++
+		}
+	}
+	if pausedAgents == 0 {
+		t.Fatalf("expected at least one paused agent, got %+v", snapshot.Agents)
+	}
+}
+
 func TestRunnerReusesCompletedAgentsOnRerun(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"source":"first","prompt":"{{PROMPT}}"}`)
 	tmp := t.TempDir()
