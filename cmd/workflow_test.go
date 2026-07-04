@@ -339,6 +339,55 @@ func TestWorkflowTriggerAddShowRun(t *testing.T) {
 	}
 }
 
+func TestWorkflowTriggerOnChangedSkipsUnchangedRepo(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"triggered"}`)
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{"trigger", "add", "changed-review", "review changes", "--kind", "on-changed", "--db", dbPath, "--cwd", tmp}, true); err != nil {
+		t.Fatalf("trigger add failed: %v", err)
+	}
+	out.Reset()
+	if err := runWorkflow(&out, []string{"trigger", "run", "changed-review", "--id", "wf-changed-1", "--db", dbPath}, true); err != nil {
+		t.Fatalf("first trigger run failed: %v", err)
+	}
+	out.Reset()
+	if err := runWorkflow(&out, []string{"trigger", "run", "changed-review", "--db", dbPath}, true); err != nil {
+		t.Fatalf("unchanged trigger run failed: %v", err)
+	}
+	var skipped map[string]any
+	if err := json.Unmarshal(out.Bytes(), &skipped); err != nil {
+		t.Fatalf("decode skipped trigger: %v\n%s", err, out.String())
+	}
+	if skipped["skipped"] != true || skipped["reason"] != "unchanged" {
+		t.Fatalf("expected unchanged skip, got %#v", skipped)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := runWorkflow(&out, []string{"trigger", "run", "changed-review", "--id", "wf-changed-2", "--db", dbPath}, true); err != nil {
+		t.Fatalf("changed trigger run failed: %v", err)
+	}
+	var snapshot map[string]any
+	if err := json.Unmarshal(out.Bytes(), &snapshot); err != nil {
+		t.Fatalf("decode changed trigger run: %v\n%s", err, out.String())
+	}
+	run := snapshot["run"].(map[string]any)
+	if run["id"] != "wf-changed-2" {
+		t.Fatalf("expected second run after repo changed, got %#v", snapshot)
+	}
+}
+
 func TestWorkflowHTTPAPI(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"api"}`)
 	t.Setenv("HOME", t.TempDir())
