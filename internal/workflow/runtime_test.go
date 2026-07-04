@@ -227,6 +227,37 @@ func TestRunnerStopsAtMaxAgents(t *testing.T) {
 	}
 }
 
+func TestRunnerEnforcesBudget(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_COST_USD", "0.01")
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("budget"); agent("one"); agent("two"); return "done";`
+	scriptPath, err := WriteRunScript("wf-budget", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-budget", Task: "budget", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10, MaxBudgetUSD: "0.015"}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), "budget exhausted") {
+		t.Fatalf("expected budget exhausted error, got %v", err)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 {
+		t.Fatalf("expected one agent before budget stop, got %+v", agents)
+	}
+}
+
 func TestParallelRunsAgentsConcurrently(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"prompt":"{{PROMPT}}"}`)
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_DELAY_MS", "250")

@@ -37,6 +37,9 @@ type Runner struct {
 	mu           sync.Mutex
 	currentPhase string
 	agentCount   int
+	budgetLimit  float64
+	budgetSpent  float64
+	agentCostUSD float64
 	capture      *parallelCapture
 	scriptHash   string
 	argsHash     string
@@ -87,6 +90,14 @@ func (r *Runner) Execute(ctx context.Context, script string, args any) (string, 
 	}
 	if r.PalliumBinary == "" {
 		r.PalliumBinary = "pallium"
+	}
+	if strings.TrimSpace(r.MaxBudgetUSD) != "" {
+		limit, err := strconv.ParseFloat(strings.TrimSpace(r.MaxBudgetUSD), 64)
+		if err != nil || limit < 0 {
+			return "", fmt.Errorf("invalid max budget usd %q", r.MaxBudgetUSD)
+		}
+		r.budgetLimit = limit
+		r.agentCostUSD = workflowAgentCostUSD()
 	}
 	if err := r.Store.SetRunStatus(r.Run.ID, "running", "", ""); err != nil {
 		return "", err
@@ -518,6 +529,13 @@ func (r *Runner) RunAgent(ctx context.Context, prompt string, opts AgentOptions)
 		r.mu.Unlock()
 		return "", fmt.Errorf("workflow exceeded max agents: %d", r.MaxAgents)
 	}
+	if r.budgetLimit > 0 && r.budgetSpent+r.agentCostUSD > r.budgetLimit {
+		r.mu.Unlock()
+		return "", fmt.Errorf("workflow budget exhausted: next agent would exceed $%.4f limit", r.budgetLimit)
+	}
+	if r.budgetLimit > 0 {
+		r.budgetSpent += r.agentCostUSD
+	}
 	r.agentCount++
 	r.mu.Unlock()
 
@@ -751,6 +769,18 @@ func stableHash(value any) string {
 	}
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
+}
+
+func workflowAgentCostUSD() float64 {
+	raw := strings.TrimSpace(os.Getenv("PALLIUM_WORKFLOW_AGENT_COST_USD"))
+	if raw == "" {
+		return 0.01
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil || value < 0 {
+		return 0.01
+	}
+	return value
 }
 
 func buildCheckPrompt(command string) string {
