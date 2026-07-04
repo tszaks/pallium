@@ -3,6 +3,8 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -334,6 +336,69 @@ func TestWorkflowTriggerAddShowRun(t *testing.T) {
 	}
 	if fleet["runs_total"].(float64) == 0 || fleet["triggers_total"].(float64) != 1 {
 		t.Fatalf("expected fleet run and trigger counts, got %#v", fleet)
+	}
+}
+
+func TestWorkflowHTTPAPI(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"api"}`)
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("api\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	handler := newWorkflowHTTPHandler(dbPath)
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("health failed: %d %s", rec.Code, rec.Body.String())
+	}
+
+	rawBody, err := json.Marshal(map[string]string{"id": "wf-api", "task": "api workflow", "cwd": tmp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := bytes.NewReader(rawBody)
+	req = httptest.NewRequest(http.MethodPost, "/workflows/run", body)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("run failed: %d %s", rec.Code, rec.Body.String())
+	}
+	var snapshot map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &snapshot); err != nil {
+		t.Fatalf("decode run response: %v\n%s", err, rec.Body.String())
+	}
+	run := snapshot["run"].(map[string]any)
+	if run["id"] != "wf-api" || run["status"] != "completed" {
+		t.Fatalf("expected completed api run, got %#v", snapshot)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/workflows/runs/wf-api", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("snapshot failed: %d %s", rec.Code, rec.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodGet, "/workflows/fleet", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("fleet failed: %d %s", rec.Code, rec.Body.String())
+	}
+	var fleet map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &fleet); err != nil {
+		t.Fatalf("decode fleet response: %v\n%s", err, rec.Body.String())
+	}
+	if fleet["runs_total"].(float64) == 0 {
+		t.Fatalf("expected fleet to include api run, got %#v", fleet)
 	}
 }
 
