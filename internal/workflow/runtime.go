@@ -18,11 +18,12 @@ import (
 )
 
 type Runner struct {
-	Store        *Store
-	Run          Run
-	MaxAgents    int
-	MaxBudgetUSD string
-	CodexBinary  string
+	Store               *Store
+	Run                 Run
+	MaxAgents           int
+	MaxBudgetUSD        string
+	CodexBinary         string
+	MaxConcurrentAgents int
 
 	mu           sync.Mutex
 	currentPhase string
@@ -59,6 +60,9 @@ func (r *Runner) Execute(ctx context.Context, script string, args any) (string, 
 	if r.MaxAgents <= 0 {
 		r.MaxAgents = 1000
 	}
+	if r.MaxConcurrentAgents <= 0 {
+		r.MaxConcurrentAgents = 16
+	}
 	if r.CodexBinary == "" {
 		r.CodexBinary = "codex"
 	}
@@ -81,7 +85,7 @@ func (r *Runner) Execute(ctx context.Context, script string, args any) (string, 
 	if err := vm.Set("parallel", r.jsParallel(ctx, vm)); err != nil {
 		return "", err
 	}
-	if err := vm.Set("pipeline", r.jsPipeline(vm)); err != nil {
+	if err := vm.Set("pipeline", r.jsPipeline(ctx, vm)); err != nil {
 		return "", err
 	}
 	if err := vm.Set("workflow", func(name string, input any) any {
@@ -90,11 +94,16 @@ func (r *Runner) Execute(ctx context.Context, script string, args any) (string, 
 		return "", err
 	}
 
-	value, err := vm.RunString("(function(){\n" + body + "\n})()")
+	value, err := vm.RunString("(async function(){\n" + body + "\n})()")
 	if r.currentPhase != "" {
 		_ = r.Store.FinishPhase(r.Run.ID, r.currentPhase)
 		r.currentPhase = ""
 	}
+	if err != nil {
+		_ = r.Store.SetRunStatus(r.Run.ID, "failed", "", err.Error())
+		return "", err
+	}
+	value, err = awaitPromiseValue(value)
 	if err != nil {
 		_ = r.Store.SetRunStatus(r.Run.ID, "failed", "", err.Error())
 		return "", err
@@ -210,24 +219,44 @@ func (r *Runner) jsParallel(ctx context.Context, vm *goja.Runtime) func(goja.Fun
 	}
 }
 
-func (r *Runner) jsPipeline(vm *goja.Runtime) func(goja.FunctionCall) goja.Value {
+func (r *Runner) jsPipeline(ctx context.Context, vm *goja.Runtime) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		items := call.Argument(0).ToObject(vm)
 		length := int(items.Get("length").ToInteger())
-		results := make([]any, 0, length)
+		values := make([]goja.Value, 0, length)
 		for i := 0; i < length; i++ {
-			value := items.Get(fmt.Sprintf("%d", i))
-			for _, stageValue := range call.Arguments[1:] {
-				fn, ok := goja.AssertFunction(stageValue)
-				if !ok {
-					panic(vm.ToValue("pipeline stages must be functions"))
-				}
+			values = append(values, items.Get(fmt.Sprintf("%d", i)))
+		}
+		for _, stageValue := range call.Arguments[1:] {
+			fn, ok := goja.AssertFunction(stageValue)
+			if !ok {
+				panic(vm.ToValue("pipeline stages must be functions"))
+			}
+			rawResults := make([]any, 0, len(values))
+			capture := &parallelCapture{}
+			previousCapture := r.capture
+			r.capture = capture
+			for _, value := range values {
 				next, err := fn(goja.Undefined(), value)
 				if err != nil {
+					r.capture = previousCapture
 					panic(err)
 				}
-				value = next
+				rawResults = append(rawResults, next.Export())
 			}
+			r.capture = previousCapture
+
+			agentResults, err := r.runParallelAgentCalls(ctx, capture.Calls)
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			values = values[:0]
+			for _, raw := range rawResults {
+				values = append(values, vm.ToValue(replaceParallelAgentMarkers(raw, agentResults)))
+			}
+		}
+		results := make([]any, 0, len(values))
+		for _, value := range values {
 			results = append(results, value.Export())
 		}
 		return vm.ToValue(results)
@@ -236,17 +265,29 @@ func (r *Runner) jsPipeline(vm *goja.Runtime) func(goja.FunctionCall) goja.Value
 
 func (r *Runner) RunAgent(ctx context.Context, prompt string, opts AgentOptions) (string, error) {
 	r.mu.Lock()
-	if r.agentCount >= r.MaxAgents {
-		r.mu.Unlock()
-		return "", fmt.Errorf("workflow exceeded max agents: %d", r.MaxAgents)
-	}
-	r.agentCount++
 	phase := r.currentPhase
 	r.mu.Unlock()
 	mode := strings.TrimSpace(opts.Mode)
 	if mode == "" {
 		mode = "read-only"
 	}
+	if cached, ok, err := r.Store.CompletedAgent(r.Run.ID, phase, opts.Label, prompt, mode, opts.Isolation); err != nil {
+		return "", err
+	} else if ok {
+		if phase != "" {
+			_ = r.Store.IncrementPhaseAgentCount(r.Run.ID, phase)
+		}
+		return cached.Output, nil
+	}
+
+	r.mu.Lock()
+	if r.agentCount >= r.MaxAgents {
+		r.mu.Unlock()
+		return "", fmt.Errorf("workflow exceeded max agents: %d", r.MaxAgents)
+	}
+	r.agentCount++
+	r.mu.Unlock()
+
 	agent := Agent{
 		RunID:     r.Run.ID,
 		Phase:     phase,
@@ -285,6 +326,11 @@ func (r *Runner) runParallelAgentCalls(ctx context.Context, calls []parallelAgen
 	defer cancel()
 
 	results := make([]any, len(calls))
+	limit := r.MaxConcurrentAgents
+	if limit <= 0 {
+		limit = 16
+	}
+	sem := make(chan struct{}, limit)
 	var wg sync.WaitGroup
 	var errMu sync.Mutex
 	var firstErr error
@@ -294,6 +340,17 @@ func (r *Runner) runParallelAgentCalls(ctx context.Context, calls []parallelAgen
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = ctx.Err()
+				}
+				errMu.Unlock()
+				return
+			}
 			output, err := r.RunAgent(ctx, call.Prompt, call.Opts)
 			if err != nil {
 				errMu.Lock()
@@ -312,6 +369,21 @@ func (r *Runner) runParallelAgentCalls(ctx context.Context, calls []parallelAgen
 		return nil, firstErr
 	}
 	return results, nil
+}
+
+func awaitPromiseValue(value goja.Value) (goja.Value, error) {
+	promise, ok := value.Export().(*goja.Promise)
+	if !ok {
+		return value, nil
+	}
+	switch promise.State() {
+	case goja.PromiseStateFulfilled:
+		return promise.Result(), nil
+	case goja.PromiseStateRejected:
+		return nil, fmt.Errorf("%s", promise.Result().String())
+	default:
+		return nil, fmt.Errorf("workflow returned a pending promise")
+	}
 }
 
 func parseAgentOutput(output string) any {
@@ -552,7 +624,7 @@ func DefaultScript(task string) string {
 	escaped, _ := json.Marshal(task)
 	return `export const meta = { name: "generated", description: "Default Pallium dynamic workflow", phases: ["plan", "verify"] };
 phase("plan");
-const plan = agent("Create a concise workflow plan for this task. Return JSON with keys summary, steps, risks. Task: " + ` + string(escaped) + `, {
+const plan = await agent("Create a concise workflow plan for this task. Return JSON with keys summary, steps, risks. Task: " + ` + string(escaped) + `, {
   label: "planner",
   mode: "read-only",
   schema: {
@@ -566,7 +638,7 @@ const plan = agent("Create a concise workflow plan for this task. Return JSON wi
   }
 });
 phase("verify");
-const verified = agent("Review this plan for missing safety or verification steps and return JSON with keys verdict and notes: " + JSON.stringify(plan), {
+const verified = await agent("Review this plan for missing safety or verification steps and return JSON with keys verdict and notes: " + JSON.stringify(plan), {
   label: "verifier",
   mode: "read-only",
   schema: {
