@@ -52,12 +52,12 @@ func generateReviewWorkflow(opts GenerateOptions) string {
 const task = ` + task + `;
 
 phase("scope");
-const changed = await pallium.changedNow();
+const preflight = await pallium.preflight(task);
 
 phase("inspect");
 const angles = ["correctness", "regression-risk", "verification-plan"];
 const reviews = await pipeline(angles, angle =>
-  agent("Review this task from the " + angle + " angle. Task: " + task + "\nChanged context: " + JSON.stringify(changed) + "\nReturn JSON with keys angle, findings, risks, next_steps.", {
+  agent("Review this task from the " + angle + " angle. Task: " + task + "\nPreflight context: " + JSON.stringify(preflight) + "\nReturn JSON with keys angle, findings, risks, next_steps.", {
     label: angle,
     mode: "read-only",
     schema: {
@@ -89,7 +89,7 @@ const summary = await agent("Synthesize the parallel reviews into a concise acti
   }
 });
 
-return { changed, reviews, drift, summary };
+return { preflight, reviews, drift, summary };
 `
 }
 
@@ -158,7 +158,7 @@ const maxRounds = ` + fmt.Sprintf("%d", maxRounds) + `;
 
 phase("scope");
 await pallium.task.start(task);
-const baselineContext = await pallium.changedNow();
+const baselineContext = await pallium.preflight(task);
 
 phase("baseline");
 let checkResult = await check(testCommand, { label: "baseline-check" });

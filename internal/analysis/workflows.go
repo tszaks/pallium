@@ -70,6 +70,23 @@ type HandoffReport struct {
 	VerificationHistory []db.VerificationRun         `json:"verification_history"`
 }
 
+type WorkflowPreflightReport struct {
+	Task              string           `json:"task"`
+	Summary           string           `json:"summary"`
+	ScopePaths        []string         `json:"scope_paths"`
+	ChangedNow        ChangedNowReport `json:"changed_now"`
+	Safe              []SafeReport     `json:"safe"`
+	RiskSummary       []string         `json:"risk_summary"`
+	FilesToInspect    []string         `json:"files_to_inspect"`
+	TestCommands      []string         `json:"test_commands"`
+	Verification      VerificationPlan `json:"verification"`
+	AgentInstructions []string         `json:"agent_instructions"`
+	NextActions       []string         `json:"next_actions"`
+	Freshness         Freshness        `json:"freshness"`
+	Evidence          Evidence         `json:"evidence"`
+	TaskScope         TaskScopeReport  `json:"task_scope"`
+}
+
 func Safe(store *db.Store, targetPath string) (SafeReport, error) {
 	risk, err := Risk(store, targetPath)
 	if err != nil {
@@ -232,6 +249,88 @@ func ChangedNow(store *db.Store) (ChangedNowReport, error) {
 	}, nil
 }
 
+func WorkflowPreflight(store *db.Store, task string, scopePaths []string) (WorkflowPreflightReport, error) {
+	task = strings.TrimSpace(task)
+	changedNow, err := ChangedNow(store)
+	if err != nil {
+		return WorkflowPreflightReport{}, err
+	}
+
+	candidates := make([]string, 0, len(scopePaths)+len(changedNow.Files))
+	candidates = append(candidates, scopePaths...)
+	for _, file := range changedNow.Files {
+		candidates = append(candidates, file.Path)
+	}
+	scope := uniqueStrings(candidates, 12)
+
+	safeReports := make([]SafeReport, 0, len(scope))
+	filesToInspect := make([]string, 0)
+	testCommands := make([]string, 0)
+	riskSummary := make([]string, 0)
+	for _, path := range scope {
+		safe, err := Safe(store, path)
+		if err != nil {
+			riskSummary = append(riskSummary, fmt.Sprintf("%s: unable to load safety context: %v", path, err))
+			filesToInspect = append(filesToInspect, path)
+			continue
+		}
+		safeReports = append(safeReports, safe)
+		filesToInspect = append(filesToInspect, safe.Path)
+		filesToInspect = append(filesToInspect, safe.BlastRadius...)
+		testCommands = append(testCommands, safe.TestCommands...)
+		riskSummary = append(riskSummary, fmt.Sprintf("%s: %s risk, %s", safe.Path, safe.Risk.Level, safe.Verdict))
+	}
+
+	verification := mergeVerificationPlans(safeReports)
+	if len(testCommands) == 0 {
+		testCommands = append(testCommands, verification.Fast...)
+	}
+	if len(testCommands) == 0 && changedNow.RecommendedNextCommand != "" {
+		testCommands = append(testCommands, changedNow.RecommendedNextCommand)
+	}
+
+	taskScope, err := activeTaskScope(store, scope)
+	if err != nil {
+		return WorkflowPreflightReport{}, err
+	}
+	freshness := buildFreshness(store)
+	evidence := buildEvidence(freshness, len(scope), len(testCommands), verification, taskScope, len(scope))
+	agentInstructions := []string{
+		"Use this preflight as the workflow scope before spawning workers.",
+		"Give workers the relevant safe report and only the files they need to inspect.",
+		"Run the suggested verification commands before final handoff.",
+	}
+	if taskScope.HasScopeDrift {
+		agentInstructions = append(agentInstructions, "Resolve task scope drift before applying patches.")
+	}
+	nextActions := []string{
+		"Generate or run a workflow using these scope paths.",
+	}
+	if len(testCommands) > 0 {
+		nextActions = append(nextActions, fmt.Sprintf("Use `%s` as the first objective check.", testCommands[0]))
+	}
+	if len(scope) == 0 {
+		nextActions = append(nextActions, "No changed or explicit scope paths were found; start with a read-only planning agent.")
+	}
+
+	return WorkflowPreflightReport{
+		Task:              task,
+		Summary:           fmt.Sprintf("Workflow preflight scoped %d file(s), %d safety report(s), and %d verification command(s).", len(scope), len(safeReports), len(testCommands)),
+		ScopePaths:        scope,
+		ChangedNow:        changedNow,
+		Safe:              safeReports,
+		RiskSummary:       uniqueStrings(riskSummary, 12),
+		FilesToInspect:    uniqueStrings(filesToInspect, 16),
+		TestCommands:      uniqueStrings(testCommands, 10),
+		Verification:      verification,
+		AgentInstructions: agentInstructions,
+		NextActions:       nextActions,
+		Freshness:         freshness,
+		Evidence:          evidence,
+		TaskScope:         taskScope,
+	}, nil
+}
+
 func Handoff(store *db.Store, baseRef string) (HandoffReport, error) {
 	review, err := Review(store, baseRef)
 	if err != nil {
@@ -285,4 +384,17 @@ func firstNonEmptyString(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func mergeVerificationPlans(reports []SafeReport) VerificationPlan {
+	var plan VerificationPlan
+	for _, report := range reports {
+		plan.Fast = append(plan.Fast, report.Verification.Fast...)
+		plan.Safe = append(plan.Safe, report.Verification.Safe...)
+		plan.Full = append(plan.Full, report.Verification.Full...)
+	}
+	plan.Fast = uniqueStrings(plan.Fast, 8)
+	plan.Safe = uniqueStrings(plan.Safe, 8)
+	plan.Full = uniqueStrings(plan.Full, 8)
+	return plan
 }

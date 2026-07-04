@@ -119,6 +119,7 @@ pallium workflow validate fix.workflow.js
 pallium workflow tools list
 pallium workflow template list
 pallium workflow template show test-fix
+pallium workflow preflight "review workflow changes" --scope cmd/workflow.go --json
 pallium workflow run --script .pallium/workflows/review.js "review this branch"
 pallium workflow run --workflow review-branch "review this branch"
 pallium workflow run /review-branch "review this branch"
@@ -163,7 +164,8 @@ Scripts also get a Pallium-native `pallium` object for repo-grounded workflow
 control: `await pallium.verify("fast")`, `await pallium.review("origin/main")`,
 `await pallium.handoff("origin/main")`, `await pallium.explain(path)`,
 `await pallium.safe(path)`, `await pallium.plan(path)`,
-`await pallium.changedNow()`, and `await pallium.task.start(goal, ...scopes)`.
+`await pallium.changedNow()`, `await pallium.preflight(task, ...scopes)`, and
+`await pallium.task.start(goal, ...scopes)`.
 Saved workflows resolve by name from the nearest `.pallium/workflows/` or
 `.claude/workflows/` directory while walking up from the current working
 directory, then from `~/.pallium/workflows/` or `~/.claude/workflows/`.
@@ -175,6 +177,9 @@ agent needs to discover the available primitives and workflow styles before
 generating or running a script automatically.
 Use `workflow validate <path.js>` before running agent-written scripts; it
 performs a compile-only goja check and does not execute agents or touch files.
+Use `workflow preflight <task> --scope path --json` before spawning workers when
+the agent needs Pallium to choose repo-native scope, safety context, likely
+inspection files, and verification commands.
 Use `workflow report <run-id> --json` as the structured handoff between
 workflow versions or follow-up agents; it extracts findings, risks, next steps,
 patches, and per-agent summaries from the stored run.
