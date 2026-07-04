@@ -39,6 +39,12 @@ type AgentOptions struct {
 	Model     string         `json:"model,omitempty"`
 }
 
+type CheckOptions struct {
+	Label  string         `json:"label,omitempty"`
+	Model  string         `json:"model,omitempty"`
+	Schema map[string]any `json:"schema,omitempty"`
+}
+
 type parallelAgentCall struct {
 	Prompt string
 	Opts   AgentOptions
@@ -80,6 +86,9 @@ func (r *Runner) Execute(ctx context.Context, script string, args any) (string, 
 		return "", err
 	}
 	if err := vm.Set("agent", r.jsAgent(ctx, vm)); err != nil {
+		return "", err
+	}
+	if err := vm.Set("check", r.jsCheck(ctx, vm)); err != nil {
 		return "", err
 	}
 	if err := vm.Set("parallel", r.jsParallel(ctx, vm)); err != nil {
@@ -174,6 +183,45 @@ func (r *Runner) jsAgent(ctx context.Context, vm *goja.Runtime) func(goja.Functi
 			return vm.ToValue(map[string]any{parallelAgentMarkerKey: index})
 		}
 		output, err := r.RunAgent(ctx, prompt, opts)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		return vm.ToValue(parseAgentOutput(output))
+	}
+}
+
+func (r *Runner) jsCheck(ctx context.Context, vm *goja.Runtime) func(goja.FunctionCall) goja.Value {
+	return func(call goja.FunctionCall) goja.Value {
+		command := strings.TrimSpace(call.Argument(0).String())
+		if command == "" {
+			panic(vm.ToValue("check command is required"))
+		}
+		opts := CheckOptions{}
+		if len(call.Arguments) > 1 && !goja.IsUndefined(call.Argument(1)) && !goja.IsNull(call.Argument(1)) {
+			raw, err := json.Marshal(call.Argument(1).Export())
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			if err := json.Unmarshal(raw, &opts); err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+		}
+		agentOpts := AgentOptions{
+			Label:  firstNonEmpty(opts.Label, "check: "+command),
+			Mode:   "test",
+			Model:  opts.Model,
+			Schema: opts.Schema,
+		}
+		if len(agentOpts.Schema) == 0 {
+			agentOpts.Schema = defaultCheckSchema()
+		}
+		prompt := buildCheckPrompt(command)
+		if r.capture != nil {
+			index := len(r.capture.Calls)
+			r.capture.Calls = append(r.capture.Calls, parallelAgentCall{Prompt: prompt, Opts: agentOpts})
+			return vm.ToValue(map[string]any{parallelAgentMarkerKey: index})
+		}
+		output, err := r.RunAgent(ctx, prompt, agentOpts)
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
@@ -394,6 +442,48 @@ func parseAgentOutput(output string) any {
 	return output
 }
 
+func buildCheckPrompt(command string) string {
+	rawCommand, _ := json.Marshal(command)
+	return "Run this verification command exactly once in the target repo: " + string(rawCommand) + "\n" +
+		"Do not edit source files. It is acceptable for the command to write normal ignored build, cache, or test artifacts. " +
+		"Use the real command result as ground truth. Return JSON with ok=true only if the command exits successfully. " +
+		"Include a concise summary, the useful tail of output, and specific failing tests or errors when available."
+}
+
+func defaultCheckSchema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"ok":          map[string]any{"type": "boolean"},
+			"command":     map[string]any{"type": "string"},
+			"summary":     map[string]any{"type": "string"},
+			"output_tail": map[string]any{"type": "string"},
+			"failures": map[string]any{
+				"type": "array",
+				"items": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"name":    map[string]any{"type": "string"},
+						"file":    map[string]any{"type": "string"},
+						"message": map[string]any{"type": "string"},
+					},
+					"required": []any{"name", "message"},
+				},
+			},
+		},
+		"required": []any{"ok", "command", "summary", "output_tail", "failures"},
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 func replaceParallelAgentMarkers(value any, agentResults []any) any {
 	switch typed := value.(type) {
 	case map[string]any:
@@ -493,7 +583,7 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent Agent, opts AgentOpt
 	defer os.RemoveAll(tmpDir)
 	outFile := filepath.Join(tmpDir, "last-message.txt")
 	cmdArgs := []string{"exec", "--cd", cwd, "--output-last-message", outFile}
-	if agent.Mode == "edit" {
+	if agent.Mode == "edit" || agent.Mode == "test" || agent.Mode == "check" {
 		cmdArgs = append(cmdArgs, "--sandbox", "workspace-write")
 	} else {
 		cmdArgs = append(cmdArgs, "--sandbox", "read-only")
