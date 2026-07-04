@@ -48,17 +48,26 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 	cwd := fs.String("cwd", "", "")
 	id := fs.String("id", "", "")
 	scriptPath := fs.String("script", "", "")
+	workflowName := fs.String("workflow", "", "")
 	argsJSON := fs.String("args", "", "")
 	codexBinary := fs.String("codex", "codex", "")
 	maxAgents := fs.Int("max-agents", 1000, "")
 	maxConcurrentAgents := fs.Int("max-concurrent-agents", 16, "")
 	maxBudgetUSD := fs.String("max-budget-usd", "", "")
 	background := fs.Bool("background", false, "")
-	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "cwd": {}, "id": {}, "script": {}, "args": {}, "codex": {}, "max-agents": {}, "max-concurrent-agents": {}, "max-budget-usd": {}}, map[string]struct{}{"background": {}}); err != nil {
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "cwd": {}, "id": {}, "script": {}, "workflow": {}, "args": {}, "codex": {}, "max-agents": {}, "max-concurrent-agents": {}, "max-budget-usd": {}}, map[string]struct{}{"background": {}}); err != nil {
 		return err
 	}
-	task := strings.TrimSpace(strings.Join(fs.Args(), " "))
-	if task == "" && *scriptPath == "" {
+	positionals := fs.Args()
+	if *scriptPath != "" && *workflowName != "" {
+		return fmt.Errorf("use either --script or --workflow, not both")
+	}
+	if *scriptPath == "" && *workflowName == "" && len(positionals) > 0 && strings.HasPrefix(positionals[0], "/") && len(positionals[0]) > 1 {
+		*workflowName = strings.TrimPrefix(positionals[0], "/")
+		positionals = positionals[1:]
+	}
+	task := strings.TrimSpace(strings.Join(positionals, " "))
+	if task == "" && *scriptPath == "" && *workflowName == "" {
 		return fmt.Errorf("workflow run requires a task or --script")
 	}
 	if *id == "" {
@@ -79,10 +88,21 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 		return err
 	}
 	if task == "" {
-		task = "Run workflow script " + *scriptPath
+		if *workflowName != "" {
+			task = "Run saved workflow " + *workflowName
+		} else {
+			task = "Run workflow script " + *scriptPath
+		}
 	}
 
 	script := ""
+	if *workflowName != "" {
+		resolved, err := workflow.ResolveSavedWorkflow(absCWD, *workflowName)
+		if err != nil {
+			return err
+		}
+		*scriptPath = resolved
+	}
 	if *scriptPath != "" {
 		raw, err := os.ReadFile(*scriptPath)
 		if err != nil {
@@ -475,7 +495,8 @@ func printWorkflowHelp(out io.Writer) {
 	fmt.Fprintln(out, `pallium workflow
 
 Usage:
-  pallium workflow run "task" [--script path.js] [--background] [--max-concurrent-agents 16] [--json]
+  pallium workflow run "task" [--script path.js] [--workflow name] [--background] [--max-concurrent-agents 16] [--json]
+  pallium workflow run /saved-name "task input"
   pallium workflow list [--limit n] [--json]
   pallium workflow show <run-id> [--json]
   pallium workflow read <run-id> [--json]

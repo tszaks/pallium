@@ -115,6 +115,8 @@ repository.
 ```bash
 pallium workflow run "review this branch for correctness issues"
 pallium workflow run --script .pallium/workflows/review.js "review this branch"
+pallium workflow run --workflow review-branch "review this branch"
+pallium workflow run /review-branch "review this branch"
 pallium workflow run --background "audit route handlers for missing auth"
 pallium workflow list
 pallium workflow show <run-id>
@@ -141,6 +143,9 @@ Use `await check("test command")` for objective verification loops. It spawns a
 dedicated test agent, runs the command as ground truth, and returns structured
 JSON with `ok`, `summary`, `output_tail`, and `failures`, so scripts can keep
 fixing until checks pass or progress stalls.
+Saved workflows resolve by name from the nearest `.pallium/workflows/` or
+`.claude/workflows/` directory while walking up from the current working
+directory, then from `~/.pallium/workflows/` or `~/.claude/workflows/`.
 
 Session-memory indexing is incremental by default: unchanged transcript files are skipped using their last indexed timestamp, with a hash check only when the file looks newer. After a global `sessions embed` pass completes and no embedding backlog remains for the model, Pallium records a model-specific embedding cursor. Later `sessions index` runs scan from that cursor minus `--safety-buffer` instead of walking historical session memory every time. This makes scheduled automation cadence-independent: hourly runs should touch about the last hour plus buffer, six-hour runs should touch about six hours plus buffer, and on-demand runs use the same cursor path. Files modified in the last two minutes are skipped so Pallium does not chase active agent logs. Use `--force` only when you intentionally want to rebuild existing session rows after parser or redaction changes.
 
