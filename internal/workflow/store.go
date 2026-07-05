@@ -295,6 +295,15 @@ func (s *Store) Run(id string) (Run, error) {
 	return run, err
 }
 
+func (s *Store) CountActiveRuns() (int, error) {
+	row := s.db.QueryRow(`SELECT COUNT(*) FROM workflow_runs WHERE status IN ('queued','running','paused')`)
+	var count int
+	if err := row.Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
 func (s *Store) ListRuns(limit int) ([]Run, error) {
 	if limit <= 0 {
 		limit = 50

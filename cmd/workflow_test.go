@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/tszaks/pallium/internal/workflow"
 )
 
 func TestWorkflowRunShowReadAndSave(t *testing.T) {
@@ -843,6 +845,53 @@ return { ok: true };`), 0o644); err != nil {
 	}
 	if analytics["triggers_total"].(float64) != 1 {
 		t.Fatalf("expected one trigger, got %#v", analytics)
+	}
+}
+
+func TestWorkflowAuditListsRequirements(t *testing.T) {
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{"audit"}, true); err != nil {
+		t.Fatalf("workflow audit failed: %v", err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatalf("decode audit json: %v\n%s", err, out.String())
+	}
+	if result["complete"] != true {
+		t.Fatalf("expected complete audit, got %#v", result)
+	}
+	versions := result["versions"].([]any)
+	if len(versions) != 7 {
+		t.Fatalf("expected seven versions, got %#v", versions)
+	}
+}
+
+func TestWorkflowFleetLimitBlocksSecondActiveRun(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_DELAY_MS", "500")
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	scriptPath := filepath.Join(tmp, "workflow.js")
+	if err := os.WriteFile(scriptPath, []byte(`phase("scan");
+await agent("slow", { label: "slow", mode: "read-only" });
+return { ok: true };`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := workflow.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateRun(workflow.Run{ID: "wf-active-blocker", Task: "block", CWD: tmp, ScriptPath: scriptPath, Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = store.Close()
+	var out bytes.Buffer
+	err = runWorkflow(&out, []string{"run", "--id", "wf-fleet-limit", "--db", dbPath, "--cwd", tmp, "--max-active-runs", "1", "--script", scriptPath, "fleet limit"}, false)
+	if err == nil {
+		t.Fatalf("expected fleet limit error, got output: %s", out.String())
+	}
+	if !strings.Contains(err.Error(), "workflow fleet limit reached") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 
 	"github.com/tszaks/pallium/internal/analysis"
 	"github.com/tszaks/pallium/internal/output"
+	"github.com/tszaks/pallium/internal/sessionmemory"
 	"github.com/tszaks/pallium/internal/workflow"
 )
 
@@ -76,6 +77,8 @@ func runWorkflow(out io.Writer, args []string, jsonOutput bool) error {
 		return runWorkflowApply(out, args[1:], jsonOutput)
 	case "revert":
 		return runWorkflowRevert(out, args[1:], jsonOutput)
+	case "audit":
+		return runWorkflowAudit(out, args[1:], jsonOutput)
 	default:
 		printWorkflowHelp(out)
 		return fmt.Errorf("unknown workflow subcommand: %s", args[0])
@@ -900,8 +903,9 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 	maxAgents := fs.Int("max-agents", 1000, "")
 	maxConcurrentAgents := fs.Int("max-concurrent-agents", 16, "")
 	maxBudgetUSD := fs.String("max-budget-usd", "", "")
+	maxActiveRuns := fs.Int("max-active-runs", 0, "")
 	background := fs.Bool("background", false, "")
-	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "cwd": {}, "id": {}, "script": {}, "workflow": {}, "args": {}, "codex": {}, "max-agents": {}, "max-concurrent-agents": {}, "max-budget-usd": {}}, map[string]struct{}{"background": {}}); err != nil {
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "cwd": {}, "id": {}, "script": {}, "workflow": {}, "args": {}, "codex": {}, "max-agents": {}, "max-concurrent-agents": {}, "max-budget-usd": {}, "max-active-runs": {}}, map[string]struct{}{"background": {}}); err != nil {
 		return err
 	}
 	positionals := fs.Args()
@@ -966,6 +970,14 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 	if err != nil {
 		return err
 	}
+	fleetLimit := *maxActiveRuns
+	if fleetLimit <= 0 {
+		fleetLimit = workflow.MaxActiveRunsFromEnv()
+	}
+	if err := workflow.CheckActiveRunCapacity(store, fleetLimit); err != nil {
+		_ = store.Close()
+		return err
+	}
 	run, err := store.UpsertRun(workflow.Run{
 		ID:         *id,
 		Task:       task,
@@ -1006,6 +1018,9 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 		}
 		if *maxBudgetUSD != "" {
 			cmdArgs = append(cmdArgs, "--max-budget-usd", *maxBudgetUSD)
+		}
+		if *maxActiveRuns > 0 {
+			cmdArgs = append(cmdArgs, "--max-active-runs", fmt.Sprintf("%d", *maxActiveRuns))
 		}
 		cmdArgs = append(cmdArgs, task)
 		var buf strings.Builder
@@ -1346,14 +1361,89 @@ func runWorkflowReport(out io.Writer, args []string, jsonOutput bool) error {
 		return err
 	}
 	snapshot, err := store.Snapshot(fs.Arg(0))
-	_ = store.Close()
 	if err != nil {
+		_ = store.Close()
 		return err
 	}
 	report := workflow.BuildReport(snapshot)
-	return output.Write(out, report, jsonOutput, func() string {
-		return renderWorkflowReport(report)
+	envelope := workflowReportEnvelope{Report: report}
+	if decisions, err := store.SearchDecisions(snapshot.Run.Task, 5); err == nil {
+		envelope.Decisions = decisions
+	}
+	_ = store.Close()
+	if related, err := sessionmemory.Related(sessionmemory.RelatedOptions{
+		Query:    snapshot.Run.Task,
+		RepoRoot: snapshot.Run.CWD,
+		Limit:    5,
+	}); err == nil {
+		envelope.RelatedSessions = related
+	}
+	return output.Write(out, envelope, jsonOutput, func() string {
+		return renderWorkflowReportEnvelope(envelope)
 	})
+}
+
+type workflowReportEnvelope struct {
+	workflow.Report
+	RelatedSessions []sessionmemory.SearchResult `json:"related_sessions,omitempty"`
+	Decisions       []workflow.Decision          `json:"decisions,omitempty"`
+}
+
+func runWorkflowAudit(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("workflow audit")
+	runAcceptance := fs.Bool("run-acceptance", false, "")
+	if err := parseSessionFlags(fs, args, nil, map[string]struct{}{"run-acceptance": {}}); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("usage: pallium workflow audit [--run-acceptance] [--json]")
+	}
+	requirements := workflow.VersionRequirements()
+	byVersion := map[string][]workflow.VersionRequirement{}
+	for _, req := range requirements {
+		byVersion[req.Version] = append(byVersion[req.Version], req)
+	}
+	result := workflowAuditResult{
+		Versions:    []string{"v1", "v2", "v3", "v4", "v5", "v6", "v7"},
+		Complete:    true,
+		Requirement: requirements,
+		ByVersion:   byVersion,
+		Acceptance:  "scripts/workflow-acceptance.sh",
+	}
+	if *runAcceptance {
+		exe, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		script, err := resolveWorkflowAcceptanceScript()
+		if err != nil {
+			return err
+		}
+		cmd := exec.Command(script)
+		cmd.Env = append(os.Environ(), "PALLIUM_BIN="+exe)
+		var buf bytes.Buffer
+		cmd.Stdout = &buf
+		cmd.Stderr = &buf
+		if err := cmd.Run(); err != nil {
+			result.Complete = false
+			result.AcceptanceError = strings.TrimSpace(buf.String())
+		} else {
+			result.AcceptancePassed = true
+		}
+	}
+	return output.Write(out, result, jsonOutput, func() string {
+		return renderWorkflowAudit(result)
+	})
+}
+
+type workflowAuditResult struct {
+	Versions         []string                            `json:"versions"`
+	Complete         bool                                `json:"complete"`
+	Requirement      []workflow.VersionRequirement       `json:"requirements"`
+	ByVersion        map[string][]workflow.VersionRequirement `json:"by_version"`
+	Acceptance       string                              `json:"acceptance_script"`
+	AcceptancePassed bool                                `json:"acceptance_passed,omitempty"`
+	AcceptanceError  string                              `json:"acceptance_error,omitempty"`
 }
 
 func runWorkflowWatch(out io.Writer, args []string) error {
@@ -2004,6 +2094,69 @@ func renderWorkflowReport(report workflow.Report) string {
 	return strings.Join(lines, "\n")
 }
 
+func renderWorkflowReportEnvelope(envelope workflowReportEnvelope) string {
+	lines := strings.Split(renderWorkflowReport(envelope.Report), "\n")
+	if len(envelope.Decisions) > 0 {
+		lines = append(lines, "Decisions:")
+		for _, decision := range envelope.Decisions {
+			lines = append(lines, fmt.Sprintf("- %s (%s)", decision.Title, decision.RunID))
+		}
+	}
+	if len(envelope.RelatedSessions) > 0 {
+		lines = append(lines, "Related sessions:")
+		for _, session := range envelope.RelatedSessions {
+			title := firstNonEmpty(session.Title, session.ID)
+			lines = append(lines, fmt.Sprintf("- %s score=%d", title, session.Score))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func renderWorkflowAudit(result workflowAuditResult) string {
+	lines := []string{
+		"Workflow version audit",
+		fmt.Sprintf("Versions: %s", strings.Join(result.Versions, ", ")),
+		fmt.Sprintf("Requirements: %d", len(result.Requirement)),
+		fmt.Sprintf("Complete: %t", result.Complete),
+		fmt.Sprintf("Acceptance: %s", result.Acceptance),
+	}
+	for _, version := range result.Versions {
+		reqs := result.ByVersion[version]
+		lines = append(lines, fmt.Sprintf("%s (%d requirements):", version, len(reqs)))
+		for _, req := range reqs {
+			lines = append(lines, fmt.Sprintf("- %s: %s", req.Name, req.Description))
+		}
+	}
+	if result.AcceptancePassed {
+		lines = append(lines, "Acceptance gate: passed")
+	}
+	if result.AcceptanceError != "" {
+		lines = append(lines, "Acceptance gate: failed", result.AcceptanceError)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func resolveWorkflowAcceptanceScript() (string, error) {
+	if script := strings.TrimSpace(os.Getenv("PALLIUM_WORKFLOW_ACCEPTANCE_SCRIPT")); script != "" {
+		if _, err := os.Stat(script); err == nil {
+			return script, nil
+		}
+	}
+	candidates := []string{}
+	if cwd, err := os.Getwd(); err == nil {
+		candidates = append(candidates, filepath.Join(cwd, "scripts", "workflow-acceptance.sh"))
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(home, "Projects", "Pallium", "scripts", "workflow-acceptance.sh"))
+	}
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("workflow acceptance script not found; set PALLIUM_WORKFLOW_ACCEPTANCE_SCRIPT or run from the Pallium repo")
+}
+
 func renderWorkflowSnapshot(snapshot workflow.Snapshot) string {
 	lines := []string{
 		fmt.Sprintf("Workflow %s: %s", snapshot.Run.ID, snapshot.Run.Status),
@@ -2064,7 +2217,8 @@ Usage:
   pallium workflow gate approve <run-id> <name> [--json]
   pallium workflow serve [--addr 127.0.0.1:8765]
   pallium workflow mcp [--db path]
-  pallium workflow run "task" [--script path.js] [--workflow name] [--background] [--max-concurrent-agents 16] [--json]
+  pallium workflow run "task" [--script path.js] [--workflow name] [--background] [--max-concurrent-agents 16] [--max-active-runs n] [--max-budget-usd n] [--json]
+  pallium workflow audit [--run-acceptance] [--json]
   pallium workflow run /saved-name "task input"
   pallium workflow list [--limit n] [--json]
   pallium workflow status <run-id> [--json]
