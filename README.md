@@ -293,6 +293,7 @@ API and MCP:
 
 ```bash
 pallium workflow serve --addr 127.0.0.1:8765
+pallium workflow serve --addr 0.0.0.0:8765 --token "$PALLIUM_WORKFLOW_API_TOKEN"
 pallium workflow mcp
 ```
 
@@ -440,6 +441,10 @@ Start the local workflow API:
 pallium workflow serve --addr 127.0.0.1:8765
 ```
 
+When binding outside localhost, set `--token` or `PALLIUM_WORKFLOW_API_TOKEN`.
+Authenticated requests use `Authorization: Bearer <token>`. `GET /healthz` stays
+open for local health checks.
+
 Endpoints:
 
 - `GET /healthz`
@@ -452,6 +457,25 @@ Endpoints:
 - `POST /workflows/run`
 
 The Go client in `pkg/workflowclient` wraps this API.
+
+## Open Source Operations
+
+Repository management files live in `.github/`:
+
+- issue templates for bugs and feature requests
+- pull request checklist
+- `CODEOWNERS`
+- Dependabot updates for Go, npm, and GitHub Actions
+- CI, CodeQL, OpenSSF Scorecard, and release asset gates
+
+Project policy files:
+
+- `CONTRIBUTING.md`
+- `SECURITY.md`
+- `CODE_OF_CONDUCT.md`
+- `SUPPORT.md`
+
+Security issues should follow `SECURITY.md`, not public issue threads.
 
 ## Proof Gates
 

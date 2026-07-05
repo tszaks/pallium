@@ -34,17 +34,19 @@ type Runner struct {
 	MaxConcurrentAgents int
 	PalliumBinary       string
 
-	mu            sync.Mutex
-	currentPhase  string
-	agentCount    int
-	budgetLimit   float64
-	budgetSpent   float64
-	agentCostUSD  float64
-	workflowDepth int
-	stubIndex     int
-	capture       *parallelCapture
-	scriptHash    string
-	argsHash      string
+	mu             sync.Mutex
+	currentPhase   string
+	agentCount     int
+	budgetLimit    float64
+	budgetSpent    float64
+	agentCostUSD   float64
+	workflowDepth  int
+	stubIndex      int
+	agentCallIndex int
+	pipelineIndex  int
+	capture        *parallelCapture
+	scriptHash     string
+	argsHash       string
 }
 
 type AgentOptions struct {
@@ -80,8 +82,9 @@ type PolicyFinding struct {
 }
 
 type parallelAgentCall struct {
-	Prompt string
-	Opts   AgentOptions
+	Prompt    string
+	Opts      AgentOptions
+	CallIndex int
 }
 
 type parallelCapture struct {
@@ -90,6 +93,10 @@ type parallelCapture struct {
 
 const parallelAgentMarkerKey = "__pallium_parallel_agent__"
 const maxWorkflowCollectionItems = 4096
+const pipelineCallIndexBase = 1_000_000_000_000
+const pipelineIndexStride = 10_000_000_000
+const pipelineStageStride = 10_000_000
+const pipelineItemStride = 1_000
 
 func (r *Runner) Execute(ctx context.Context, script string, args any) (string, error) {
 	if r.Store == nil {
@@ -97,6 +104,9 @@ func (r *Runner) Execute(ctx context.Context, script string, args any) (string, 
 	}
 	if r.Run.ID == "" {
 		return "", fmt.Errorf("workflow run is required")
+	}
+	if r.MaxAgents <= 0 && r.Run.MaxAgents > 0 {
+		r.MaxAgents = r.Run.MaxAgents
 	}
 	if r.MaxAgents <= 0 {
 		r.MaxAgents = 1000
@@ -111,13 +121,24 @@ func (r *Runner) Execute(ctx context.Context, script string, args any) (string, 
 		r.PalliumBinary = "pallium"
 	}
 	r.agentCostUSD = workflowAgentCostUSD()
-	if strings.TrimSpace(r.MaxBudgetUSD) != "" {
-		limit, err := strconv.ParseFloat(strings.TrimSpace(r.MaxBudgetUSD), 64)
+	maxBudgetUSD := strings.TrimSpace(firstNonEmpty(r.MaxBudgetUSD, r.Run.MaxBudgetUSD))
+	if maxBudgetUSD != "" {
+		limit, err := strconv.ParseFloat(maxBudgetUSD, 64)
 		if err != nil || limit < 0 {
-			return "", fmt.Errorf("invalid max budget usd %q", r.MaxBudgetUSD)
+			return "", fmt.Errorf("invalid max budget usd %q", maxBudgetUSD)
 		}
 		r.budgetLimit = limit
 	}
+	usedAgents, usedBudget, err := r.Store.AgentUsage(r.Run.ID)
+	if err != nil {
+		return "", err
+	}
+	r.mu.Lock()
+	r.agentCount = usedAgents
+	r.budgetSpent = usedBudget
+	r.agentCallIndex = 0
+	r.pipelineIndex = 0
+	r.mu.Unlock()
 	if err := r.Store.SetRunStatus(r.Run.ID, "running", "", ""); err != nil {
 		return "", err
 	}
@@ -466,7 +487,7 @@ func (r *Runner) jsAgent(ctx context.Context, vm *goja.Runtime) func(goja.Functi
 			r.capture.Calls = append(r.capture.Calls, parallelAgentCall{Prompt: prompt, Opts: opts})
 			return vm.ToValue(map[string]any{parallelAgentMarkerKey: index})
 		}
-		output, err := r.RunAgent(ctx, prompt, opts)
+		output, err := r.runAgentAtCallIndex(ctx, prompt, opts, r.nextAgentCallIndex())
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
@@ -506,7 +527,7 @@ func (r *Runner) jsCheck(ctx context.Context, vm *goja.Runtime) func(goja.Functi
 			r.capture.Calls = append(r.capture.Calls, parallelAgentCall{Prompt: prompt, Opts: agentOpts})
 			return vm.ToValue(map[string]any{parallelAgentMarkerKey: index})
 		}
-		output, err := r.RunAgent(ctx, prompt, agentOpts)
+		output, err := r.runAgentAtCallIndex(ctx, prompt, agentOpts, r.nextAgentCallIndex())
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
@@ -794,6 +815,7 @@ func (r *Runner) jsParallel(ctx context.Context, vm *goja.Runtime) func(goja.Fun
 		}
 		r.capture = previousCapture
 
+		r.assignSequentialCallIndexes(capture.Calls)
 		agentResults, err := r.runParallelAgentCalls(ctx, capture.Calls)
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
@@ -828,6 +850,7 @@ func (r *Runner) jsPipeline(ctx context.Context, vm *goja.Runtime) func(goja.Fun
 		if len(stages) == 0 {
 			return vm.ToValue(values)
 		}
+		pipelineIndex := r.nextPipelineIndex()
 
 		limit := r.MaxConcurrentAgents
 		if limit <= 0 {
@@ -848,8 +871,8 @@ func (r *Runner) jsPipeline(ctx context.Context, vm *goja.Runtime) func(goja.Fun
 			go func() {
 				defer wg.Done()
 				current := item
-				for _, stage := range stages {
-					rawResult, calls, err := r.capturePipelineStage(vm, &vmMu, stage, current, item, itemIndex)
+				for stageIndex, stage := range stages {
+					rawResult, calls, err := r.capturePipelineStage(vm, &vmMu, stage, current, item, pipelineIndex, stageIndex, itemIndex)
 					if err != nil {
 						results[itemIndex] = nil
 						return
@@ -877,7 +900,7 @@ func (r *Runner) jsPipeline(ctx context.Context, vm *goja.Runtime) func(goja.Fun
 	}
 }
 
-func (r *Runner) capturePipelineStage(vm *goja.Runtime, vmMu *sync.Mutex, fn func(goja.Value, ...goja.Value) (goja.Value, error), value, originalItem any, itemIndex int) (any, []parallelAgentCall, error) {
+func (r *Runner) capturePipelineStage(vm *goja.Runtime, vmMu *sync.Mutex, fn func(goja.Value, ...goja.Value) (goja.Value, error), value, originalItem any, pipelineIndex, stageIndex, itemIndex int) (any, []parallelAgentCall, error) {
 	vmMu.Lock()
 	defer vmMu.Unlock()
 
@@ -892,7 +915,15 @@ func (r *Runner) capturePipelineStage(vm *goja.Runtime, vmMu *sync.Mutex, fn fun
 	if err != nil {
 		return nil, nil, err
 	}
-	return next.Export(), append([]parallelAgentCall(nil), capture.Calls...), nil
+	next, err = awaitPromiseValue(next)
+	if err != nil {
+		return nil, nil, err
+	}
+	calls := append([]parallelAgentCall(nil), capture.Calls...)
+	for i := range calls {
+		calls[i].CallIndex = pipelineCallIndex(pipelineIndex, stageIndex, itemIndex, i)
+	}
+	return next.Export(), calls, nil
 }
 
 func installDeterministicWorkflowGuards(vm *goja.Runtime) {
@@ -951,6 +982,40 @@ func (r *Runner) runPalliumCommand(ctx context.Context, args ...string) (any, er
 }
 
 func (r *Runner) RunAgent(ctx context.Context, prompt string, opts AgentOptions) (string, error) {
+	return r.runAgentAtCallIndex(ctx, prompt, opts, r.nextAgentCallIndex())
+}
+
+func (r *Runner) nextAgentCallIndex() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.agentCallIndex++
+	return r.agentCallIndex
+}
+
+func (r *Runner) assignSequentialCallIndexes(calls []parallelAgentCall) {
+	for i := range calls {
+		if calls[i].CallIndex == 0 {
+			calls[i].CallIndex = r.nextAgentCallIndex()
+		}
+	}
+}
+
+func (r *Runner) nextPipelineIndex() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pipelineIndex++
+	return r.pipelineIndex
+}
+
+func pipelineCallIndex(pipelineIndex, stageIndex, itemIndex, callOrdinal int) int {
+	return pipelineCallIndexBase +
+		pipelineIndex*pipelineIndexStride +
+		stageIndex*pipelineStageStride +
+		itemIndex*pipelineItemStride +
+		callOrdinal + 1
+}
+
+func (r *Runner) runAgentAtCallIndex(ctx context.Context, prompt string, opts AgentOptions, callIndex int) (string, error) {
 	if err := r.ensureNotStopped(ctx); err != nil {
 		return "", err
 	}
@@ -974,9 +1039,12 @@ func (r *Runner) RunAgent(ctx context.Context, prompt string, opts AgentOptions)
 		return "", err
 	}
 	schemaHash := agentSchemaHash(opts.Schema)
-	if cached, ok, err := r.Store.CompletedAgent(r.Run.ID, phase, opts.Label, prompt, provider, absRepo, mode, opts.Isolation, opts.Model, schemaHash, r.scriptHash, r.argsHash); err != nil {
+	if cached, ok, err := r.Store.CompletedAgent(r.Run.ID, callIndex, phase, opts.Label, prompt, provider, absRepo, mode, opts.Isolation, opts.Model, schemaHash, r.argsHash); err != nil {
 		return "", err
 	} else if ok {
+		if _, err := parseAgentOutputWithSchema(cached.Output, opts.Schema); err != nil {
+			return "", fmt.Errorf("cached agent %s failed schema validation: %w", cached.ID, err)
+		}
 		if phase != "" {
 			_ = r.Store.IncrementPhaseAgentCount(r.Run.ID, phase)
 		}
@@ -1000,6 +1068,7 @@ func (r *Runner) RunAgent(ctx context.Context, prompt string, opts AgentOptions)
 
 	agent := Agent{
 		RunID:            r.Run.ID,
+		CallIndex:        callIndex,
 		Phase:            phase,
 		Label:            opts.Label,
 		Prompt:           prompt,
@@ -1037,6 +1106,11 @@ func (r *Runner) RunAgent(ctx context.Context, prompt string, opts AgentOptions)
 	}
 	if err := r.ensureNotStopped(ctx); err != nil {
 		_ = r.Store.FinishAgentStatus(agent, interruptedStatus(err), output, interruptedMessage(err))
+		return "", err
+	}
+	if _, err := parseAgentOutputWithSchema(output, opts.Schema); err != nil {
+		agent.PatchPath = ""
+		_ = r.Store.FinishAgent(agent, output, err.Error())
 		return "", err
 	}
 	if err := r.Store.FinishAgent(agent, output, ""); err != nil {
@@ -1084,8 +1158,12 @@ func (r *Runner) runAgentCallsWithSemaphore(ctx context.Context, calls []paralle
 				errMu.Unlock()
 				return
 			}
-			output, err := r.RunAgent(ctx, call.Prompt, call.Opts)
+			output, err := r.runAgentAtCallIndex(ctx, call.Prompt, call.Opts, call.CallIndex)
 			if err != nil {
+				if !isWorkflowFatalAgentError(err) {
+					results[i] = nil
+					return
+				}
 				errMu.Lock()
 				if firstErr == nil {
 					firstErr = err
@@ -1102,6 +1180,17 @@ func (r *Runner) runAgentCallsWithSemaphore(ctx context.Context, calls []paralle
 		return nil, firstErr
 	}
 	return results, nil
+}
+
+func isWorkflowFatalAgentError(err error) bool {
+	if isWorkflowInterruptedError(err) {
+		return true
+	}
+	if err == nil {
+		return false
+	}
+	text := err.Error()
+	return strings.Contains(text, "workflow budget exhausted") || strings.Contains(text, "workflow exceeded max agents")
 }
 
 func isWorkflowStoppedError(err error) bool {
@@ -1220,6 +1309,178 @@ func parseAgentOutput(output string) any {
 		return structured
 	}
 	return output
+}
+
+func parseAgentOutputWithSchema(output string, schema map[string]any) (any, error) {
+	if len(schema) == 0 {
+		return parseAgentOutput(output), nil
+	}
+	var structured any
+	if err := json.Unmarshal([]byte(output), &structured); err != nil {
+		return nil, fmt.Errorf("agent output does not match schema: output is not JSON: %w", err)
+	}
+	normalized, ok := normalizeSchema(schema).(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("agent output schema must be an object")
+	}
+	if err := validateSchemaValue(structured, normalized, "$"); err != nil {
+		return nil, fmt.Errorf("agent output does not match schema: %w", err)
+	}
+	return structured, nil
+}
+
+func validateSchemaValue(value any, schema map[string]any, path string) error {
+	if rawType, ok := schema["type"]; ok && !schemaTypeMatches(value, rawType) {
+		return fmt.Errorf("%s expected %s", path, schemaTypeName(rawType))
+	}
+	switch schemaConcreteType(value, schema["type"], schema) {
+	case "object":
+		obj, ok := value.(map[string]any)
+		if !ok {
+			return fmt.Errorf("%s expected object", path)
+		}
+		if rawRequired, ok := schema["required"].([]any); ok {
+			for _, rawName := range rawRequired {
+				name, ok := rawName.(string)
+				if ok && name != "" {
+					if _, exists := obj[name]; !exists {
+						return fmt.Errorf("%s missing required property %q", path, name)
+					}
+				}
+			}
+		}
+		properties, _ := schema["properties"].(map[string]any)
+		for name, child := range properties {
+			if childSchema, ok := child.(map[string]any); ok {
+				if childValue, exists := obj[name]; exists {
+					if err := validateSchemaValue(childValue, childSchema, path+"."+name); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if allowAdditional, ok := schema["additionalProperties"].(bool); ok && !allowAdditional {
+			for name := range obj {
+				if _, known := properties[name]; !known {
+					return fmt.Errorf("%s has unexpected property %q", path, name)
+				}
+			}
+		}
+	case "array":
+		items, ok := value.([]any)
+		if !ok {
+			return fmt.Errorf("%s expected array", path)
+		}
+		itemSchema, _ := schema["items"].(map[string]any)
+		if itemSchema != nil {
+			for i, item := range items {
+				if err := validateSchemaValue(item, itemSchema, fmt.Sprintf("%s[%d]", path, i)); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func schemaConcreteType(value any, rawType any, schema map[string]any) string {
+	switch typed := rawType.(type) {
+	case string:
+		if singleSchemaTypeMatches(value, typed) {
+			return typed
+		}
+	case []any:
+		for _, option := range typed {
+			text, ok := option.(string)
+			if ok && singleSchemaTypeMatches(value, text) {
+				return text
+			}
+		}
+	}
+	if _, ok := schema["properties"]; ok {
+		return "object"
+	}
+	if _, ok := schema["required"]; ok {
+		return "object"
+	}
+	if _, ok := schema["additionalProperties"]; ok {
+		return "object"
+	}
+	if _, ok := schema["items"]; ok {
+		return "array"
+	}
+	return ""
+}
+
+func schemaTypeMatches(value any, rawType any) bool {
+	switch typed := rawType.(type) {
+	case string:
+		return singleSchemaTypeMatches(value, typed)
+	case []any:
+		for _, option := range typed {
+			if text, ok := option.(string); ok && singleSchemaTypeMatches(value, text) {
+				return true
+			}
+		}
+	}
+	return true
+}
+
+func singleSchemaTypeMatches(value any, typ string) bool {
+	switch typ {
+	case "object":
+		_, ok := value.(map[string]any)
+		return ok
+	case "array":
+		_, ok := value.([]any)
+		return ok
+	case "string":
+		_, ok := value.(string)
+		return ok
+	case "boolean":
+		_, ok := value.(bool)
+		return ok
+	case "number":
+		switch value.(type) {
+		case float64, int, int64, json.Number:
+			return true
+		default:
+			return false
+		}
+	case "integer":
+		switch typed := value.(type) {
+		case int, int64:
+			return true
+		case float64:
+			return typed == float64(int64(typed))
+		case json.Number:
+			_, err := typed.Int64()
+			return err == nil
+		default:
+			return false
+		}
+	case "null":
+		return value == nil
+	default:
+		return true
+	}
+}
+
+func schemaTypeName(rawType any) string {
+	switch typed := rawType.(type) {
+	case string:
+		return typed
+	case []any:
+		names := make([]string, 0, len(typed))
+		for _, value := range typed {
+			if text, ok := value.(string); ok {
+				names = append(names, text)
+			}
+		}
+		return strings.Join(names, "|")
+	default:
+		return ""
+	}
 }
 
 func agentSchemaHash(schema map[string]any) string {
@@ -1845,6 +2106,9 @@ func ApplyPatches(ctx context.Context, snapshot Snapshot) ([]string, error) {
 	applied := []string{}
 	for _, agent := range snapshot.Agents {
 		if agent.PatchPath == "" {
+			continue
+		}
+		if agent.Status != "completed" {
 			continue
 		}
 		targetRepo := firstNonEmpty(agent.Repo, snapshot.Run.CWD)

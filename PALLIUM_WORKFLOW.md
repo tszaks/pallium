@@ -77,7 +77,7 @@ const finding = await agent("Review auth middleware", {
 | `effort` | low to max | **not yet** - use prompt/provider |
 | `isolation: "worktree"` | edit isolation | same |
 | `agentType` | named agent | use `provider` |
-| `schema` | StructuredOutput | Codex `--output-schema`; providers get schema file |
+| `schema` | StructuredOutput | Codex `--output-schema`; providers get schema file and Pallium validates returned JSON locally |
 
 Non-Codex providers: `PALLIUM_WORKFLOW_PROVIDER_<NAME>_COMMAND`
 
@@ -145,7 +145,7 @@ if (budget.total !== null && budget.remaining() < 0.01) {
 }
 ```
 
-Set ceiling with `--max-budget-usd` and per-agent estimate with `PALLIUM_WORKFLOW_AGENT_COST_USD`. Further `agent()` calls throw when exhausted.
+Set ceiling with `--max-budget-usd` and per-agent estimate with `PALLIUM_WORKFLOW_AGENT_COST_USD`. Further `agent()` calls throw when exhausted. Agent and budget caps are lifetime run limits, so resume does not reset them.
 
 ## Pallium Extras
 
@@ -169,7 +169,14 @@ const plan = await coordinator.replan("adapt after verifier findings", { label: 
 
 ## Resume and caching
 
-Completed `agent()` calls reuse cache when prompt, provider, repo, mode, model, schema, script hash, and args hash match.
+Completed `agent()` calls reuse cache by deterministic call position plus prompt, provider, repo, mode, model, schema, and args hash.
+
+What that means:
+
+- Two identical `agent()` calls in the same execution are separate calls and both run.
+- Resuming a run replays the script from the top and reuses matching completed call positions.
+- Editing the tail of a script keeps the unchanged prefix cached.
+- Changing args, model, provider, repo, mode, label, prompt, or schema invalidates the affected call.
 
 ```bash
 pallium workflow resume <run-id>
@@ -203,7 +210,7 @@ These are **patterns**, not built-ins. Match harness to task:
 | Native Workflow tool in-session | CLI / MCP / HTTP (`pallium workflow run`) |
 | Token `budget` | USD-shaped `budget` object |
 | `effort`, `agentType` | `provider`, `model`, `mode` |
-| Agent death -> `null` | Agent failure fails the run (use try/catch in script for soft handling) |
+| Agent death -> `null` | Parallel/pipeline agent failure -> `null`; direct `agent()` failure throws |
 | `journal.jsonl` in transcript dir | SQLite store + `workflow show/inspect` |
 | MCP via ToolSearch in headless workers | Provider must bundle tools; Pallium exposes repo via `pallium.*` |
 | Permission dialog from `meta` | `meta` for naming/phases; gates run verifier agents |

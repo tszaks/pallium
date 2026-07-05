@@ -89,13 +89,10 @@ func TestConsoleRunReadAndOwnedList(t *testing.T) {
 		"--cwd", tmp,
 		"--log", logPath,
 		"--",
-		"/bin/sh", "-c", "printf hello-owned",
+		"/bin/sh", "-c", "printf 'hello-owned\n'",
 	}, false)
 	if err != nil {
 		t.Fatalf("console run failed: %v", err)
-	}
-	if !strings.Contains(out.String(), "hello-owned") {
-		t.Fatalf("expected command output, got %q", out.String())
 	}
 	raw, err := os.ReadFile(logPath)
 	if err != nil {

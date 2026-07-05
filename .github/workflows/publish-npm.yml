@@ -1,0 +1,47 @@
+name: Publish npm Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish, for example v0.9.6
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish-npm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Verify package version
+        id: version
+        run: |
+          version="$(node -p 'require("./npm/package.json").version')"
+          tag_version="${{ inputs.tag }}"
+          tag_version="${tag_version#v}"
+          if [ "$version" != "$tag_version" ]; then
+            echo "npm/package.json version $version does not match release tag ${{ inputs.tag }}" >&2
+            exit 1
+          fi
+          if npm view "pallium@$version" version >/dev/null 2>&1; then
+            echo "pallium@$version is already published"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish with trusted publishing
+        if: steps.version.outputs.publish == 'true'
+        run: npm publish ./npm --access public

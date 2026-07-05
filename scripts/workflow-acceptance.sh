@@ -166,7 +166,7 @@ phase("verify");
 const result = await verify.untilGreen("go test ./...", { label: "green", maxRounds: 2 });
 return result;
 JS
-PALLIUM_WORKFLOW_AGENT_STUB_SEQUENCE='["{\"ok\":false,\"summary\":\"failing\",\"failures\":[{\"name\":\"Test\",\"message\":\"boom\"}]}","{\"summary\":\"fixed\"}","{\"ok\":true,\"summary\":\"passing\",\"failures\":[]}"]' \
+PALLIUM_WORKFLOW_AGENT_STUB_SEQUENCE='["{\"ok\":false,\"command\":\"go test ./...\",\"summary\":\"failing\",\"output_tail\":\"boom\",\"failures\":[{\"name\":\"Test\",\"message\":\"boom\"}]}","{\"summary\":\"fixed\"}","{\"ok\":true,\"command\":\"go test ./...\",\"summary\":\"passing\",\"output_tail\":\"\",\"failures\":[]}"]' \
   PALLIUM_WORKFLOW_AGENT_STUB='{"ok":false}' \
   "$PALLIUM_BIN" workflow run --id wf-accept-until-green --db "$db" --cwd "$repo" --script "$ROOT/until-green.js" "until green acceptance" --json >"$ROOT/until-green-run.json"
 assert_grep "$ROOT/until-green-run.json" '"status": "completed"'
@@ -255,7 +255,8 @@ fi
 grep -q 'workflow patch policy blocked' /tmp/pallium-accept-secret.out
 test ! -f "$repo/secret.env"
 "$PALLIUM_BIN" workflow trigger add changed-review "review changes" --kind on-changed --db "$db" --cwd "$repo" --json >/dev/null
-PALLIUM_WORKFLOW_AGENT_STUB='{"summary":"trigger"}' \
+PALLIUM_WORKFLOW_AGENT_STUB_SEQUENCE='["{\"summary\":\"trigger\",\"steps\":[],\"risks\":[]}","{\"verdict\":\"pass\",\"notes\":[]}"]' \
+PALLIUM_WORKFLOW_AGENT_STUB='{"summary":"fallback","steps":[],"risks":[]}' \
   "$PALLIUM_BIN" workflow trigger run changed-review --id wf-accept-trigger-1 --db "$db" --json >/dev/null
 "$PALLIUM_BIN" workflow trigger run changed-review --db "$db" --json >"$ROOT/trigger-skip.json"
 assert_grep "$ROOT/trigger-skip.json" '"skipped": true'
@@ -296,7 +297,8 @@ section "v6 infrastructure api mcp sdk analytics"
 "$PALLIUM_BIN" workflow analytics --db "$db" --json >"$ROOT/analytics.json"
 assert_grep "$ROOT/analytics.json" '"estimated_cost_usd"'
 port="${PALLIUM_WORKFLOW_ACCEPTANCE_PORT:-18766}"
-"$PALLIUM_BIN" workflow serve --db "$db" --addr "127.0.0.1:$port" >/tmp/pallium-workflow-acceptance-api.log 2>&1 &
+PALLIUM_WORKFLOW_API_TOKEN=acceptance-token \
+  "$PALLIUM_BIN" workflow serve --db "$db" --addr "127.0.0.1:$port" >/tmp/pallium-workflow-acceptance-api.log 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 50); do
   if curl -fsS "http://127.0.0.1:$port/healthz" >/dev/null 2>&1; then
@@ -304,11 +306,15 @@ for _ in $(seq 1 50); do
   fi
   sleep 0.1
 done
-curl -fsS "http://127.0.0.1:$port/workflows/fleet" >"$ROOT/api-fleet.json"
+if curl -fsS "http://127.0.0.1:$port/workflows/fleet" >/tmp/pallium-accept-api-unauth.out 2>&1; then
+  echo "expected workflow API to reject missing token" >&2
+  exit 1
+fi
+curl -fsS -H "Authorization: Bearer acceptance-token" "http://127.0.0.1:$port/workflows/fleet" >"$ROOT/api-fleet.json"
 assert_grep "$ROOT/api-fleet.json" '"runs_total"'
-curl -fsS "http://127.0.0.1:$port/workflows/analytics" >"$ROOT/api-analytics.json"
+curl -fsS -H "Authorization: Bearer acceptance-token" "http://127.0.0.1:$port/workflows/analytics" >"$ROOT/api-analytics.json"
 assert_grep "$ROOT/api-analytics.json" '"estimated_cost_usd"'
-curl -fsS "http://127.0.0.1:$port/workflows/library" >"$ROOT/api-library.json"
+curl -fsS -H "Authorization: Bearer acceptance-token" "http://127.0.0.1:$port/workflows/library" >"$ROOT/api-library.json"
 assert_grep "$ROOT/api-library.json" 'security-audit'
 printf '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n' |
   "$PALLIUM_BIN" workflow mcp --db "$db" >"$ROOT/mcp-tools.json"
