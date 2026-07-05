@@ -1,47 +1,362 @@
-# pallium
+# Pallium
 
 [![npm version](https://img.shields.io/npm/v/pallium.svg)](https://www.npmjs.com/package/pallium)
 [![npm downloads](https://img.shields.io/npm/dm/pallium.svg)](https://www.npmjs.com/package/pallium)
 [![GitHub release](https://img.shields.io/github/v/release/tszaks/pallium?sort=semver)](https://github.com/tszaks/pallium/releases/latest)
 [![GitHub Packages](https://img.shields.io/badge/GitHub%20Packages-%40tszaks%2Fpallium-24292f?logo=github)](https://github.com/tszaks/pallium/pkgs/npm/pallium)
 
-`pallium` is a local-first CLI for AI-powered coding workflows.
+Pallium is a local-first control plane for AI coding agents.
 
-It gives an LLM fast repo context before, during, and after edits:
+It gives agents repo memory, risk context, verification history, session recall,
+and Claude-shaped dynamic workflows that can run independently of the main chat.
 
-- what files are risky
-- what else is likely to move
-- what tests are most relevant
-- what focused test command to run first, plus the safer fallback
-- what fast, safe, and full verification steps to run
-- how fresh the local index is, and what evidence the guidance is based on
-- what the blast radius probably is
-- what action an agent should take next
-- whether the current task drifted outside its planned scope
-- what related agent sessions may explain the current repo or files
-- what verification commands actually passed or failed recently
-- what changed in the working tree right now
+The core idea is simple: keep orchestration, state, and verification outside the
+model context so agents can do larger tasks without losing the thread.
 
-## Why It Matters
+## What Pallium Does
 
-LLMs are good at writing code and bad at remembering repository context.
+Pallium has three main jobs:
 
-That leads to common mistakes:
+1. Build repo context before an edit.
+2. Remember prior agent sessions and decisions.
+3. Run auditable, resumable, multi-agent workflows.
 
-- editing a risky file in isolation
-- missing related files
-- skipping the most useful tests
-- handing work off without a clean summary
+Use it when an agent needs to know:
 
-`pallium` exists to lower those surprises.
+- which files are risky
+- which files usually move together
+- what changed in the working tree
+- which tests matter first
+- what verification recently passed or failed
+- whether a task drifted outside its planned scope
+- what prior sessions or decisions explain the current work
+- how to hand work off cleanly to another agent or human
 
-## Core Commands
+Most user-facing commands support `--json` where agent parsing matters.
+
+## Quick Start
 
 ```bash
 pallium index
 pallium doctor
-pallium version
+pallium changed-now --json
+pallium explain cmd/workflow.go --json
+pallium safe internal/workflow/runtime.go --json
+pallium plan internal/workflow/runtime.go --json
+pallium verify fast --json
+pallium handoff origin/main --json
+```
+
+For a dynamic workflow:
+
+```bash
+pallium workflow tools list --json
+pallium workflow template list --json
+pallium workflow preflight "review workflow changes" --scope internal/workflow --json
+pallium workflow run "review workflow changes"
+```
+
+For a generated workflow script:
+
+```bash
+pallium workflow generate "fix tests until green" \
+  --style test-fix \
+  --test-command "go test ./..." \
+  --output fix.workflow.js
+
+pallium workflow validate fix.workflow.js
+pallium workflow run --script fix.workflow.js "fix tests until green"
+```
+
+## Dynamic Workflows
+
+`pallium workflow` is Pallium's local dynamic workflow runtime. It is inspired by
+Claude Code dynamic workflows, but it is agent-agnostic and grounded in Pallium's
+repo memory.
+
+Agents should read `PALLIUM_WORKFLOW.md` before writing custom workflow scripts.
+
+A workflow is an async JavaScript script executed by Pallium's Go runtime. The
+script coordinates workers through primitives such as:
+
+- `phase(name, fn?)`
+- `await agent(prompt, options)`
+- `await parallel(items, fn)`
+- `await pipeline(items, stage1, stage2, ...)`
+- `await check(command, options)`
+- `await verify.untilGreen(command, options)`
+- `await workflow(savedName, args)`
+- `await gate(name, message)`
+- `await coordinator.replan(goal, options)`
+- `await pallium.preflight(task, ...scopes)`
+- `await pallium.decisions.record(title, body, ...tags)`
+- `await pallium.decisions.search(query, limit)`
+
+The script owns orchestration. Workers own thinking, shell use, and edits.
+
+Pallium persists each run in SQLite and stores artifacts under
+`~/.pallium/workflow-runs/`. Runs have stable ids, phases, workers, outputs,
+patches, reports, gates, and status.
+
+### Example Workflow
+
+```js
+phase("scope");
+const preflight = await pallium.preflight(
+  "review workflow runtime changes",
+  "internal/workflow",
+  "cmd/workflow.go"
+);
+
+phase("inspect");
+const findings = await parallel(preflight.files_to_inspect || [], file =>
+  agent("Review " + file + " for correctness risks", {
+    label: "review-" + file,
+    mode: "read-only"
+  })
+);
+
+phase("verify");
+const verification = await verify.untilGreen("go test ./...", {
+  label: "tests",
+  maxRounds: 3
+});
+
+return { findings, verification };
+```
+
+## How It Differs From A Normal Agent Loop
+
+Normal agent work keeps planning, state, verification output, and next steps in
+one chat context. That works for small tasks, then gets noisy.
+
+Pallium workflows move that control flow into executable JavaScript:
+
+- loops are normal code
+- intermediate state lives in variables and SQLite
+- workers can run in parallel
+- completed workers are cached on resume
+- tests are treated as external checks
+- reports and patches are inspectable after the run
+- gates, triggers, API calls, and MCP clients can continue work outside chat
+
+This is the part that makes it feel close to Claude-style dynamic workflows:
+the model can author a script, Pallium runs the script, and subagents carry out
+the work under a tracked runtime.
+
+`pipeline(items, stage1, stage2, ...)` uses Ultracode-style streaming stages:
+each item moves to its next stage as soon as its prior stage completes. A slow
+item does not hold faster items behind a stage-wide barrier.
+
+## Agent Workers
+
+The default worker provider is Codex:
+
+```js
+await agent("Inspect auth routes", {
+  label: "auth-review",
+  mode: "read-only"
+});
+```
+
+Worker modes:
+
+- `read-only`: inspect code with a read-only sandbox
+- `test`: run verification commands and summarize failures
+- `edit`: make changes in an isolated worktree and produce a patch
+
+Edit workers do not edit the target checkout directly. They run in git
+worktrees under `~/.pallium/workflow-runs/`, then Pallium applies patches back
+to the target repo only after the workflow completes successfully.
+
+Before applying a patch, Pallium scans added lines for common secret patterns
+such as API keys, tokens, passwords, OpenAI-style keys, and AWS access keys. A
+matching patch is blocked unless `PALLIUM_WORKFLOW_ALLOW_SECRET_PATCH=1` is set.
+
+Use `workflow revert <run-id>` to reverse workflow patches after they have been
+applied.
+
+## Any Agent, Any Model
+
+Pallium is not limited to Codex. A workflow agent can target any configured
+provider:
+
+```js
+await agent("Review this design decision", {
+  label: "claude-review",
+  provider: "claude-code",
+  mode: "read-only"
+});
+```
+
+Configure providers with environment variables:
+
+```bash
+export PALLIUM_WORKFLOW_PROVIDER_CLAUDE_CODE_COMMAND='claude -p "$(cat "$PALLIUM_WORKFLOW_PROMPT_FILE")" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"'
+```
+
+Provider commands run through `sh -c` in the worker cwd and receive:
+
+- `PALLIUM_WORKFLOW_RUN_ID`
+- `PALLIUM_WORKFLOW_AGENT_ID`
+- `PALLIUM_WORKFLOW_PROVIDER`
+- `PALLIUM_WORKFLOW_LABEL`
+- `PALLIUM_WORKFLOW_MODE`
+- `PALLIUM_WORKFLOW_MODEL`
+- `PALLIUM_WORKFLOW_REPO`
+- `PALLIUM_WORKFLOW_CWD`
+- `PALLIUM_WORKFLOW_PROMPT`
+- `PALLIUM_WORKFLOW_PROMPT_FILE`
+- `PALLIUM_WORKFLOW_OUTPUT_FILE`
+- `PALLIUM_WORKFLOW_SCHEMA_FILE`
+
+The provider should write its final worker message to
+`PALLIUM_WORKFLOW_OUTPUT_FILE`. Stdout is used as a fallback.
+
+Agents can also target another repo:
+
+```js
+await agent("Inspect backend API contract", {
+  label: "backend",
+  repo: "/path/to/backend",
+  mode: "read-only"
+});
+```
+
+For edit workers, patches apply back to that worker repo.
+
+## Workflow CLI
+
+Discovery and generation:
+
+```bash
+pallium workflow tools list --json
+pallium workflow template list --json
+pallium workflow template show test-fix --json
+pallium workflow library list --json
+pallium workflow library show security-audit --json
+pallium workflow library install security-audit --cwd .
+pallium workflow generate "review auth" --style review --output review.js
+pallium workflow generate "custom migration workflow" --llm --output custom.js
+pallium workflow validate custom.js
+```
+
+Run and inspect:
+
+```bash
+pallium workflow run "review this branch"
+pallium workflow run --script review.js "review this branch"
+pallium workflow run --workflow review-branch "review this branch"
+pallium workflow run /review-branch "review this branch"
+pallium workflow run --background "audit route handlers for missing auth"
+pallium workflow list
+pallium workflow status <run-id>
+pallium workflow inspect <run-id>
+pallium workflow show <run-id>
+pallium workflow read <run-id>
+pallium workflow report <run-id> --json
+pallium workflow watch <run-id>
+```
+
+Control:
+
+```bash
+pallium workflow pause <run-id>
+pallium workflow resume <run-id>
+pallium workflow stop <run-id>
+pallium workflow save <run-id> --name review-branch
+pallium workflow apply <run-id>
+pallium workflow revert <run-id>
+```
+
+Automation and fleet:
+
+```bash
+pallium workflow trigger add daily-review "review workflow changes" --cwd .
+pallium workflow trigger add changed-review "review workflow changes" --kind on-changed --cwd .
+pallium workflow trigger list
+pallium workflow trigger run changed-review
+pallium workflow trigger watch --once
+pallium workflow fleet status --json
+pallium workflow analytics --json
+```
+
+Human gates:
+
+```bash
+pallium workflow gate list <run-id>
+pallium workflow gate approve <run-id> approve-patches
+```
+
+API and MCP:
+
+```bash
+pallium workflow serve --addr 127.0.0.1:8765
+pallium workflow mcp
+```
+
+Audit:
+
+```bash
+pallium workflow audit --json
+pallium workflow audit --run-acceptance --json
+scripts/workflow-acceptance.sh
+```
+
+## Verification Loops
+
+Use `check()` when the script wants to branch on one command result:
+
+```js
+const result = await check("go test ./...", { label: "go-tests" });
+if (!result.ok) {
+  await parallel(result.failures || [], failure =>
+    agent("Fix this failure: " + JSON.stringify(failure), {
+      label: "fix-" + failure.name,
+      mode: "edit",
+      isolation: "worktree"
+    })
+  );
+}
+```
+
+Use `verify.untilGreen()` when Pallium should own the check, fix, re-check loop:
+
+```js
+return verify.untilGreen("go test ./...", {
+  label: "go-tests",
+  maxRounds: 3
+});
+```
+
+The loop stops when the command passes, the round limit is reached, or failures
+stop changing.
+
+## Costs And Budgets
+
+Pallium does not add a billing layer. Workflow cost comes from whatever worker
+provider you run, such as Codex, Claude, or another model CLI.
+
+Pallium tracks an estimated per-agent cost so agents can make budget decisions:
+
+```bash
+export PALLIUM_WORKFLOW_AGENT_COST_USD=0.02
+pallium workflow run "large review" --max-budget-usd 1.00
+pallium workflow analytics --json
+```
+
+The estimate is local bookkeeping. It is not provider billing data unless your
+provider command makes it so.
+
+## Repo Memory Commands
+
+```bash
+pallium index
+pallium doctor
 pallium explain <path>
+pallium risk <path>
+pallium neighbors <path>
+pallium decisions <query>
 pallium safe <path>
 pallium plan <path>
 pallium changed-now
@@ -50,15 +365,16 @@ pallium verify <fast|safe|full>
 pallium handoff [base-ref]
 pallium task start "Tighten auth flow" src/auth cmd
 pallium task show
-pallium workflow run "review this branch with a workflow"
-pallium workflow show <run-id>
+pallium task clear
 ```
 
-Use `--json` with any command for agent-friendly output.
+`verify` records each run in the repo-local Pallium database so future `review`
+and `handoff` output can include recent verification history.
 
-## Agent Session Memory
+## Session Memory
 
-`pallium` can also index Codex CLI transcripts from `~/.codex/sessions/**/*.jsonl` plus metadata from `~/.codex/state_5.sqlite`, and Claude Code transcripts from `~/.claude/projects/**/*.jsonl`.
+Pallium indexes Codex CLI transcripts from `~/.codex/sessions/**/*.jsonl` and
+Claude Code transcripts from `~/.claude/projects/**/*.jsonl`.
 
 ```bash
 pallium sessions live --details
@@ -78,15 +394,28 @@ pallium sessions semantic "find the session where we debugged MCP startup failur
 pallium sessions stats
 ```
 
+Indexing is incremental. Active transcript files modified in the last two
+minutes are skipped so Pallium does not chase logs while agents are still
+writing them.
+
+Session-memory data lives at `~/.pallium/codex-sessions.sqlite`. If an older
+database exists, Pallium can fall back to `~/.codex-memory/codex-sessions.sqlite`.
+Embeddings use `OPENAI_API_KEY` or `OPENAI_ADMIN_API_KEY`.
+
+For another machine's sessions:
+
+```bash
+pallium sessions index --include /path/to/other/.codex/sessions --machine tylers-macbook
+pallium sessions index --provider claude --include /path/to/other/.claude/projects --machine tylers-macbook
+```
+
 ## Console Coordination
 
-`pallium console` is an experimental local control plane for agent sessions.
-It can inspect live Codex and Claude Code sessions, coordinate manifests,
-handoffs, file claims, action requests, authority gates, and review gates.
+`pallium console` is a local coordination surface for agent sessions. It can
+inspect live Codex and Claude Code sessions, store manifests, create handoffs,
+track file claims, request authority, and manage review gates.
 
-This release also adds Pallium-owned process control. Pallium can spawn a
-foreground or background PTY-backed session, persist its metadata, capture its
-log, read its output later, and interrupt it as a process group.
+Pallium can also spawn sessions it owns:
 
 ```bash
 pallium console ls --details
@@ -98,215 +427,76 @@ pallium console read owned-worker --tail 50
 pallium console interrupt owned-worker
 ```
 
-The control boundary is intentionally conservative: this release controls
-sessions that Pallium spawned itself. It does not inject commands into arbitrary
-existing Codex or Claude Code sessions.
+The current control boundary is conservative: Pallium controls sessions it
+spawned itself. It does not inject commands into arbitrary existing Codex or
+Claude Code sessions.
 
-## Dynamic Workflows
+## HTTP API And SDK
 
-`pallium workflow` is a local Codex workflow runner inspired by Claude Code
-dynamic workflows. A workflow is a JavaScript file with a `meta` block plus
-helpers such as `phase()`, `await agent()`, `await check()`, `parallel()`, and
-`await pipeline()`. The runtime stores the run, phases, worker outputs,
-generated script, and patches in Pallium's local control-plane database and
-`~/.pallium/workflow-runs/`, so normal workflow runs do not dirty the target
-repository.
+Start the local workflow API:
 
 ```bash
-pallium workflow run "review this branch for correctness issues"
-pallium workflow generate "fix tests until green" --style test-fix --test-command "go test ./..." --output fix.workflow.js
-pallium workflow generate "custom migration workflow" --llm --output custom.workflow.js
-pallium workflow validate fix.workflow.js
-pallium workflow tools list
-pallium workflow template list
-pallium workflow template show test-fix
-pallium workflow library list
-pallium workflow library install security-audit
-pallium workflow preflight "review workflow changes" --scope cmd/workflow.go --json
-pallium workflow trigger add daily-review "review workflow changes" --cwd .
-pallium workflow trigger add changed-review "review workflow changes" --kind on-changed --cwd .
-pallium workflow trigger run daily-review
-pallium workflow trigger watch --once
-pallium workflow fleet status
-pallium workflow analytics
-pallium workflow gate list <run-id>
-pallium workflow gate approve <run-id> approve-patches
 pallium workflow serve --addr 127.0.0.1:8765
-pallium workflow mcp
-pallium workflow run --script .pallium/workflows/review.js "review this branch"
-pallium workflow run --workflow review-branch "review this branch"
-pallium workflow run /review-branch "review this branch"
-pallium workflow run --background "audit route handlers for missing auth"
-pallium workflow list
-pallium workflow status <run-id>
-pallium workflow inspect <run-id>
-pallium workflow show <run-id>
-pallium workflow read <run-id>
-pallium workflow report <run-id>
-pallium workflow watch <run-id>
-pallium workflow pause <run-id>
-pallium workflow resume <run-id>
-pallium workflow save <run-id> --name review-branch
-pallium workflow apply <run-id>
-pallium workflow revert <run-id>
+```
+
+Endpoints:
+
+- `GET /healthz`
+- `GET /workflows/fleet`
+- `GET /workflows/analytics`
+- `GET /workflows/library`
+- `GET /workflows/library/{name}`
+- `POST /workflows/library/install`
+- `GET /workflows/runs/{id}`
+- `POST /workflows/run`
+
+The Go client in `pkg/workflowclient` wraps this API.
+
+## Proof Gates
+
+The workflow system has an installed-CLI acceptance gate:
+
+```bash
+PALLIUM_BIN="$(which pallium)" scripts/workflow-acceptance.sh
+pallium workflow audit --run-acceptance --json
+```
+
+The acceptance script exercises:
+
+- parallel worker timing
+- resume cache reuse
+- workflow generation and validation
+- composition with saved workflows
+- budget failure behavior
+- structured reports
+- repo preflight
+- `verify.untilGreen`
+- durable decisions
+- multi-repo agents
+- library install
+- configured providers
+- coordinator replanning
+- edit patch apply and revert
+- secret patch blocking
+- on-changed triggers
+- human gates
+- fleet limits
+- analytics
+- HTTP API
+- MCP tool listing
+- the v1-v7 audit checklist
+
+For normal development:
+
+```bash
+go test ./...
+go vet ./...
 scripts/workflow-acceptance.sh
 ```
 
-Workers run through `codex exec`. Read-only agents use a read-only sandbox;
-edit agents run in isolated git worktrees under `~/.pallium/workflow-runs/` and
-produce patches that are applied back to the target checkout automatically when
-the workflow completes successfully. `workflow apply` remains as an idempotent
-retry command for older or interrupted runs. `workflow save` is the only command
-in this group that intentionally writes a reusable workflow into the target
-repo. Set `PALLIUM_WORKFLOW_AGENT_STUB` in tests to return deterministic worker
-output without launching Codex.
-Before any workflow patch is applied, Pallium scans added lines for common
-secret patterns such as API keys, tokens, passwords, OpenAI-style keys, and AWS
-access keys. A matching patch is blocked before it reaches the target checkout;
-`PALLIUM_WORKFLOW_ALLOW_SECRET_PATCH=1` is the explicit local bypass for rare
-false positives.
-Use `workflow revert <run-id>` to reverse patches produced by a workflow; this
-also respects multi-repo agent targets.
-Use `scripts/workflow-acceptance.sh` as the installed-CLI acceptance gate for
-v1-v7. It exercises core runner controls, generation/report/budget/composition,
-repo-native preflight and verify loops, autonomy triggers and gates, fleet
-coordination, HTTP/MCP infrastructure, and the `workflow audit` checklist with
-stubbed workers.
-Use `pallium workflow audit --json` to print the v1-v7 requirement checklist.
-Add `--run-acceptance` to execute `scripts/workflow-acceptance.sh` from the
-Pallium repo or via `PALLIUM_WORKFLOW_ACCEPTANCE_SCRIPT`.
-
-Workflow scripts run as async JavaScript, matching Claude's saved workflow
-shape: top-level `await` is supported, `pipeline()` fans one worker per item in
-parallel for each stage, and completed agents are reused when the same run id is
-relaunched. Runs default to 16 concurrent agents and 1,000 total agents.
-Scripts can call `await workflow("saved-name", args)` to compose one saved
-workflow from `.pallium/workflows/`, `.claude/workflows/`, or user workflow
-folders. Composition is capped at one nested level so generated scripts remain
-inspectable and do not recurse indefinitely.
-Scripts can call `await coordinator.replan(goal, options)` to spawn a read-only
-coordinator worker with the current run snapshot. Use this when a verifier or
-worker finds new information and the workflow should adapt by returning a
-decision, next steps, and optional new spawn prompts.
-Scripts can call `await gate("name", "message")` to pause until a human runs
-`pallium workflow gate approve <run-id> <name>` and then resumes the workflow.
-`workflow pause <run-id>` and `workflow stop <run-id>` are cooperative for
-foreground runs: they mark the run state in Pallium's database, the active
-runtime observes that state, cancels live worker commands, and records paused
-or stopped agents instead of completing the run. `workflow resume <run-id>`
-reloads the saved script, args, and cwd, then continues with completed-agent
-cache reuse so finished work is not repeated.
-`workflow trigger add <name> "task"` stores a local automation definition in
-Pallium's workflow database. `workflow trigger run <name>` starts the saved
-workflow with the normal runner, records the resulting run id on the trigger,
-and can be called by cron, launchd, or another agent without keeping the chat
-session alive. Use `--kind on-changed` to skip trigger runs until the repo HEAD
-or working tree status changes. `workflow trigger watch` polls enabled triggers
-and runs changed ones automatically; use `--once` for launchd/cron-style checks
-or leave it running as a local watcher.
-`workflow fleet status` gives agents and humans a compact control-plane view of
-recent workflow runs, active runs, triggers, and running/paused/failed workers.
-`workflow analytics` summarizes completion rate, agent status/provider/mode
-mix, patch production, trigger count, average agents per run, and estimated
-agent cost from the local workflow store so background workflow behavior can be
-judged from evidence. Use `PALLIUM_WORKFLOW_AGENT_COST_USD` to tune the local
-per-agent estimate and `--max-budget-usd` to stop a run before it exceeds that
-budget.
-`workflow library list/show/install` exposes built-in reusable workflow packs
-such as `security-audit`, `migration-assistant`, and `test-gap-finder`; install
-puts a saved script in `.pallium/workflows/` so agents can invoke it later with
-`pallium workflow run /name "task"`.
-Agent options accept `provider: "codex"` for the native Codex worker and any
-other provider configured with
-`PALLIUM_WORKFLOW_PROVIDER_<NAME>_COMMAND`. Provider names are uppercased and
-non-alphanumeric characters become underscores, so `claude-code` uses
-`PALLIUM_WORKFLOW_PROVIDER_CLAUDE_CODE_COMMAND`. Configured provider commands
-run in the worker cwd through `sh -c` and receive
-`PALLIUM_WORKFLOW_PROMPT_FILE`, `PALLIUM_WORKFLOW_OUTPUT_FILE`,
-`PALLIUM_WORKFLOW_SCHEMA_FILE`, `PALLIUM_WORKFLOW_PROVIDER`,
-`PALLIUM_WORKFLOW_LABEL`, `PALLIUM_WORKFLOW_MODE`,
-`PALLIUM_WORKFLOW_MODEL`, `PALLIUM_WORKFLOW_REPO`, and
-`PALLIUM_WORKFLOW_CWD`. The command should write the final worker message to
-`PALLIUM_WORKFLOW_OUTPUT_FILE`; stdout is used as a fallback. Provider, model,
-repo, schema hash, and script hash are part of the completed-agent cache key.
-Agent options also accept `repo: "/path/to/other/repo"` for multi-repo
-workflows. Edit agents still use isolated worktrees, and their patches apply
-back to that agent repo rather than the parent workflow cwd.
-`workflow serve` exposes the local workflow control plane over HTTP for other
-tools: `GET /healthz`, `GET /workflows/fleet`, `GET /workflows/analytics`,
-`GET /workflows/library`, `GET /workflows/library/{name}`,
-`POST /workflows/library/install`, `GET /workflows/runs/{id}`, and
-`POST /workflows/run`.
-The Go SDK in `pkg/workflowclient` wraps that HTTP API for embedded tools.
-`workflow mcp` exposes the same local workflow control plane over stdio JSON-RPC
-for MCP clients, with tools for run, status, fleet, analytics, and library pack
-operations.
-Use `await check("test command")` for objective verification loops. It spawns a
-dedicated test agent, runs the command as ground truth, and returns structured
-JSON with `ok`, `summary`, `output_tail`, and `failures`, so scripts can keep
-fixing until checks pass or progress stalls.
-Use `await verify.untilGreen("test command", { maxRounds: 3 })` when the
-workflow should own the full check, fix, re-check loop. It stops when the check
-passes, the round budget is exhausted, or failures stop changing.
-Scripts also get a Pallium-native `pallium` object for repo-grounded workflow
-control: `await pallium.verify("fast")`, `await pallium.review("origin/main")`,
-`await pallium.handoff("origin/main")`, `await pallium.explain(path)`,
-`await pallium.safe(path)`, `await pallium.plan(path)`,
-`await pallium.changedNow()`, `await pallium.preflight(task, ...scopes)`, and
-`await pallium.task.start(goal, ...scopes)`.
-Workflows can persist decisions with
-`await pallium.decisions.record(title, body, ...tags)` and recall prior choices
-with `await pallium.decisions.search(query, limit)`.
-Saved workflows resolve by name from the nearest `.pallium/workflows/` or
-`.claude/workflows/` directory while walking up from the current working
-directory, then from `~/.pallium/workflows/` or `~/.claude/workflows/`.
-`workflow generate` emits deterministic Claude-shaped JS workflows for review,
-research, and test-fix loops. Use `workflow status` for a compact progress view
-and `workflow inspect` for phase, agent, patch, and failure detail.
-Add `--llm` to let Codex write a custom orchestration script from the current
-tool catalog and templates; Pallium validates the generated JavaScript before
-saving it.
-Use `workflow tools list --json` and `workflow template list --json` when an
-agent needs to discover the available primitives and workflow styles before
-generating or running a script automatically.
-Use `workflow validate <path.js>` before running agent-written scripts; it
-performs a compile-only goja check and does not execute agents or touch files.
-Use `workflow preflight <task> --scope path --json` before spawning workers when
-the agent needs Pallium to choose repo-native scope, safety context, likely
-inspection files, and verification commands.
-Use `workflow report <run-id> --json` as the structured handoff between
-workflow versions or follow-up agents; it extracts findings, risks, next steps,
-patches, and per-agent summaries from the stored run.
-
-Session-memory indexing is incremental by default: unchanged transcript files are skipped using their last indexed timestamp, with a hash check only when the file looks newer. After a global `sessions embed` pass completes and no embedding backlog remains for the model, Pallium records a model-specific embedding cursor. Later `sessions index` runs scan from that cursor minus `--safety-buffer` instead of walking historical session memory every time. This makes scheduled automation cadence-independent: hourly runs should touch about the last hour plus buffer, six-hour runs should touch about six hours plus buffer, and on-demand runs use the same cursor path. Files modified in the last two minutes are skipped so Pallium does not chase active agent logs. Use `--force` only when you intentionally want to rebuild existing session rows after parser or redaction changes.
-
-Session-memory data is stored outside any one repo at `~/.pallium/codex-sessions.sqlite`. If an existing legacy database is present, Pallium falls back to `~/.codex-memory/codex-sessions.sqlite` so older indexed memory keeps working. It includes redacted raw agent events, transcript/tool-call rows, FTS indexes, chunks, OpenAI embeddings, and brute-force cosine semantic search. Use `OPENAI_API_KEY` or `OPENAI_ADMIN_API_KEY` for embedding commands.
-
-For another machine's sessions:
-
-```bash
-pallium sessions index --include /path/to/other/.codex/sessions --machine tylers-macbook
-pallium sessions index --provider claude --include /path/to/other/.claude/projects --machine tylers-macbook
-```
-
-## Typical Agent Loop
-
-```bash
-pallium index
-pallium explain path/to/file --json
-pallium safe path/to/file --json
-pallium plan path/to/file --json
-pallium task start "Tighten auth flow" src/auth cmd --json
-pallium changed-now --json
-pallium handoff origin/main --json
-pallium verify fast --json
-```
-
-`verify` records each run in the repo-local Pallium database so future `review` and `handoff` output can show recent verification history.
-
 ## Install
 
-The primary install path is npm:
+Install from npm:
 
 ```bash
 npm install -g pallium
@@ -314,32 +504,28 @@ pallium version
 ```
 
 The npm package installs the matching Pallium release binary from GitHub and
-keeps it in `~/.pallium/npm/<version>/`. Release assets include macOS and Linux
-binaries for arm64 and x64, plus a packed npm tarball for direct install from
-GitHub Releases.
+keeps it in `~/.pallium/npm/<version>/`.
 
-If npm registry access is unavailable, install the release tarball directly:
+Install a release tarball directly:
 
 ```bash
-npm install -g https://github.com/tszaks/pallium/releases/download/v0.9.3/pallium-0.9.3.tgz
+npm install -g https://github.com/tszaks/pallium/releases/download/vX.Y.Z/pallium-X.Y.Z.tgz
 ```
 
-Or install with Go:
+Install with Go:
 
 ```bash
 go install github.com/tszaks/pallium@latest
 ```
 
-GitHub Packages is also published as `@tszaks/pallium`. GitHub Packages
-requires GitHub npm registry authentication, so this is mainly a backup channel
-for GitHub-authenticated environments:
+Install from GitHub Packages:
 
 ```bash
 npm config set @tszaks:registry https://npm.pkg.github.com
 npm install -g @tszaks/pallium
 ```
 
-Or from source:
+Build from source:
 
 ```bash
 git clone https://github.com/tszaks/pallium.git
@@ -348,48 +534,13 @@ go test ./...
 go run . --help
 ```
 
-## What Each Command Does
+## Data Locations
 
-- `doctor`: checks git, local DB, repo index, session index, embeddings backlog, and environment readiness
-- `version`: prints the installed Pallium build information
-- `explain`: best pre-edit briefing for a file
-- `safe`: tells an agent how cautious it should be, with confidence
-- `plan`: gives a lightweight edit plan plus likely test commands and verification tiers
-- `changed-now`: shows the live working tree, even before the repo has been indexed
-- `review`: reviews branch diff plus working-tree changes with confidence, task drift, boundary warnings, related sessions, verification history, and the riskiest files first
-- `verify`: runs Pallium's inferred fast, safe, or full verification command and records the result
-- `handoff`: generates a final summary before handoff with related sessions and recent verification history
-- `task`: stores the current goal and planned scope so drift shows up in review and handoff
-- `sessions related`: ranks prior sessions by current repo, git origin, touched files, query terms, and recency
-- `sessions search --hybrid`: mixes lexical search with repo and file-aware ranking
-- `workflow`: runs Codex dynamic workflows with tracked phases, clean-context workers, saved scripts, top-level await, parallel pipeline stages, cached completed agents, and automatic edit application
-
-It also handles brand-new files better now by inferring likely related files and tests even before they have indexed history, adds lightweight Go, JS/TS, and Python dependency signals including nested `tsconfig` aliases and Python `src/` layouts, prefers real repo verification commands when they exist across `package.json`, Python project files, and common `Makefile` targets, and surfaces boundary warnings for areas like auth, config, DB, API, payments, and jobs.
-
-## Example
-
-```bash
-pallium explain src/auth/session.ts --json
-pallium safe src/auth/session.ts --json
-pallium handoff origin/main --json
-```
-
-## Development
-
-```bash
-go test ./...
-go run . index
-go run . explain README.md
-go run . changed-now
-go run . verify fast
-go run . handoff HEAD~1
-```
-
-## Notes
-
-- Local data lives in `.pallium/`
-- Existing `.codex-memory/` indexes are still read when no `.pallium/` index exists
-- If the repo has not been indexed yet, `changed-now` still reports live working-tree files and recommends `pallium index`
+- Repo-local index and verification data: `.pallium/`
+- Session memory database: `~/.pallium/codex-sessions.sqlite`
+- Workflow run artifacts: `~/.pallium/workflow-runs/`
+- User workflow library: `~/.pallium/workflows/`
+- Legacy session database fallback: `~/.codex-memory/codex-sessions.sqlite`
 
 ## License
 
