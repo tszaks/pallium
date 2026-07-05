@@ -1,0 +1,267 @@
+# Pallium Workflow - Ultracode Parity Guide
+
+For any agent (Claude, Codex, Cursor, custom) writing Pallium dynamic workflows.
+
+## Mental model
+
+You are the conductor. The workflow script is the score. Subagents are the players.
+
+Pallium runs async JavaScript locally, spawns provider-backed workers, persists run state in SQLite, and returns structured artifacts. The goal is **Claude Ultracode-shaped orchestration** with **repo-native Pallium primitives** on top.
+
+## Run a workflow
+
+```bash
+pallium workflow run --script workflow.js "task description" --json
+pallium workflow run --background --script workflow.js "long task"
+pallium workflow resume <run-id>
+pallium workflow inspect <run-id> --json
+pallium workflow report <run-id> --json
+```
+
+Discover primitives first:
+
+```bash
+pallium workflow tools list --json
+pallium workflow template list --json
+pallium workflow validate workflow.js
+```
+
+## Script shape
+
+### `meta` block
+
+Start every script with a pure-literal block (no spreads, no function calls):
+
+```js
+export const meta = {
+  name: "security-audit",
+  description: "Parallel security review with adversarial verify",
+  phases: ["scope", "audit", "synthesize"],
+};
+```
+
+Pallium strips `meta` before execution. Phase names should match `phase()` calls.
+
+### Execution context
+
+- Async JavaScript only (not TypeScript)
+- Top-level `await` supported
+- `args` - value passed via `--args` JSON
+- **Determinism guards:** `Date.now()`, `Math.random()`, and argless `new Date()` throw. Pass timestamps/randomness through `args` so resume cache stays sound.
+
+## Core primitives
+
+### `await agent(prompt, opts?)`
+
+Spawns one worker. Default provider is Codex; set `provider` for others.
+
+```js
+const finding = await agent("Review auth middleware", {
+  label: "auth-review",
+  mode: "read-only",
+  schema: {
+    type: "object",
+    properties: {
+      findings: { type: "array", items: { type: "string" } },
+    },
+    required: ["findings"],
+  },
+});
+```
+
+| Opt | Ultracode | Pallium |
+|-----|-----------|---------|
+| `label` | display name | same |
+| `phase` | progress group | use `phase()` instead |
+| `model` | model id | same (Codex `--model`) |
+| `effort` | low to max | **not yet** - use prompt/provider |
+| `isolation: "worktree"` | edit isolation | same |
+| `agentType` | named agent | use `provider` |
+| `schema` | StructuredOutput | Codex `--output-schema`; providers get schema file |
+
+Non-Codex providers: `PALLIUM_WORKFLOW_PROVIDER_<NAME>_COMMAND`
+
+### `await pipeline(items, stage1, stage2, ...)`
+
+**Default for multi-stage work.** Pallium matches Ultracode streaming semantics:
+
+- Each item flows through stages **independently**
+- Fast items do not wait behind slow items at a stage barrier
+- Stage callback: `(prevResult, originalItem, index)`
+- Stage throw -> that item becomes `null`, others continue
+
+```js
+const verified = await pipeline(findings,
+  f => agent(`Find issues: ${f.path}`, { label: "find-" + f.path, schema: FINDING_SCHEMA }),
+  review => agent(`Refute: ${JSON.stringify(review)}`, { label: "verify-" + review.id, schema: VERDICT_SCHEMA }),
+);
+```
+
+### `await parallel(itemsOrThunks, fn?)`
+
+Barrier concurrency - waits for **all** items before returning.
+
+Use only when the next step needs the full set (merge, dedupe, judge, early-exit on total count).
+
+```js
+const angles = ["security", "perf", "correctness"];
+const reports = await parallel(angles, angle =>
+  agent(`Review from ${angle}`, { label: angle }),
+);
+const merged = await agent(`Synthesize: ${JSON.stringify(reports)}`, { label: "synth" });
+```
+
+**Discipline:** if code between two `parallel()` calls is pure data plumbing (flat/map/filter), fold it into a `pipeline` stage instead.
+
+### `phase(title, callback?)` / `log(msg)`
+
+Progress grouping and stderr narration (`[workflow:<run-id>] ...`).
+
+### `await workflow(name, args?)`
+
+Compose a saved workflow from `.pallium/workflows/`. **One nesting level only.**
+
+### `await gate(name, message?)`
+
+Pauses until exact gate approval:
+
+```bash
+pallium workflow gate approve <run-id> <name>
+pallium workflow resume <run-id>
+```
+
+Wrong gate names **fail** (they do not create phantom approvals).
+
+### `budget`
+
+Ultracode uses token budgets. Pallium exposes the same **shape** over local USD estimates:
+
+```js
+if (budget.total !== null && budget.remaining() < 0.01) {
+  log("skipping deep verify: budget nearly exhausted");
+}
+```
+
+Set ceiling with `--max-budget-usd` and per-agent estimate with `PALLIUM_WORKFLOW_AGENT_COST_USD`. Further `agent()` calls throw when exhausted.
+
+## Pallium Extras
+
+```js
+const preflight = await pallium.preflight(task, "cmd/workflow.go");
+const changed = await pallium.changedNow();
+const safe = await pallium.safe(path);
+const green = await verify.untilGreen("go test ./...", { maxRounds: 3, label: "tests" });
+await pallium.decisions.record("Chose worktrees", "Edit agents stay isolated.", "workflow");
+const plan = await coordinator.replan("adapt after verifier findings", { label: "coordinator" });
+```
+
+## Limits
+
+| Limit | Value |
+|-------|-------|
+| Concurrent agents | `--max-concurrent-agents` (default 16) |
+| Lifetime agents | `--max-agents` (default 1000) |
+| Items per `parallel`/`pipeline` | 4096 |
+| Nested `workflow()` | 1 level |
+
+## Resume and caching
+
+Completed `agent()` calls reuse cache when prompt, provider, repo, mode, model, schema, script hash, and args hash match.
+
+```bash
+pallium workflow resume <run-id>
+```
+
+Inspect actual worker output before assuming cache behavior:
+
+```bash
+pallium workflow show <run-id> --json
+pallium workflow inspect <run-id> --json
+```
+
+## Quality patterns (compose in script)
+
+These are **patterns**, not built-ins. Match harness to task:
+
+| Pattern | Shape |
+|---------|-------|
+| Adversarial verify | `pipeline(findings, f => agent(skeptic))` + majority vote in plain JS |
+| Perspective-diverse verify | Different verifier prompts per lens |
+| Judge panel | `parallel(angles, ...)` -> `agent(judge)` -> `agent(synthesize)` |
+| Loop-until-dry | `while` + dedup against **all seen**, not just confirmed |
+| Multi-modal sweep | `parallel(modalities, ...)` |
+| Completeness critic | Final `agent("what's missing?")` -> next round |
+| No silent caps | `log("dropped", n, "items after cap")` |
+
+## Ultracode Vs Pallium
+
+| Ultracode | Pallium today |
+|-----------|---------------|
+| Native Workflow tool in-session | CLI / MCP / HTTP (`pallium workflow run`) |
+| Token `budget` | USD-shaped `budget` object |
+| `effort`, `agentType` | `provider`, `model`, `mode` |
+| Agent death -> `null` | Agent failure fails the run (use try/catch in script for soft handling) |
+| `journal.jsonl` in transcript dir | SQLite store + `workflow show/inspect` |
+| MCP via ToolSearch in headless workers | Provider must bundle tools; Pallium exposes repo via `pallium.*` |
+| Permission dialog from `meta` | `meta` for naming/phases; gates for human approval |
+
+## Proof gate
+
+```bash
+bash scripts/workflow-verify.sh
+pallium workflow audit --run-acceptance
+```
+
+## Example: adversarial review
+
+```js
+export const meta = {
+  name: "adversarial-review",
+  description: "Parallel find + per-finding skeptic verify",
+  phases: ["scope", "find", "verify", "synthesize"],
+};
+
+const task = args?.task ?? "Review this change set";
+phase("scope");
+const preflight = await pallium.preflight(task);
+
+phase("find");
+const files = (preflight.files_to_inspect ?? []).slice(0, 20);
+log("inspecting", files.length, "files");
+const findings = (await pipeline(files,
+  file => agent(`Find concrete issues in ${file}. Task: ${task}`, {
+    label: "find-" + file,
+    mode: "read-only",
+    schema: {
+      type: "object",
+      properties: {
+        file: { type: "string" },
+        findings: { type: "array", items: { type: "string" } },
+      },
+      required: ["file", "findings"],
+    },
+  }),
+)).flatMap(r => (r?.findings ?? []).map(text => ({ file: r.file, text })));
+
+phase("verify");
+const surviving = (await pipeline(findings,
+  f => agent(`Try to refute this finding. Default to refuted if uncertain.\n${JSON.stringify(f)}`, {
+    label: "skeptic-" + f.file,
+    mode: "read-only",
+    schema: {
+      type: "object",
+      properties: {
+        verdict: { type: "string", enum: ["confirmed", "refuted"] },
+        reason: { type: "string" },
+      },
+      required: ["verdict", "reason"],
+    },
+  }),
+)).filter(r => r?.verdict === "confirmed");
+
+phase("synthesize");
+return await agent(`Synthesize confirmed findings into next steps.\n${JSON.stringify(surviving)}`, {
+  label: "synthesize",
+  mode: "read-only",
+});
+```

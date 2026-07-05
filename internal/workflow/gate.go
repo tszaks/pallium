@@ -60,8 +60,16 @@ func (s *Store) ListGates(runID string) ([]Gate, error) {
 }
 
 func (s *Store) ApproveGate(runID, name string) (Gate, error) {
-	gate, err := s.EnsureGate(runID, name, "")
+	runID = strings.TrimSpace(runID)
+	name = strings.TrimSpace(name)
+	if runID == "" || name == "" {
+		return Gate{}, fmt.Errorf("workflow gate requires run id and name")
+	}
+	gate, err := s.Gate(runID, name)
 	if err != nil {
+		if err == sql.ErrNoRows {
+			return Gate{}, fmt.Errorf("workflow gate %q for run %q was not found", name, runID)
+		}
 		return Gate{}, err
 	}
 	gate.Status = "approved"

@@ -60,8 +60,53 @@ if [[ "$elapsed" -ge 800 ]]; then
 fi
 "$PALLIUM_BIN" workflow tools list --json >"$ROOT/tools.json"
 assert_grep "$ROOT/tools.json" '"name": "parallel"'
+assert_grep "$ROOT/tools.json" 'pipeline(items, stage1, stage2, ...)'
 "$PALLIUM_BIN" workflow template list --json >"$ROOT/templates.json"
 assert_grep "$ROOT/templates.json" '"name": "test-fix"'
+
+cat > "$ROOT/pipeline-provider.py" <<'PY'
+#!/usr/bin/env python3
+import json
+import os
+import time
+
+prompt = open(os.environ["PALLIUM_WORKFLOW_PROMPT_FILE"]).read().strip()
+log = os.environ["PIPELINE_LOG"]
+with open(log, "a") as f:
+    f.write(f"start|{prompt}|{time.time()}\n")
+if prompt == "stage1 slow":
+    time.sleep(0.35)
+elif prompt == "stage1 fast":
+    time.sleep(0.05)
+else:
+    time.sleep(0.10)
+with open(log, "a") as f:
+    f.write(f"end|{prompt}|{time.time()}\n")
+parts = prompt.split()
+with open(os.environ["PALLIUM_WORKFLOW_OUTPUT_FILE"], "w") as f:
+    json.dump({"stage": parts[0], "item": parts[1], "prompt": prompt}, f)
+PY
+chmod +x "$ROOT/pipeline-provider.py"
+cat > "$ROOT/pipeline-stream.js" <<'JS'
+phase("pipeline");
+return pipeline(["slow", "fast"],
+  item => agent("stage1 " + item, { label: "stage1-" + item, provider: "pipeline" }),
+  result => agent("stage2 " + result.item, { label: "stage2-" + result.item, provider: "pipeline" })
+);
+JS
+PIPELINE_LOG="$ROOT/pipeline.log" \
+PALLIUM_WORKFLOW_PROVIDER_PIPELINE_COMMAND="$ROOT/pipeline-provider.py" \
+  "$PALLIUM_BIN" workflow run --id wf-accept-pipeline-stream --db "$db" --cwd "$repo" --script "$ROOT/pipeline-stream.js" "pipeline streaming acceptance" --json >/dev/null
+python3 - "$ROOT/pipeline.log" <<'PY'
+import sys
+
+times = {}
+for line in open(sys.argv[1]):
+    kind, prompt, ts = line.strip().split("|")
+    times[f"{kind}|{prompt}"] = float(ts)
+if times["start|stage2 fast"] >= times["end|stage1 slow"]:
+    raise SystemExit("pipeline stage barrier detected")
+PY
 
 cat > "$ROOT/pause.js" <<'JS'
 phase("scan");
