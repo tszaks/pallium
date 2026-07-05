@@ -121,16 +121,19 @@ Progress grouping and stderr narration (`[workflow:<run-id>] ...`).
 
 Compose a saved workflow from `.pallium/workflows/`. **One nesting level only.**
 
-### `await gate(name, message?)`
+### `await gate(name, prompt, options?)`
 
-Pauses until exact gate approval:
+Runs an autonomous verifier agent before the workflow continues:
 
-```bash
-pallium workflow gate approve <run-id> <name>
-pallium workflow resume <run-id>
+```js
+const verdict = await gate("patch-safety", "Verify generated patches before apply", {
+  criteria: "tests pass, no secrets are introduced, and scope matches the task",
+});
 ```
 
-Wrong gate names **fail** (they do not create phantom approvals).
+The verifier returns structured JSON with `approved` and `reason`. Rejected
+gates fail the workflow by default. Set `fail_on_deny: false` when the script
+should handle rejection itself.
 
 ### `budget`
 
@@ -203,7 +206,7 @@ These are **patterns**, not built-ins. Match harness to task:
 | Agent death -> `null` | Agent failure fails the run (use try/catch in script for soft handling) |
 | `journal.jsonl` in transcript dir | SQLite store + `workflow show/inspect` |
 | MCP via ToolSearch in headless workers | Provider must bundle tools; Pallium exposes repo via `pallium.*` |
-| Permission dialog from `meta` | `meta` for naming/phases; gates for human approval |
+| Permission dialog from `meta` | `meta` for naming/phases; gates run verifier agents |
 
 ## Proof gate
 

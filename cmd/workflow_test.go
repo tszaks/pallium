@@ -731,8 +731,8 @@ return result;`), 0o644); err != nil {
 	}
 }
 
-func TestWorkflowGateApproveAndResume(t *testing.T) {
-	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+func TestWorkflowAgentGateApprovesDuringRun(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"approved":true,"reason":"ok"}`)
 	t.Setenv("HOME", t.TempDir())
 	tmp := t.TempDir()
 	runGit(t, tmp, "init")
@@ -746,14 +746,21 @@ func TestWorkflowGateApproveAndResume(t *testing.T) {
 	dbPath := filepath.Join(tmp, "sessions.sqlite")
 	scriptPath := filepath.Join(tmp, "workflow.js")
 	if err := os.WriteFile(scriptPath, []byte(`phase("gate");
-gate("approve", "approve before worker");
-return agent("after gate", { label: "after" });`), 0o644); err != nil {
+const verdict = gate("approve", "verify before worker");
+return { verdict };`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	err := runWorkflow(&out, []string{"run", "--id", "wf-gate-cli", "--db", dbPath, "--cwd", tmp, "--script", scriptPath, "gate"}, false)
-	if err == nil || !strings.Contains(err.Error(), "workflow paused") {
-		t.Fatalf("expected paused run, got %v", err)
+	if err := runWorkflow(&out, []string{"run", "--id", "wf-gate-cli", "--db", dbPath, "--cwd", tmp, "--script", scriptPath, "gate"}, true); err != nil {
+		t.Fatalf("workflow run failed: %v", err)
+	}
+	var snapshot map[string]any
+	if err := json.Unmarshal(out.Bytes(), &snapshot); err != nil {
+		t.Fatalf("decode gate snapshot: %v\n%s", err, out.String())
+	}
+	run := snapshot["run"].(map[string]any)
+	if run["status"] != "completed" {
+		t.Fatalf("expected completed run after agent gate approval, got %#v", snapshot)
 	}
 	out.Reset()
 	if err := runWorkflow(&out, []string{"gate", "list", "wf-gate-cli", "--db", dbPath}, true); err != nil {
@@ -763,24 +770,8 @@ return agent("after gate", { label: "after" });`), 0o644); err != nil {
 	if err := json.Unmarshal(out.Bytes(), &gates); err != nil {
 		t.Fatalf("decode gates: %v\n%s", err, out.String())
 	}
-	if len(gates) != 1 || gates[0]["status"] != "open" {
-		t.Fatalf("expected open gate, got %#v", gates)
-	}
-	out.Reset()
-	if err := runWorkflow(&out, []string{"gate", "approve", "wf-gate-cli", "approve", "--db", dbPath}, true); err != nil {
-		t.Fatalf("gate approve failed: %v", err)
-	}
-	out.Reset()
-	if err := runWorkflow(&out, []string{"resume", "wf-gate-cli", "--db", dbPath}, true); err != nil {
-		t.Fatalf("resume after gate failed: %v", err)
-	}
-	var snapshot map[string]any
-	if err := json.Unmarshal(out.Bytes(), &snapshot); err != nil {
-		t.Fatalf("decode resumed snapshot: %v\n%s", err, out.String())
-	}
-	run := snapshot["run"].(map[string]any)
-	if run["status"] != "completed" {
-		t.Fatalf("expected completed run after gate approval, got %#v", snapshot)
+	if len(gates) != 1 || gates[0]["status"] != "approved" {
+		t.Fatalf("expected approved gate, got %#v", gates)
 	}
 }
 

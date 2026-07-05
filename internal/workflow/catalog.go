@@ -121,12 +121,12 @@ func WorkflowTools() []ToolInfo {
 		},
 		{
 			Name:        "gate",
-			Signature:   `await gate(name, message?)`,
+			Signature:   `await gate(name, prompt, options?)`,
 			Kind:        "control",
-			Description: "Pauses the workflow until a human approves the named gate.",
-			Returns:     "Approved gate JSON after resume.",
-			Example:     `await gate("approve-patches", "Review generated patches before applying")`,
-			Notes:       []string{"Approve with pallium workflow gate approve <run-id> <name>, then resume the run."},
+			Description: "Runs an autonomous verifier agent that approves or rejects whether the workflow may continue.",
+			Returns:     "Gate verdict JSON with approved, reason, gate, and verifier output.",
+			Example:     `await gate("approve-patches", "Verify generated patches are safe to apply", { criteria: "tests pass and no secrets are introduced" })`,
+			Notes:       []string{"The gate fails the workflow on rejection by default.", "Set fail_on_deny: false to let the script handle a rejected verdict."},
 		},
 		{
 			Name:        "coordinator.replan",

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,21 +34,20 @@ func TestWorkflowAdversarialInvalidMaxBudgetUSD(t *testing.T) {
 	}
 }
 
-func TestWorkflowAdversarialGateApproveWrongNameStillPauses(t *testing.T) {
-	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+func TestWorkflowAdversarialGateApproveWrongNameDoesNotMutateAgentGate(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"approved":true,"reason":"ok"}`)
 	t.Setenv("HOME", t.TempDir())
 	tmp := t.TempDir()
 	dbPath := filepath.Join(tmp, "sessions.sqlite")
 	scriptPath := filepath.Join(tmp, "workflow.js")
 	if err := os.WriteFile(scriptPath, []byte(`phase("gate");
-gate("approve", "approve before worker");
-return agent("after gate", { label: "after" });`), 0o644); err != nil {
+gate("approve", "verify before worker");
+return "done";`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	err := runWorkflow(&out, []string{"run", "--id", "wf-wrong-gate-cli", "--db", dbPath, "--cwd", tmp, "--script", scriptPath, "gate"}, false)
-	if err == nil || !strings.Contains(err.Error(), "workflow paused") {
-		t.Fatalf("expected paused run, got %v", err)
+	if err := runWorkflow(&out, []string{"run", "--id", "wf-wrong-gate-cli", "--db", dbPath, "--cwd", tmp, "--script", scriptPath, "gate"}, false); err != nil {
+		t.Fatalf("workflow run failed: %v", err)
 	}
 	out.Reset()
 	if err := runWorkflow(&out, []string{"gate", "approve", "wf-wrong-gate-cli", "wrong-name", "--db", dbPath}, true); err == nil {
@@ -56,9 +56,15 @@ return agent("after gate", { label: "after" });`), 0o644); err != nil {
 		t.Fatalf("expected not-found gate error, got %v", err)
 	}
 	out.Reset()
-	err = runWorkflow(&out, []string{"resume", "wf-wrong-gate-cli", "--db", dbPath}, false)
-	if err == nil || !strings.Contains(err.Error(), "workflow paused") {
-		t.Fatalf("expected resume to stay paused after wrong gate approval, got %v\n%s", err, out.String())
+	if err := runWorkflow(&out, []string{"gate", "list", "wf-wrong-gate-cli", "--db", dbPath}, true); err != nil {
+		t.Fatalf("gate list failed: %v", err)
+	}
+	var gates []map[string]any
+	if err := json.Unmarshal(out.Bytes(), &gates); err != nil {
+		t.Fatalf("decode gates: %v\n%s", err, out.String())
+	}
+	if len(gates) != 1 || gates[0]["name"] != "approve" || gates[0]["status"] != "approved" {
+		t.Fatalf("expected original gate to stay approved, got %#v", gates)
 	}
 }
 

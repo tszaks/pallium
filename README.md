@@ -86,7 +86,7 @@ script coordinates workers through primitives such as:
 - `await check(command, options)`
 - `await verify.untilGreen(command, options)`
 - `await workflow(savedName, args)`
-- `await gate(name, message)`
+- `await gate(name, prompt, options)`
 - `await coordinator.replan(goal, options)`
 - `await pallium.preflight(task, ...scopes)`
 - `await pallium.decisions.record(title, body, ...tags)`
@@ -281,11 +281,12 @@ pallium workflow fleet status --json
 pallium workflow analytics --json
 ```
 
-Human gates:
+Agent gates:
 
-```bash
-pallium workflow gate list <run-id>
-pallium workflow gate approve <run-id> approve-patches
+```js
+await gate("patch-safety", "Verify patches are safe to apply", {
+  criteria: "tests pass, no secrets are introduced, and scope matches the task"
+});
 ```
 
 API and MCP:
@@ -479,7 +480,7 @@ The acceptance script exercises:
 - edit patch apply and revert
 - secret patch blocking
 - on-changed triggers
-- human gates
+- agent gates
 - fleet limits
 - analytics
 - HTTP API
