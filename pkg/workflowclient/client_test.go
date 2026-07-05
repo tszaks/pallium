@@ -47,3 +47,20 @@ func TestClientCallsWorkflowAPI(t *testing.T) {
 		t.Fatalf("unexpected run response: %s", string(raw))
 	}
 }
+
+func TestClientSendsBearerToken(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /workflows/fleet", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Fatalf("authorization header=%q", got)
+		}
+		_, _ = w.Write([]byte(`{"runs_total":0}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	client := NewWithToken(server.URL, "test-token")
+	if raw, err := client.Fleet(context.Background()); err != nil || string(raw) != `{"runs_total":0}` {
+		t.Fatalf("fleet raw=%s err=%v", string(raw), err)
+	}
+}

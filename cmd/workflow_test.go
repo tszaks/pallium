@@ -133,7 +133,7 @@ return result;`), 0o644); err != nil {
 }
 
 func TestWorkflowGenerateStatusAndInspect(t *testing.T) {
-	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"prompt":"{{PROMPT}}"}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"command":"go test ./...","summary":"passed","output_tail":"","failures":[]}`)
 	t.Setenv("PALLIUM_WORKFLOW_PALLIUM_STUB", `{"ok":true,"args":"{{ARGS}}"}`)
 	t.Setenv("HOME", t.TempDir())
 	tmp := t.TempDir()
@@ -305,7 +305,11 @@ func TestWorkflowPreflightCommand(t *testing.T) {
 }
 
 func TestWorkflowTriggerAddShowRun(t *testing.T) {
-	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"triggered"}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_SEQUENCE", `[
+		"{\"summary\":\"triggered\",\"steps\":[],\"risks\":[]}",
+		"{\"verdict\":\"pass\",\"notes\":[]}"
+	]`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"fallback","steps":[],"risks":[]}`)
 	t.Setenv("HOME", t.TempDir())
 	tmp := t.TempDir()
 	runGit(t, tmp, "init")
@@ -359,7 +363,11 @@ func TestWorkflowTriggerAddShowRun(t *testing.T) {
 }
 
 func TestWorkflowTriggerOnChangedSkipsUnchangedRepo(t *testing.T) {
-	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"triggered"}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_SEQUENCE", `[
+		"{\"summary\":\"triggered\",\"steps\":[],\"risks\":[]}",
+		"{\"verdict\":\"pass\",\"notes\":[]}"
+	]`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"fallback","steps":[],"risks":[]}`)
 	t.Setenv("HOME", t.TempDir())
 	tmp := t.TempDir()
 	runGit(t, tmp, "init")
@@ -419,7 +427,11 @@ func TestWorkflowTriggerOnChangedSkipsUnchangedRepo(t *testing.T) {
 }
 
 func TestWorkflowHTTPAPI(t *testing.T) {
-	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"api"}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_SEQUENCE", `[
+		"{\"summary\":\"api\",\"steps\":[],\"risks\":[]}",
+		"{\"verdict\":\"pass\",\"notes\":[]}"
+	]`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"fallback","steps":[],"risks":[]}`)
 	t.Setenv("HOME", t.TempDir())
 	tmp := t.TempDir()
 	runGit(t, tmp, "init")
@@ -431,7 +443,7 @@ func TestWorkflowHTTPAPI(t *testing.T) {
 	runGit(t, tmp, "add", "README.md")
 	runGit(t, tmp, "commit", "-m", "initial")
 	dbPath := filepath.Join(tmp, "sessions.sqlite")
-	handler := newWorkflowHTTPHandler(dbPath)
+	handler := newWorkflowHTTPHandler(dbPath, "")
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
@@ -510,6 +522,90 @@ func TestWorkflowHTTPAPI(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(tmp, ".pallium", "workflows", "api-security.js")); err != nil {
 		t.Fatalf("expected api-installed workflow: %v", err)
+	}
+}
+
+func TestWorkflowHTTPAPIRequiresTokenWhenConfigured(t *testing.T) {
+	tmp := t.TempDir()
+	handler := newWorkflowHTTPHandler(filepath.Join(tmp, "sessions.sqlite"), "secret-token")
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("health should not require token, got %d %s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/workflows/fleet", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected unauthorized without token, got %d %s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/workflows/fleet", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected authorized request, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestWorkflowServeRejectsWhitespaceTokenForNonLocalBind(t *testing.T) {
+	var out bytes.Buffer
+	err := runWorkflowServe(&out, []string{"--addr", "0.0.0.0:0", "--token", "   ", "--db", filepath.Join(t.TempDir(), "sessions.sqlite")}, false)
+	if err == nil || !strings.Contains(err.Error(), "requires --token") {
+		t.Fatalf("expected whitespace-only token to be rejected, got %v", err)
+	}
+}
+
+func TestWorkflowResumeUsesStoredCaps(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"source":"first"}`)
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	scriptPath := filepath.Join(tmp, "workflow.js")
+	firstScript := `phase("one");
+return agent("first", { label: "first" });`
+	if err := os.WriteFile(scriptPath, []byte(firstScript), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{
+		"run",
+		"--id", "wf-resume-stored-cap",
+		"--db", dbPath,
+		"--cwd", tmp,
+		"--script", scriptPath,
+		"--max-agents", "1",
+		"stored cap",
+	}, false); err != nil {
+		t.Fatalf("initial workflow run failed: %v", err)
+	}
+	store, err := workflow.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.Run("wf-resume-stored-cap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.MaxAgents != 1 {
+		t.Fatalf("expected stored max agents, got %+v", run)
+	}
+	secondScript := `phase("one");
+agent("first", { label: "first" });
+return agent("second", { label: "second" });`
+	if err := os.WriteFile(run.ScriptPath, []byte(secondScript), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_ = store.Close()
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"source":"second"}`)
+	out.Reset()
+	err = runWorkflow(&out, []string{"resume", "wf-resume-stored-cap", "--db", dbPath}, false)
+	if err == nil || !strings.Contains(err.Error(), "workflow exceeded max agents: 1") {
+		t.Fatalf("expected resume to preserve stored max-agent cap, got %v", err)
 	}
 }
 
