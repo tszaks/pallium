@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 
@@ -33,18 +35,24 @@ func runWorkflowServe(out io.Writer, args []string, jsonOutput bool) error {
 	fs := newSessionFlagSet("workflow serve")
 	dbPath := fs.String("db", "", "")
 	addr := fs.String("addr", "127.0.0.1:8765", "")
-	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "addr": {}}, nil); err != nil {
+	token := fs.String("token", "", "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "addr": {}, "token": {}}, nil); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
-		return fmt.Errorf("usage: pallium workflow serve [--addr host:port]")
+		return fmt.Errorf("usage: pallium workflow serve [--addr host:port] [--token token]")
 	}
-	server := &http.Server{Addr: *addr, Handler: newWorkflowHTTPHandler(*dbPath)}
+	apiToken := strings.TrimSpace(firstNonEmpty(*token, os.Getenv("PALLIUM_WORKFLOW_API_TOKEN")))
+	if apiToken == "" && !isLocalHTTPAddr(*addr) {
+		return fmt.Errorf("workflow serve requires --token or PALLIUM_WORKFLOW_API_TOKEN when binding outside localhost")
+	}
+	server := &http.Server{Addr: *addr, Handler: newWorkflowHTTPHandler(*dbPath, apiToken)}
 	fmt.Fprintf(out, "pallium workflow API listening on http://%s\n", *addr)
 	return server.ListenAndServe()
 }
 
-func newWorkflowHTTPHandler(dbPath string) http.Handler {
+func newWorkflowHTTPHandler(dbPath, token string) http.Handler {
+	token = strings.TrimSpace(token)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"ok": true})
@@ -151,7 +159,53 @@ func newWorkflowHTTPHandler(dbPath string) http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(out.Bytes())
 	})
-	return mux
+	if strings.TrimSpace(token) == "" {
+		return mux
+	}
+	return requireWorkflowAPIToken(mux, token)
+}
+
+func requireWorkflowAPIToken(next http.Handler, token string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if subtleConstantTimeCompareBearer(r.Header.Get("Authorization"), token) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		http.Error(w, "missing or invalid workflow API token", http.StatusUnauthorized)
+	})
+}
+
+func subtleConstantTimeCompareBearer(header, token string) bool {
+	const prefix = "Bearer "
+	if !strings.HasPrefix(header, prefix) {
+		return false
+	}
+	got := strings.TrimSpace(strings.TrimPrefix(header, prefix))
+	if got == "" || token == "" || len(got) != len(token) {
+		return false
+	}
+	var diff byte
+	for i := 0; i < len(token); i++ {
+		diff |= got[i] ^ token[i]
+	}
+	return diff == 0
+}
+
+func isLocalHTTPAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	host = strings.Trim(host, "[]")
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func workflowRunRequestArgs(dbPath string, req workflowRunRequest) ([]string, error) {

@@ -31,3 +31,12 @@ jobs:
 
       - name: Test
         run: go test ./... -count=1
+
+      - name: Workflow race tests
+        run: go test -race ./internal/workflow -count=1
+
+      - name: Govulncheck
+        uses: golang/govulncheck-action@v1
+        with:
+          go-version-file: go.mod
+          go-package: ./...
