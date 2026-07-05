@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -83,6 +84,16 @@ func runWorkflow(out io.Writer, args []string, jsonOutput bool) error {
 		printWorkflowHelp(out)
 		return fmt.Errorf("unknown workflow subcommand: %s", args[0])
 	}
+}
+
+func flagWasSet(fs *flag.FlagSet, name string) bool {
+	found := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
 }
 
 func runWorkflowPreflight(out io.Writer, args []string, jsonOutput bool) error {
@@ -826,13 +837,11 @@ func buildWorkflowFleetStatus(store *workflow.Store, limit int) (workflowFleetSt
 
 func runWorkflowGate(out io.Writer, args []string, jsonOutput bool) error {
 	if len(args) == 0 || hasHelpArg(args) {
-		return fmt.Errorf("usage: pallium workflow gate <list|approve>")
+		return fmt.Errorf("usage: pallium workflow gate list <run-id>")
 	}
 	switch args[0] {
 	case "list", "ls":
 		return runWorkflowGateList(out, args[1:], jsonOutput)
-	case "approve":
-		return runWorkflowGateApprove(out, args[1:], jsonOutput)
 	default:
 		return fmt.Errorf("unknown workflow gate subcommand: %s", args[0])
 	}
@@ -868,29 +877,6 @@ func runWorkflowGateList(out io.Writer, args []string, jsonOutput bool) error {
 	})
 }
 
-func runWorkflowGateApprove(out io.Writer, args []string, jsonOutput bool) error {
-	fs := newSessionFlagSet("workflow gate approve")
-	dbPath := fs.String("db", "", "")
-	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}}, nil); err != nil {
-		return err
-	}
-	if fs.NArg() != 2 {
-		return fmt.Errorf("usage: pallium workflow gate approve <run-id> <name>")
-	}
-	store, err := workflow.Open(*dbPath)
-	if err != nil {
-		return err
-	}
-	defer store.Close()
-	gate, err := store.ApproveGate(fs.Arg(0), fs.Arg(1))
-	if err != nil {
-		return err
-	}
-	return output.Write(out, gate, jsonOutput, func() string {
-		return fmt.Sprintf("Approved workflow gate %s for %s", gate.Name, gate.RunID)
-	})
-}
-
 func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 	fs := newSessionFlagSet("workflow run")
 	dbPath := fs.String("db", "", "")
@@ -900,7 +886,7 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 	workflowName := fs.String("workflow", "", "")
 	argsJSON := fs.String("args", "", "")
 	codexBinary := fs.String("codex", "codex", "")
-	maxAgents := fs.Int("max-agents", 1000, "")
+	maxAgents := fs.Int("max-agents", 0, "")
 	maxConcurrentAgents := fs.Int("max-concurrent-agents", 16, "")
 	maxBudgetUSD := fs.String("max-budget-usd", "", "")
 	maxActiveRuns := fs.Int("max-active-runs", 0, "")
@@ -908,6 +894,8 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "cwd": {}, "id": {}, "script": {}, "workflow": {}, "args": {}, "codex": {}, "max-agents": {}, "max-concurrent-agents": {}, "max-budget-usd": {}, "max-active-runs": {}}, map[string]struct{}{"background": {}}); err != nil {
 		return err
 	}
+	maxAgentsSet := flagWasSet(fs, "max-agents")
+	maxBudgetSet := flagWasSet(fs, "max-budget-usd")
 	positionals := fs.Args()
 	if *scriptPath != "" && *workflowName != "" {
 		return fmt.Errorf("use either --script or --workflow, not both")
@@ -978,17 +966,32 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 		_ = store.Close()
 		return err
 	}
-	run, err := store.UpsertRun(workflow.Run{
+	runSpec := workflow.Run{
 		ID:         *id,
 		Task:       task,
 		CWD:        absCWD,
 		ScriptPath: runScriptPath,
 		ArgsJSON:   *argsJSON,
 		Status:     "queued",
-	})
+	}
+	if maxAgentsSet {
+		runSpec.MaxAgents = *maxAgents
+	}
+	if maxBudgetSet {
+		runSpec.MaxBudgetUSD = strings.TrimSpace(*maxBudgetUSD)
+	}
+	run, err := store.UpsertRun(runSpec)
 	_ = store.Close()
 	if err != nil {
 		return err
+	}
+	effectiveMaxAgents := *maxAgents
+	if !maxAgentsSet && run.MaxAgents > 0 {
+		effectiveMaxAgents = run.MaxAgents
+	}
+	effectiveMaxBudgetUSD := strings.TrimSpace(*maxBudgetUSD)
+	if !maxBudgetSet {
+		effectiveMaxBudgetUSD = strings.TrimSpace(run.MaxBudgetUSD)
 	}
 	if *background {
 		exe, err := os.Executable()
@@ -1007,17 +1010,19 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 			"--cwd", absCWD,
 			"--script", runScriptPath,
 			"--codex", *codexBinary,
-			"--max-agents", fmt.Sprintf("%d", *maxAgents),
 			"--max-concurrent-agents", fmt.Sprintf("%d", *maxConcurrentAgents),
 		)
+		if effectiveMaxAgents > 0 && (maxAgentsSet || run.MaxAgents > 0) {
+			cmdArgs = append(cmdArgs, "--max-agents", fmt.Sprintf("%d", effectiveMaxAgents))
+		}
 		if *dbPath != "" {
 			cmdArgs = append(cmdArgs, "--db", *dbPath)
 		}
 		if *argsJSON != "" {
 			cmdArgs = append(cmdArgs, "--args", *argsJSON)
 		}
-		if *maxBudgetUSD != "" {
-			cmdArgs = append(cmdArgs, "--max-budget-usd", *maxBudgetUSD)
+		if effectiveMaxBudgetUSD != "" {
+			cmdArgs = append(cmdArgs, "--max-budget-usd", effectiveMaxBudgetUSD)
 		}
 		if *maxActiveRuns > 0 {
 			cmdArgs = append(cmdArgs, "--max-active-runs", fmt.Sprintf("%d", *maxActiveRuns))
@@ -1049,9 +1054,9 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 	runner := workflow.Runner{
 		Store:               store,
 		Run:                 run,
-		MaxAgents:           *maxAgents,
+		MaxAgents:           effectiveMaxAgents,
 		MaxConcurrentAgents: *maxConcurrentAgents,
-		MaxBudgetUSD:        *maxBudgetUSD,
+		MaxBudgetUSD:        effectiveMaxBudgetUSD,
 		CodexBinary:         *codexBinary,
 	}
 	result, err := runner.Execute(context.Background(), script, inputArgs)
@@ -1437,13 +1442,13 @@ func runWorkflowAudit(out io.Writer, args []string, jsonOutput bool) error {
 }
 
 type workflowAuditResult struct {
-	Versions         []string                            `json:"versions"`
-	Complete         bool                                `json:"complete"`
-	Requirement      []workflow.VersionRequirement       `json:"requirements"`
+	Versions         []string                                 `json:"versions"`
+	Complete         bool                                     `json:"complete"`
+	Requirement      []workflow.VersionRequirement            `json:"requirements"`
 	ByVersion        map[string][]workflow.VersionRequirement `json:"by_version"`
-	Acceptance       string                              `json:"acceptance_script"`
-	AcceptancePassed bool                                `json:"acceptance_passed,omitempty"`
-	AcceptanceError  string                              `json:"acceptance_error,omitempty"`
+	Acceptance       string                                   `json:"acceptance_script"`
+	AcceptancePassed bool                                     `json:"acceptance_passed,omitempty"`
+	AcceptanceError  string                                   `json:"acceptance_error,omitempty"`
 }
 
 func runWorkflowWatch(out io.Writer, args []string) error {
@@ -1549,6 +1554,8 @@ func runWorkflowResume(out io.Writer, args []string, jsonOutput bool) error {
 	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "codex": {}, "max-agents": {}, "max-concurrent-agents": {}, "max-budget-usd": {}}, map[string]struct{}{"background": {}}); err != nil {
 		return err
 	}
+	maxAgentsSet := flagWasSet(fs, "max-agents")
+	maxBudgetSet := flagWasSet(fs, "max-budget-usd")
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: pallium workflow resume <run-id>")
 	}
@@ -1561,15 +1568,22 @@ func runWorkflowResume(out io.Writer, args []string, jsonOutput bool) error {
 	if err != nil {
 		return err
 	}
-	runArgs := []string{"run", "--id", run.ID, "--cwd", run.CWD, "--script", run.ScriptPath, "--codex", *codexBinary, "--max-agents", fmt.Sprintf("%d", *maxAgents), "--max-concurrent-agents", fmt.Sprintf("%d", *maxConcurrentAgents)}
+	runArgs := []string{"run", "--id", run.ID, "--cwd", run.CWD, "--script", run.ScriptPath, "--codex", *codexBinary, "--max-concurrent-agents", fmt.Sprintf("%d", *maxConcurrentAgents)}
+	if maxAgentsSet && *maxAgents > 0 {
+		runArgs = append(runArgs, "--max-agents", fmt.Sprintf("%d", *maxAgents))
+	} else if !maxAgentsSet && run.MaxAgents > 0 {
+		runArgs = append(runArgs, "--max-agents", fmt.Sprintf("%d", run.MaxAgents))
+	}
 	if *dbPath != "" {
 		runArgs = append(runArgs, "--db", *dbPath)
 	}
 	if run.ArgsJSON != "" {
 		runArgs = append(runArgs, "--args", run.ArgsJSON)
 	}
-	if *maxBudgetUSD != "" {
-		runArgs = append(runArgs, "--max-budget-usd", *maxBudgetUSD)
+	if maxBudgetSet && strings.TrimSpace(*maxBudgetUSD) != "" {
+		runArgs = append(runArgs, "--max-budget-usd", strings.TrimSpace(*maxBudgetUSD))
+	} else if !maxBudgetSet && strings.TrimSpace(run.MaxBudgetUSD) != "" {
+		runArgs = append(runArgs, "--max-budget-usd", strings.TrimSpace(run.MaxBudgetUSD))
 	}
 	if *background {
 		runArgs = append(runArgs, "--background")
@@ -2214,8 +2228,7 @@ Usage:
   pallium workflow fleet status [--limit n] [--json]
   pallium workflow analytics [--limit n] [--json]
   pallium workflow gate list <run-id> [--json]
-  pallium workflow gate approve <run-id> <name> [--json]   # compatibility/debug override
-  pallium workflow serve [--addr 127.0.0.1:8765]
+  pallium workflow serve [--addr 127.0.0.1:8765] [--token token]
   pallium workflow mcp [--db path]
   pallium workflow run "task" [--script path.js] [--workflow name] [--background] [--max-concurrent-agents 16] [--max-active-runs n] [--max-budget-usd n] [--json]
   pallium workflow audit [--run-acceptance] [--json]

@@ -34,7 +34,7 @@ func TestWorkflowAdversarialInvalidMaxBudgetUSD(t *testing.T) {
 	}
 }
 
-func TestWorkflowAdversarialGateApproveWrongNameDoesNotMutateAgentGate(t *testing.T) {
+func TestWorkflowAdversarialManualGateApproveCommandIsUnavailable(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"approved":true,"reason":"ok"}`)
 	t.Setenv("HOME", t.TempDir())
 	tmp := t.TempDir()
@@ -51,9 +51,9 @@ return "done";`), 0o644); err != nil {
 	}
 	out.Reset()
 	if err := runWorkflow(&out, []string{"gate", "approve", "wf-wrong-gate-cli", "wrong-name", "--db", dbPath}, true); err == nil {
-		t.Fatal("expected wrong gate approval to fail")
-	} else if !strings.Contains(err.Error(), "was not found") {
-		t.Fatalf("expected not-found gate error, got %v", err)
+		t.Fatal("expected manual gate approval command to be unavailable")
+	} else if !strings.Contains(err.Error(), "unknown workflow gate subcommand") {
+		t.Fatalf("expected unknown subcommand error, got %v", err)
 	}
 	out.Reset()
 	if err := runWorkflow(&out, []string{"gate", "list", "wf-wrong-gate-cli", "--db", dbPath}, true); err != nil {

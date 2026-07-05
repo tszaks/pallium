@@ -14,6 +14,7 @@ import (
 type Client struct {
 	BaseURL    string
 	HTTPClient *http.Client
+	Token      string
 }
 
 type RunRequest struct {
@@ -35,6 +36,10 @@ type LibraryInstallRequest struct {
 
 func New(baseURL string) *Client {
 	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), HTTPClient: http.DefaultClient}
+}
+
+func NewWithToken(baseURL, token string) *Client {
+	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), HTTPClient: http.DefaultClient, Token: strings.TrimSpace(token)}
 }
 
 func (c *Client) Health(ctx context.Context) (json.RawMessage, error) {
@@ -114,6 +119,9 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader) (j
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {

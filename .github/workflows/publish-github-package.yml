@@ -16,7 +16,7 @@ jobs:
   publish-github-package:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag }}
 
@@ -32,6 +32,12 @@ jobs:
       - name: Publish to GitHub Packages
         run: |
           version="$(node -p 'require("./dist/github-npm/package.json").version')"
+          tag_version="${{ inputs.tag }}"
+          tag_version="${tag_version#v}"
+          if [ "$version" != "$tag_version" ]; then
+            echo "dist/github-npm/package.json version $version does not match release tag ${{ inputs.tag }}" >&2
+            exit 1
+          fi
           if npm view "@tszaks/pallium@$version" version --registry=https://npm.pkg.github.com >/dev/null 2>&1; then
             echo "@tszaks/pallium@$version is already published"
           else
