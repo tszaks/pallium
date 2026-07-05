@@ -58,7 +58,9 @@ jobs:
         run: go test ./... -count=1
 
       - name: Workflow acceptance
-        run: bash scripts/workflow-acceptance.sh
+        run: |
+          go build -o pallium-test-bin .
+          PALLIUM_BIN="$PWD/pallium-test-bin" bash scripts/workflow-acceptance.sh
 
       - name: Build release assets
         run: scripts/build-release-assets.sh "${{ steps.tag.outputs.tag }}"
