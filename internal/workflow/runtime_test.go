@@ -480,8 +480,8 @@ return { count: decisions.length, title: decisions[0].title };`
 	}
 }
 
-func TestRunnerGatePausesUntilApproved(t *testing.T) {
-	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+func TestRunnerAgentGateApprovesAndContinues(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"approved":true,"reason":"checks passed"}`)
 	tmp := t.TempDir()
 	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
 	if err != nil {
@@ -489,9 +489,9 @@ func TestRunnerGatePausesUntilApproved(t *testing.T) {
 	}
 	defer store.Close()
 	script := `phase("gate");
-gate("approve-patches", "review before continuing");
+const verdict = gate("approve-patches", "verify before continuing");
 const result = agent("after gate", { label: "after" });
-return result;`
+return { verdict, result };`
 	scriptPath, err := WriteRunScript("wf-gate", tmp, script)
 	if err != nil {
 		t.Fatal(err)
@@ -500,26 +500,51 @@ return result;`
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
-	if !errors.Is(err, ErrWorkflowPaused) {
-		t.Fatalf("expected workflow paused, got %v", err)
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
 	gates, err := store.ListGates(run.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(gates) != 1 || gates[0].Status != "open" {
-		t.Fatalf("expected open gate, got %+v", gates)
+	if len(gates) != 1 || gates[0].Status != "approved" {
+		t.Fatalf("expected approved gate, got %+v", gates)
 	}
-	if _, err := store.ApproveGate(run.ID, "approve-patches"); err != nil {
-		t.Fatal(err)
+	if !strings.Contains(result, `"approved": true`) || !strings.Contains(result, "checks passed") {
+		t.Fatalf("expected agent-approved gate result, got %s", result)
 	}
-	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+}
+
+func TestRunnerAgentGateRejectsByDefault(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"approved":false,"reason":"tests are failing"}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(result, `"ok": true`) {
-		t.Fatalf("expected run after approved gate, got %s", result)
+	defer store.Close()
+	script := `phase("gate");
+gate("approve-patches", "verify before continuing");
+return agent("after gate", { label: "after" });`
+	scriptPath, err := WriteRunScript("wf-gate-reject", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-gate-reject", Task: "gate reject", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), `workflow gate "approve-patches" rejected by agent`) {
+		t.Fatalf("expected agent gate rejection, got %v", err)
+	}
+	gates, err := store.ListGates(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gates) != 1 || gates[0].Status != "rejected" {
+		t.Fatalf("expected rejected gate, got %+v", gates)
 	}
 }
 

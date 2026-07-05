@@ -2214,7 +2214,7 @@ Usage:
   pallium workflow fleet status [--limit n] [--json]
   pallium workflow analytics [--limit n] [--json]
   pallium workflow gate list <run-id> [--json]
-  pallium workflow gate approve <run-id> <name> [--json]
+  pallium workflow gate approve <run-id> <name> [--json]   # compatibility/debug override
   pallium workflow serve [--addr 127.0.0.1:8765]
   pallium workflow mcp [--db path]
   pallium workflow run "task" [--script path.js] [--workflow name] [--background] [--max-concurrent-agents 16] [--max-active-runs n] [--max-budget-usd n] [--json]

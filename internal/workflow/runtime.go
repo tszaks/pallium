@@ -64,6 +64,15 @@ type CheckOptions struct {
 	Schema   map[string]any `json:"schema,omitempty"`
 }
 
+type GateOptions struct {
+	Label      string `json:"label,omitempty"`
+	Provider   string `json:"provider,omitempty"`
+	Model      string `json:"model,omitempty"`
+	Mode       string `json:"mode,omitempty"`
+	Criteria   string `json:"criteria,omitempty"`
+	FailOnDeny *bool  `json:"fail_on_deny,omitempty"`
+}
+
 type PolicyFinding struct {
 	Kind    string `json:"kind"`
 	Line    int    `json:"line"`
@@ -208,20 +217,7 @@ func (r *Runner) executeScript(ctx context.Context, script string, args any, top
 	if err := vm.Set("coordinator", r.jsCoordinator(ctx, vm)); err != nil {
 		return "", err
 	}
-	if err := vm.Set("gate", func(name string, message ...string) goja.Value {
-		text := ""
-		if len(message) > 0 {
-			text = message[0]
-		}
-		gate, err := r.Store.EnsureGate(r.Run.ID, name, text)
-		if err != nil {
-			panic(vm.ToValue(err.Error()))
-		}
-		if gate.Status == "approved" {
-			return vm.ToValue(gate)
-		}
-		panic(vm.ToValue(ErrWorkflowPaused.Error()))
-	}); err != nil {
+	if err := vm.Set("gate", r.jsGate(ctx, vm)); err != nil {
 		return "", err
 	}
 
@@ -316,6 +312,88 @@ func (r *Runner) executeSavedWorkflow(ctx context.Context, name string, input an
 		r.workflowDepth--
 	}()
 	return r.executeScript(ctx, string(raw), input, false)
+}
+
+func (r *Runner) jsGate(ctx context.Context, vm *goja.Runtime) func(goja.FunctionCall) goja.Value {
+	return func(call goja.FunctionCall) goja.Value {
+		name := strings.TrimSpace(call.Argument(0).String())
+		if name == "" {
+			panic(vm.ToValue("gate name is required"))
+		}
+		message := ""
+		if len(call.Arguments) > 1 && !goja.IsUndefined(call.Argument(1)) && !goja.IsNull(call.Argument(1)) {
+			message = strings.TrimSpace(call.Argument(1).String())
+		}
+		opts := GateOptions{}
+		if len(call.Arguments) > 2 && !goja.IsUndefined(call.Argument(2)) && !goja.IsNull(call.Argument(2)) {
+			raw, err := json.Marshal(call.Argument(2).Export())
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			if err := json.Unmarshal(raw, &opts); err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+		}
+		result, err := r.runAgentGate(ctx, name, message, opts)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		return vm.ToValue(result)
+	}
+}
+
+func (r *Runner) runAgentGate(ctx context.Context, name, message string, opts GateOptions) (map[string]any, error) {
+	gate, err := r.Store.EnsureGate(r.Run.ID, name, message)
+	if err != nil {
+		return nil, err
+	}
+	if gate.Status == "approved" {
+		return map[string]any{"approved": true, "gate": gate, "cached": true}, nil
+	}
+	if gate.Status == "rejected" {
+		return map[string]any{"approved": false, "gate": gate, "cached": true}, fmt.Errorf("workflow gate %q was already rejected", name)
+	}
+
+	failOnDeny := true
+	if opts.FailOnDeny != nil {
+		failOnDeny = *opts.FailOnDeny
+	}
+	mode := strings.TrimSpace(opts.Mode)
+	if mode == "" {
+		mode = "read-only"
+	}
+	agentOpts := AgentOptions{
+		Label:    firstNonEmpty(opts.Label, "gate-"+name),
+		Provider: opts.Provider,
+		Mode:     mode,
+		Model:    opts.Model,
+		Schema:   defaultGateSchema(),
+	}
+	output, err := r.RunAgent(ctx, buildGatePrompt(name, message, opts.Criteria), agentOpts)
+	if err != nil {
+		return nil, err
+	}
+	verdict := parseAgentOutput(output)
+	approved, reason := gateVerdict(verdict)
+	if approved {
+		gate, err = r.Store.ApproveGate(r.Run.ID, name)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"approved": true, "reason": reason, "gate": gate, "verdict": verdict}, nil
+	}
+	gate, err = r.Store.RejectGate(r.Run.ID, name)
+	if err != nil {
+		return nil, err
+	}
+	result := map[string]any{"approved": false, "reason": reason, "gate": gate, "verdict": verdict}
+	if failOnDeny {
+		if reason == "" {
+			reason = "agent gate denied continuation"
+		}
+		return result, fmt.Errorf("workflow gate %q rejected by agent: %s", name, reason)
+	}
+	return result, nil
 }
 
 func (r *Runner) jsPhase(vm *goja.Runtime) func(goja.FunctionCall) goja.Value {
@@ -1250,6 +1328,52 @@ func defaultCheckSchema() map[string]any {
 		},
 		"required": []any{"ok", "command", "summary", "output_tail", "failures"},
 	}
+}
+
+func buildGatePrompt(name, message, criteria string) string {
+	var b strings.Builder
+	b.WriteString("You are an autonomous workflow gate verifier.\n")
+	b.WriteString("Decide whether the workflow may continue through gate ")
+	b.WriteString(strconv.Quote(name))
+	b.WriteString(".\n")
+	if strings.TrimSpace(message) != "" {
+		b.WriteString("\nGate request:\n")
+		b.WriteString(strings.TrimSpace(message))
+		b.WriteString("\n")
+	}
+	if strings.TrimSpace(criteria) != "" {
+		b.WriteString("\nApproval criteria:\n")
+		b.WriteString(strings.TrimSpace(criteria))
+		b.WriteString("\n")
+	}
+	b.WriteString("\nReturn JSON only. Set approved=true only when the criteria are satisfied. ")
+	b.WriteString("If uncertain, set approved=false and explain the blocker in reason.")
+	return b.String()
+}
+
+func defaultGateSchema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"approved": map[string]any{"type": "boolean"},
+			"reason":   map[string]any{"type": "string"},
+			"evidence": map[string]any{
+				"type":  "array",
+				"items": map[string]any{"type": "string"},
+			},
+		},
+		"required": []any{"approved", "reason"},
+	}
+}
+
+func gateVerdict(value any) (bool, string) {
+	result, ok := value.(map[string]any)
+	if !ok {
+		return false, "gate agent returned an invalid verdict"
+	}
+	approved, _ := result["approved"].(bool)
+	reason, _ := result["reason"].(string)
+	return approved, strings.TrimSpace(reason)
 }
 
 func firstNonEmpty(values ...string) string {

@@ -263,23 +263,14 @@ assert_grep "$ROOT/trigger-skip.json" '"skipped": true'
 assert_grep "$ROOT/trigger-watch.json" '"skipped": 1'
 cat > "$ROOT/gate.js" <<'JS'
 phase("gate");
-gate("approve", "acceptance gate");
-return agent("after gate", { label: "after" });
+const verdict = gate("approve", "acceptance gate");
+return { verdict };
 JS
-set +e
-PALLIUM_WORKFLOW_AGENT_STUB='{"ok":true}' \
-  "$PALLIUM_BIN" workflow run --id wf-accept-gate --db "$db" --cwd "$repo" --script "$ROOT/gate.js" "gate acceptance" >/tmp/pallium-accept-gate.out 2>&1
-gate_status=$?
-set -e
-if [[ "$gate_status" -eq 0 ]]; then
-  echo "expected gate workflow to pause" >&2
-  exit 1
-fi
+PALLIUM_WORKFLOW_AGENT_STUB='{"approved":true,"reason":"acceptance approved"}' \
+  "$PALLIUM_BIN" workflow run --id wf-accept-gate --db "$db" --cwd "$repo" --script "$ROOT/gate.js" "gate acceptance" --json >"$ROOT/gate-run.json"
 "$PALLIUM_BIN" workflow gate list wf-accept-gate --db "$db" --json >"$ROOT/gate-list.json"
-assert_grep "$ROOT/gate-list.json" '"status": "open"'
-"$PALLIUM_BIN" workflow gate approve wf-accept-gate approve --db "$db" --json >/dev/null
-PALLIUM_WORKFLOW_AGENT_STUB='{"ok":true}' \
-  "$PALLIUM_BIN" workflow resume wf-accept-gate --db "$db" --json >/dev/null
+assert_grep "$ROOT/gate-run.json" 'acceptance approved'
+assert_grep "$ROOT/gate-list.json" '"status": "approved"'
 
 section "v5 fleet coordination"
 "$PALLIUM_BIN" workflow fleet status --db "$db" --json >"$ROOT/fleet-status.json"
