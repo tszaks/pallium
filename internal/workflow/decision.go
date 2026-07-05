@@ -27,6 +27,11 @@ func (s *Store) RecordDecision(runID, title, body string, tags []string) (Decisi
 	if err != nil {
 		return Decision{}, err
 	}
+	if existing, err := s.decisionByContent(runID, title, strings.TrimSpace(body), string(rawTags)); err == nil {
+		return existing, nil
+	} else if err != sql.ErrNoRows {
+		return Decision{}, err
+	}
 	decision := Decision{
 		ID:        NewID("decision"),
 		RunID:     runID,
@@ -38,6 +43,12 @@ func (s *Store) RecordDecision(runID, title, body string, tags []string) (Decisi
 	_, err = s.db.Exec(`INSERT INTO workflow_decisions(id,run_id,title,body,tags,created_at) VALUES(?,?,?,?,?,?)`,
 		decision.ID, decision.RunID, decision.Title, decision.Body, string(rawTags), decision.CreatedAt)
 	return decision, err
+}
+
+func (s *Store) decisionByContent(runID, title, body, rawTags string) (Decision, error) {
+	row := s.db.QueryRow(`SELECT id,run_id,title,COALESCE(body,''),COALESCE(tags,'[]'),created_at FROM workflow_decisions WHERE run_id=? AND title=? AND COALESCE(body,'')=? AND COALESCE(tags,'[]')=? ORDER BY created_at ASC LIMIT 1`,
+		runID, title, body, rawTags)
+	return scanDecision(row)
 }
 
 func (s *Store) SearchDecisions(query string, limit int) ([]Decision, error) {

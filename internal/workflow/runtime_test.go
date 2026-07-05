@@ -941,6 +941,38 @@ return { prompts: results.map(result => result.prompt) };`
 	}
 }
 
+func TestPipelineSupportsAsyncStages(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"prompt":"{{PROMPT}}"}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("pipeline");
+const results = await pipeline(["alpha"],
+  async item => item.toUpperCase(),
+  async prev => prev + " DONE",
+  prev => agent("inspect " + prev, { label: "inspect" })
+);
+return { result: results[0].prompt };`
+	scriptPath, err := WriteRunScript("wf-pipeline-async", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-pipeline-async", Task: "pipeline async", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, "inspect ALPHA DONE") {
+		t.Fatalf("async pipeline stage did not resolve before next stage: %s", result)
+	}
+}
+
 func TestPipelineStageThrowDropsOnlyThatItem(t *testing.T) {
 	tmp := t.TempDir()
 	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
@@ -1362,15 +1394,6 @@ func TestRunnerInvalidatesCompletedAgentCacheOnFingerprintChange(t *testing.T) {
 		secondArgs any
 	}{
 		{
-			name: "script",
-			first: `phase("scan");
-const result = await agent("stable prompt", { label: "stable" });
-return result;`,
-			second: `phase("scan");
-const result = await agent("stable prompt", { label: "stable" });
-return { source: result.source, changed_script: true };`,
-		},
-		{
 			name: "args",
 			first: `phase("scan");
 const result = await agent("stable prompt", { label: "stable" });
@@ -1386,7 +1409,7 @@ return { source: result.source, topic: args.topic };`,
 			first: `phase("scan");
 const result = await agent("stable prompt", {
   label: "stable",
-  schema: { type: "object", properties: { source: { type: "string" } }, required: ["source"] }
+  schema: { type: "object", properties: { source: { type: "string" }, changed: { type: "boolean" } }, required: ["source"] }
 });
 return result;`,
 			second: `phase("scan");
@@ -1422,7 +1445,7 @@ return result;`,
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"source":"first","prompt":"{{PROMPT}}","changed":false}`)
+			t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"source":"first","changed":false}`)
 			first, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), tc.first, tc.firstArgs)
 			if err != nil {
 				t.Fatal(err)
@@ -1430,7 +1453,7 @@ return result;`,
 			if !strings.Contains(first, `"source": "first"`) {
 				t.Fatalf("unexpected first result: %s", first)
 			}
-			t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"source":"second","prompt":"{{PROMPT}}","changed":true}`)
+			t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"source":"second","changed":true}`)
 			second, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), tc.second, tc.secondArgs)
 			if err != nil {
 				t.Fatal(err)
@@ -1446,6 +1469,439 @@ return result;`,
 				t.Fatalf("expected two agent records after cache miss, got %+v", agents)
 			}
 		})
+	}
+}
+
+func TestRunnerReusesCompletedAgentPrefixAfterScriptTailChange(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	firstScript := `phase("scan");
+const result = await agent("stable prompt", { label: "stable" });
+return result;`
+	secondScript := `phase("scan");
+const result = await agent("stable prompt", { label: "stable" });
+return { source: result.source, changed_script: true };`
+	scriptPath, err := WriteRunScript("wf-cache-script-prefix", tmp, firstScript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-cache-script-prefix", Task: "cache prefix", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"source":"first"}`)
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), firstScript, nil); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"source":"second"}`)
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), secondScript, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"source": "first"`) || !strings.Contains(result, `"changed_script": true`) {
+		t.Fatalf("expected cached prefix with edited tail, got %s", result)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 {
+		t.Fatalf("expected one cached prefix agent, got %+v", agents)
+	}
+}
+
+func TestRunnerDoesNotCacheIdenticalAgentCallsWithinSameExecution(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_SEQUENCE", `[
+		"{\"source\":\"first\"}",
+		"{\"source\":\"second\"}"
+	]`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"source":"fallback"}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("loop");
+const first = await agent("same prompt", { label: "same" });
+const second = await agent("same prompt", { label: "same" });
+return { first: first.source, second: second.source };`
+	scriptPath, err := WriteRunScript("wf-identical-calls", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-identical-calls", Task: "identical calls", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"first": "first"`) || !strings.Contains(result, `"second": "second"`) {
+		t.Fatalf("expected identical calls to execute independently, got %s", result)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 2 || agents[0].CallIndex != 1 || agents[1].CallIndex != 2 {
+		t.Fatalf("expected two positional agent calls, got %+v", agents)
+	}
+}
+
+func TestRunnerResumePreservesMaxAgentCap(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"source":"first"}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	firstScript := `phase("scan");
+const first = await agent("first", { label: "first" });
+return first;`
+	secondScript := `phase("scan");
+const first = await agent("first", { label: "first" });
+const second = await agent("second", { label: "second" });
+return { first, second };`
+	scriptPath, err := WriteRunScript("wf-agent-cap-resume", tmp, firstScript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-agent-cap-resume", Task: "agent cap", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 1}).Execute(context.Background(), firstScript, nil); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"source":"second"}`)
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 1}).Execute(context.Background(), secondScript, nil)
+	if err == nil || !strings.Contains(err.Error(), "workflow exceeded max agents") {
+		t.Fatalf("expected resumed run to preserve max agent cap, got %v", err)
+	}
+}
+
+func TestRunnerResumePreservesBudgetCap(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"source":"first"}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_COST_USD", "0.01")
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	firstScript := `phase("budget");
+const first = await agent("first", { label: "first" });
+return first;`
+	secondScript := `phase("budget");
+const first = await agent("first", { label: "first" });
+const second = await agent("second", { label: "second" });
+return { first, second };`
+	scriptPath, err := WriteRunScript("wf-budget-resume", tmp, firstScript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-budget-resume", Task: "budget resume", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10, MaxBudgetUSD: "0.01"}).Execute(context.Background(), firstScript, nil); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"source":"second"}`)
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10, MaxBudgetUSD: "0.01"}).Execute(context.Background(), secondScript, nil)
+	if err == nil || !strings.Contains(err.Error(), "workflow budget exhausted") {
+		t.Fatalf("expected resumed run to preserve budget cap, got %v", err)
+	}
+}
+
+func TestRunnerDoesNotDuplicateDecisionOnResume(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("decide");
+return pallium.decisions.record("Stable decision", "Do not duplicate this.", "resume");`
+	scriptPath, err := WriteRunScript("wf-decision-idempotent", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-decision-idempotent", Task: "decision idempotent", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	decisions, err := store.SearchDecisions("Stable decision", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decisions) != 1 {
+		t.Fatalf("expected one idempotent decision, got %+v", decisions)
+	}
+}
+
+func TestParallelAgentFailureReturnsNullWithoutCancellingSiblings(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_TEST_COMMAND", `if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q bad; then echo "failed intentionally" >&2; exit 7; fi; printf '{"prompt":"%s"}' "$PALLIUM_WORKFLOW_PROMPT" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("parallel");
+const results = await parallel(["good", "bad", "also-good"], item =>
+  agent("worker " + item, { label: item, provider: "test" })
+);
+return { results };`
+	scriptPath, err := WriteRunScript("wf-parallel-null", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-parallel-null", Task: "parallel null", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10, MaxConcurrentAgents: 3}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, "worker good") || !strings.Contains(result, "null") || !strings.Contains(result, "worker also-good") {
+		t.Fatalf("expected failed parallel agent to become null while siblings complete, got %s", result)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 3 {
+		t.Fatalf("expected three agent records, got %+v", agents)
+	}
+	failed := 0
+	for _, agent := range agents {
+		if agent.Status == "failed" {
+			failed++
+		}
+	}
+	if failed != 1 {
+		t.Fatalf("expected one failed agent record, got %+v", agents)
+	}
+}
+
+func TestRunnerValidatesStructuredOutputFromCustomProvider(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_TEST_COMMAND", `printf '{"summary":123}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("schema");
+return await agent("structured", {
+  label: "structured",
+  provider: "test",
+  schema: {
+    type: "object",
+    properties: { summary: { type: "string" } },
+    required: ["summary"]
+  }
+});`
+	scriptPath, err := WriteRunScript("wf-provider-schema", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-provider-schema", Task: "provider schema", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), "agent output does not match schema") {
+		t.Fatalf("expected local schema validation failure, got %v", err)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].Status != "failed" {
+		t.Fatalf("expected failed schema agent, got %+v", agents)
+	}
+}
+
+func TestRunnerDoesNotApplyPatchFromSchemaFailedParallelAgent(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"status":"edited"}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_WRITE_FILE", "note.txt")
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_WRITE_CONTENT", "changed\n")
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "note.txt"), []byte("original\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "note.txt")
+	runGit(t, tmp, "commit", "-m", "initial")
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("edit");
+const results = await parallel([
+  () => agent("edit invalid", {
+    label: "editor",
+    mode: "edit",
+    isolation: "worktree",
+    schema: { type: "object", properties: { status: { type: "integer" } }, required: ["status"] }
+  })
+]);
+return results;`
+	scriptPath, err := WriteRunScript("wf-schema-patch", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-schema-patch", Task: "schema patch", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatalf("parallel schema failure should be nonfatal, got %v", err)
+	}
+	if !strings.Contains(result, "null") {
+		t.Fatalf("expected failed parallel agent to return null, got %s", result)
+	}
+	raw, err := os.ReadFile(filepath.Join(tmp, "note.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != "original\n" {
+		t.Fatalf("schema-failed patch was applied: %q", string(raw))
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].Status != "failed" || agents[0].PatchPath != "" {
+		t.Fatalf("expected failed agent with no patch path, got %+v", agents)
+	}
+}
+
+func TestRunnerValidatesNullableObjectSchemasRecursively(t *testing.T) {
+	schema := map[string]any{
+		"type": []any{"object", "null"},
+		"properties": map[string]any{
+			"summary": map[string]any{"type": "string"},
+		},
+		"required":             []any{"summary"},
+		"additionalProperties": false,
+	}
+	if _, err := parseAgentOutputWithSchema(`{}`, schema); err == nil || !strings.Contains(err.Error(), "missing required property") {
+		t.Fatalf("expected nullable object schema to enforce required fields, got %v", err)
+	}
+	if _, err := parseAgentOutputWithSchema(`{"summary":"ok"}`, schema); err != nil {
+		t.Fatalf("expected object with required field to pass: %v", err)
+	}
+	if _, err := parseAgentOutputWithSchema(`null`, schema); err != nil {
+		t.Fatalf("expected null branch to pass: %v", err)
+	}
+}
+
+func TestPipelineCallIndexesAreDeterministicByItemAndStage(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"source":"first","prompt":"{{PROMPT}}"}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("pipeline");
+const results = await pipeline(["slow", "fast"],
+  item => agent("stage1 " + item, { label: "stage1-" + item }),
+  result => agent("stage2 " + result.prompt, { label: "stage2-" + result.prompt })
+);
+return results;`
+	scriptPath, err := WriteRunScript("wf-pipeline-indexes", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-pipeline-indexes", Task: "pipeline indexes", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10, MaxConcurrentAgents: 4}).Execute(context.Background(), script, nil); err != nil {
+		t.Fatal(err)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]int{}
+	for _, agent := range agents {
+		got[agent.Label] = agent.CallIndex
+	}
+	expected := map[string]int{
+		"stage1-slow":        pipelineCallIndex(1, 0, 0, 0),
+		"stage1-fast":        pipelineCallIndex(1, 0, 1, 0),
+		"stage2-stage1 slow": pipelineCallIndex(1, 1, 0, 0),
+		"stage2-stage1 fast": pipelineCallIndex(1, 1, 1, 0),
+	}
+	for label, want := range expected {
+		if got[label] != want {
+			t.Fatalf("call index for %s = %d, want %d; all=%+v", label, got[label], want, agents)
+		}
+	}
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"source":"second","prompt":"{{PROMPT}}"}`)
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10, MaxConcurrentAgents: 4}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(result, "second") {
+		t.Fatalf("expected deterministic pipeline cache reuse, got %s", result)
+	}
+}
+
+func TestStoreBackfillsLegacyAgentCallIndexes(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-legacy-index", Task: "legacy", CWD: tmp, ScriptPath: "workflow.js"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, prompt := range []string{"first", "second"} {
+		if _, err := store.db.Exec(`INSERT INTO workflow_agents(id,run_id,call_index,prompt,mode,status,output,created_at,updated_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+			NewID("agent"), run.ID, 0, prompt, "read-only", "completed", `{"ok":true}`, nowString(), nowString(), nowString()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 2 || agents[0].CallIndex != 1 || agents[1].CallIndex != 2 {
+		t.Fatalf("expected legacy call indexes to be backfilled, got %+v", agents)
 	}
 }
 

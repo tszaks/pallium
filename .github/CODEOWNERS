@@ -1,0 +1,8 @@
+* @tszaks
+
+/internal/workflow/ @tszaks
+/cmd/workflow* @tszaks
+/pkg/workflowclient/ @tszaks
+/.github/ @tszaks
+/npm/ @tszaks
+/scripts/ @tszaks

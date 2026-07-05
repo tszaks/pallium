@@ -34,6 +34,32 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Verify release version
+        run: |
+          package_version="$(node -p 'require("./npm/package.json").version')"
+          tag_version="${{ steps.tag.outputs.tag }}"
+          tag_version="${tag_version#v}"
+          if [ "$package_version" != "$tag_version" ]; then
+            echo "npm/package.json version $package_version does not match release tag ${{ steps.tag.outputs.tag }}" >&2
+            exit 1
+          fi
+
+      - name: Test npm wrapper
+        run: node npm/scripts/test.js
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./... -count=1
+
+      - name: Workflow acceptance
+        run: bash scripts/workflow-acceptance.sh
+
       - name: Build release assets
         run: scripts/build-release-assets.sh "${{ steps.tag.outputs.tag }}"
 
