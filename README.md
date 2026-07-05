@@ -167,11 +167,14 @@ access keys. A matching patch is blocked before it reaches the target checkout;
 false positives.
 Use `workflow revert <run-id>` to reverse patches produced by a workflow; this
 also respects multi-repo agent targets.
-Use `scripts/workflow-acceptance.sh` as the installed-CLI acceptance gate. It
-exercises validation, parallel agents, edit/apply/revert, on-changed triggers,
-approval gates, provider commands, coordinator replanning, workflow library
-packs, analytics, reports, fleet status, and the local HTTP API with stubbed
-workers.
+Use `scripts/workflow-acceptance.sh` as the installed-CLI acceptance gate for
+v1-v7. It exercises core runner controls, generation/report/budget/composition,
+repo-native preflight and verify loops, autonomy triggers and gates, fleet
+coordination, HTTP/MCP infrastructure, and the `workflow audit` checklist with
+stubbed workers.
+Use `pallium workflow audit --json` to print the v1-v7 requirement checklist.
+Add `--run-acceptance` to execute `scripts/workflow-acceptance.sh` from the
+Pallium repo or via `PALLIUM_WORKFLOW_ACCEPTANCE_SCRIPT`.
 
 Workflow scripts run as async JavaScript, matching Claude's saved workflow
 shape: top-level `await` is supported, `pipeline()` fans one worker per item in
