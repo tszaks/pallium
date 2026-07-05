@@ -2,7 +2,6 @@ package workflow
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -64,8 +63,8 @@ return agent("failing provider", { label: "fail", provider: "fail" });`
 	}
 }
 
-func TestAdversarialGateApproveWrongNameLeavesRunPaused(t *testing.T) {
-	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+func TestAdversarialGateApproveWrongNameDoesNotMutateAgentGate(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"approved":true,"reason":"ok"}`)
 	tmp := t.TempDir()
 	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
 	if err != nil {
@@ -73,7 +72,7 @@ func TestAdversarialGateApproveWrongNameLeavesRunPaused(t *testing.T) {
 	}
 	defer store.Close()
 	script := `phase("gate");
-gate("approve", "wait for approval");
+gate("approve", "verify before worker");
 return agent("after gate", { label: "after" });`
 	scriptPath, err := WriteRunScript("wf-wrong-gate", tmp, script)
 	if err != nil {
@@ -83,9 +82,8 @@ return agent("after gate", { label: "after" });`
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
-	if !errors.Is(err, ErrWorkflowPaused) {
-		t.Fatalf("expected paused workflow, got %v", err)
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil); err != nil {
+		t.Fatalf("expected agent gate to approve, got %v", err)
 	}
 	if _, err := store.ApproveGate(run.ID, "wrong-gate"); err == nil {
 		t.Fatal("expected wrong gate approval to fail")
@@ -96,12 +94,8 @@ return agent("after gate", { label: "after" });`
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(gates) != 1 || gates[0].Name != "approve" || gates[0].Status != "open" {
-		t.Fatalf("expected original gate to stay open, got %+v", gates)
-	}
-	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
-	if !errors.Is(err, ErrWorkflowPaused) {
-		t.Fatalf("expected resume to remain paused after wrong gate approval, got %v", err)
+	if len(gates) != 1 || gates[0].Name != "approve" || gates[0].Status != "approved" {
+		t.Fatalf("expected original gate to stay approved, got %+v", gates)
 	}
 }
 

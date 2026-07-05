@@ -30,7 +30,7 @@ func VersionRequirements() []VersionRequirement {
 		{ID: "v4-triggers", Version: "v4", Name: "Triggers", Description: "workflow trigger add/list/show/run stores reusable automations in SQLite"},
 		{ID: "v4-on-changed", Version: "v4", Name: "On-changed triggers", Description: "trigger --kind on-changed skips until repo HEAD or dirty state changes"},
 		{ID: "v4-watch", Version: "v4", Name: "Trigger watch", Description: "workflow trigger watch --once polls enabled triggers for autonomous execution"},
-		{ID: "v4-gates", Version: "v4", Name: "Approval gates", Description: "gate() pauses until pallium workflow gate approve and resume continue the run"},
+		{ID: "v4-gates", Version: "v4", Name: "Agent gates", Description: "gate() runs a verifier agent that approves or rejects whether the workflow may continue"},
 		{ID: "v4-library", Version: "v4", Name: "Workflow library", Description: "workflow library list/show/install exposes reusable packs such as security-audit"},
 		{ID: "v5-providers", Version: "v5", Name: "Providers", Description: "agent provider options route through codex or PALLIUM_WORKFLOW_PROVIDER_<NAME>_COMMAND"},
 		{ID: "v5-fleet", Version: "v5", Name: "Fleet status", Description: "workflow fleet status summarizes active runs, triggers, and worker health"},

@@ -60,6 +60,14 @@ func (s *Store) ListGates(runID string) ([]Gate, error) {
 }
 
 func (s *Store) ApproveGate(runID, name string) (Gate, error) {
+	return s.setGateStatus(runID, name, "approved")
+}
+
+func (s *Store) RejectGate(runID, name string) (Gate, error) {
+	return s.setGateStatus(runID, name, "rejected")
+}
+
+func (s *Store) setGateStatus(runID, name, status string) (Gate, error) {
 	runID = strings.TrimSpace(runID)
 	name = strings.TrimSpace(name)
 	if runID == "" || name == "" {
@@ -72,8 +80,12 @@ func (s *Store) ApproveGate(runID, name string) (Gate, error) {
 		}
 		return Gate{}, err
 	}
-	gate.Status = "approved"
+	status = strings.TrimSpace(status)
+	if status == "" {
+		return Gate{}, fmt.Errorf("workflow gate status is required")
+	}
+	gate.Status = status
 	gate.ApprovedAt = nowString()
-	_, err = s.db.Exec(`UPDATE workflow_gates SET status='approved',approved_at=? WHERE run_id=? AND name=?`, gate.ApprovedAt, runID, name)
+	_, err = s.db.Exec(`UPDATE workflow_gates SET status=?,approved_at=? WHERE run_id=? AND name=?`, gate.Status, gate.ApprovedAt, runID, name)
 	return gate, err
 }

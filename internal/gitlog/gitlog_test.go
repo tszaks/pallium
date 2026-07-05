@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -25,6 +26,36 @@ func TestReadHistory(t *testing.T) {
 
 	if len(commits[0].ChangedFiles) == 0 {
 		t.Fatalf("expected changed files in most recent commit")
+	}
+}
+
+func TestReadHistoryDoesNotTreatMultilineBodyAsChangedFiles(t *testing.T) {
+	repo := initTempRepo(t)
+
+	writeFile(t, filepath.Join(repo, "feature.txt"), "feature\n")
+	run(t, repo, "git", "add", ".")
+	run(t, repo, "git", "commit",
+		"-m", "feat: add feature",
+		"-m", "This explains why the feature exists.",
+		"-m", "It is not a path and must not become a changed file.",
+	)
+
+	commits, err := ReadHistory(repo)
+	if err != nil {
+		t.Fatalf("ReadHistory failed: %v", err)
+	}
+	if len(commits) == 0 {
+		t.Fatal("expected commits")
+	}
+	latest := commits[0]
+	if latest.Subject != "feat: add feature" {
+		t.Fatalf("unexpected latest subject: %q", latest.Subject)
+	}
+	if !strings.Contains(latest.Body, "must not become a changed file") {
+		t.Fatalf("expected multiline body to be preserved, got %q", latest.Body)
+	}
+	if len(latest.ChangedFiles) != 1 || latest.ChangedFiles[0] != "feature.txt" {
+		t.Fatalf("commit body leaked into changed files: %#v", latest.ChangedFiles)
 	}
 }
 

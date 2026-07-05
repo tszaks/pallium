@@ -13,6 +13,7 @@ import (
 const (
 	commitDelimiter = "\x1e"
 	fieldDelimiter  = "\x1f"
+	filesDelimiter  = "\x1d"
 )
 
 type Commit struct {
@@ -73,7 +74,7 @@ func ReadHistory(repoRoot string) ([]Commit, error) {
 		"log",
 		"--date=iso-strict",
 		"--name-only",
-		"--pretty=format:"+commitDelimiter+"%H"+fieldDelimiter+"%an"+fieldDelimiter+"%ae"+fieldDelimiter+"%ad"+fieldDelimiter+"%s"+fieldDelimiter+"%b",
+		"--pretty=format:"+commitDelimiter+"%H"+fieldDelimiter+"%an"+fieldDelimiter+"%ae"+fieldDelimiter+"%ad"+fieldDelimiter+"%s"+fieldDelimiter+"%b"+filesDelimiter,
 	)
 
 	output, err := cmd.Output()
@@ -89,16 +90,14 @@ func ReadHistory(repoRoot string) ([]Commit, error) {
 			continue
 		}
 
-		reader := bufio.NewReader(bytes.NewBufferString(chunk))
-		header, err := reader.ReadString('\n')
-		if err != nil && header == "" {
-			return nil, fmt.Errorf("failed to parse git history header: %w", err)
+		parts := strings.SplitN(chunk, filesDelimiter, 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("unexpected git history record: missing file delimiter")
 		}
 
-		header = strings.TrimRight(header, "\n")
-		fields := strings.Split(header, fieldDelimiter)
+		fields := strings.SplitN(strings.TrimRight(parts[0], "\n"), fieldDelimiter, 6)
 		if len(fields) < 6 {
-			return nil, fmt.Errorf("unexpected git history header: %q", header)
+			return nil, fmt.Errorf("unexpected git history header: %q", parts[0])
 		}
 
 		committedAt, err := time.Parse(time.RFC3339, strings.TrimSpace(fields[3]))
@@ -107,6 +106,7 @@ func ReadHistory(repoRoot string) ([]Commit, error) {
 		}
 
 		files := make([]string, 0)
+		reader := bufio.NewReader(bytes.NewBufferString(parts[1]))
 		scanner := bufio.NewScanner(reader)
 		for scanner.Scan() {
 			path := strings.TrimSpace(scanner.Text())
