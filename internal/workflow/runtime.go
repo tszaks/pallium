@@ -80,6 +80,7 @@ type parallelCapture struct {
 }
 
 const parallelAgentMarkerKey = "__pallium_parallel_agent__"
+const maxWorkflowCollectionItems = 4096
 
 func (r *Runner) Execute(ctx context.Context, script string, args any) (string, error) {
 	if r.Store == nil {
@@ -130,7 +131,40 @@ func (r *Runner) executeScript(ctx context.Context, script string, args any, top
 	body := stripMeta(script)
 	vm := goja.New()
 	vm.SetFieldNameMapper(goja.TagFieldNameMapper("json", true))
+	installDeterministicWorkflowGuards(vm)
 	if err := vm.Set("args", args); err != nil {
+		return "", err
+	}
+	if err := vm.Set("log", func(message ...any) goja.Value {
+		parts := make([]string, 0, len(message))
+		for _, part := range message {
+			parts = append(parts, fmt.Sprint(part))
+		}
+		fmt.Fprintf(os.Stderr, "[workflow:%s] %s\n", r.Run.ID, strings.Join(parts, " "))
+		return goja.Undefined()
+	}); err != nil {
+		return "", err
+	}
+	budgetTotal := any(nil)
+	if r.budgetLimit > 0 {
+		budgetTotal = r.budgetLimit
+	}
+	if err := vm.Set("budget", map[string]any{
+		"total": budgetTotal,
+		"spent": func() goja.Value {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			return vm.ToValue(r.budgetSpent)
+		},
+		"remaining": func() goja.Value {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			if r.budgetLimit > 0 {
+				return vm.ToValue(r.budgetLimit - r.budgetSpent)
+			}
+			return goja.Null()
+		},
+	}); err != nil {
 		return "", err
 	}
 	if err := vm.Set("phase", r.jsPhase(vm)); err != nil {
@@ -644,6 +678,9 @@ func (r *Runner) jsParallel(ctx context.Context, vm *goja.Runtime) func(goja.Fun
 		items := call.Argument(0).ToObject(vm)
 		lengthValue := items.Get("length")
 		length := int(lengthValue.ToInteger())
+		if length > maxWorkflowCollectionItems {
+			panic(vm.ToValue(fmt.Sprintf("parallel item limit exceeded: %d > %d", length, maxWorkflowCollectionItems)))
+		}
 		var mapper func(goja.Value, ...goja.Value) (goja.Value, error)
 		if len(call.Arguments) > 1 && !goja.IsUndefined(call.Argument(1)) && !goja.IsNull(call.Argument(1)) {
 			fn, ok := goja.AssertFunction(call.Argument(1))
@@ -695,43 +732,117 @@ func (r *Runner) jsPipeline(ctx context.Context, vm *goja.Runtime) func(goja.Fun
 	return func(call goja.FunctionCall) goja.Value {
 		items := call.Argument(0).ToObject(vm)
 		length := int(items.Get("length").ToInteger())
-		values := make([]goja.Value, 0, length)
-		for i := 0; i < length; i++ {
-			values = append(values, items.Get(fmt.Sprintf("%d", i)))
+		if length > maxWorkflowCollectionItems {
+			panic(vm.ToValue(fmt.Sprintf("pipeline item limit exceeded: %d > %d", length, maxWorkflowCollectionItems)))
 		}
+		values := make([]any, 0, length)
+		for i := 0; i < length; i++ {
+			values = append(values, items.Get(fmt.Sprintf("%d", i)).Export())
+		}
+		stages := make([]func(goja.Value, ...goja.Value) (goja.Value, error), 0, len(call.Arguments)-1)
 		for _, stageValue := range call.Arguments[1:] {
 			fn, ok := goja.AssertFunction(stageValue)
 			if !ok {
 				panic(vm.ToValue("pipeline stages must be functions"))
 			}
-			rawResults := make([]any, 0, len(values))
-			capture := &parallelCapture{}
-			previousCapture := r.capture
-			r.capture = capture
-			for _, value := range values {
-				next, err := fn(goja.Undefined(), value)
-				if err != nil {
-					r.capture = previousCapture
-					panic(err)
-				}
-				rawResults = append(rawResults, next.Export())
-			}
-			r.capture = previousCapture
-
-			agentResults, err := r.runParallelAgentCalls(ctx, capture.Calls)
-			if err != nil {
-				panic(vm.ToValue(err.Error()))
-			}
-			values = values[:0]
-			for _, raw := range rawResults {
-				values = append(values, vm.ToValue(replaceParallelAgentMarkers(raw, agentResults)))
-			}
+			stages = append(stages, fn)
 		}
-		results := make([]any, 0, len(values))
-		for _, value := range values {
-			results = append(results, value.Export())
+		if len(stages) == 0 {
+			return vm.ToValue(values)
+		}
+
+		limit := r.MaxConcurrentAgents
+		if limit <= 0 {
+			limit = 16
+		}
+		sem := make(chan struct{}, limit)
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		results := make([]any, len(values))
+		var vmMu sync.Mutex
+		var wg sync.WaitGroup
+		var errMu sync.Mutex
+		var firstErr error
+		for itemIndex, item := range values {
+			itemIndex, item := itemIndex, item
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				current := item
+				for _, stage := range stages {
+					rawResult, calls, err := r.capturePipelineStage(vm, &vmMu, stage, current, item, itemIndex)
+					if err != nil {
+						results[itemIndex] = nil
+						return
+					}
+					agentResults, err := r.runAgentCallsWithSemaphore(ctx, calls, sem)
+					if err != nil {
+						errMu.Lock()
+						if firstErr == nil {
+							firstErr = err
+							cancel()
+						}
+						errMu.Unlock()
+						return
+					}
+					current = replaceParallelAgentMarkers(rawResult, agentResults)
+				}
+				results[itemIndex] = current
+			}()
+		}
+		wg.Wait()
+		if firstErr != nil {
+			panic(vm.ToValue(firstErr.Error()))
 		}
 		return vm.ToValue(results)
+	}
+}
+
+func (r *Runner) capturePipelineStage(vm *goja.Runtime, vmMu *sync.Mutex, fn func(goja.Value, ...goja.Value) (goja.Value, error), value, originalItem any, itemIndex int) (any, []parallelAgentCall, error) {
+	vmMu.Lock()
+	defer vmMu.Unlock()
+
+	capture := &parallelCapture{}
+	previousCapture := r.capture
+	r.capture = capture
+	defer func() {
+		r.capture = previousCapture
+	}()
+
+	next, err := fn(goja.Undefined(), vm.ToValue(value), vm.ToValue(originalItem), vm.ToValue(itemIndex))
+	if err != nil {
+		return nil, nil, err
+	}
+	return next.Export(), append([]parallelAgentCall(nil), capture.Calls...), nil
+}
+
+func installDeterministicWorkflowGuards(vm *goja.Runtime) {
+	determinismError := func(name string) func() {
+		return func() {
+			panic(vm.ToValue(name + " is disabled in Pallium workflow scripts; pass nondeterministic values through args"))
+		}
+	}
+	if mathObj := vm.Get("Math").ToObject(vm); mathObj != nil {
+		_ = mathObj.Set("random", determinismError("Math.random"))
+	}
+	originalDate := vm.Get("Date")
+	if originalDate != nil && !goja.IsUndefined(originalDate) && !goja.IsNull(originalDate) {
+		originalDateObj := originalDate.ToObject(vm)
+		_ = vm.Set("Date", func(call goja.ConstructorCall) *goja.Object {
+			if len(call.Arguments) == 0 {
+				panic(vm.ToValue("new Date() is disabled in Pallium workflow scripts; pass nondeterministic values through args"))
+			}
+			date, err := vm.New(originalDateObj, call.Arguments...)
+			if err != nil {
+				panic(err)
+			}
+			return date
+		})
+		dateObj := vm.Get("Date").ToObject(vm)
+		_ = dateObj.Set("now", determinismError("Date.now"))
+		_ = dateObj.Set("parse", originalDateObj.Get("parse"))
+		_ = dateObj.Set("UTC", originalDateObj.Get("UTC"))
 	}
 }
 
@@ -860,15 +971,21 @@ func (r *Runner) runParallelAgentCalls(ctx context.Context, calls []parallelAgen
 	if len(calls) == 0 {
 		return nil, nil
 	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	results := make([]any, len(calls))
 	limit := r.MaxConcurrentAgents
 	if limit <= 0 {
 		limit = 16
 	}
-	sem := make(chan struct{}, limit)
+	return r.runAgentCallsWithSemaphore(ctx, calls, make(chan struct{}, limit))
+}
+
+func (r *Runner) runAgentCallsWithSemaphore(ctx context.Context, calls []parallelAgentCall, sem chan struct{}) ([]any, error) {
+	if len(calls) == 0 {
+		return nil, nil
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	results := make([]any, len(calls))
 	var wg sync.WaitGroup
 	var errMu sync.Mutex
 	var firstErr error
@@ -1106,7 +1223,7 @@ func buildCheckPrompt(command string) string {
 	rawCommand, _ := json.Marshal(command)
 	return "Run this verification command exactly once in the target repo: " + string(rawCommand) + "\n" +
 		"Do not edit source files. It is acceptable for the command to write normal ignored build, cache, or test artifacts. " +
-		"Use the real command result as ground truth. Return JSON with ok=true only if the command exits successfully. " +
+		"Use the actual command result as ground truth. Return JSON with ok=true only if the command exits successfully. " +
 		"Include a concise summary, the useful tail of output, and specific failing tests or errors when available."
 }
 

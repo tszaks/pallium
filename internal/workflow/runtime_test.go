@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -821,6 +822,278 @@ return { count: results.length, prompts: results.map(result => result.prompt) };
 	if !strings.Contains(result, `"count": 4`) || !strings.Contains(result, "inspect d") {
 		t.Fatalf("unexpected result: %s", result)
 	}
+}
+
+func TestPipelineStreamsItemsAcrossStages(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := filepath.Join(tmp, "pipeline.log")
+	providerPath := filepath.Join(tmp, "provider.py")
+	if err := os.WriteFile(providerPath, []byte(`#!/usr/bin/env python3
+import json
+import os
+import time
+
+prompt = open(os.environ["PALLIUM_WORKFLOW_PROMPT_FILE"]).read().strip()
+log = os.environ["PIPELINE_LOG"]
+with open(log, "a") as f:
+    f.write(f"start|{prompt}|{time.time()}\n")
+if prompt == "stage1 slow":
+    time.sleep(0.45)
+elif prompt == "stage1 fast":
+    time.sleep(0.05)
+else:
+    time.sleep(0.10)
+with open(log, "a") as f:
+    f.write(f"end|{prompt}|{time.time()}\n")
+parts = prompt.split()
+with open(os.environ["PALLIUM_WORKFLOW_OUTPUT_FILE"], "w") as f:
+    json.dump({"stage": parts[0], "item": parts[1], "prompt": prompt}, f)
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_PROBE_COMMAND", providerPath)
+	t.Setenv("PIPELINE_LOG", logPath)
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("pipeline");
+const results = await pipeline(["slow", "fast"],
+  item => agent("stage1 " + item, { label: "stage1-" + item, provider: "probe" }),
+  result => agent("stage2 " + result.item, { label: "stage2-" + result.item, provider: "probe" })
+);
+return { prompts: results.map(result => result.prompt) };`
+	scriptPath, err := WriteRunScript("wf-pipeline-streaming", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-pipeline-streaming", Task: "pipeline streaming", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10, MaxConcurrentAgents: 4}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, "stage2 slow") || !strings.Contains(result, "stage2 fast") {
+		t.Fatalf("unexpected result: %s", result)
+	}
+	times := readPipelineTimes(t, logPath)
+	if times["start|stage2 fast"] >= times["end|stage1 slow"] {
+		t.Fatalf("pipeline has a stage barrier: stage2 fast started at %f after stage1 slow ended at %f\nlog=%#v", times["start|stage2 fast"], times["end|stage1 slow"], times)
+	}
+}
+
+func TestPipelineStageReceivesPreviousOriginalAndIndex(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"prompt":"{{PROMPT}}"}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("pipeline");
+const results = await pipeline(["alpha", "beta"],
+  (item, original, index) => ({ current: item.toUpperCase(), original, index }),
+  (prev, original, index) => agent("verify " + prev.current + " from " + original + " #" + index, { label: "verify-" + index })
+);
+return { prompts: results.map(result => result.prompt) };`
+	scriptPath, err := WriteRunScript("wf-pipeline-args", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-pipeline-args", Task: "pipeline args", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, "verify ALPHA from alpha #0") || !strings.Contains(result, "verify BETA from beta #1") {
+		t.Fatalf("pipeline did not pass previous result, original item, and index: %s", result)
+	}
+}
+
+func TestPipelineStageThrowDropsOnlyThatItem(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("pipeline");
+const results = await pipeline(["keep", "drop", "also-keep"],
+  item => {
+    if (item === "drop") {
+      throw new Error("drop this item");
+    }
+    return item.toUpperCase();
+  }
+);
+return { results };`
+	scriptPath, err := WriteRunScript("wf-pipeline-throw", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-pipeline-throw", Task: "pipeline throw", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"KEEP"`) || !strings.Contains(result, "null") || !strings.Contains(result, `"ALSO-KEEP"`) {
+		t.Fatalf("pipeline throw did not preserve item order with null drop: %s", result)
+	}
+}
+
+func TestWorkflowCollectionItemLimit(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `const items = Array.from({ length: 4097 }, (_, index) => index);
+return parallel(items, item => item);`
+	scriptPath, err := WriteRunScript("wf-item-cap", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-item-cap", Task: "item cap", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), "parallel item limit exceeded") {
+		t.Fatalf("expected parallel item limit error, got %v", err)
+	}
+
+	script = `const items = Array.from({ length: 4097 }, (_, index) => index);
+return pipeline(items, item => item);`
+	scriptPath, err = WriteRunScript("wf-pipeline-item-cap", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err = store.CreateRun(Run{ID: "wf-pipeline-item-cap", Task: "pipeline item cap", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), "pipeline item limit exceeded") {
+		t.Fatalf("expected pipeline item limit error, got %v", err)
+	}
+}
+
+func TestWorkflowDeterministicGuards(t *testing.T) {
+	for name, script := range map[string]string{
+		"math-random": `return Math.random();`,
+		"date-now":    `return Date.now();`,
+		"new-date":    `return new Date();`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			tmp := t.TempDir()
+			store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			scriptPath, err := WriteRunScript("wf-"+name, tmp, script)
+			if err != nil {
+				t.Fatal(err)
+			}
+			run, err := store.CreateRun(Run{ID: "wf-" + name, Task: name, CWD: tmp, ScriptPath: scriptPath})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+			if err == nil || !strings.Contains(err.Error(), "disabled in Pallium workflow scripts") {
+				t.Fatalf("expected deterministic guard error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestWorkflowBudgetObjectShape(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_COST_USD", "0.25")
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("budget");
+const before = { total: budget.total, spent: budget.spent(), remaining: budget.remaining() };
+await agent("one", { label: "one" });
+const after = { total: budget.total, spent: budget.spent(), remaining: budget.remaining() };
+return { before, after };`
+	scriptPath, err := WriteRunScript("wf-budget-object", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-budget-object", Task: "budget object", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10, MaxBudgetUSD: "1.00"}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"total": 1`, `"spent": 0`, `"remaining": 1`, `"spent": 0.25`, `"remaining": 0.75`} {
+		if !strings.Contains(result, want) {
+			t.Fatalf("budget object result missing %s: %s", want, result)
+		}
+	}
+}
+
+func TestWorkflowAllowsDeterministicDateConstruction(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `return new Date(0).toISOString();`
+	scriptPath, err := WriteRunScript("wf-date-explicit", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-date-explicit", Task: "date explicit", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, "1970-01-01T00:00:00.000Z") {
+		t.Fatalf("unexpected explicit date result: %s", result)
+	}
+}
+
+func readPipelineTimes(t *testing.T, path string) map[string]float64 {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	times := map[string]float64{}
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		parts := strings.Split(line, "|")
+		if len(parts) != 3 {
+			t.Fatalf("unexpected pipeline log line %q", line)
+		}
+		value, err := strconv.ParseFloat(parts[2], 64)
+		if err != nil {
+			t.Fatalf("parse pipeline timestamp %q: %v", line, err)
+		}
+		times[parts[0]+"|"+parts[1]] = value
+	}
+	return times
 }
 
 func TestParallelHonorsConcurrentAgentCap(t *testing.T) {
