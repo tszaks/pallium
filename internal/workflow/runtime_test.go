@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/dop251/goja"
 )
 
 func TestRunnerExecutesScriptAndRecordsAgents(t *testing.T) {
@@ -1227,6 +1229,88 @@ return { results };`
 	}
 	if !strings.Contains(result, "inspect keep") || !strings.Contains(result, "null") || !strings.Contains(result, "inspect also-keep") {
 		t.Fatalf("parallel mapper throw did not preserve item order with null drop: %s", result)
+	}
+}
+
+func TestParallelMapperFatalErrorAbortsRun(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	// "drop" throws an ordinary error and must still be nulled out, but "fatal"
+	// synchronously calls verify.untilGreen(), which runs an agent past the
+	// MaxAgents cap (already exhausted by the earlier warmup agent() call).
+	// That fatal error must propagate and fail the whole run instead of being
+	// swallowed into a null result.
+	script := `phase("parallel-fatal");
+agent("warmup");
+const results = await parallel(["drop", "fatal"], item => {
+  if (item === "drop") {
+    throw new Error("drop this item");
+  }
+  return verify.untilGreen("stub-check", { maxRounds: 0 });
+});
+return { results };`
+	scriptPath, err := WriteRunScript("wf-parallel-fatal", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-parallel-fatal", Task: "parallel fatal", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 1}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), "exceeded max agents") {
+		t.Fatalf("expected fatal mapper error to abort the run, got %v", err)
+	}
+}
+
+// TestUnwrapMapperThrowRecoversInterruptedSentinel guards against a subtler
+// variant of the same swallowing bug: when a parallel() mapper throws
+// synchronously because the workflow was stopped/paused (not just a budget
+// or max-agents cap), goja wraps the thrown value in a *goja.Exception whose
+// Error() appends call-site stack info (e.g. " at ...(native)"). That extra
+// text breaks the exact-string comparison isWorkflowStoppedError/
+// isWorkflowPausedError use for ErrWorkflowStopped/ErrWorkflowPaused, so
+// isWorkflowFatalAgentError alone misses it. unwrapMapperThrow must recover
+// the original message so the fatal check still matches.
+func TestUnwrapMapperThrowRecoversInterruptedSentinel(t *testing.T) {
+	vm := goja.New()
+	if err := vm.Set("boom", func(call goja.FunctionCall) goja.Value {
+		// Mirrors how jsVerify's untilGreen (and other JS bindings) surface a
+		// Go error to a script: panic with the error text as a plain JS value.
+		panic(vm.ToValue(ErrWorkflowStopped.Error()))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// jsParallel never calls a native-bound function directly as the
+	// "mapper" - it calls a real JS function, which in turn calls a native
+	// binding like verify.untilGreen(). That extra JS call frame is what
+	// makes goja attach stack info to the exception's Error() text, so
+	// reproduce it here instead of calling "boom" directly.
+	if _, err := vm.RunString("var mapperLike = function() { return boom(); };"); err != nil {
+		t.Fatal(err)
+	}
+	fn, ok := goja.AssertFunction(vm.Get("mapperLike"))
+	if !ok {
+		t.Fatal("expected mapperLike to be callable")
+	}
+	_, err := fn(goja.Undefined())
+	if err == nil {
+		t.Fatal("expected boom() to return an error")
+	}
+	if isWorkflowFatalAgentError(err) {
+		t.Fatalf("expected the raw goja exception to not classify as fatal without unwrapping (documents why unwrapMapperThrow is needed), got %v", err)
+	}
+	cause := unwrapMapperThrow(err)
+	if !isWorkflowFatalAgentError(cause) {
+		t.Fatalf("expected unwrapMapperThrow(%v) to recover a fatal interrupted error, got %v", err, cause)
+	}
+	if cause.Error() != ErrWorkflowStopped.Error() {
+		t.Fatalf("expected unwrapped cause to carry the clean stopped sentinel message, got %q", cause.Error())
 	}
 }
 

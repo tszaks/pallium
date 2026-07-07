@@ -958,6 +958,24 @@ func (r *Runner) jsPallium(ctx context.Context, vm *goja.Runtime) map[string]any
 	}
 }
 
+// unwrapMapperThrow recovers the original error a parallel() mapper threw
+// synchronously. goja wraps a thrown value in a *goja.Exception and its
+// Error() appends call-site stack info (e.g. " at ...(native)"), which
+// breaks the exact-string comparisons isWorkflowStoppedError/
+// isWorkflowPausedError rely on for sentinel errors like ErrWorkflowStopped.
+// When the mapper threw a plain string (as our internal panics do via
+// vm.ToValue(err.Error())), unwrap it back to a clean error so fatal
+// classification sees the original message rather than the decorated one.
+func unwrapMapperThrow(err error) error {
+	var exception *goja.Exception
+	if errors.As(err, &exception) {
+		if message, ok := exception.Value().Export().(string); ok {
+			return errors.New(message)
+		}
+	}
+	return err
+}
+
 func (r *Runner) jsParallel(ctx context.Context, vm *goja.Runtime) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		items := call.Argument(0).ToObject(vm)
@@ -986,6 +1004,9 @@ func (r *Runner) jsParallel(ctx context.Context, vm *goja.Runtime) func(goja.Fun
 				callStart := len(capture.Calls)
 				value, err := mapper(goja.Undefined(), item, vm.ToValue(i))
 				if err != nil {
+					if cause := unwrapMapperThrow(err); isWorkflowFatalAgentError(cause) {
+						panic(vm.ToValue(cause.Error()))
+					}
 					capture.Calls = capture.Calls[:callStart]
 					r.recordDroppedItem(fmt.Sprintf("parallel item %d", i), err.Error())
 					rawResults = append(rawResults, nil)
