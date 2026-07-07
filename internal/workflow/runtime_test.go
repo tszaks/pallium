@@ -2095,6 +2095,230 @@ func TestRunArtifactDirUsesHomePalliumDirectory(t *testing.T) {
 	}
 }
 
+func TestAgentTimeoutInParallelBecomesNull(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_SLOWPOKE_COMMAND", `if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q slow; then exec sleep 5; fi; printf '{"prompt":"%s"}' "$PALLIUM_WORKFLOW_PROMPT" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("parallel");
+const results = await parallel(["slow", "fast"], item =>
+  agent("worker " + item, { label: item, provider: "slowpoke" })
+);
+return { results };`
+	scriptPath, err := WriteRunScript("wf-agent-timeout", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-agent-timeout", Task: "agent timeout", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10, MaxConcurrentAgents: 2, AgentTimeoutSeconds: 1}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, "worker fast") || !strings.Contains(result, "null") {
+		t.Fatalf("expected timed-out agent to become null while sibling completes, got %s", result)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 2 {
+		t.Fatalf("expected two agent records, got %+v", agents)
+	}
+	timedOut := 0
+	for _, agent := range agents {
+		if agent.Status == "failed" && strings.Contains(agent.Error, "workflow agent timed out after 1s") {
+			timedOut++
+		}
+	}
+	if timedOut != 1 {
+		t.Fatalf("expected one timed-out agent record, got %+v", agents)
+	}
+}
+
+func TestAgentTimeoutOptionFailsDirectCall(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_SLOWPOKE_COMMAND", `exec sleep 5`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `return await agent("slow direct", { label: "slow", provider: "slowpoke", timeout_seconds: 1 });`
+	scriptPath, err := WriteRunScript("wf-agent-timeout-direct", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-agent-timeout-direct", Task: "agent timeout direct", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), "workflow agent timed out after 1s") {
+		t.Fatalf("expected agent timeout error, got %v", err)
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Run.Status != "failed" {
+		t.Fatalf("expected failed run, got %+v", snapshot.Run)
+	}
+	if len(snapshot.Agents) != 1 || snapshot.Agents[0].Status != "failed" {
+		t.Fatalf("expected one failed agent, got %+v", snapshot.Agents)
+	}
+}
+
+func TestConfiguredProviderSchemaRetryCorrectsOutput(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("SCHEMA_MARKER", filepath.Join(tmp, "marker"))
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_FLAKY_COMMAND", `if [ -f "$SCHEMA_MARKER" ]; then if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q "schema validation"; then printf '{"summary":"corrected"}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"; else printf '{"summary":"missing-correction"}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"; fi; else touch "$SCHEMA_MARKER"; printf 'sure, here is the JSON you asked for' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"; fi`)
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("schema");
+return await agent("structured", {
+  label: "structured",
+  provider: "flaky",
+  schema: {
+    type: "object",
+    properties: { summary: { type: "string" } },
+    required: ["summary"]
+  }
+});`
+	scriptPath, err := WriteRunScript("wf-schema-retry", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-schema-retry", Task: "schema retry", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"summary": "corrected"`) {
+		t.Fatalf("expected corrective retry output, got %s", result)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].Status != "completed" {
+		t.Fatalf("expected one completed agent, got %+v", agents)
+	}
+}
+
+func TestConfiguredProviderSchemaRetryStillFailingIsNonFatalInParallel(t *testing.T) {
+	tmp := t.TempDir()
+	callLog := filepath.Join(tmp, "calls.log")
+	t.Setenv("SCHEMA_CALL_LOG", callLog)
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_PROSE_COMMAND", `echo call >> "$SCHEMA_CALL_LOG"; if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q bad; then printf 'not json at all' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"; else printf '{"summary":"good"}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"; fi`)
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("parallel");
+const results = await parallel(["good", "bad"], item =>
+  agent("worker " + item, {
+    label: item,
+    provider: "prose",
+    schema: {
+      type: "object",
+      properties: { summary: { type: "string" } },
+      required: ["summary"]
+    }
+  })
+);
+return { results };`
+	scriptPath, err := WriteRunScript("wf-schema-retry-fail", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-schema-retry-fail", Task: "schema retry fail", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10, MaxConcurrentAgents: 2}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"summary": "good"`) || !strings.Contains(result, "null") {
+		t.Fatalf("expected schema-failed agent to become null while sibling survives, got %s", result)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 2 {
+		t.Fatalf("expected two agent records, got %+v", agents)
+	}
+	failed := 0
+	for _, agent := range agents {
+		if agent.Status == "failed" && strings.Contains(agent.Error, "does not match schema") {
+			failed++
+		}
+	}
+	if failed != 1 {
+		t.Fatalf("expected one schema-failed agent record, got %+v", agents)
+	}
+	raw, err := os.ReadFile(callLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls := strings.Count(string(raw), "call"); calls != 3 {
+		t.Fatalf("expected exactly one corrective retry (3 provider calls total), got %d", calls)
+	}
+}
+
+func TestConfiguredProviderUsageFileOverridesCostEstimate(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_METERED_COMMAND", `printf '{"input_tokens":100,"output_tokens":50,"cost_usd":0.25}' > "$PALLIUM_WORKFLOW_USAGE_FILE"; printf '{"ok":true}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("usage");
+await agent("first metered", { label: "first", provider: "metered" });
+await agent("second metered", { label: "second", provider: "metered" });
+return "done";`
+	scriptPath, err := WriteRunScript("wf-usage", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-usage", Task: "usage", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10, MaxBudgetUSD: "0.20"}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), "budget exhausted") {
+		t.Fatalf("expected reported cost to exhaust budget, got %v", err)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 {
+		t.Fatalf("expected one agent record, got %+v", agents)
+	}
+	if agents[0].EstimatedCostUSD != 0.25 {
+		t.Fatalf("expected reported cost 0.25, got %+v", agents[0])
+	}
+	if agents[0].UsageJSON != `{"input_tokens":100,"output_tokens":50,"cost_usd":0.25}` {
+		t.Fatalf("expected raw usage json persisted, got %q", agents[0].UsageJSON)
+	}
+}
+
 func runGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)

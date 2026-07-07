@@ -33,6 +33,7 @@ type Runner struct {
 	CodexBinary         string
 	MaxConcurrentAgents int
 	PalliumBinary       string
+	AgentTimeoutSeconds int
 
 	mu             sync.Mutex
 	currentPhase   string
@@ -50,13 +51,14 @@ type Runner struct {
 }
 
 type AgentOptions struct {
-	Label     string         `json:"label,omitempty"`
-	Provider  string         `json:"provider,omitempty"`
-	Repo      string         `json:"repo,omitempty"`
-	Mode      string         `json:"mode,omitempty"`
-	Isolation string         `json:"isolation,omitempty"`
-	Schema    map[string]any `json:"schema,omitempty"`
-	Model     string         `json:"model,omitempty"`
+	Label          string         `json:"label,omitempty"`
+	Provider       string         `json:"provider,omitempty"`
+	Repo           string         `json:"repo,omitempty"`
+	Mode           string         `json:"mode,omitempty"`
+	Isolation      string         `json:"isolation,omitempty"`
+	Schema         map[string]any `json:"schema,omitempty"`
+	Model          string         `json:"model,omitempty"`
+	TimeoutSeconds *int           `json:"timeout_seconds,omitempty"`
 }
 
 type CheckOptions struct {
@@ -1094,9 +1096,14 @@ func (r *Runner) runAgentAtCallIndex(ctx context.Context, prompt string, opts Ag
 
 	agentCtx, stopWatching := r.contextWithStoredStop(ctx)
 	defer stopWatching()
-	output, patchPath, worktree, err := r.runAgentCommand(agentCtx, agent, opts)
+	output, patchPath, worktree, err := r.runAgentCommand(agentCtx, &agent, opts)
 	agent.PatchPath = patchPath
 	agent.Worktree = worktree
+	if delta := agent.EstimatedCostUSD - r.agentCostUSD; delta != 0 {
+		r.mu.Lock()
+		r.budgetSpent += delta
+		r.mu.Unlock()
+	}
 	if err != nil {
 		if normalized := r.normalizeInterruptError(agentCtx, err); isWorkflowInterruptedError(normalized) {
 			_ = r.Store.FinishAgentStatus(agent, interruptedStatus(normalized), output, interruptedMessage(normalized))
@@ -1685,7 +1692,31 @@ func numberToInt(value any) (int, bool) {
 	}
 }
 
-func (r *Runner) runAgentCommand(ctx context.Context, agent Agent, opts AgentOptions) (string, string, string, error) {
+func (r *Runner) agentTimeout(opts AgentOptions) time.Duration {
+	seconds := r.AgentTimeoutSeconds
+	if opts.TimeoutSeconds != nil {
+		seconds = *opts.TimeoutSeconds
+	}
+	if seconds <= 0 {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func agentCommandError(ctx context.Context, timeout time.Duration, err error) error {
+	if timeout > 0 && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("workflow agent timed out after %ds", int(timeout/time.Second))
+	}
+	return err
+}
+
+func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOptions) (string, string, string, error) {
+	timeout := r.agentTimeout(opts)
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
 	if stub := os.Getenv("PALLIUM_WORKFLOW_AGENT_STUB"); stub != "" {
 		if sequence := strings.TrimSpace(os.Getenv("PALLIUM_WORKFLOW_AGENT_STUB_SEQUENCE")); sequence != "" {
 			var values []string
@@ -1711,7 +1742,7 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent Agent, opts AgentOpt
 			select {
 			case <-time.After(time.Duration(ms) * time.Millisecond):
 			case <-ctx.Done():
-				return "", "", "", ctx.Err()
+				return "", "", "", agentCommandError(ctx, timeout, ctx.Err())
 			}
 		}
 		cwd := firstNonEmpty(agent.Repo, r.Run.CWD)
@@ -1767,9 +1798,24 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent Agent, opts AgentOpt
 		if command == "" {
 			return "", "", worktree, fmt.Errorf("workflow agent provider %q is not configured; set %s", provider, providerCommandEnvName(provider))
 		}
-		output, err := r.runConfiguredProviderCommand(ctx, command, tmpDir, outFile, cwd, agent, opts)
+		usageFile := filepath.Join(tmpDir, "usage.json")
+		output, err := r.runConfiguredProviderCommand(ctx, command, tmpDir, outFile, usageFile, cwd, agent.Prompt, agent, opts)
+		if err == nil && len(opts.Schema) > 0 {
+			if _, schemaErr := parseAgentOutputWithSchema(output, opts.Schema); schemaErr != nil {
+				_ = os.Remove(outFile)
+				if retryOutput, retryErr := r.runConfiguredProviderCommand(ctx, command, tmpDir, outFile, usageFile, cwd, buildSchemaRetryPrompt(agent.Prompt, schemaErr), agent, opts); retryErr == nil {
+					output = retryOutput
+				}
+			}
+		}
+		if raw, cost, hasCost := readAgentUsage(usageFile); raw != "" {
+			agent.UsageJSON = raw
+			if hasCost {
+				agent.EstimatedCostUSD = cost
+			}
+		}
 		if err != nil {
-			return output, "", worktree, err
+			return output, "", worktree, agentCommandError(ctx, timeout, err)
 		}
 		patchPath := ""
 		if worktree != "" {
@@ -1804,10 +1850,11 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent Agent, opts AgentOpt
 	cmdArgs = append(cmdArgs, agent.Prompt)
 	cmd := exec.CommandContext(ctx, r.CodexBinary, cmdArgs...)
 	cmd.Dir = cwd
+	cmd.WaitDelay = 5 * time.Second
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return "", "", worktree, fmt.Errorf("codex agent failed: %w: %s", err, strings.TrimSpace(stderr.String()))
+		return "", "", worktree, agentCommandError(ctx, timeout, fmt.Errorf("codex agent failed: %w: %s", err, strings.TrimSpace(stderr.String())))
 	}
 	raw, err := os.ReadFile(outFile)
 	if err != nil {
@@ -1824,9 +1871,9 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent Agent, opts AgentOpt
 	return output, patchPath, worktree, nil
 }
 
-func (r *Runner) runConfiguredProviderCommand(ctx context.Context, command, tmpDir, outFile, cwd string, agent Agent, opts AgentOptions) (string, error) {
+func (r *Runner) runConfiguredProviderCommand(ctx context.Context, command, tmpDir, outFile, usageFile, cwd, prompt string, agent *Agent, opts AgentOptions) (string, error) {
 	promptFile := filepath.Join(tmpDir, "prompt.txt")
-	if err := os.WriteFile(promptFile, []byte(agent.Prompt), 0o600); err != nil {
+	if err := os.WriteFile(promptFile, []byte(prompt), 0o600); err != nil {
 		return "", err
 	}
 	schemaFile := ""
@@ -1843,6 +1890,7 @@ func (r *Runner) runConfiguredProviderCommand(ctx context.Context, command, tmpD
 	}
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	cmd.Dir = cwd
+	cmd.WaitDelay = 5 * time.Second
 	cmd.Env = append(os.Environ(),
 		"PALLIUM_WORKFLOW_RUN_ID="+r.Run.ID,
 		"PALLIUM_WORKFLOW_AGENT_ID="+agent.ID,
@@ -1852,10 +1900,11 @@ func (r *Runner) runConfiguredProviderCommand(ctx context.Context, command, tmpD
 		"PALLIUM_WORKFLOW_MODEL="+agent.Model,
 		"PALLIUM_WORKFLOW_REPO="+agent.Repo,
 		"PALLIUM_WORKFLOW_CWD="+cwd,
-		"PALLIUM_WORKFLOW_PROMPT="+agent.Prompt,
+		"PALLIUM_WORKFLOW_PROMPT="+prompt,
 		"PALLIUM_WORKFLOW_PROMPT_FILE="+promptFile,
 		"PALLIUM_WORKFLOW_OUTPUT_FILE="+outFile,
 		"PALLIUM_WORKFLOW_SCHEMA_FILE="+schemaFile,
+		"PALLIUM_WORKFLOW_USAGE_FILE="+usageFile,
 	)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -1872,6 +1921,27 @@ func (r *Runner) runConfiguredProviderCommand(ctx context.Context, command, tmpD
 		return "", fmt.Errorf("workflow provider %q produced no output", agent.Provider)
 	}
 	return output, nil
+}
+
+func buildSchemaRetryPrompt(prompt string, schemaErr error) string {
+	return prompt +
+		"\n\nCORRECTION REQUIRED: your previous response failed schema validation: " + schemaErr.Error() +
+		"\nRespond again with bare JSON only that conforms to the provided schema. No prose, no markdown, no code fences."
+}
+
+func readAgentUsage(path string) (string, float64, bool) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", 0, false
+	}
+	var usage map[string]any
+	if json.Unmarshal(raw, &usage) != nil {
+		return "", 0, false
+	}
+	if cost, ok := usage["cost_usd"].(float64); ok && cost >= 0 {
+		return strings.TrimSpace(string(raw)), cost, true
+	}
+	return strings.TrimSpace(string(raw)), 0, false
 }
 
 func providerCommandEnvName(provider string) string {
