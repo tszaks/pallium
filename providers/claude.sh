@@ -28,28 +28,40 @@ if [ -n "${PALLIUM_WORKFLOW_MODEL:-}" ]; then
   MODEL_ARGS=(--model "$PALLIUM_WORKFLOW_MODEL")
 fi
 
-# Mode mapping. read-only gets read/search tools; edit/test/check additionally
-# get file edits (auto-accepted, contained to the workspace Pallium set as cwd)
-# and a narrow Go/JS/Python toolchain allowlist. Adjust for your stack.
+# Mode mapping. Only "edit" agents run in an isolated worktree (per Pallium's
+# runtime), so only "edit" gets file-write tools. "test"/"check"/"read-only"
+# all execute against the live checkout and must never be able to mutate it —
+# they get a read/search + test-runner toolchain allowlist, plus an explicit
+# --disallowedTools denylist so a user's global Claude Code permission-mode
+# default (acceptEdits/auto/bypassPermissions) can't grant edits anyway.
+# Adjust the allowlist for your stack.
+READ_TOOLS="Read,Grep,Glob,LS,Bash(ls:*),Bash(cat:*),Bash(grep:*),Bash(rg:*),Bash(find:*),Bash(wc:*),Bash(go doc:*)"
+TEST_TOOLS="$READ_TOOLS,Bash(go test:*),Bash(go build:*),Bash(go vet:*),Bash(gofmt:*),Bash(npm test:*),Bash(npx:*),Bash(pytest:*)"
+EDIT_TOOLS="$TEST_TOOLS,Edit,Write"
 case "${PALLIUM_WORKFLOW_MODE:-read-only}" in
-  edit|test|check)
-    PERM_ARGS=(--permission-mode acceptEdits --allowedTools "Read,Grep,Glob,LS,Edit,Write,Bash(go test:*),Bash(go build:*),Bash(go vet:*),Bash(gofmt:*),Bash(npm test:*),Bash(npx:*),Bash(pytest:*),Bash(ls:*),Bash(cat:*),Bash(grep:*),Bash(rg:*),Bash(find:*),Bash(wc:*)")
+  edit)
+    PERM_ARGS=(--permission-mode acceptEdits --allowedTools "$EDIT_TOOLS")
+    ;;
+  test|check)
+    PERM_ARGS=(--allowedTools "$TEST_TOOLS" --disallowedTools "Edit,Write,NotebookEdit")
     ;;
   *)
-    PERM_ARGS=(--allowedTools "Read,Grep,Glob,LS,Bash(ls:*),Bash(cat:*),Bash(grep:*),Bash(rg:*),Bash(find:*),Bash(wc:*),Bash(go doc:*)")
+    PERM_ARGS=(--allowedTools "$READ_TOOLS" --disallowedTools "Edit,Write,NotebookEdit")
     ;;
 esac
 
 # JSON envelope gives us the result text plus token usage in one call.
 RAW=$(claude -p "$PROMPT" --output-format json ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} ${PERM_ARGS[@]+"${PERM_ARGS[@]}"} 2>/dev/null)
 
-printf '%s' "$RAW" | python3 - <<'PY'
+CLAUDE_PROVIDER_RAW="$RAW" python3 - <<'PY'
 import json
 import os
 import re
-import sys
 
-raw = sys.stdin.read().strip()
+# NOTE: read RAW from an env var, not stdin — this script body is itself
+# fed to `python3 -` via a heredoc, so stdin is already consumed by the
+# heredoc redirection and would read back empty.
+raw = os.environ.get("CLAUDE_PROVIDER_RAW", "").strip()
 result = raw
 usage = None
 try:
@@ -74,17 +86,22 @@ fence = re.match(r"^```(?:json)?\s*(.*?)\s*```\s*$", text, re.S)
 if fence:
     text = fence.group(1)
 
-# When a schema is expected, extract the outermost JSON object even if the
-# model wrapped it in prose, so Pallium's validation sees bare JSON.
-if os.environ.get("PALLIUM_WORKFLOW_SCHEMA_FILE") and not text.startswith("{"):
-    start, end = text.find("{"), text.rfind("}")
-    if start != -1 and end > start:
-        candidate = text[start:end + 1]
-        try:
-            json.loads(candidate)
-            text = candidate
-        except (json.JSONDecodeError, ValueError):
-            pass
+# When a schema is expected, try the whole response as JSON first; if that
+# fails (e.g. trailing prose after a valid object, like `{...}\nDone.`),
+# extract the outermost {...} substring and validate that instead, so
+# Pallium's validation sees bare JSON either way.
+if os.environ.get("PALLIUM_WORKFLOW_SCHEMA_FILE"):
+    try:
+        json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        start, end = text.find("{"), text.rfind("}")
+        if start != -1 and end > start:
+            candidate = text[start:end + 1]
+            try:
+                json.loads(candidate)
+                text = candidate
+            except (json.JSONDecodeError, ValueError):
+                pass
 
 with open(os.environ["PALLIUM_WORKFLOW_OUTPUT_FILE"], "w") as f:
     f.write(text)
