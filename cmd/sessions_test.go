@@ -79,6 +79,34 @@ func TestSessionsStatsHelpDoesNotReadStats(t *testing.T) {
 	}
 }
 
+func TestSessionsSearchQueryContainingHelpRunsSearch(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	var out bytes.Buffer
+	if err := runSessions(&out, []string{"search", "help", "with", "auth"}, true); err != nil {
+		t.Fatalf("search failed: %v", err)
+	}
+	if strings.Contains(out.String(), "pallium sessions") {
+		t.Fatalf("expected search results, got help output: %q", out.String())
+	}
+}
+
+func TestSessionsSearchBareHelpShowsHelp(t *testing.T) {
+	var out bytes.Buffer
+	if err := runSessions(&out, []string{"search", "help"}, false); err != nil {
+		t.Fatalf("help returned error: %v", err)
+	}
+	if !strings.Contains(out.String(), "pallium sessions") {
+		t.Fatalf("expected sessions help, got %q", out.String())
+	}
+	out.Reset()
+	if err := runSessions(&out, []string{"search", "-h"}, false); err != nil {
+		t.Fatalf("-h returned error: %v", err)
+	}
+	if !strings.Contains(out.String(), "pallium sessions") {
+		t.Fatalf("expected sessions help, got %q", out.String())
+	}
+}
+
 func TestSessionFlagsCanFollowPositionals(t *testing.T) {
 	fs := newSessionFlagSet("test")
 	limit := fs.Int("limit", 10, "")

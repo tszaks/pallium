@@ -48,6 +48,68 @@ func TestWorkingTreeChanges(t *testing.T) {
 	}
 }
 
+func TestChangedFilesBetweenUnescapesNonASCIIPaths(t *testing.T) {
+	repo := initTempRepo(t)
+
+	writeFile(t, filepath.Join(repo, "naïve.txt"), "naïve\n")
+	run(t, repo, "git", "add", ".")
+	run(t, repo, "git", "commit", "-m", "feat: add naïve file")
+
+	files, err := ChangedFilesBetween(repo, "HEAD~1", "HEAD")
+	if err != nil {
+		t.Fatalf("ChangedFilesBetween failed: %v", err)
+	}
+
+	if len(files) != 1 || files[0] != "naïve.txt" {
+		t.Fatalf("expected exactly [naïve.txt], got %#v", files)
+	}
+}
+
+func TestWorkingTreeChangesUnquotesPathsWithSpaces(t *testing.T) {
+	repo := initTempRepo(t)
+
+	writeFile(t, filepath.Join(repo, "my file.txt"), "hello\n")
+
+	files, err := WorkingTreeChanges(repo)
+	if err != nil {
+		t.Fatalf("WorkingTreeChanges failed: %v", err)
+	}
+
+	if len(files) != 1 {
+		t.Fatalf("expected 1 working tree change, got %#v", files)
+	}
+	if files[0].Path != "my file.txt" {
+		t.Fatalf("expected path %q, got %q", "my file.txt", files[0].Path)
+	}
+	if files[0].Status != "??" {
+		t.Fatalf("expected status ??, got %q", files[0].Status)
+	}
+}
+
+func TestWorkingTreeChangesHandlesRenames(t *testing.T) {
+	repo := initTempRepo(t)
+
+	writeFile(t, filepath.Join(repo, "old.txt"), "some stable content for rename detection\n")
+	run(t, repo, "git", "add", ".")
+	run(t, repo, "git", "commit", "-m", "feat: add old file")
+	run(t, repo, "git", "mv", "old.txt", "new file.txt")
+
+	files, err := WorkingTreeChanges(repo)
+	if err != nil {
+		t.Fatalf("WorkingTreeChanges failed: %v", err)
+	}
+
+	if len(files) != 1 {
+		t.Fatalf("expected 1 working tree change, got %#v", files)
+	}
+	if files[0].Path != "new file.txt" {
+		t.Fatalf("expected renamed path %q, got %q", "new file.txt", files[0].Path)
+	}
+	if files[0].Status != "R" {
+		t.Fatalf("expected status R, got %q", files[0].Status)
+	}
+}
+
 func TestWorkingTreeChangesExpandsUntrackedDirectories(t *testing.T) {
 	repo := initTempRepo(t)
 

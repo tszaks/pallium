@@ -45,12 +45,33 @@ func (i *Indexer) Run() (Result, error) {
 	}
 
 	indexedAt := time.Now().UTC()
-	repo, err := i.Store.UpsertRepo(branch, lastIndexedCommit, indexedAt)
+
+	// A single transaction keeps reindexing atomic: last_indexed_commit is
+	// only recorded when the repopulated data commits along with it.
+	var result Result
+	err = i.Store.WithTx(func(tx *db.Store) error {
+		var txErr error
+		result, txErr = repopulate(tx, branch, lastIndexedCommit, indexedAt, commits)
+		return txErr
+	})
+	if err != nil {
+		return Result{}, err
+	}
+	return result, nil
+}
+
+type edgeKey struct {
+	source  string
+	related string
+}
+
+func repopulate(store *db.Store, branch, lastIndexedCommit string, indexedAt time.Time, commits []gitlog.Commit) (Result, error) {
+	repo, err := store.UpsertRepo(branch, lastIndexedCommit, indexedAt)
 	if err != nil {
 		return Result{}, err
 	}
 
-	if err := i.Store.ResetRepoData(repo.ID); err != nil {
+	if err := store.ResetRepoData(repo.ID); err != nil {
 		return Result{}, err
 	}
 
@@ -59,10 +80,10 @@ func (i *Indexer) Run() (Result, error) {
 	authors := make(map[string]map[string]struct{})
 	lastTouched := make(map[string]time.Time)
 	threshold := indexedAt.AddDate(0, 0, -30)
-	edges := make(map[string]db.CochangeEdge)
+	edges := make(map[edgeKey]db.CochangeEdge)
 
 	for _, commit := range commits {
-		if err := i.Store.InsertCommit(repo.ID, db.CommitRecord{
+		if err := store.InsertCommit(repo.ID, db.CommitRecord{
 			SHA:         commit.SHA,
 			AuthorName:  commit.AuthorName,
 			AuthorEmail: commit.AuthorEmail,
@@ -73,7 +94,7 @@ func (i *Indexer) Run() (Result, error) {
 			return Result{}, err
 		}
 
-		if err := i.Store.UpsertDecisionNote(repo.ID, db.DecisionNote{
+		if err := store.UpsertDecisionNote(repo.ID, db.DecisionNote{
 			SourceType:  "git",
 			SourceRef:   commit.SHA,
 			Title:       commit.Subject,
@@ -97,7 +118,7 @@ func (i *Indexer) Run() (Result, error) {
 				lastTouched[filePath] = commit.CommittedAt
 			}
 
-			if err := i.Store.InsertFileCommit(repo.ID, filePath, commit.SHA, commit.CommittedAt); err != nil {
+			if err := store.InsertFileCommit(repo.ID, filePath, commit.SHA, commit.CommittedAt); err != nil {
 				return Result{}, err
 			}
 		}
@@ -108,7 +129,7 @@ func (i *Indexer) Run() (Result, error) {
 					continue
 				}
 
-				key := source + "::" + related
+				key := edgeKey{source: source, related: related}
 				edge := edges[key]
 				edge.SourcePath = source
 				edge.RelatedPath = related
@@ -125,11 +146,11 @@ func (i *Indexer) Run() (Result, error) {
 
 	fileCount := 0
 	for filePath, churnScore := range churn {
-		absPath := filepath.Join(i.Store.RepoRoot, filepath.FromSlash(filePath))
+		absPath := filepath.Join(store.RepoRoot, filepath.FromSlash(filePath))
 		_, statErr := os.Stat(absPath)
 		exists := statErr == nil
 
-		if err := i.Store.UpsertFile(repo.ID, db.FileStat{
+		if err := store.UpsertFile(repo.ID, db.FileStat{
 			Path:             filePath,
 			Extension:        strings.TrimPrefix(filepath.Ext(filePath), "."),
 			ChurnScore:       churnScore,
@@ -144,13 +165,13 @@ func (i *Indexer) Run() (Result, error) {
 	}
 
 	for _, edge := range edges {
-		if err := i.Store.UpsertEdge(repo.ID, edge); err != nil {
+		if err := store.UpsertEdge(repo.ID, edge); err != nil {
 			return Result{}, err
 		}
 	}
 
 	return Result{
-		RepoRoot:          i.Store.RepoRoot,
+		RepoRoot:          store.RepoRoot,
 		Branch:            branch,
 		CommitCount:       len(commits),
 		FileCount:         fileCount,

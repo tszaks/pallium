@@ -45,7 +45,13 @@ func inferredVerificationPlan(repoRoot, normalized string, tests []string) Verif
 	plan := VerificationPlan{}
 
 	if strings.HasSuffix(normalized, ".go") || hasGoTests(tests) {
-		packageDir := filepath.ToSlash(filepath.Dir(normalized))
+		packageSource := normalized
+		if !strings.HasSuffix(normalized, ".go") {
+			packageSource = firstMatchingPath(tests, func(path string) bool {
+				return strings.HasSuffix(path, "_test.go")
+			})
+		}
+		packageDir := filepath.ToSlash(filepath.Dir(packageSource))
 		if packageDir == "." {
 			plan.Fast = append(plan.Fast, "go test .")
 			plan.Safe = append(plan.Safe, "go test .")
@@ -54,11 +60,6 @@ func inferredVerificationPlan(repoRoot, normalized string, tests []string) Verif
 			plan.Fast = append(plan.Fast, packageCmd)
 			plan.Safe = append(plan.Safe, packageCmd)
 		}
-		plan.Full = append(plan.Full, "go test ./...")
-		return normalizeVerificationPlan(plan)
-	}
-
-	if strings.HasSuffix(normalized, ".go") {
 		plan.Full = append(plan.Full, "go test ./...")
 		return normalizeVerificationPlan(plan)
 	}

@@ -426,6 +426,111 @@ func TestWorkflowTriggerOnChangedSkipsUnchangedRepo(t *testing.T) {
 	}
 }
 
+func TestWorkflowTriggerOnChangedFailedRunKeepsFingerprint(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"status":"ok","prompt":"{{PROMPT}}"}`)
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	scriptPath := filepath.Join(t.TempDir(), "trigger-workflow.js")
+
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{"trigger", "add", "broken-review", "review changes", "--kind", "on-changed", "--script", scriptPath, "--db", dbPath, "--cwd", tmp}, true); err != nil {
+		t.Fatalf("trigger add failed: %v", err)
+	}
+	out.Reset()
+	if err := runWorkflow(&out, []string{"trigger", "run", "broken-review", "--id", "wf-broken-1", "--db", dbPath}, true); err == nil {
+		t.Fatalf("expected trigger run with missing script to fail, got %s", out.String())
+	}
+	out.Reset()
+	if err := runWorkflow(&out, []string{"trigger", "show", "broken-review", "--db", dbPath}, true); err != nil {
+		t.Fatalf("trigger show failed: %v", err)
+	}
+	var trigger map[string]any
+	if err := json.Unmarshal(out.Bytes(), &trigger); err != nil {
+		t.Fatalf("decode trigger: %v\n%s", err, out.String())
+	}
+	if fingerprint := trigger["last_fingerprint"]; fingerprint != nil && fingerprint != "" {
+		t.Fatalf("expected fingerprint unset after failed run, got %#v", trigger)
+	}
+	if err := os.WriteFile(scriptPath, []byte(`phase("scan");
+const result = agent("scan repo", { label: "scanner" });
+return { result };`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := runWorkflow(&out, []string{"trigger", "run", "broken-review", "--id", "wf-broken-2", "--db", dbPath}, true); err != nil {
+		t.Fatalf("retry trigger run failed: %v", err)
+	}
+	var snapshot map[string]any
+	if err := json.Unmarshal(out.Bytes(), &snapshot); err != nil {
+		t.Fatalf("decode retry run: %v\n%s", err, out.String())
+	}
+	if snapshot["skipped"] == true {
+		t.Fatalf("expected retry to fire instead of skipping, got %#v", snapshot)
+	}
+	run := snapshot["run"].(map[string]any)
+	if run["id"] != "wf-broken-2" {
+		t.Fatalf("expected retry run after failed launch, got %#v", snapshot)
+	}
+}
+
+func TestWorkflowTriggerMidRunFailureConsumesFingerprint(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"status":"ok","prompt":"{{PROMPT}}"}`)
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	scriptPath := filepath.Join(t.TempDir(), "trigger-workflow.js")
+	if err := os.WriteFile(scriptPath, []byte(`throw new Error("mid-run failure");`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{"trigger", "add", "midrun-review", "review changes", "--kind", "on-changed", "--script", scriptPath, "--db", dbPath, "--cwd", tmp}, true); err != nil {
+		t.Fatalf("trigger add failed: %v", err)
+	}
+	out.Reset()
+	if err := runWorkflow(&out, []string{"trigger", "run", "midrun-review", "--id", "wf-midrun-1", "--db", dbPath}, true); err == nil {
+		t.Fatalf("expected trigger run with throwing script to fail, got %s", out.String())
+	}
+	out.Reset()
+	if err := runWorkflow(&out, []string{"trigger", "run", "midrun-review", "--id", "wf-midrun-2", "--db", dbPath}, true); err != nil {
+		t.Fatalf("second trigger run failed: %v\n%s", err, out.String())
+	}
+	var snapshot map[string]any
+	if err := json.Unmarshal(out.Bytes(), &snapshot); err != nil {
+		t.Fatalf("decode second run: %v\n%s", err, out.String())
+	}
+	if snapshot["skipped"] != true {
+		t.Fatalf("expected second cycle to skip as unchanged after mid-run failure, got %#v", snapshot)
+	}
+}
+
+func TestWorkflowHelpTopicShowsHelp(t *testing.T) {
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{"help", "generate"}, false); err != nil {
+		t.Fatalf("workflow help returned error: %v", err)
+	}
+	if !strings.Contains(out.String(), "pallium workflow") {
+		t.Fatalf("expected workflow help output, got %q", out.String())
+	}
+}
+
 func TestWorkflowHTTPAPI(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_SEQUENCE", `[
 		"{\"summary\":\"api\",\"steps\":[],\"risks\":[]}",
