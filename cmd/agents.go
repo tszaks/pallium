@@ -23,7 +23,7 @@ const agentsBlock = agentsBlockBegin + "\n" +
 	"\n" +
 	"Reach for it when a task is multi-step, needs tests objectively green, wants parallel workers, must survive the session, or needs isolated reviewable edits. Skip it for one-shot edits.\n" +
 	"\n" +
-	"- Scope first: `pallium preflight \"<task>\"` (files to inspect, risk, test commands)\n" +
+	"- Scope first: `pallium workflow preflight \"<task>\"` (files to inspect, risk, test commands)\n" +
 	"- Orchestrate: write an async-JS workflow, then `pallium workflow validate f.js && pallium workflow run --script f.js \"<task>\" --json`\n" +
 	"- Primitives: `agent()` (schema-validated workers), `pipeline()` (streaming stages), `parallel()` (barrier), `verify.untilGreen()`, `gate()` — discover all with `pallium workflow tools list --json`\n" +
 	"- Resume and inspect: `pallium workflow resume|inspect|report <run-id>`\n" +

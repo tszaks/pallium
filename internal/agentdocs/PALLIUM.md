@@ -20,18 +20,18 @@ Do NOT use Pallium for a one-shot edit, a quick question, or exploration you can
 ## Mental model: five capabilities
 
 1. **Workflows** (`pallium workflow run --script f.js "task"`) — you write async JavaScript as the conductor; Pallium spawns provider-backed workers, streams items through `pipeline()`, fans out with `parallel()`, validates structured output against JSON Schemas, caches completed calls for resume, and persists everything in SQLite. This is the flagship. Discover primitives with `pallium workflow tools list --json`.
-2. **Repo memory** (`pallium preflight`, `pallium safe <path>`, `pallium changed-now`, `pallium neighbors`) — static index answering "what does this change touch, how risky is it, which tests cover it" before you fan out.
+2. **Repo memory** (`pallium workflow preflight`, `pallium safe <path>`, `pallium changed-now`, `pallium neighbors`) — static index answering "what does this change touch, how risky is it, which tests cover it" before you fan out.
 3. **Verification** (`pallium verify fast|safe|full`, `verify.untilGreen(cmd)` inside workflows) — objective test-fix loops with stall detection.
 4. **Session memory** (`pallium sessions`, `pallium decisions`, `pallium handoff`) — what happened in previous agent runs, durable decision log, structured handoffs between agents.
 5. **Safe execution** — edit-mode workers run in isolated git worktrees; patches are secret-scanned before applying; `pallium workflow revert` undoes an applied run.
 
 ## The recommended pattern
 
-1. Scope first: `pallium preflight "<task>"` to get files-to-inspect, risk, and test commands.
+1. Scope first: `pallium workflow preflight "<task>"` to get files-to-inspect, risk, and test commands.
 2. Write a workflow script (see `examples/workflows/` for commented recipes, or `pallium workflow template list`).
 3. Validate, then run: `pallium workflow validate f.js && pallium workflow run --script f.js "<task>" --json`.
 4. Inside the script: `pipeline()` for multi-stage per-item work (default), `parallel()` only when the next step needs the full set, `verify.untilGreen()` before declaring edits done, `gate()` for autonomous approval checkpoints.
-5. Afterward: `pallium workflow report <run-id> --json` for findings, `pallium decisions record` for choices worth remembering, `pallium handoff` if another agent continues.
+5. Afterward: `pallium workflow report <run-id> --json` for findings, `await pallium.decisions.record(title, body, ...tags)` inside a workflow script for choices worth remembering, `pallium handoff` if another agent continues.
 
 ## Decision table
 

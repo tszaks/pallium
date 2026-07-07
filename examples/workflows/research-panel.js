@@ -1,6 +1,9 @@
 // Judge panel: independent angles analyzed in parallel, judged, synthesized.
 // Use when the question is wide and one perspective would miss things.
-// Run: pallium workflow run --script examples/workflows/research-panel.js "how should we shard the store?"
+// Run: pallium workflow run --script examples/workflows/research-panel.js "how should we shard the store?" --args '{"question":"how should we shard the store?"}'
+// Note: the positional task string only becomes run metadata (visible via
+// `pallium workflow inspect`) — it is NOT injected into the script's `args`
+// global. Pass the question through --args as well so `args?.question` resolves.
 export const meta = {
   name: "research-panel",
   description: "Parallel perspective analysis, judged and synthesized",

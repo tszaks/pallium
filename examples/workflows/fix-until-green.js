@@ -1,46 +1,43 @@
-// Fix with objective verification: scoped edit workers, then a test-fix loop
-// that only ends when the suite is green (or provably stalled), then a gate.
-// Run: pallium workflow run --script examples/workflows/fix-until-green.js "fix the failing date parser" --json
+// Fix with objective verification: repo-memory scoping, then a single
+// test-fix loop that only ends when the suite is green (or provably
+// stalled), then a gate. verify.untilGreen() is the sole fix+verify
+// mechanism here — see the note in the "verify" phase for why a separate
+// standalone edit-mode fix agent does NOT chain correctly with it.
+// Run: pallium workflow run --script examples/workflows/fix-until-green.js "fix the failing date parser" --args '{"task":"fix the failing date parser","test_command":"go test ./..."}' --json
+// Note: the positional task string only becomes run metadata (visible via
+// `pallium workflow inspect`) — it is NOT injected into the script's `args`
+// global. Pass task/test_command through --args as well so `args?.task` and
+// `args?.test_command` resolve.
 export const meta = {
   name: "fix-until-green",
-  description: "Scoped edit agents, verify.untilGreen loop, safety gate",
-  phases: ["scope", "fix", "verify", "gate"],
+  description: "Repo-memory scoping, verify.untilGreen fix+verify loop, safety gate",
+  phases: ["scope", "verify", "gate"],
 };
 
 const task = args?.task ?? "Fix the reported defect";
 const testCommand = args?.test_command ?? "go test ./...";
 
 phase("scope");
+// Repo memory narrows what matters before the fix loop starts; it does not
+// make any edits itself.
 const preflight = await pallium.preflight(task);
-
-phase("fix");
-// Edit-mode workers run in isolated worktrees; their patches auto-apply
-// only after the whole run completes successfully.
-const fix = await agent(
-  `${task}\n\nScope from repo analysis: ${JSON.stringify(preflight.files_to_inspect ?? [])}\n` +
-    `Make the smallest correct change and add a regression test that fails without the fix.`,
-  {
-    label: "fix",
-    mode: "edit",
-    schema: {
-      type: "object",
-      properties: {
-        status: { type: "string", enum: ["fixed", "failed"] },
-        files_changed: { type: "array", items: { type: "string" } },
-        notes: { type: "string" },
-      },
-      required: ["status", "files_changed", "notes"],
-    },
-  },
-);
-log("fix agent:", fix.status);
+log("scoped files:", (preflight.files_to_inspect ?? []).length);
 
 phase("verify");
-// Objective loop: check agent runs the command, fix agent repairs failures,
-// stall detection breaks repeats. Never trust "done" without this.
+// Edit-mode agents (mode: "edit") run in isolated worktrees; their patches
+// are only applied to the real repo after this whole script returns
+// successfully (see internal/workflow/runtime.go ApplyPatches). That means
+// a standalone edit-mode "fix" agent run before verify.untilGreen would be
+// invisible to untilGreen's check step, which runs directly against the
+// real repo. So verify.untilGreen must be the sole fix+verify mechanism:
+// its internal loop repeats check (mode: "test") and fix (mode: "edit",
+// isolated worktree) rounds against the failing command itself, with stall
+// detection, until it converges or gives up.
 const green = await verify.untilGreen(testCommand, { maxRounds: 3, label: "tests" });
 if (!green.ok) {
-  log("verification did not converge:", JSON.stringify(green));
+  // Fail before the gate/return so no patches are applied on an
+  // unverified or still-failing result.
+  throw new Error("verification did not converge: " + JSON.stringify(green));
 }
 
 phase("gate");
@@ -49,4 +46,4 @@ await gate("patch-safety", "Verify the produced patches before they apply", {
   criteria: "tests pass, no secrets introduced, change scope matches the task",
 });
 
-return { fix, green };
+return { green };
