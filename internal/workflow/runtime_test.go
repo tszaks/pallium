@@ -1040,6 +1040,42 @@ return { results };`
 	}
 }
 
+func TestParallelMapperFatalErrorAbortsRun(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	// "drop" throws an ordinary error and must still be nulled out, but "fatal"
+	// synchronously calls verify.untilGreen(), which runs an agent past the
+	// MaxAgents cap (already exhausted by the earlier warmup agent() call).
+	// That fatal error must propagate and fail the whole run instead of being
+	// swallowed into a null result.
+	script := `phase("parallel-fatal");
+agent("warmup");
+const results = await parallel(["drop", "fatal"], item => {
+  if (item === "drop") {
+    throw new Error("drop this item");
+  }
+  return verify.untilGreen("stub-check", { maxRounds: 0 });
+});
+return { results };`
+	scriptPath, err := WriteRunScript("wf-parallel-fatal", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-parallel-fatal", Task: "parallel fatal", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 1}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), "exceeded max agents") {
+		t.Fatalf("expected fatal mapper error to abort the run, got %v", err)
+	}
+}
+
 func TestWorkflowCollectionItemLimit(t *testing.T) {
 	tmp := t.TempDir()
 	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
