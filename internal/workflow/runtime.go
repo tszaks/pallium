@@ -801,6 +801,9 @@ func (r *Runner) jsParallel(ctx context.Context, vm *goja.Runtime) func(goja.Fun
 				callStart := len(capture.Calls)
 				value, err := mapper(goja.Undefined(), item, vm.ToValue(i))
 				if err != nil {
+					if isWorkflowFatalAgentError(err) {
+						panic(vm.ToValue(err.Error()))
+					}
 					capture.Calls = capture.Calls[:callStart]
 					rawResults = append(rawResults, nil)
 					continue
