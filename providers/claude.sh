@@ -43,12 +43,14 @@ fi
 # was dropped entirely (its own `-delete`/`-exec` actions can remove or run
 # arbitrary things, and no `Bash(find ...:*)` prefix can rule that out since
 # the flags can be appended after any fixed prefix — use the built-in Glob
-# tool for file-finding instead) and so was `gofmt -l` (the same problem:
-# `gofmt -l -w .` still matches a `Bash(gofmt -l:*)` prefix and writes files,
-# so there's no safe prefix-based way to allow gofmt without also allowing
-# `-w`). The old blanket `npx:*` entry was dropped for the same reason: npx
-# executes arbitrary, possibly unpinned/unaudited packages. Add a narrower,
-# genuinely non-mutating entry only if you've confirmed it can't be abused.
+# tool for file-finding instead), so was `gofmt -l` (the same problem:
+# `gofmt -l -w .` still matches a `Bash(gofmt -l:*)` prefix and writes files),
+# and so was `rg` (ripgrep's own `--pre COMMAND` runs an arbitrary command
+# per matched file — e.g. `rg --pre rm pattern .` — same unfixable-by-prefix
+# problem; the built-in Grep tool already covers content search). The old
+# blanket `npx:*` entry was dropped for the same reason: npx executes
+# arbitrary, possibly unpinned/unaudited packages. Add a narrower, genuinely
+# non-mutating entry only if you've confirmed it can't be abused.
 #
 # --allowedTools/--disallowedTools alone also can't protect against a
 # checked-in project or user Claude config that has already pre-approved a
@@ -68,22 +70,46 @@ fi
 # project's `.claude/settings.json` or a `.claude/settings.local.json` in
 # the checkout, so a malicious/compromised repo can't inject either a Bash
 # allow rule or a hook into a "read-only" session. `--safe-mode` adds a
-# second layer disabling hooks/plugins/custom commands generally (verified
-# locally: a SessionStart hook that touches a file did not fire with either
-# flag present; a `.claude/settings.json` Bash allow rule was not even read
-# with --setting-sources user, vs. merely "ignored" — and only in an
-# untrusted workspace — with --safe-mode alone).
+# second layer disabling hooks/plugins/custom commands generally.
+#
+# `--permission-mode plan` is also required here, and this reverses an
+# earlier decision in this file to avoid it. Verified empirically: even
+# with --tools/--strict-mcp-config/--setting-sources/--disallowedTools all
+# present, if the *effective* permission mode ends up being something
+# permissive (e.g. the invoking user's own ~/.claude/settings.json sets
+# permissions.defaultMode to bypassPermissions or auto — a setting
+# --setting-sources user deliberately still honors, since it's the user's
+# own trusted config), an out-of-allowlist Bash command (e.g. a bare
+# `touch file`) still executes; --disallowedTools alone does not stop this
+# because it only denies the tools explicitly listed there (Edit/Write/
+# NotebookEdit), not arbitrary Bash. --permission-mode plan is the only
+# mode that reliably fails an unapproved action closed regardless of the
+# effective default: verified it still runs already-allowlisted commands
+# normally (a plain read-only query, and an allowlisted `go vet` test
+# command, both completed and returned real output), while a request to
+# write an unapproved file was refused with a plain-text explanation
+# instead of executing. `manual`/`dontAsk`/`default` were all tested and do
+# NOT reliably block this the same way.
 # Adjust the allowlist for your stack.
-READ_TOOLS="Read,Grep,Glob,LS,Bash(ls:*),Bash(cat:*),Bash(grep:*),Bash(rg:*),Bash(wc:*),Bash(go doc:*)"
+READ_TOOLS="Read,Grep,Glob,LS,Bash(ls:*),Bash(cat:*),Bash(grep:*),Bash(wc:*),Bash(go doc:*)"
 TEST_TOOLS="$READ_TOOLS,Bash(go test:*),Bash(go build:*),Bash(go vet:*),Bash(npm test:*),Bash(pytest:*)"
 EDIT_TOOLS="$TEST_TOOLS,Edit,Write"
 NON_EDIT_HARD_TOOLS="Read,Grep,Glob,LS,Bash"
-NON_EDIT_ISOLATION_ARGS=(--safe-mode --setting-sources user --tools "$NON_EDIT_HARD_TOOLS" --strict-mcp-config)
+NON_EDIT_ISOLATION_ARGS=(--safe-mode --setting-sources user --permission-mode plan --tools "$NON_EDIT_HARD_TOOLS" --strict-mcp-config)
 case "${PALLIUM_WORKFLOW_MODE:-read-only}" in
   edit)
     PERM_ARGS=(--permission-mode acceptEdits --allowedTools "$EDIT_TOOLS")
     ;;
   test|check)
+    # NOTE: go test/npm test/pytest execute the repo's own test code, which
+    # is inherently capable of doing anything the language runtime can do
+    # (writing files, deleting things, network calls) — that's true of any
+    # test suite, isolated or not, and no allowlist or permission-mode can
+    # change it without breaking the ability to actually run the tests.
+    # Isolation (isolation: "worktree") limits the blast radius by giving
+    # the run a disposable checkout; it doesn't and can't limit the test
+    # code itself. Only use test/check against repos whose test code you
+    # trust, and prefer isolation: "worktree" for anything you don't.
     PERM_ARGS=("${NON_EDIT_ISOLATION_ARGS[@]}" --allowedTools "$TEST_TOOLS" --disallowedTools "Edit,Write,NotebookEdit")
     ;;
   *)
