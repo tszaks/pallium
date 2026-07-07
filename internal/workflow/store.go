@@ -28,6 +28,7 @@ type Run struct {
 	OwnedID       string       `json:"owned_session_id,omitempty"`
 	MaxAgents     int          `json:"max_agents,omitempty"`
 	MaxBudgetUSD  string       `json:"max_budget_usd,omitempty"`
+	AgentTimeout  int          `json:"agent_timeout_seconds,omitempty"`
 	Status        string       `json:"status"`
 	Result        string       `json:"result,omitempty"`
 	Error         string       `json:"error,omitempty"`
@@ -130,6 +131,7 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
   owned_session_id TEXT,
   max_agents INTEGER DEFAULT 0,
   max_budget_usd TEXT,
+  agent_timeout_seconds INTEGER DEFAULT 0,
   status TEXT NOT NULL,
   result TEXT,
   error TEXT,
@@ -232,6 +234,7 @@ CREATE INDEX IF NOT EXISTS idx_workflow_gates_run ON workflow_gates(run_id, open
 		"ALTER TABLE workflow_agents ADD COLUMN usage_json TEXT",
 		"ALTER TABLE workflow_runs ADD COLUMN max_agents INTEGER DEFAULT 0",
 		"ALTER TABLE workflow_runs ADD COLUMN max_budget_usd TEXT",
+		"ALTER TABLE workflow_runs ADD COLUMN agent_timeout_seconds INTEGER DEFAULT 0",
 		"ALTER TABLE workflow_runs ADD COLUMN failures TEXT",
 		"ALTER TABLE workflow_runs ADD COLUMN script_hash TEXT",
 		"ALTER TABLE workflow_runs ADD COLUMN script_changed INTEGER DEFAULT 0",
@@ -278,8 +281,8 @@ func (s *Store) CreateRun(run Run) (Run, error) {
 	if run.UpdatedAt == "" {
 		run.UpdatedAt = run.CreatedAt
 	}
-	_, err := s.db.Exec(`INSERT INTO workflow_runs(id,task,cwd,script_path,args_json,owned_session_id,max_agents,max_budget_usd,status,result,error,created_at,updated_at,completed_at)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, run.ID, run.Task, run.CWD, run.ScriptPath, run.ArgsJSON, run.OwnedID, run.MaxAgents, run.MaxBudgetUSD, run.Status, run.Result, run.Error, run.CreatedAt, run.UpdatedAt, run.CompletedAt)
+	_, err := s.db.Exec(`INSERT INTO workflow_runs(id,task,cwd,script_path,args_json,owned_session_id,max_agents,max_budget_usd,agent_timeout_seconds,status,result,error,created_at,updated_at,completed_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, run.ID, run.Task, run.CWD, run.ScriptPath, run.ArgsJSON, run.OwnedID, run.MaxAgents, run.MaxBudgetUSD, run.AgentTimeout, run.Status, run.Result, run.Error, run.CreatedAt, run.UpdatedAt, run.CompletedAt)
 	return run, err
 }
 
@@ -306,13 +309,16 @@ func (s *Store) UpsertRun(run Run) (Run, error) {
 		if run.MaxBudgetUSD == "" {
 			run.MaxBudgetUSD = existing.MaxBudgetUSD
 		}
+		if run.AgentTimeout == 0 {
+			run.AgentTimeout = existing.AgentTimeout
+		}
 		if run.Status == "" {
 			run.Status = existing.Status
 		}
 		run.CreatedAt = existing.CreatedAt
 		run.UpdatedAt = nowString()
-		_, err := s.db.Exec(`UPDATE workflow_runs SET task=?,cwd=?,script_path=?,args_json=?,owned_session_id=?,max_agents=?,max_budget_usd=?,status=?,result=?,error=?,updated_at=?,completed_at=? WHERE id=?`,
-			run.Task, run.CWD, run.ScriptPath, run.ArgsJSON, run.OwnedID, run.MaxAgents, run.MaxBudgetUSD, run.Status, run.Result, run.Error, run.UpdatedAt, run.CompletedAt, run.ID)
+		_, err := s.db.Exec(`UPDATE workflow_runs SET task=?,cwd=?,script_path=?,args_json=?,owned_session_id=?,max_agents=?,max_budget_usd=?,agent_timeout_seconds=?,status=?,result=?,error=?,updated_at=?,completed_at=? WHERE id=?`,
+			run.Task, run.CWD, run.ScriptPath, run.ArgsJSON, run.OwnedID, run.MaxAgents, run.MaxBudgetUSD, run.AgentTimeout, run.Status, run.Result, run.Error, run.UpdatedAt, run.CompletedAt, run.ID)
 		return run, err
 	}
 	return s.CreateRun(run)
@@ -336,13 +342,13 @@ func (s *Store) SetRunOwnedID(id, ownedID string) error {
 	return err
 }
 
-const runSelectColumns = `id,task,cwd,script_path,COALESCE(args_json,''),COALESCE(owned_session_id,''),COALESCE(max_agents,0),COALESCE(max_budget_usd,''),status,COALESCE(result,''),COALESCE(error,''),COALESCE(failures,''),COALESCE(script_hash,''),COALESCE(script_changed,0),created_at,updated_at,COALESCE(completed_at,'')`
+const runSelectColumns = `id,task,cwd,script_path,COALESCE(args_json,''),COALESCE(owned_session_id,''),COALESCE(max_agents,0),COALESCE(max_budget_usd,''),COALESCE(agent_timeout_seconds,0),status,COALESCE(result,''),COALESCE(error,''),COALESCE(failures,''),COALESCE(script_hash,''),COALESCE(script_changed,0),created_at,updated_at,COALESCE(completed_at,'')`
 
 func scanRun(row interface{ Scan(dest ...any) error }) (Run, error) {
 	var run Run
 	var failuresJSON string
 	var scriptChanged int
-	if err := row.Scan(&run.ID, &run.Task, &run.CWD, &run.ScriptPath, &run.ArgsJSON, &run.OwnedID, &run.MaxAgents, &run.MaxBudgetUSD, &run.Status, &run.Result, &run.Error, &failuresJSON, &run.ScriptHash, &scriptChanged, &run.CreatedAt, &run.UpdatedAt, &run.CompletedAt); err != nil {
+	if err := row.Scan(&run.ID, &run.Task, &run.CWD, &run.ScriptPath, &run.ArgsJSON, &run.OwnedID, &run.MaxAgents, &run.MaxBudgetUSD, &run.AgentTimeout, &run.Status, &run.Result, &run.Error, &failuresJSON, &run.ScriptHash, &scriptChanged, &run.CreatedAt, &run.UpdatedAt, &run.CompletedAt); err != nil {
 		return Run{}, err
 	}
 	run.ScriptChanged = scriptChanged != 0
