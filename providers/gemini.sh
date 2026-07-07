@@ -130,13 +130,17 @@ with open(os.environ["GEMINI_PROVIDER_RAW_FILE"], "r") as f:
     text = f.read().strip()
 
 def extract_first_json_value(s):
-    """Return the first balanced {...} or [...] substring in s, honoring
-    strings/escapes so brackets inside string values don't confuse the
-    scan, and supporting array-rooted schemas as well as object-rooted
-    ones (Pallium's validator accepts either). Using text.find('{')/
-    text.rfind('}') instead would span into any brackets that show up in
-    trailing prose (e.g. '{"ok":true}\\nNote: {done}'), producing an
-    invalid, unrecoverable candidate."""
+    """Return the first balanced {...} or [...] substring in s that
+    actually parses as JSON, honoring strings/escapes so brackets inside
+    string values don't confuse the scan, and supporting array-rooted
+    schemas as well as object-rooted ones (Pallium's validator accepts
+    either). Using text.find('{')/text.rfind('}') instead would span into
+    any brackets that show up in trailing prose (e.g.
+    '{"ok":true}\\nNote: {done}'), producing an invalid, unrecoverable
+    candidate. Keeps scanning past a balanced-but-non-JSON match too (e.g.
+    bracketed prose like 'Here is [the JSON]: {"ok":true}' — the first
+    balanced span, '[the JSON]', isn't valid JSON, so this moves on to the
+    next '{'/'[' rather than giving up)."""
     opens, closes = "{[", "}]"
     pairs = {"{": "}", "[": "]"}
     pos = 0
@@ -170,7 +174,11 @@ def extract_first_json_value(s):
                     matched = s[start:i + 1]
                     break
         if matched:
-            return matched
+            try:
+                json.loads(matched)
+                return matched
+            except (json.JSONDecodeError, ValueError):
+                pass
         pos = start + 1
 
 # Structured output only: strip accidental markdown fences and, if the
@@ -187,11 +195,7 @@ if os.environ.get("PALLIUM_WORKFLOW_SCHEMA_FILE"):
     except (json.JSONDecodeError, ValueError):
         candidate = extract_first_json_value(text)
         if candidate:
-            try:
-                json.loads(candidate)
-                text = candidate
-            except (json.JSONDecodeError, ValueError):
-                pass
+            text = candidate
 
 with open(os.environ["PALLIUM_WORKFLOW_OUTPUT_FILE"], "w") as f:
     f.write(text)
