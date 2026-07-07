@@ -1,6 +1,9 @@
 // Adversarial review: find issues per file, then a skeptic tries to refute
 // each finding. Only claims that survive refutation reach the synthesis.
-// Run: pallium workflow run --script examples/workflows/adversarial-review.js "review the auth layer"
+// Run: pallium workflow run --script examples/workflows/adversarial-review.js "review the auth layer" --args '{"task":"review the auth layer"}'
+// Note: the positional task string only becomes run metadata (visible via
+// `pallium workflow inspect`) — it is NOT injected into the script's `args`
+// global. Pass the task through --args as well so `args?.task` resolves.
 export const meta = {
   name: "adversarial-review",
   description: "Per-file find, per-finding skeptic verify, synthesized report",
