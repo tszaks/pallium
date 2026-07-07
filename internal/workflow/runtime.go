@@ -964,8 +964,16 @@ func (r *Runner) jsPallium(ctx context.Context, vm *goja.Runtime) map[string]any
 // breaks the exact-string comparisons isWorkflowStoppedError/
 // isWorkflowPausedError rely on for sentinel errors like ErrWorkflowStopped.
 // When the mapper threw a plain string (as our internal panics do via
-// vm.ToValue(err.Error())), unwrap it back to a clean error so fatal
+// vm.ToValue(err.Error())), unwrap it back to a clean error so text-based
 // classification sees the original message rather than the decorated one.
+//
+// jsParallel's own mapper-throw catch no longer needs this: it classifies
+// fatal errors via Runner.fatalCause() instead (set at the error's true
+// point of origin, before any stringification), which is robust to both the
+// goja round-trip and to an ordinary provider failure's stderr coincidentally
+// containing a sentinel's phrasing. This helper is kept for any caller that
+// only has the stringified error to work with and needs the same recovery
+// isWorkflowStoppedError/isWorkflowPausedError already tolerate.
 func unwrapMapperThrow(err error) error {
 	var exception *goja.Exception
 	if errors.As(err, &exception) {
@@ -1002,10 +1010,26 @@ func (r *Runner) jsParallel(ctx context.Context, vm *goja.Runtime) func(goja.Fun
 			item := items.Get(fmt.Sprintf("%d", i))
 			if mapper != nil {
 				callStart := len(capture.Calls)
+				fatalBefore := r.fatalCause()
 				value, err := mapper(goja.Undefined(), item, vm.ToValue(i))
 				if err != nil {
-					if cause := unwrapMapperThrow(err); isWorkflowFatalAgentError(cause) {
-						panic(vm.ToValue(cause.Error()))
+					// A mapper can throw synchronously by calling something
+					// like verify.untilGreen(), which crosses the goja panic
+					// boundary as a plain string and loses the original
+					// error's type before we ever see it here (see
+					// unwrapMapperThrow's doc comment) — text-based fallback
+					// classification isn't safe either, since an ordinary
+					// provider failure's own stderr can coincidentally
+					// contain the same phrasing as a fatal sentinel's
+					// message. Runner.fatalCause() sidesteps both problems:
+					// it's set at the fatal error's true point of origin,
+					// before any stringification, so comparing it against
+					// its pre-call snapshot tells us whether this specific
+					// mapper invocation just recorded a genuinely fatal
+					// condition (interrupt, budget, or max-agents), with no
+					// text parsing at all.
+					if fatal := r.fatalCause(); fatal != nil && fatal != fatalBefore {
+						panic(vm.ToValue(fatal.Error()))
 					}
 					capture.Calls = capture.Calls[:callStart]
 					r.recordDroppedItem(fmt.Sprintf("parallel item %d", i), err.Error())
@@ -1510,8 +1534,18 @@ func (r *Runner) runAgentCallsWithSemaphore(ctx context.Context, calls []paralle
 	return results, nil
 }
 
-// isWorkflowFatalAgentError only sees Go-side errors from runAgentAtCallIndex,
-// so typed sentinel checks are sufficient; error text is never parsed.
+// isWorkflowFatalAgentError only sees Go-side errors from runAgentAtCallIndex
+// and the async parallel agent-fanout path, so typed sentinel checks are
+// sufficient here; error text is deliberately never parsed for the budget/
+// max-agents categories, because an ordinary (non-fatal) provider failure's
+// own stderr can coincidentally contain that same phrasing (see
+// TestParallelAgentErrorContainingBudgetPhraseIsNonFatal) — substring
+// matching there would misclassify a real but unrelated failure as fatal.
+// A parallel() mapper's synchronous throw is classified separately in
+// jsParallel via Runner.fatalCause(), which sees the original, never-
+// stringified error recorded at its true point of origin and so doesn't
+// need to parse text at all; see unwrapMapperThrow for why text recovered
+// from a goja exception can't reliably carry sentinel identity regardless.
 func isWorkflowFatalAgentError(err error) bool {
 	if err == nil {
 		return false
@@ -1522,11 +1556,17 @@ func isWorkflowFatalAgentError(err error) bool {
 }
 
 func isWorkflowStoppedError(err error) bool {
-	return errors.Is(err, ErrWorkflowStopped)
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, ErrWorkflowStopped) || strings.TrimSpace(err.Error()) == ErrWorkflowStopped.Error()
 }
 
 func isWorkflowPausedError(err error) bool {
-	return errors.Is(err, ErrWorkflowPaused)
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, ErrWorkflowPaused) || strings.TrimSpace(err.Error()) == ErrWorkflowPaused.Error()
 }
 
 func isWorkflowInterruptedError(err error) bool {
