@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tszaks/pallium/internal/workflow"
 )
@@ -1075,6 +1076,75 @@ return { results };`
 	}
 	if failures, ok := report["failures"].([]any); !ok || len(failures) != 1 {
 		t.Fatalf("expected report failures list, got %#v", report["failures"])
+	}
+}
+
+func TestWorkflowGCRemovesOldTerminalRunArtifacts(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	store, err := workflow.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().UTC().Add(-10 * 24 * time.Hour).Format(time.RFC3339Nano)
+	recent := time.Now().UTC().Format(time.RFC3339Nano)
+	runs := []workflow.Run{
+		{ID: "wf-gc-old-done", Status: "completed", CreatedAt: old, UpdatedAt: old, CompletedAt: old},
+		{ID: "wf-gc-new-done", Status: "completed", CreatedAt: recent, UpdatedAt: recent, CompletedAt: recent},
+		{ID: "wf-gc-old-running", Status: "running", CreatedAt: old, UpdatedAt: old},
+	}
+	for _, run := range runs {
+		run.Task = "gc test"
+		run.CWD = tmp
+		run.ScriptPath = filepath.Join(tmp, "workflow.js")
+		if _, err := store.CreateRun(run); err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Join(home, ".pallium", "workflow-runs", run.ID, "patches")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "agent.patch"), []byte("data\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{"gc", "--db", dbPath, "--dry-run"}, true); err != nil {
+		t.Fatalf("workflow gc --dry-run failed: %v", err)
+	}
+	var dry map[string]any
+	if err := json.Unmarshal(out.Bytes(), &dry); err != nil {
+		t.Fatalf("decode gc dry-run json: %v\n%s", err, out.String())
+	}
+	if dry["count"] != float64(1) || dry["dry_run"] != true || dry["bytes_freed"] != float64(5) {
+		t.Fatalf("expected dry run to report one old terminal run, got %#v", dry)
+	}
+	for _, run := range runs {
+		if _, err := os.Stat(filepath.Join(home, ".pallium", "workflow-runs", run.ID)); err != nil {
+			t.Fatalf("dry run must not remove artifacts for %s: %v", run.ID, err)
+		}
+	}
+
+	out.Reset()
+	if err := runWorkflow(&out, []string{"gc", "--db", dbPath}, false); err != nil {
+		t.Fatalf("workflow gc failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "removed 1 run directories (5 bytes freed)") || !strings.Contains(out.String(), "wf-gc-old-done") {
+		t.Fatalf("unexpected gc output: %s", out.String())
+	}
+	if _, err := os.Stat(filepath.Join(home, ".pallium", "workflow-runs", "wf-gc-old-done")); !os.IsNotExist(err) {
+		t.Fatalf("expected old terminal run artifacts removed, stat err=%v", err)
+	}
+	for _, keep := range []string{"wf-gc-new-done", "wf-gc-old-running"} {
+		if _, err := os.Stat(filepath.Join(home, ".pallium", "workflow-runs", keep)); err != nil {
+			t.Fatalf("expected %s artifacts kept: %v", keep, err)
+		}
 	}
 }
 

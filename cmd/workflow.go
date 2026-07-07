@@ -80,6 +80,8 @@ func runWorkflow(out io.Writer, args []string, jsonOutput bool) error {
 		return runWorkflowRevert(out, args[1:], jsonOutput)
 	case "audit":
 		return runWorkflowAudit(out, args[1:], jsonOutput)
+	case "gc":
+		return runWorkflowGC(out, args[1:], jsonOutput)
 	default:
 		printWorkflowHelp(out)
 		return fmt.Errorf("unknown workflow subcommand: %s", args[0])
@@ -1721,6 +1723,130 @@ func runWorkflowRevert(out io.Writer, args []string, jsonOutput bool) error {
 	})
 }
 
+type workflowGCRun struct {
+	ID    string `json:"id"`
+	Path  string `json:"path"`
+	Bytes int64  `json:"bytes"`
+}
+
+type workflowGCResult struct {
+	Removed    []workflowGCRun `json:"removed"`
+	Count      int             `json:"count"`
+	BytesFreed int64           `json:"bytes_freed"`
+	DryRun     bool            `json:"dry_run,omitempty"`
+}
+
+// runWorkflowGC removes artifact directories (~/.pallium/workflow-runs/<id>)
+// for terminal runs older than --older-than days and prunes stale git
+// worktree metadata in the affected repos.
+func runWorkflowGC(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("workflow gc")
+	dbPath := fs.String("db", "", "")
+	olderThan := fs.Int("older-than", 7, "")
+	dryRun := fs.Bool("dry-run", false, "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "older-than": {}}, map[string]struct{}{"dry-run": {}}); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 || *olderThan < 0 {
+		return fmt.Errorf("usage: pallium workflow gc [--older-than days] [--dry-run] [--json]")
+	}
+	root, err := workflow.RunsRootDir()
+	if err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	store, err := workflow.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	cutoff := time.Now().UTC().Add(-time.Duration(*olderThan) * 24 * time.Hour)
+	result := workflowGCResult{Removed: []workflowGCRun{}, DryRun: *dryRun}
+	repos := map[string]struct{}{}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		run, err := store.Run(entry.Name())
+		if err != nil {
+			continue // not a known run: leave the directory alone
+		}
+		if !isWorkflowGCEligible(run.Status) {
+			continue
+		}
+		finished := run.CompletedAt
+		if finished == "" {
+			finished = run.UpdatedAt
+		}
+		finishedAt, err := time.Parse(time.RFC3339Nano, finished)
+		if err != nil || finishedAt.After(cutoff) {
+			continue
+		}
+		path := filepath.Join(root, entry.Name())
+		size := workflowRunDirSize(path)
+		if !*dryRun {
+			if err := os.RemoveAll(path); err != nil {
+				return err
+			}
+			repos[run.CWD] = struct{}{}
+		}
+		result.Removed = append(result.Removed, workflowGCRun{ID: run.ID, Path: path, Bytes: size})
+		result.BytesFreed += size
+	}
+	result.Count = len(result.Removed)
+	if !*dryRun {
+		for repo := range repos {
+			prune := exec.Command("git", "worktree", "prune")
+			prune.Dir = repo
+			_ = prune.Run()
+		}
+	}
+	return output.Write(out, result, jsonOutput, func() string {
+		return renderWorkflowGC(result)
+	})
+}
+
+func isWorkflowGCEligible(status string) bool {
+	switch status {
+	case "completed", "failed", "stopped":
+		return true
+	default:
+		return false
+	}
+}
+
+func workflowRunDirSize(path string) int64 {
+	var total int64
+	_ = filepath.WalkDir(path, func(_ string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if info, err := d.Info(); err == nil {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
+}
+
+func renderWorkflowGC(result workflowGCResult) string {
+	verb := "removed"
+	if result.DryRun {
+		verb = "would remove"
+	}
+	if result.Count == 0 {
+		return fmt.Sprintf("Workflow gc %s no run directories.", verb)
+	}
+	lines := []string{fmt.Sprintf("Workflow gc %s %d run directories (%d bytes freed):", verb, result.Count, result.BytesFreed)}
+	for _, run := range result.Removed {
+		lines = append(lines, fmt.Sprintf("- %s (%d bytes) %s", run.ID, run.Bytes, run.Path))
+	}
+	return strings.Join(lines, "\n")
+}
+
 func renderWorkflowResult(snapshot workflow.Snapshot, result string) string {
 	text := renderWorkflowSnapshot(snapshot)
 	if result != "" {
@@ -2276,7 +2402,8 @@ Usage:
   pallium workflow stop <run-id> [--json]
   pallium workflow save <run-id> --name name [--user] [--json]
   pallium workflow apply <run-id> [--json]
-  pallium workflow revert <run-id> [--json]`)
+  pallium workflow revert <run-id> [--json]
+  pallium workflow gc [--older-than days] [--dry-run] [--json]`)
 }
 
 func latestWorkflowRun(store *workflow.Store) (workflow.Run, error) {

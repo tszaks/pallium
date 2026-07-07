@@ -615,17 +615,37 @@ func (r *Runner) runUntilGreen(ctx context.Context, command string, options map[
 		maxRounds = 3
 	}
 	label := optionString(options, "label", "until-green")
+	provider := optionString(options, "provider", "")
 	testModel := optionString(options, "model", "")
 	fixModel := optionString(options, "fix_model", testModel)
+
+	// One persistent worktree hosts the whole loop so every check round sees
+	// the fix agents' edits immediately. The combined patch is captured once
+	// at the end and registered like a normal edit-agent patch.
+	repoRoot := r.Run.CWD
+	loopID := fmt.Sprintf("untilgreen-%d", r.nextAgentCallIndex())
+	worktreeRoot, err := RunArtifactDir(r.Run.ID, "worktrees")
+	if err != nil {
+		return nil, err
+	}
+	r.removeWorktree(repoRoot, filepath.Join(worktreeRoot, loopID))
+	worktree, err := r.createWorktree(loopID, repoRoot)
+	if err != nil {
+		return nil, err
+	}
+
 	var rounds []map[string]any
 	lastSignature := ""
 	stalled := false
+	green := false
 	for round := 0; round <= maxRounds; round++ {
 		checkOutput, err := r.RunAgent(ctx, buildCheckPrompt(command), AgentOptions{
-			Label:  fmt.Sprintf("%s-check-%d", label, round+1),
-			Mode:   "test",
-			Model:  testModel,
-			Schema: defaultCheckSchema(),
+			Label:    fmt.Sprintf("%s-check-%d", label, round+1),
+			Provider: provider,
+			Repo:     worktree,
+			Mode:     "test",
+			Model:    testModel,
+			Schema:   defaultCheckSchema(),
 		})
 		if err != nil {
 			return nil, err
@@ -639,7 +659,8 @@ func (r *Runner) runUntilGreen(ctx context.Context, command string, options map[
 		}
 		rounds = append(rounds, roundRecord)
 		if checkOK(checkResult) {
-			return map[string]any{"ok": true, "command": command, "rounds": rounds, "stalled": false}, nil
+			green = true
+			break
 		}
 		signature := stableHash(checkResult)
 		if round > 0 && signature == lastSignature {
@@ -653,8 +674,10 @@ func (r *Runner) runUntilGreen(ctx context.Context, command string, options map[
 		fixPrompt := "Fix the failing verification for this workflow.\nCommand: " + command + "\nFailure JSON: " + stringifyResult(checkResult) + "\nMake the smallest correct code change. Do not skip, weaken, or hide tests."
 		fixOutput, err := r.RunAgent(ctx, fixPrompt, AgentOptions{
 			Label:     fmt.Sprintf("%s-fix-%d", label, round+1),
+			Provider:  provider,
+			Repo:      worktree,
 			Mode:      "edit",
-			Isolation: "worktree",
+			Isolation: "none",
 			Model:     fixModel,
 			Schema: map[string]any{
 				"type": "object",
@@ -672,7 +695,56 @@ func (r *Runner) runUntilGreen(ctx context.Context, command string, options map[
 		roundRecord["fixed"] = true
 		roundRecord["fix"] = parseAgentOutput(fixOutput)
 	}
-	return map[string]any{"ok": false, "command": command, "rounds": rounds, "stalled": stalled}, nil
+	result := map[string]any{"ok": green, "command": command, "rounds": rounds, "stalled": stalled}
+	if err := r.registerUntilGreenPatch(label, command, worktree, repoRoot, result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// registerUntilGreenPatch captures the combined patch from the untilGreen
+// loop worktree on an internal agent row so it auto-applies with the other
+// edit-agent patches when the run completes. A row cached from a previous
+// execution wins so resume keeps the originally captured patch.
+func (r *Runner) registerUntilGreenPatch(label, command, worktree, repoRoot string, result map[string]any) error {
+	r.mu.Lock()
+	phase := r.currentPhase
+	scriptHash := r.scriptHash
+	argsHash := r.argsHash
+	r.mu.Unlock()
+	callIndex := r.nextAgentCallIndex()
+	patchLabel := label + "-patch"
+	prompt := "verify.untilGreen combined patch: " + command
+	if _, ok, err := r.Store.CompletedAgent(r.Run.ID, callIndex, phase, patchLabel, prompt, "internal", repoRoot, "edit", "worktree", "", "", argsHash); err != nil {
+		return err
+	} else if ok {
+		r.removeWorktree(repoRoot, worktree)
+		return nil
+	}
+	created, err := r.Store.CreateAgent(Agent{
+		RunID:      r.Run.ID,
+		CallIndex:  callIndex,
+		Phase:      phase,
+		Label:      patchLabel,
+		Prompt:     prompt,
+		Provider:   "internal",
+		Repo:       repoRoot,
+		Mode:       "edit",
+		Isolation:  "worktree",
+		ScriptHash: scriptHash,
+		ArgsHash:   argsHash,
+		Worktree:   worktree,
+	})
+	if err != nil {
+		return err
+	}
+	patchPath, err := r.captureWorktreePatch(created.ID, worktree, repoRoot)
+	if err != nil {
+		_ = r.Store.FinishAgent(created, "", err.Error())
+		return err
+	}
+	created.PatchPath = patchPath
+	return r.Store.FinishAgent(created, stringifyResult(result), "")
 }
 
 func (r *Runner) jsCoordinator(ctx context.Context, vm *goja.Runtime) map[string]any {
@@ -1860,11 +1932,12 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 				return "", "", "", agentCommandError(ctx, timeout, ctx.Err())
 			}
 		}
-		cwd := firstNonEmpty(agent.Repo, r.Run.CWD)
+		repoRoot := firstNonEmpty(agent.Repo, r.Run.CWD)
+		cwd := repoRoot
 		worktree := ""
-		if agent.Mode == "edit" || agent.Isolation == "worktree" {
+		if agent.Isolation != "none" && (agent.Mode == "edit" || agent.Isolation == "worktree") {
 			var err error
-			worktree, err = r.createWorktree(agent.ID, cwd)
+			worktree, err = r.createWorktree(agent.ID, repoRoot)
 			if err != nil {
 				return "", "", "", err
 			}
@@ -1883,7 +1956,7 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 		patchPath := ""
 		if worktree != "" {
 			var err error
-			patchPath, err = r.writeWorktreePatch(agent.ID, worktree)
+			patchPath, err = r.captureWorktreePatch(agent.ID, worktree, repoRoot)
 			if err != nil {
 				return "", "", worktree, err
 			}
@@ -1891,11 +1964,12 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 		return strings.ReplaceAll(stub, "{{PROMPT}}", agent.Prompt), patchPath, worktree, nil
 	}
 	provider := firstNonEmpty(agent.Provider, opts.Provider, "codex")
-	cwd := firstNonEmpty(agent.Repo, r.Run.CWD)
+	repoRoot := firstNonEmpty(agent.Repo, r.Run.CWD)
+	cwd := repoRoot
 	worktree := ""
-	if agent.Mode == "edit" || agent.Isolation == "worktree" {
+	if agent.Isolation != "none" && (agent.Mode == "edit" || agent.Isolation == "worktree") {
 		var err error
-		worktree, err = r.createWorktree(agent.ID, cwd)
+		worktree, err = r.createWorktree(agent.ID, repoRoot)
 		if err != nil {
 			return "", "", "", err
 		}
@@ -1934,7 +2008,7 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 		}
 		patchPath := ""
 		if worktree != "" {
-			patchPath, err = r.writeWorktreePatch(agent.ID, worktree)
+			patchPath, err = r.captureWorktreePatch(agent.ID, worktree, repoRoot)
 			if err != nil {
 				return output, "", worktree, err
 			}
@@ -1978,7 +2052,7 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 	output := strings.TrimSpace(string(raw))
 	patchPath := ""
 	if worktree != "" {
-		patchPath, err = r.writeWorktreePatch(agent.ID, worktree)
+		patchPath, err = r.captureWorktreePatch(agent.ID, worktree, repoRoot)
 		if err != nil {
 			return output, "", worktree, err
 		}
@@ -2139,6 +2213,35 @@ func (r *Runner) writeWorktreePatch(agentID, worktree string) (string, error) {
 	return patchPath, nil
 }
 
+// captureWorktreePatch writes the agent patch from the worktree and removes
+// the worktree once the patch is captured; the patch file is the durable
+// artifact. When patch capture fails the worktree is kept for debugging.
+func (r *Runner) captureWorktreePatch(agentID, worktree, repoRoot string) (string, error) {
+	patchPath, err := r.writeWorktreePatch(agentID, worktree)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[workflow:%s] patch capture failed; keeping worktree %s for debugging: %v\n", r.Run.ID, worktree, err)
+		return "", err
+	}
+	r.removeWorktree(repoRoot, worktree)
+	return patchPath, nil
+}
+
+// removeWorktree detaches and deletes an agent worktree. Failures fall back
+// to deleting the directory and pruning stale git worktree metadata.
+func (r *Runner) removeWorktree(repoRoot, worktree string) {
+	if worktree == "" {
+		return
+	}
+	cmd := exec.Command("git", "worktree", "remove", "--force", worktree)
+	cmd.Dir = repoRoot
+	if err := cmd.Run(); err != nil {
+		_ = os.RemoveAll(worktree)
+		prune := exec.Command("git", "worktree", "prune")
+		prune.Dir = repoRoot
+		_ = prune.Run()
+	}
+}
+
 var metaPrefixRe = regexp.MustCompile(`export\s+const\s+meta\s*=\s*\{`)
 
 // stripMeta removes the export const meta = {...}; block by scanning brace
@@ -2286,15 +2389,25 @@ func isFile(path string) bool {
 	return err == nil && !info.IsDir()
 }
 
-func RunArtifactDir(runID, child string) (string, error) {
-	if err := ValidateID(runID); err != nil {
-		return "", err
-	}
+// RunsRootDir returns the root directory that holds per-run workflow
+// artifacts (~/.pallium/workflow-runs).
+func RunsRootDir() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	parts := []string{home, ".pallium", "workflow-runs", runID}
+	return filepath.Join(home, ".pallium", "workflow-runs"), nil
+}
+
+func RunArtifactDir(runID, child string) (string, error) {
+	if err := ValidateID(runID); err != nil {
+		return "", err
+	}
+	root, err := RunsRootDir()
+	if err != nil {
+		return "", err
+	}
+	parts := []string{root, runID}
 	if strings.TrimSpace(child) != "" {
 		parts = append(parts, filepath.Clean(child))
 	}
