@@ -81,8 +81,10 @@ const finding = await agent("Review auth middleware", {
 
 Non-Codex providers: `PALLIUM_WORKFLOW_PROVIDER_<NAME>_COMMAND`. Reference
 wrappers (Claude Code, Gemini CLI) and the full environment contract live in
-[`providers/README.md`](providers/README.md) — workers adopt whatever model
-your guiding agent uses.
+[`providers/README.md`](providers/README.md). Model selection is still
+per-call: pass `model` to `agent()` and the wrapper maps it to
+`PALLIUM_WORKFLOW_MODEL`; leave it out and the worker runs its CLI's own
+default model, not necessarily the guiding agent's.
 
 ### `await pipeline(items, stage1, stage2, ...)`
 
