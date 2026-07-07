@@ -236,6 +236,18 @@ func TestWorkflowGenerateLLMValidatesScript(t *testing.T) {
 	}
 }
 
+func TestWorkflowGenerateLLMReturnsStyleError(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_GENERATE_STUB", "phase(\"llm\");\nreturn { ok: true };")
+	var out bytes.Buffer
+	err := runWorkflow(&out, []string{"generate", "--llm", "--style", "bogus", "write custom workflow"}, true)
+	if err == nil {
+		t.Fatal("expected llm generate to reject bogus style")
+	}
+	if !strings.Contains(err.Error(), `unknown workflow style "bogus"`) {
+		t.Fatalf("expected unknown style error, got %v", err)
+	}
+}
+
 func TestWorkflowValidateScript(t *testing.T) {
 	tmp := t.TempDir()
 	validPath := filepath.Join(tmp, "valid.js")
