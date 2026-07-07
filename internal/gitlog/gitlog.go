@@ -3,9 +3,11 @@ package gitlog
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -26,11 +28,23 @@ type Commit struct {
 	ChangedFiles []string
 }
 
+// wrapGitError wraps a git command failure, including stderr when available
+// so failures are diagnosable.
+func wrapGitError(msg string, err error) error {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		if stderr := strings.TrimSpace(string(exitErr.Stderr)); stderr != "" {
+			return fmt.Errorf("%s: %w: %s", msg, err, stderr)
+		}
+	}
+	return fmt.Errorf("%s: %w", msg, err)
+}
+
 func RepoRoot(path string) (string, error) {
 	cmd := exec.Command("git", "-C", path, "rev-parse", "--show-toplevel")
 	output, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("failed to resolve git repo root: %w", err)
+		return "", wrapGitError("failed to resolve git repo root", err)
 	}
 
 	return strings.TrimSpace(string(output)), nil
@@ -40,7 +54,7 @@ func CurrentBranch(repoRoot string) (string, error) {
 	cmd := exec.Command("git", "-C", repoRoot, "rev-parse", "--abbrev-ref", "HEAD")
 	output, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("failed to read git branch: %w", err)
+		return "", wrapGitError("failed to read git branch", err)
 	}
 
 	return strings.TrimSpace(string(output)), nil
@@ -50,7 +64,7 @@ func CurrentCommit(repoRoot string) (string, error) {
 	cmd := exec.Command("git", "-C", repoRoot, "rev-parse", "HEAD")
 	output, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("failed to read git head commit: %w", err)
+		return "", wrapGitError("failed to read git head commit", err)
 	}
 
 	return strings.TrimSpace(string(output)), nil
@@ -60,7 +74,7 @@ func OriginURL(repoRoot string) (string, error) {
 	cmd := exec.Command("git", "-C", repoRoot, "config", "--get", "remote.origin.url")
 	output, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("failed to read git origin url: %w", err)
+		return "", wrapGitError("failed to read git origin url", err)
 	}
 
 	return strings.TrimSpace(string(output)), nil
@@ -71,6 +85,8 @@ func ReadHistory(repoRoot string) ([]Commit, error) {
 		"git",
 		"-C",
 		repoRoot,
+		"-c",
+		"core.quotepath=false",
 		"log",
 		"--date=iso-strict",
 		"--name-only",
@@ -79,7 +95,7 @@ func ReadHistory(repoRoot string) ([]Commit, error) {
 
 	output, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("failed to read git history: %w", err)
+		return nil, wrapGitError("failed to read git history", err)
 	}
 
 	commits := make([]Commit, 0)
@@ -112,6 +128,13 @@ func ReadHistory(repoRoot string) ([]Commit, error) {
 			path := strings.TrimSpace(scanner.Text())
 			if path == "" {
 				continue
+			}
+			// Even with core.quotepath=false, git C-quotes paths containing
+			// double quotes, backslashes, or control characters.
+			if len(path) >= 2 && strings.HasPrefix(path, `"`) && strings.HasSuffix(path, `"`) {
+				if unquoted, err := strconv.Unquote(path); err == nil {
+					path = unquoted
+				}
 			}
 			files = append(files, filepath.ToSlash(path))
 		}

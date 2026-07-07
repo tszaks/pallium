@@ -59,6 +59,54 @@ func TestReadHistoryDoesNotTreatMultilineBodyAsChangedFiles(t *testing.T) {
 	}
 }
 
+func TestReadHistoryUnescapesNonASCIIPaths(t *testing.T) {
+	repo := initTempRepo(t)
+
+	writeFile(t, filepath.Join(repo, "naïve.txt"), "naïve\n")
+	run(t, repo, "git", "add", ".")
+	run(t, repo, "git", "commit", "-m", "feat: add naïve file")
+
+	commits, err := ReadHistory(repo)
+	if err != nil {
+		t.Fatalf("ReadHistory failed: %v", err)
+	}
+	if len(commits) == 0 {
+		t.Fatal("expected commits")
+	}
+	latest := commits[0]
+	if len(latest.ChangedFiles) != 1 || latest.ChangedFiles[0] != "naïve.txt" {
+		t.Fatalf("expected changed files [naïve.txt], got %#v", latest.ChangedFiles)
+	}
+}
+
+func TestReadHistoryUnquotesPathsWithDoubleQuotes(t *testing.T) {
+	repo := initTempRepo(t)
+
+	name := `foo"bar.txt`
+	if err := os.WriteFile(filepath.Join(repo, name), []byte("quoted\n"), 0o644); err != nil {
+		t.Skipf("cannot create file with double quote in name: %v", err)
+	}
+	run(t, repo, "git", "add", ".")
+	run(t, repo, "git", "commit", "-m", "feat: add quoted file")
+
+	commits, err := ReadHistory(repo)
+	if err != nil {
+		t.Fatalf("ReadHistory failed: %v", err)
+	}
+	if len(commits) == 0 {
+		t.Fatal("expected commits")
+	}
+	latest := commits[0]
+	if len(latest.ChangedFiles) != 1 || latest.ChangedFiles[0] != name {
+		t.Fatalf("expected changed files [%s], got %#v", name, latest.ChangedFiles)
+	}
+	for _, f := range latest.ChangedFiles {
+		if strings.HasPrefix(f, `"`) || strings.HasSuffix(f, `"`) {
+			t.Fatalf("expected unquoted path, got %q", f)
+		}
+	}
+}
+
 func initTempRepo(t *testing.T) string {
 	t.Helper()
 
