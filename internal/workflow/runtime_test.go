@@ -3,12 +3,14 @@ package workflow
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -2762,5 +2764,382 @@ func runGit(t *testing.T, dir string, args ...string) {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
+	}
+}
+
+func TestUntilGreenResumeRestoresFixEditsAfterMidLoopError(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
+	providerScript := filepath.Join(t.TempDir(), "loop-provider.sh")
+	if err := os.WriteFile(providerScript, []byte(`#!/bin/sh
+if [ "$PALLIUM_WORKFLOW_MODE" = "edit" ]; then
+  printf 'fixed\n' > marker.txt
+  printf '{"summary":"created marker"}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+elif [ -f marker.txt ]; then
+  printf '{"ok":true,"command":"check marker","summary":"marker present","output_tail":"","failures":[]}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+else
+  printf '{"ok":false,"command":"check marker","summary":"marker missing","output_tail":"no marker","failures":[{"name":"marker","message":"missing"}]}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+fi
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_LOOP_COMMAND", providerScript)
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("verify");
+const result = verify.untilGreen("check marker", { label: "green", maxRounds: 2, provider: "loop" });
+return result;`
+	scriptPath, err := WriteRunScript("wf-until-green-resume", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-until-green-resume", Task: "until green resume", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// First execution: the budget covers check-1 and fix-1 only, so check-2
+	// aborts the loop mid-flight after the fix agent already edited the
+	// worktree.
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10, MaxBudgetUSD: "0.025"}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), "budget exhausted") {
+		t.Fatalf("expected mid-loop budget exhaustion, got %v", err)
+	}
+	worktreeRoot, err := RunArtifactDir(run.ID, "worktrees")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := os.ReadDir(worktreeRoot); err == nil && len(entries) > 0 {
+		t.Fatalf("expected no leftover loop worktree after mid-loop error, got %v", entries)
+	}
+	patchRoot, err := RunArtifactDir(run.ID, "patches")
+	if err != nil {
+		t.Fatal(err)
+	}
+	patchEntries, err := os.ReadDir(patchRoot)
+	if err != nil || len(patchEntries) != 1 {
+		t.Fatalf("expected one durable loop patch after mid-loop error, got %v err=%v", patchEntries, err)
+	}
+	durable, err := os.ReadFile(filepath.Join(patchRoot, patchEntries[0].Name()))
+	if err != nil || !strings.Contains(string(durable), "marker.txt") {
+		t.Fatalf("expected durable patch to keep the fix edits, err=%v patch=%s", err, string(durable))
+	}
+	// Second execution: check-1 and fix-1 replay from cache (output only);
+	// the durable patch must restore the fix edits so the loop goes green and
+	// the registered combined patch is not empty.
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"ok": true`) {
+		t.Fatalf("expected resumed loop to converge, got %s", result)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	patchAgent := agents[len(agents)-1]
+	if patchAgent.Label != "green-patch" || patchAgent.Status != "completed" || patchAgent.PatchPath == "" {
+		t.Fatalf("expected completed untilGreen patch agent, got %+v", patchAgent)
+	}
+	raw, err := os.ReadFile(patchAgent.PatchPath)
+	if err != nil || !strings.Contains(string(raw), "marker.txt") {
+		t.Fatalf("expected non-empty combined patch with prior fix edits, err=%v patch=%s", err, string(raw))
+	}
+	if content, err := os.ReadFile(filepath.Join(tmp, "marker.txt")); err != nil || string(content) != "fixed\n" {
+		t.Fatalf("expected restored fix applied to repo on completion, got %q err=%v", string(content), err)
+	}
+	if _, err := os.Stat(patchAgent.Worktree); !os.IsNotExist(err) {
+		t.Fatalf("expected loop worktree removed after completion, stat err=%v", err)
+	}
+}
+
+func TestUntilGreenAlreadyGreenSkipsWorktreeAndPatch(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"command":"go test ./...","summary":"passed","output_tail":"","failures":[]}`)
+	// The cwd is intentionally not a git repo: an already-green check must
+	// succeed without ever creating a worktree.
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("verify");
+const result = verify.untilGreen("go test ./...", { label: "green", maxRounds: 2 });
+return result;`
+	scriptPath, err := WriteRunScript("wf-until-green-lazy", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-until-green-lazy", Task: "until green lazy", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"ok": true`) {
+		t.Fatalf("expected green result, got %s", result)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].Mode != "test" {
+		t.Fatalf("expected a single check agent and no patch row, got %+v", agents)
+	}
+	worktreeRoot, err := RunArtifactDir(run.ID, "worktrees")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(worktreeRoot); !os.IsNotExist(err) {
+		t.Fatalf("expected no worktree directory for an already-green check, stat err=%v", err)
+	}
+}
+
+func TestRecordDroppedItemPersistsAllConcurrentDrops(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run, err := store.CreateRun(Run{ID: "wf-drop-race", Task: "drop race", CWD: tmp, ScriptPath: filepath.Join(tmp, "workflow.js")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &Runner{Store: store, Run: run}
+	const drops = 64
+	var wg sync.WaitGroup
+	for i := 0; i < drops; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			runner.recordDroppedItem(fmt.Sprintf("item-%d", i), "boom")
+		}(i)
+	}
+	wg.Wait()
+	stored, err := store.Run(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.mu.Lock()
+	inMemory := len(runner.failures)
+	runner.mu.Unlock()
+	if inMemory != drops {
+		t.Fatalf("expected %d in-memory failures, got %d", drops, inMemory)
+	}
+	if len(stored.Failures) != drops {
+		t.Fatalf("expected %d persisted failures, got %d", drops, len(stored.Failures))
+	}
+}
+
+func TestConfiguredProviderUsageAccumulatesAcrossSchemaRetry(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("SCHEMA_MARKER", filepath.Join(tmp, "marker"))
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_METERED_COMMAND", `printf '{"input_tokens":100,"output_tokens":50,"cost_usd":0.1}' > "$PALLIUM_WORKFLOW_USAGE_FILE"; if [ -f "$SCHEMA_MARKER" ]; then printf '{"summary":"corrected"}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"; else touch "$SCHEMA_MARKER"; printf 'not json at all' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"; fi`)
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("usage");
+return await agent("structured", {
+  label: "structured",
+  provider: "metered",
+  schema: {
+    type: "object",
+    properties: { summary: { type: "string" } },
+    required: ["summary"]
+  }
+});`
+	scriptPath, err := WriteRunScript("wf-usage-retry", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-usage-retry", Task: "usage retry", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"summary": "corrected"`) {
+		t.Fatalf("expected corrective retry output, got %s", result)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].Status != "completed" {
+		t.Fatalf("expected one completed agent, got %+v", agents)
+	}
+	if agents[0].EstimatedCostUSD != 0.2 {
+		t.Fatalf("expected cost summed across both attempts (0.2), got %+v", agents[0])
+	}
+	if agents[0].UsageJSON != `{"cost_usd":0.2,"input_tokens":200,"output_tokens":100}` {
+		t.Fatalf("expected merged usage json across attempts, got %q", agents[0].UsageJSON)
+	}
+}
+
+func TestEditModeSchemaFailureSkipsCorrectiveRetry(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
+	callLog := filepath.Join(t.TempDir(), "calls.log")
+	t.Setenv("EDIT_CALL_LOG", callLog)
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_EDITY_COMMAND", `echo call >> "$EDIT_CALL_LOG"; printf 'not json at all' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("edit");
+return await agent("edit something", {
+  label: "editor",
+  provider: "edity",
+  mode: "edit",
+  schema: {
+    type: "object",
+    properties: { summary: { type: "string" } },
+    required: ["summary"]
+  }
+});`
+	scriptPath, err := WriteRunScript("wf-edit-no-retry", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-edit-no-retry", Task: "edit no retry", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), "does not match schema") {
+		t.Fatalf("expected schema validation failure, got %v", err)
+	}
+	raw, err := os.ReadFile(callLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls := strings.Count(string(raw), "call"); calls != 1 {
+		t.Fatalf("edit-mode agent must not run the corrective retry, expected 1 provider call, got %d", calls)
+	}
+}
+
+func TestScriptCannotUseIsolationNone(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"x"}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("iso");
+return agent("edit the live repo", { label: "live", mode: "edit", isolation: "none" });`
+	scriptPath, err := WriteRunScript("wf-isolation-none", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-isolation-none", Task: "isolation none", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), `invalid agent isolation "none"`) {
+		t.Fatalf("expected isolation validation error, got %v", err)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 0 {
+		t.Fatalf("expected no agent to launch, got %+v", agents)
+	}
+}
+
+func TestCaughtPauseInterruptThenScriptErrorFailsAsScriptError(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_DELAY_MS", "2000")
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("catch");
+try {
+  await agent("slow", { label: "slow" });
+} catch (e) {
+  throw new Error("unrelated script failure");
+}
+return "unreachable";`
+	scriptPath, err := WriteRunScript("wf-caught-pause", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-caught-pause", Task: "caught pause", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+		errCh <- err
+	}()
+	deadline := time.After(2 * time.Second)
+	for {
+		agents, err := store.ListAgents(run.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(agents) == 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for running agent, got %d", len(agents))
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if err := store.SetRunStatus(run.ID, "paused", "", "test pause"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-errCh:
+		if err == nil || errors.Is(err, ErrWorkflowPaused) {
+			t.Fatalf("caught interrupt followed by a script error must not classify as paused, got %v", err)
+		}
+		if !strings.Contains(err.Error(), "unrelated script failure") {
+			t.Fatalf("expected the script's own error to surface, got %v", err)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("runner did not finish after pause")
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Run.Status != "failed" {
+		t.Fatalf("expected failed run, got %+v", snapshot.Run)
 	}
 }

@@ -38,6 +38,7 @@ type Runner struct {
 	AgentTimeoutSeconds int
 
 	mu             sync.Mutex
+	failuresMu     sync.Mutex
 	currentPhase   string
 	agentCount     int
 	budgetLimit    float64
@@ -266,7 +267,7 @@ func (r *Runner) executeScript(ctx context.Context, script string, args any, top
 		}
 		result, err := r.executeSavedWorkflow(ctx, name, input)
 		if err != nil {
-			panic(vm.ToValue(err.Error()))
+			panic(vm.ToValue(r.throwable(err)))
 		}
 		return vm.ToValue(parseAgentOutput(result))
 	}); err != nil {
@@ -399,7 +400,7 @@ func (r *Runner) jsGate(ctx context.Context, vm *goja.Runtime) func(goja.Functio
 		}
 		result, err := r.runAgentGate(ctx, name, message, opts)
 		if err != nil {
-			panic(vm.ToValue(err.Error()))
+			panic(vm.ToValue(r.throwable(err)))
 		}
 		return vm.ToValue(result)
 	}
@@ -528,6 +529,9 @@ func (r *Runner) jsAgent(ctx context.Context, vm *goja.Runtime) func(goja.Functi
 				panic(vm.ToValue(err.Error()))
 			}
 		}
+		if err := validateUserIsolation(opts.Isolation); err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
 		if capture := r.activeCapture(); capture != nil {
 			index := len(capture.Calls)
 			capture.Calls = append(capture.Calls, parallelAgentCall{Prompt: prompt, Opts: opts})
@@ -535,7 +539,7 @@ func (r *Runner) jsAgent(ctx context.Context, vm *goja.Runtime) func(goja.Functi
 		}
 		output, err := r.runAgentAtCallIndex(ctx, prompt, opts, r.nextAgentCallIndex())
 		if err != nil {
-			panic(vm.ToValue(err.Error()))
+			panic(vm.ToValue(r.throwable(err)))
 		}
 		return vm.ToValue(parseAgentOutput(output))
 	}
@@ -575,7 +579,7 @@ func (r *Runner) jsCheck(ctx context.Context, vm *goja.Runtime) func(goja.Functi
 		}
 		output, err := r.runAgentAtCallIndex(ctx, prompt, agentOpts, r.nextAgentCallIndex())
 		if err != nil {
-			panic(vm.ToValue(err.Error()))
+			panic(vm.ToValue(r.throwable(err)))
 		}
 		return vm.ToValue(parseAgentOutput(output))
 	}
@@ -596,14 +600,14 @@ func (r *Runner) jsVerify(ctx context.Context, vm *goja.Runtime) map[string]any 
 			}
 			result, err := r.runUntilGreen(ctx, strings.TrimSpace(command), options)
 			if err != nil {
-				panic(vm.ToValue(err.Error()))
+				panic(vm.ToValue(r.throwable(err)))
 			}
 			return vm.ToValue(result)
 		},
 	}
 }
 
-func (r *Runner) runUntilGreen(ctx context.Context, command string, options map[string]any) (map[string]any, error) {
+func (r *Runner) runUntilGreen(ctx context.Context, command string, options map[string]any) (result map[string]any, err error) {
 	if command == "" {
 		return nil, fmt.Errorf("verify.untilGreen command is required")
 	}
@@ -619,19 +623,72 @@ func (r *Runner) runUntilGreen(ctx context.Context, command string, options map[
 	testModel := optionString(options, "model", "")
 	fixModel := optionString(options, "fix_model", testModel)
 
-	// One persistent worktree hosts the whole loop so every check round sees
-	// the fix agents' edits immediately. The combined patch is captured once
-	// at the end and registered like a normal edit-agent patch.
+	// One persistent worktree hosts the fix rounds so every later check sees
+	// the fix agents' edits immediately. The worktree is created lazily: the
+	// first check runs in the original cwd, so an already-green command needs
+	// no worktree at all (and untilGreen works in a non-git cwd). The combined
+	// diff is captured to a deterministic patch file after every fix round so
+	// an interrupted loop restores its progress on resume instead of silently
+	// registering an empty patch.
 	repoRoot := r.Run.CWD
 	loopID := fmt.Sprintf("untilgreen-%d", r.nextAgentCallIndex())
-	worktreeRoot, err := RunArtifactDir(r.Run.ID, "worktrees")
+	loopPatchPath, err := r.agentPatchPath(loopID)
 	if err != nil {
 		return nil, err
 	}
-	r.removeWorktree(repoRoot, filepath.Join(worktreeRoot, loopID))
-	worktree, err := r.createWorktree(loopID, repoRoot)
-	if err != nil {
-		return nil, err
+	worktree := ""
+	// Every loop exit (green, stalled, max rounds, mid-loop agent error) runs
+	// through this defer: a clean end registers the combined patch on an
+	// internal agent row; an error exit captures the durable patch file so
+	// resume can restore the fix edits. The worktree is removed either way and
+	// kept only when patch capture fails.
+	defer func() {
+		if worktree == "" {
+			return
+		}
+		if err == nil {
+			if regErr := r.registerUntilGreenPatch(label, command, loopID, worktree, repoRoot, result); regErr != nil {
+				result, err = nil, regErr
+			}
+			return
+		}
+		if _, patchErr := r.writeWorktreePatch(loopID, worktree); patchErr != nil {
+			fmt.Fprintf(os.Stderr, "[workflow:%s] untilGreen patch capture failed; keeping worktree %s for debugging: %v\n", r.Run.ID, worktree, patchErr)
+			return
+		}
+		r.removeWorktree(repoRoot, worktree)
+	}()
+	ensureWorktree := func() error {
+		if worktree != "" {
+			return nil
+		}
+		path, pathErr := r.worktreePath(loopID)
+		if pathErr != nil {
+			return pathErr
+		}
+		r.removeWorktree(repoRoot, path)
+		created, createErr := r.createWorktree(loopID, repoRoot)
+		if createErr != nil {
+			return createErr
+		}
+		worktree = created
+		// Restore progress captured before an interrupt so cached fix agents
+		// replaying output-only do not silently lose their edits.
+		if raw, readErr := os.ReadFile(loopPatchPath); readErr == nil && strings.TrimSpace(string(raw)) != "" {
+			apply := exec.Command("git", "apply", "--3way", loopPatchPath)
+			apply.Dir = worktree
+			var stderr bytes.Buffer
+			apply.Stderr = &stderr
+			if applyErr := apply.Run(); applyErr != nil {
+				fmt.Fprintf(os.Stderr, "[workflow:%s] could not restore untilGreen patch %s: %v: %s; continuing from HEAD\n", r.Run.ID, loopPatchPath, applyErr, strings.TrimSpace(stderr.String()))
+			}
+			// git apply --3way stages the restored changes; unstage them so
+			// the loop's later `git diff` captures keep seeing the edits.
+			reset := exec.Command("git", "reset", "-q")
+			reset.Dir = worktree
+			_ = reset.Run()
+		}
+		return nil
 	}
 
 	var rounds []map[string]any
@@ -639,10 +696,14 @@ func (r *Runner) runUntilGreen(ctx context.Context, command string, options map[
 	stalled := false
 	green := false
 	for round := 0; round <= maxRounds; round++ {
+		checkRepo := repoRoot
+		if worktree != "" {
+			checkRepo = worktree
+		}
 		checkOutput, err := r.RunAgent(ctx, buildCheckPrompt(command), AgentOptions{
 			Label:    fmt.Sprintf("%s-check-%d", label, round+1),
 			Provider: provider,
-			Repo:     worktree,
+			Repo:     checkRepo,
 			Mode:     "test",
 			Model:    testModel,
 			Schema:   defaultCheckSchema(),
@@ -671,6 +732,9 @@ func (r *Runner) runUntilGreen(ctx context.Context, command string, options map[
 		if round == maxRounds {
 			break
 		}
+		if err := ensureWorktree(); err != nil {
+			return nil, err
+		}
 		fixPrompt := "Fix the failing verification for this workflow.\nCommand: " + command + "\nFailure JSON: " + stringifyResult(checkResult) + "\nMake the smallest correct code change. Do not skip, weaken, or hide tests."
 		fixOutput, err := r.RunAgent(ctx, fixPrompt, AgentOptions{
 			Label:     fmt.Sprintf("%s-fix-%d", label, round+1),
@@ -694,19 +758,23 @@ func (r *Runner) runUntilGreen(ctx context.Context, command string, options map[
 		}
 		roundRecord["fixed"] = true
 		roundRecord["fix"] = parseAgentOutput(fixOutput)
+		// Durable incremental capture: overwrite the loop patch after every
+		// completed fix round so a crash or interrupt cannot lose the edits.
+		if _, captureErr := r.writeWorktreePatch(loopID, worktree); captureErr != nil {
+			fmt.Fprintf(os.Stderr, "[workflow:%s] untilGreen incremental patch capture failed: %v\n", r.Run.ID, captureErr)
+		}
 	}
-	result := map[string]any{"ok": green, "command": command, "rounds": rounds, "stalled": stalled}
-	if err := r.registerUntilGreenPatch(label, command, worktree, repoRoot, result); err != nil {
-		return nil, err
-	}
+	result = map[string]any{"ok": green, "command": command, "rounds": rounds, "stalled": stalled}
 	return result, nil
 }
 
 // registerUntilGreenPatch captures the combined patch from the untilGreen
 // loop worktree on an internal agent row so it auto-applies with the other
 // edit-agent patches when the run completes. A row cached from a previous
-// execution wins so resume keeps the originally captured patch.
-func (r *Runner) registerUntilGreenPatch(label, command, worktree, repoRoot string, result map[string]any) error {
+// execution wins so resume keeps the originally captured patch. The patch is
+// written to the loop's deterministic path, matching the incremental captures
+// taken during the loop.
+func (r *Runner) registerUntilGreenPatch(label, command, loopID, worktree, repoRoot string, result map[string]any) error {
 	r.mu.Lock()
 	phase := r.currentPhase
 	scriptHash := r.scriptHash
@@ -738,7 +806,7 @@ func (r *Runner) registerUntilGreenPatch(label, command, worktree, repoRoot stri
 	if err != nil {
 		return err
 	}
-	patchPath, err := r.captureWorktreePatch(created.ID, worktree, repoRoot)
+	patchPath, err := r.captureWorktreePatch(loopID, worktree, repoRoot)
 	if err != nil {
 		_ = r.Store.FinishAgent(created, "", err.Error())
 		return err
@@ -762,7 +830,7 @@ func (r *Runner) jsCoordinator(ctx context.Context, vm *goja.Runtime) map[string
 			}
 			result, err := r.runCoordinatorReplan(ctx, goal, options)
 			if err != nil {
-				panic(vm.ToValue(err.Error()))
+				panic(vm.ToValue(r.throwable(err)))
 			}
 			return vm.ToValue(parseAgentOutput(result))
 		},
@@ -934,12 +1002,11 @@ func (r *Runner) jsParallel(ctx context.Context, vm *goja.Runtime) func(goja.Fun
 				rawResults = append(rawResults, item.Export())
 			}
 		}
-		r.setCapture(previousCapture)
 
 		r.assignSequentialCallIndexes(capture.Calls)
 		agentResults, err := r.runParallelAgentCalls(ctx, capture.Calls)
 		if err != nil {
-			panic(vm.ToValue(err.Error()))
+			panic(vm.ToValue(r.throwable(err)))
 		}
 		results := make([]any, 0, len(rawResults))
 		for _, result := range rawResults {
@@ -1016,7 +1083,7 @@ func (r *Runner) jsPipeline(ctx context.Context, vm *goja.Runtime) func(goja.Fun
 		}
 		wg.Wait()
 		if firstErr != nil {
-			panic(vm.ToValue(firstErr.Error()))
+			panic(vm.ToValue(r.throwable(firstErr)))
 		}
 		return vm.ToValue(results)
 	}
@@ -1134,8 +1201,13 @@ func (r *Runner) setCapture(capture *parallelCapture) {
 }
 
 // recordDroppedItem tracks an item that parallel/pipeline converted into a
-// null result so partial success stays visible at the run level.
+// null result so partial success stays visible at the run level. failuresMu
+// is held across both the append and the store write so concurrent drops
+// persist in append order and a stale shorter snapshot can never overwrite a
+// longer one.
 func (r *Runner) recordDroppedItem(label, errText string) {
+	r.failuresMu.Lock()
+	defer r.failuresMu.Unlock()
 	r.mu.Lock()
 	r.failures = append(r.failures, RunFailure{Label: label, Phase: r.currentPhase, Error: errText})
 	failures := append([]RunFailure(nil), r.failures...)
@@ -1165,12 +1237,34 @@ func (r *Runner) fatalCause() error {
 	return r.fatalErr
 }
 
+// interruptSentinel is a run-scoped token embedded in interrupt errors thrown
+// into JS, so classifyRunError can tell the original interrupt apart from a
+// later unrelated script error (e.g. a script that catches the interrupt and
+// throws its own error).
+func (r *Runner) interruptSentinel() string {
+	return "[pallium-workflow-interrupt:" + r.Run.ID + "]"
+}
+
+// throwable renders an error for a goja throw, tagging workflow interrupts
+// with the run-scoped sentinel token.
+func (r *Runner) throwable(err error) string {
+	if isWorkflowInterruptedError(err) {
+		return err.Error() + " " + r.interruptSentinel()
+	}
+	return err.Error()
+}
+
 // classifyRunError maps a script-level failure back to a recorded workflow
 // interrupt. Errors that cross the goja VM boundary arrive as plain text, so
-// classification consults the cause recorded where the interrupt originated
-// instead of parsing arbitrary error strings.
+// reclassification only happens when the surfaced error still carries the
+// sentinel token added by throwable; the actual verdict comes from the cause
+// recorded where the interrupt originated, never from parsing arbitrary
+// error strings.
 func (r *Runner) classifyRunError(err error) error {
 	if err == nil || isWorkflowInterruptedError(err) {
+		return err
+	}
+	if !strings.Contains(err.Error(), r.interruptSentinel()) {
 		return err
 	}
 	cause := r.fatalCause()
@@ -1832,6 +1926,19 @@ func gateVerdict(value any) (bool, string) {
 	return approved, strings.TrimSpace(reason)
 }
 
+// validateUserIsolation guards the JS option boundary: scripts may only pick
+// "" (default) or "worktree". "none" is reserved for internal Go callers like
+// runUntilGreen; from a script it would let an edit agent write to the live
+// repo with no worktree and no patch.
+func validateUserIsolation(isolation string) error {
+	switch strings.TrimSpace(isolation) {
+	case "", "worktree":
+		return nil
+	default:
+		return fmt.Errorf("invalid agent isolation %q: allowed values are \"\" and \"worktree\"", isolation)
+	}
+}
+
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
@@ -1989,17 +2096,38 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 		}
 		usageFile := filepath.Join(tmpDir, "usage.json")
 		output, err := r.runConfiguredProviderCommand(ctx, command, tmpDir, outFile, usageFile, cwd, agent.Prompt, agent, opts)
+		usageRaw, usage := readAndRemoveAgentUsage(usageFile)
 		if err == nil && len(opts.Schema) > 0 {
-			if _, schemaErr := parseAgentOutputWithSchema(output, opts.Schema); schemaErr != nil {
+			// The corrective retry re-executes the full provider command in
+			// the same cwd with no workspace reset, so it is limited to
+			// read-only agents. Edit/test/check agents could apply their side
+			// effects twice; they fail schema validation immediately instead.
+			if _, schemaErr := parseAgentOutputWithSchema(output, opts.Schema); schemaErr != nil && isReadOnlyAgentMode(agent.Mode) {
 				_ = os.Remove(outFile)
 				if retryOutput, retryErr := r.runConfiguredProviderCommand(ctx, command, tmpDir, outFile, usageFile, cwd, buildSchemaRetryPrompt(agent.Prompt, schemaErr), agent, opts); retryErr == nil {
 					output = retryOutput
 				}
+				// Usage is read after each invocation (the file is removed in
+				// between), so the retry's cost adds to attempt one instead of
+				// overwriting it.
+				if retryRaw, retryUsage := readAndRemoveAgentUsage(usageFile); retryUsage != nil {
+					if usage == nil {
+						usageRaw, usage = retryRaw, retryUsage
+					} else {
+						usage = mergeAgentUsage(usage, retryUsage)
+						usageRaw = ""
+					}
+				}
 			}
 		}
-		if raw, cost, hasCost := readAgentUsage(usageFile); raw != "" {
-			agent.UsageJSON = raw
-			if hasCost {
+		if usage != nil {
+			if usageRaw == "" {
+				if raw, marshalErr := json.Marshal(usage); marshalErr == nil {
+					usageRaw = string(raw)
+				}
+			}
+			agent.UsageJSON = usageRaw
+			if cost, ok := usage["cost_usd"].(float64); ok && cost >= 0 {
 				agent.EstimatedCostUSD = cost
 			}
 		}
@@ -2118,19 +2246,42 @@ func buildSchemaRetryPrompt(prompt string, schemaErr error) string {
 		"\nRespond again with bare JSON only that conforms to the provided schema. No prose, no markdown, no code fences."
 }
 
-func readAgentUsage(path string) (string, float64, bool) {
+// isReadOnlyAgentMode reports whether an agent mode has no workspace side
+// effects, which is the precondition for the corrective schema retry.
+func isReadOnlyAgentMode(mode string) bool {
+	mode = strings.TrimSpace(mode)
+	return mode == "" || mode == "read-only"
+}
+
+// readAndRemoveAgentUsage reads and deletes the provider usage file so the
+// next invocation writes a fresh one instead of overwriting this attempt.
+// Unreadable or non-JSON files are ignored.
+func readAndRemoveAgentUsage(path string) (string, map[string]any) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return "", 0, false
+		return "", nil
 	}
+	_ = os.Remove(path)
 	var usage map[string]any
 	if json.Unmarshal(raw, &usage) != nil {
-		return "", 0, false
+		return "", nil
 	}
-	if cost, ok := usage["cost_usd"].(float64); ok && cost >= 0 {
-		return strings.TrimSpace(string(raw)), cost, true
+	return strings.TrimSpace(string(raw)), usage
+}
+
+// mergeAgentUsage sums numeric fields (cost and token counts) across provider
+// invocations; non-numeric fields keep the latest value.
+func mergeAgentUsage(total, next map[string]any) map[string]any {
+	for key, value := range next {
+		if num, ok := value.(float64); ok {
+			if prev, ok := total[key].(float64); ok {
+				total[key] = prev + num
+				continue
+			}
+		}
+		total[key] = value
 	}
-	return strings.TrimSpace(string(raw)), 0, false
+	return total
 }
 
 func providerCommandEnvName(provider string) string {
@@ -2166,15 +2317,24 @@ func normalizeSchema(value any) any {
 	}
 }
 
-func (r *Runner) createWorktree(agentID, repoRoot string) (string, error) {
+// worktreePath returns the deterministic worktree location for an agent or
+// loop id under the run's artifact directory.
+func (r *Runner) worktreePath(agentID string) (string, error) {
 	root, err := RunArtifactDir(r.Run.ID, "worktrees")
 	if err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(root, 0o755); err != nil {
+	return filepath.Join(root, agentID), nil
+}
+
+func (r *Runner) createWorktree(agentID, repoRoot string) (string, error) {
+	path, err := r.worktreePath(agentID)
+	if err != nil {
 		return "", err
 	}
-	path := filepath.Join(root, agentID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
 	cmd := exec.Command("git", "worktree", "add", "--detach", path, "HEAD")
 	cmd.Dir = repoRoot
 	var stderr bytes.Buffer
@@ -2183,6 +2343,19 @@ func (r *Runner) createWorktree(agentID, repoRoot string) (string, error) {
 		return "", fmt.Errorf("create worktree: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
 	return path, nil
+}
+
+// agentPatchPath returns the deterministic patch location for an agent or
+// loop id under the run's artifact directory, creating the patches directory.
+func (r *Runner) agentPatchPath(agentID string) (string, error) {
+	patchDir, err := RunArtifactDir(r.Run.ID, "patches")
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(patchDir, 0o755); err != nil {
+		return "", err
+	}
+	return filepath.Join(patchDir, agentID+".patch"), nil
 }
 
 func (r *Runner) writeWorktreePatch(agentID, worktree string) (string, error) {
@@ -2199,14 +2372,10 @@ func (r *Runner) writeWorktreePatch(agentID, worktree string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	patchDir, err := RunArtifactDir(r.Run.ID, "patches")
+	patchPath, err := r.agentPatchPath(agentID)
 	if err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(patchDir, 0o755); err != nil {
-		return "", err
-	}
-	patchPath := filepath.Join(patchDir, agentID+".patch")
 	if err := os.WriteFile(patchPath, raw, 0o644); err != nil {
 		return "", err
 	}

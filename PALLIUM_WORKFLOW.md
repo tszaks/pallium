@@ -78,20 +78,22 @@ const finding = await agent("Review auth middleware", {
 | `effort` | low to max | **not yet** - use prompt/provider |
 | `isolation: "worktree"` | edit isolation | same |
 | `agentType` | named agent | use `provider` |
-| `schema` | StructuredOutput | Codex `--output-schema`; providers get schema file, Pallium validates returned JSON locally and retries once with a corrective prompt before failing the agent |
+| `schema` | StructuredOutput | Codex `--output-schema`; providers get schema file, Pallium validates returned JSON locally and, for read-only agents only, retries once with a corrective prompt before failing the agent. Edit/test/check agents fail schema validation immediately: the retry re-runs the full provider command in the same cwd, which could apply side effects twice |
 | `timeout_seconds` | - | per-call wall-clock cap; overrides `--agent-timeout` (`0` disables) |
 
 Edit and worktree-isolated agents run in a detached git worktree under
 `~/.pallium/workflow-runs/<run-id>/worktrees/`. The worktree is removed as soon
 as the agent's patch is captured — the patch file is the durable artifact — and
 kept only when patch capture fails, for debugging. `pallium workflow gc
-[--older-than days] [--dry-run]` removes the artifact directories of terminal
-runs (completed/failed/stopped) older than N days (default 7), reports the
-count and bytes freed, and prunes stale git worktree metadata.
+[--older-than days] [--include-failed] [--dry-run]` removes the artifact
+directories of completed/stopped runs older than N days (default 7), reports
+the count and bytes freed, and prunes stale git worktree metadata. Failed runs
+are resumable, so their workflow.js and patches are kept unless
+`--include-failed` is passed.
 
 Non-Codex providers: `PALLIUM_WORKFLOW_PROVIDER_<NAME>_COMMAND`
 
-Provider commands receive `PALLIUM_WORKFLOW_PROMPT_FILE`, `PALLIUM_WORKFLOW_OUTPUT_FILE`, `PALLIUM_WORKFLOW_SCHEMA_FILE`, and `PALLIUM_WORKFLOW_USAGE_FILE`. A provider may write `{"input_tokens":N,"output_tokens":N,"cost_usd":X}` to the usage file; the reported `cost_usd` replaces the flat per-agent estimate for that agent (including budget accounting) and the raw JSON is persisted on the agent record as `usage_json`. Unreadable or absent usage files are ignored.
+Provider commands receive `PALLIUM_WORKFLOW_PROMPT_FILE`, `PALLIUM_WORKFLOW_OUTPUT_FILE`, `PALLIUM_WORKFLOW_SCHEMA_FILE`, and `PALLIUM_WORKFLOW_USAGE_FILE`. A provider may write `{"input_tokens":N,"output_tokens":N,"cost_usd":X}` to the usage file; the reported `cost_usd` replaces the flat per-agent estimate for that agent (including budget accounting) and the raw JSON is persisted on the agent record as `usage_json`. The usage file is read (and removed) after each provider invocation, so when the corrective schema retry runs, `cost_usd` and token counts are summed across both attempts. Unreadable or absent usage files are ignored.
 
 ### `await pipeline(items, stage1, stage2, ...)`
 
@@ -178,13 +180,18 @@ const plan = await coordinator.replan("adapt after verifier findings", { label: 
 
 ### `await verify.untilGreen(command, options?)`
 
-Owns the check -> fix -> re-check loop. Each invocation gets **one persistent
-worktree** for the whole loop: the check agent and the fix agents all run
-inside it, so every check round sees the previous fixes immediately. When the
-loop ends, the combined diff is captured as a single patch and registered like
-a normal edit-agent patch — it auto-applies when the run completes and
-participates in `workflow apply`/`revert` — and the loop worktree is removed
-(kept only if patch capture fails, for debugging).
+Owns the check -> fix -> re-check loop. The first check runs in the original
+cwd; if it is already green the loop finishes with no worktree and no patch.
+Once a fix round is needed, the invocation gets **one persistent worktree**
+for the rest of the loop: the fix agents and every later check run inside it,
+so each check round sees the previous fixes immediately. The combined diff is
+written to a durable patch file after every fix round, so an interrupted loop
+restores that progress into a fresh worktree on resume. When the loop ends —
+green, stalled, max rounds, or a mid-loop agent error — the final combined
+diff is captured; on a clean end it is registered like a normal edit-agent
+patch (auto-applies when the run completes and participates in `workflow
+apply`/`revert`). The loop worktree is always removed (kept only if patch
+capture fails, for debugging).
 
 Options: `maxRounds` (default 3), `label`, `provider` (used for both check and
 fix agents; a provider command can branch on `PALLIUM_WORKFLOW_MODE` — `test`
@@ -201,7 +208,7 @@ lost.
 |-------|-------|
 | Concurrent agents | `--max-concurrent-agents` (default 16) |
 | Lifetime agents | `--max-agents` (default 1000) |
-| Per-agent wall clock | `--agent-timeout` seconds (default 600, `0` disables) |
+| Per-agent wall clock | `--agent-timeout` seconds (default 600, `0` disables); stored on the run and reused by `resume` unless the flag is passed again |
 | Items per `parallel`/`pipeline` | 4096 |
 | Nested `workflow()` | 1 level |
 

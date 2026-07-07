@@ -899,6 +899,7 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 	}
 	maxAgentsSet := flagWasSet(fs, "max-agents")
 	maxBudgetSet := flagWasSet(fs, "max-budget-usd")
+	agentTimeoutSet := flagWasSet(fs, "agent-timeout")
 	positionals := fs.Args()
 	if *scriptPath != "" && *workflowName != "" {
 		return fmt.Errorf("use either --script or --workflow, not both")
@@ -983,6 +984,9 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 	if maxBudgetSet {
 		runSpec.MaxBudgetUSD = strings.TrimSpace(*maxBudgetUSD)
 	}
+	if agentTimeoutSet {
+		runSpec.AgentTimeout = *agentTimeout
+	}
 	run, err := store.UpsertRun(runSpec)
 	_ = store.Close()
 	if err != nil {
@@ -995,6 +999,10 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 	effectiveMaxBudgetUSD := strings.TrimSpace(*maxBudgetUSD)
 	if !maxBudgetSet {
 		effectiveMaxBudgetUSD = strings.TrimSpace(run.MaxBudgetUSD)
+	}
+	effectiveAgentTimeout := *agentTimeout
+	if !agentTimeoutSet && run.AgentTimeout > 0 {
+		effectiveAgentTimeout = run.AgentTimeout
 	}
 	if *background {
 		exe, err := os.Executable()
@@ -1014,8 +1022,10 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 			"--script", runScriptPath,
 			"--codex", *codexBinary,
 			"--max-concurrent-agents", fmt.Sprintf("%d", *maxConcurrentAgents),
-			"--agent-timeout", fmt.Sprintf("%d", *agentTimeout),
 		)
+		if agentTimeoutSet || run.AgentTimeout > 0 {
+			cmdArgs = append(cmdArgs, "--agent-timeout", fmt.Sprintf("%d", effectiveAgentTimeout))
+		}
 		if effectiveMaxAgents > 0 && (maxAgentsSet || run.MaxAgents > 0) {
 			cmdArgs = append(cmdArgs, "--max-agents", fmt.Sprintf("%d", effectiveMaxAgents))
 		}
@@ -1062,7 +1072,7 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 		MaxConcurrentAgents: *maxConcurrentAgents,
 		MaxBudgetUSD:        effectiveMaxBudgetUSD,
 		CodexBinary:         *codexBinary,
-		AgentTimeoutSeconds: *agentTimeout,
+		AgentTimeoutSeconds: effectiveAgentTimeout,
 	}
 	result, err := runner.Execute(context.Background(), script, inputArgs)
 	if err != nil {
@@ -1580,6 +1590,7 @@ func runWorkflowResume(out io.Writer, args []string, jsonOutput bool) error {
 	}
 	maxAgentsSet := flagWasSet(fs, "max-agents")
 	maxBudgetSet := flagWasSet(fs, "max-budget-usd")
+	agentTimeoutSet := flagWasSet(fs, "agent-timeout")
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: pallium workflow resume <run-id>")
 	}
@@ -1592,7 +1603,12 @@ func runWorkflowResume(out io.Writer, args []string, jsonOutput bool) error {
 	if err != nil {
 		return err
 	}
-	runArgs := []string{"run", "--id", run.ID, "--cwd", run.CWD, "--script", run.ScriptPath, "--codex", *codexBinary, "--max-concurrent-agents", fmt.Sprintf("%d", *maxConcurrentAgents), "--agent-timeout", fmt.Sprintf("%d", *agentTimeout)}
+	runArgs := []string{"run", "--id", run.ID, "--cwd", run.CWD, "--script", run.ScriptPath, "--codex", *codexBinary, "--max-concurrent-agents", fmt.Sprintf("%d", *maxConcurrentAgents)}
+	if agentTimeoutSet {
+		runArgs = append(runArgs, "--agent-timeout", fmt.Sprintf("%d", *agentTimeout))
+	} else if run.AgentTimeout > 0 {
+		runArgs = append(runArgs, "--agent-timeout", fmt.Sprintf("%d", run.AgentTimeout))
+	}
 	if maxAgentsSet && *maxAgents > 0 {
 		runArgs = append(runArgs, "--max-agents", fmt.Sprintf("%d", *maxAgents))
 	} else if !maxAgentsSet && run.MaxAgents > 0 {
@@ -1737,18 +1753,20 @@ type workflowGCResult struct {
 }
 
 // runWorkflowGC removes artifact directories (~/.pallium/workflow-runs/<id>)
-// for terminal runs older than --older-than days and prunes stale git
-// worktree metadata in the affected repos.
+// for completed/stopped runs older than --older-than days and prunes stale
+// git worktree metadata in the affected repos. Failed runs are resumable, so
+// their workflow.js and patches are only removed with --include-failed.
 func runWorkflowGC(out io.Writer, args []string, jsonOutput bool) error {
 	fs := newSessionFlagSet("workflow gc")
 	dbPath := fs.String("db", "", "")
 	olderThan := fs.Int("older-than", 7, "")
+	includeFailed := fs.Bool("include-failed", false, "")
 	dryRun := fs.Bool("dry-run", false, "")
-	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "older-than": {}}, map[string]struct{}{"dry-run": {}}); err != nil {
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "older-than": {}}, map[string]struct{}{"dry-run": {}, "include-failed": {}}); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 || *olderThan < 0 {
-		return fmt.Errorf("usage: pallium workflow gc [--older-than days] [--dry-run] [--json]")
+		return fmt.Errorf("usage: pallium workflow gc [--older-than days] [--include-failed] [--dry-run] [--json]")
 	}
 	root, err := workflow.RunsRootDir()
 	if err != nil {
@@ -1774,7 +1792,7 @@ func runWorkflowGC(out io.Writer, args []string, jsonOutput bool) error {
 		if err != nil {
 			continue // not a known run: leave the directory alone
 		}
-		if !isWorkflowGCEligible(run.Status) {
+		if !isWorkflowGCEligible(run.Status, *includeFailed) {
 			continue
 		}
 		finished := run.CompletedAt
@@ -1809,10 +1827,14 @@ func runWorkflowGC(out io.Writer, args []string, jsonOutput bool) error {
 	})
 }
 
-func isWorkflowGCEligible(status string) bool {
+// isWorkflowGCEligible treats only completed/stopped runs as collectable by
+// default; failed runs stay resumable unless --include-failed opts in.
+func isWorkflowGCEligible(status string, includeFailed bool) bool {
 	switch status {
-	case "completed", "failed", "stopped":
+	case "completed", "stopped":
 		return true
+	case "failed":
+		return includeFailed
 	default:
 		return false
 	}
@@ -2403,7 +2425,7 @@ Usage:
   pallium workflow save <run-id> --name name [--user] [--json]
   pallium workflow apply <run-id> [--json]
   pallium workflow revert <run-id> [--json]
-  pallium workflow gc [--older-than days] [--dry-run] [--json]`)
+  pallium workflow gc [--older-than days] [--include-failed] [--dry-run] [--json]`)
 }
 
 func latestWorkflowRun(store *workflow.Store) (workflow.Run, error) {

@@ -622,6 +622,56 @@ return agent("second", { label: "second" });`
 	}
 }
 
+func TestWorkflowResumePersistsAgentTimeout(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_DELAY_MS", "1500")
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	scriptPath := filepath.Join(tmp, "workflow.js")
+	if err := os.WriteFile(scriptPath, []byte(`phase("one");
+return agent("slow", { label: "slow" });`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	err := runWorkflow(&out, []string{
+		"run",
+		"--id", "wf-resume-timeout",
+		"--db", dbPath,
+		"--cwd", tmp,
+		"--script", scriptPath,
+		"--agent-timeout", "1",
+		"timeout test",
+	}, false)
+	if err == nil || !strings.Contains(err.Error(), "timed out after 1s") {
+		t.Fatalf("expected initial run to hit the 1s agent timeout, got %v", err)
+	}
+	store, err := workflow.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.Run("wf-resume-timeout")
+	_ = store.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.AgentTimeout != 1 {
+		t.Fatalf("expected agent timeout stored on the run, got %+v", run)
+	}
+	// Resume without the flag must reuse the stored 1s timeout, not the 600s
+	// flag default.
+	out.Reset()
+	err = runWorkflow(&out, []string{"resume", "wf-resume-timeout", "--db", dbPath}, false)
+	if err == nil || !strings.Contains(err.Error(), "timed out after 1s") {
+		t.Fatalf("expected resume to reuse the stored agent timeout, got %v", err)
+	}
+	// An explicit flag on resume overrides the stored value.
+	out.Reset()
+	if err := runWorkflow(&out, []string{"resume", "wf-resume-timeout", "--db", dbPath, "--agent-timeout", "30"}, false); err != nil {
+		t.Fatalf("expected explicit --agent-timeout to override stored value, got %v", err)
+	}
+}
+
 func TestWorkflowReportSummarizesAgentOutputs(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"reviewed auth","observations":["auth flow is covered"],"risks":["missing edge test"],"next_steps":["add edge test"]}`)
 	tmp := t.TempDir()
@@ -1094,6 +1144,7 @@ func TestWorkflowGCRemovesOldTerminalRunArtifacts(t *testing.T) {
 		{ID: "wf-gc-old-done", Status: "completed", CreatedAt: old, UpdatedAt: old, CompletedAt: old},
 		{ID: "wf-gc-new-done", Status: "completed", CreatedAt: recent, UpdatedAt: recent, CompletedAt: recent},
 		{ID: "wf-gc-old-running", Status: "running", CreatedAt: old, UpdatedAt: old},
+		{ID: "wf-gc-old-failed", Status: "failed", CreatedAt: old, UpdatedAt: old, CompletedAt: old},
 	}
 	for _, run := range runs {
 		run.Task = "gc test"
@@ -1140,6 +1191,24 @@ func TestWorkflowGCRemovesOldTerminalRunArtifacts(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(home, ".pallium", "workflow-runs", "wf-gc-old-done")); !os.IsNotExist(err) {
 		t.Fatalf("expected old terminal run artifacts removed, stat err=%v", err)
+	}
+	// Failed runs are resumable, so their artifacts stay unless
+	// --include-failed opts in.
+	for _, keep := range []string{"wf-gc-new-done", "wf-gc-old-running", "wf-gc-old-failed"} {
+		if _, err := os.Stat(filepath.Join(home, ".pallium", "workflow-runs", keep)); err != nil {
+			t.Fatalf("expected %s artifacts kept: %v", keep, err)
+		}
+	}
+
+	out.Reset()
+	if err := runWorkflow(&out, []string{"gc", "--db", dbPath, "--include-failed"}, false); err != nil {
+		t.Fatalf("workflow gc --include-failed failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "wf-gc-old-failed") {
+		t.Fatalf("expected --include-failed to collect the old failed run: %s", out.String())
+	}
+	if _, err := os.Stat(filepath.Join(home, ".pallium", "workflow-runs", "wf-gc-old-failed")); !os.IsNotExist(err) {
+		t.Fatalf("expected old failed run artifacts removed with --include-failed, stat err=%v", err)
 	}
 	for _, keep := range []string{"wf-gc-new-done", "wf-gc-old-running"} {
 		if _, err := os.Stat(filepath.Join(home, ".pallium", "workflow-runs", keep)); err != nil {
