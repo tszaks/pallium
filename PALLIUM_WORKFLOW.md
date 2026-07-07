@@ -16,6 +16,7 @@ pallium workflow run --background --script workflow.js "long task"
 pallium workflow resume <run-id>
 pallium workflow inspect <run-id> --json
 pallium workflow report <run-id> --json
+pallium workflow gc --older-than 7 --dry-run
 ```
 
 Discover primitives first:
@@ -79,6 +80,14 @@ const finding = await agent("Review auth middleware", {
 | `agentType` | named agent | use `provider` |
 | `schema` | StructuredOutput | Codex `--output-schema`; providers get schema file, Pallium validates returned JSON locally and retries once with a corrective prompt before failing the agent |
 | `timeout_seconds` | - | per-call wall-clock cap; overrides `--agent-timeout` (`0` disables) |
+
+Edit and worktree-isolated agents run in a detached git worktree under
+`~/.pallium/workflow-runs/<run-id>/worktrees/`. The worktree is removed as soon
+as the agent's patch is captured — the patch file is the durable artifact — and
+kept only when patch capture fails, for debugging. `pallium workflow gc
+[--older-than days] [--dry-run]` removes the artifact directories of terminal
+runs (completed/failed/stopped) older than N days (default 7), reports the
+count and bytes freed, and prunes stale git worktree metadata.
 
 Non-Codex providers: `PALLIUM_WORKFLOW_PROVIDER_<NAME>_COMMAND`
 
@@ -166,6 +175,25 @@ const green = await verify.untilGreen("go test ./...", { maxRounds: 3, label: "t
 await pallium.decisions.record("Chose worktrees", "Edit agents stay isolated.", "workflow");
 const plan = await coordinator.replan("adapt after verifier findings", { label: "coordinator" });
 ```
+
+### `await verify.untilGreen(command, options?)`
+
+Owns the check -> fix -> re-check loop. Each invocation gets **one persistent
+worktree** for the whole loop: the check agent and the fix agents all run
+inside it, so every check round sees the previous fixes immediately. When the
+loop ends, the combined diff is captured as a single patch and registered like
+a normal edit-agent patch — it auto-applies when the run completes and
+participates in `workflow apply`/`revert` — and the loop worktree is removed
+(kept only if patch capture fails, for debugging).
+
+Options: `maxRounds` (default 3), `label`, `provider` (used for both check and
+fix agents; a provider command can branch on `PALLIUM_WORKFLOW_MODE` — `test`
+for check, `edit` for fix), `model`, and `fix_model`.
+
+Returns `{ ok, command, rounds, stalled }`. The loop stops early when two
+consecutive check rounds fail identically (stall detection) or when
+`maxRounds` is exhausted; the patch is still captured so partial fixes are not
+lost.
 
 ## Limits
 

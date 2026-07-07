@@ -393,6 +393,7 @@ func TestRunnerRejectsDeepNestedWorkflow(t *testing.T) {
 }
 
 func TestRunnerVerifyUntilGreenFixLoop(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_SEQUENCE", `[
 		"{\"ok\":false,\"command\":\"go test ./...\",\"summary\":\"failed\",\"output_tail\":\"boom\",\"failures\":[{\"name\":\"TestOne\",\"message\":\"boom\"}]}",
@@ -435,8 +436,15 @@ return result;`
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(agents) != 3 || agents[1].Mode != "edit" {
-		t.Fatalf("expected check/fix/check agents, got %+v", agents)
+	if len(agents) != 4 || agents[1].Mode != "edit" {
+		t.Fatalf("expected check/fix/check/patch agents, got %+v", agents)
+	}
+	patchAgent := agents[3]
+	if patchAgent.Label != "green-patch" || patchAgent.Provider != "internal" || patchAgent.Status != "completed" || patchAgent.PatchPath == "" {
+		t.Fatalf("expected completed internal patch agent, got %+v", patchAgent)
+	}
+	if _, err := os.Stat(patchAgent.Worktree); !os.IsNotExist(err) {
+		t.Fatalf("expected loop worktree removed after patch capture, stat err=%v", err)
 	}
 }
 
@@ -652,6 +660,131 @@ func TestRunnerPatchIncludesNewFiles(t *testing.T) {
 	}
 	if string(raw) != "created by workflow\n" {
 		t.Fatalf("unexpected new file content: %q", string(raw))
+	}
+}
+
+func TestRunnerRemovesWorktreeAfterPatchCapture(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"edited"}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_WRITE_FILE", "note.txt")
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_WRITE_CONTENT", "changed by workflow\n")
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "note.txt"), []byte("original\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "note.txt")
+	runGit(t, tmp, "commit", "-m", "initial")
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("edit"); return agent("edit note", { label: "editor", mode: "edit", isolation: "worktree" });`
+	scriptPath, err := WriteRunScript("wf-worktree-gc", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-worktree-gc", Task: "worktree cleanup", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil); err != nil {
+		t.Fatal(err)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].PatchPath == "" || agents[0].Worktree == "" {
+		t.Fatalf("expected one edit agent with patch and worktree, got %+v", agents)
+	}
+	if _, err := os.Stat(agents[0].PatchPath); err != nil {
+		t.Fatalf("expected durable patch file: %v", err)
+	}
+	if _, err := os.Stat(agents[0].Worktree); !os.IsNotExist(err) {
+		t.Fatalf("expected worktree removed after patch capture, stat err=%v", err)
+	}
+	list := exec.Command("git", "worktree", "list", "--porcelain")
+	list.Dir = tmp
+	raw, err := list.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(raw), "worktree "); got != 1 {
+		t.Fatalf("expected only the main worktree registered, got %d:\n%s", got, string(raw))
+	}
+	if content, err := os.ReadFile(filepath.Join(tmp, "note.txt")); err != nil || string(content) != "changed by workflow\n" {
+		t.Fatalf("expected patch applied on completion, got %q err=%v", string(content), err)
+	}
+}
+
+func TestRunnerUntilGreenConvergesInLoopWorktreeAndAppliesPatch(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
+	providerScript := filepath.Join(t.TempDir(), "loop-provider.sh")
+	if err := os.WriteFile(providerScript, []byte(`#!/bin/sh
+if [ "$PALLIUM_WORKFLOW_MODE" = "edit" ]; then
+  printf 'fixed\n' > marker.txt
+  printf '{"summary":"created marker"}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+elif [ -f marker.txt ]; then
+  printf '{"ok":true,"command":"check marker","summary":"marker present","output_tail":"","failures":[]}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+else
+  printf '{"ok":false,"command":"check marker","summary":"marker missing","output_tail":"no marker","failures":[{"name":"marker","message":"missing"}]}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+fi
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_LOOP_COMMAND", providerScript)
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("verify");
+const result = verify.untilGreen("check marker", { label: "green", maxRounds: 2, provider: "loop" });
+return result;`
+	scriptPath, err := WriteRunScript("wf-until-green-worktree", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-until-green-worktree", Task: "until green worktree", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"ok": true`) || !strings.Contains(result, `"fixed": true`) {
+		t.Fatalf("expected converged fix loop, got %s", result)
+	}
+	if content, err := os.ReadFile(filepath.Join(tmp, "marker.txt")); err != nil || string(content) != "fixed\n" {
+		t.Fatalf("expected combined patch applied to repo on completion, got %q err=%v", string(content), err)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	patchAgent := agents[len(agents)-1]
+	if patchAgent.Label != "green-patch" || patchAgent.Status != "completed" || patchAgent.PatchPath == "" {
+		t.Fatalf("expected registered untilGreen patch agent, got %+v", patchAgent)
+	}
+	if raw, err := os.ReadFile(patchAgent.PatchPath); err != nil || !strings.Contains(string(raw), "marker.txt") {
+		t.Fatalf("expected combined patch to include marker.txt, err=%v patch=%s", err, string(raw))
+	}
+	if _, err := os.Stat(patchAgent.Worktree); !os.IsNotExist(err) {
+		t.Fatalf("expected loop worktree removed after patch capture, stat err=%v", err)
 	}
 }
 
