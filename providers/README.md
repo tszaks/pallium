@@ -10,7 +10,14 @@ This directory ships reference wrappers:
 | Provider | Wrapper | Notes |
 |----------|---------|-------|
 | Claude Code | `claude.sh` | Structured output, mode-scoped permissions, token/cost reporting |
-| Gemini CLI | `gemini.sh` | Structured output via prompt contract |
+| Gemini CLI | `gemini.sh` | Structured output via prompt contract; see security note below |
+
+**Security note on `gemini.sh`:** Gemini CLI runs `SessionStart` hooks from
+the target repo's `.gemini/settings.json` at startup, before this wrapper's
+`--approval-mode` gating ever applies, and there's currently no documented
+CLI flag or env var to disable hook loading. A `worktree` doesn't help
+either, since it checks out the same tracked files. Only point `gemini.sh`
+at repos whose committed Gemini config you've reviewed.
 
 ## Quick start
 
