@@ -1007,6 +1007,39 @@ return { results };`
 	}
 }
 
+func TestParallelMapperThrowDropsOnlyThatItem(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"prompt":"{{PROMPT}}"}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("parallel");
+const results = await parallel(["keep", "drop", "also-keep"], item => {
+  if (item === "drop") {
+    throw new Error("drop this item");
+  }
+  return agent("inspect " + item, { label: item });
+});
+return { results };`
+	scriptPath, err := WriteRunScript("wf-parallel-throw", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-parallel-throw", Task: "parallel throw", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, "inspect keep") || !strings.Contains(result, "null") || !strings.Contains(result, "inspect also-keep") {
+		t.Fatalf("parallel mapper throw did not preserve item order with null drop: %s", result)
+	}
+}
+
 func TestWorkflowCollectionItemLimit(t *testing.T) {
 	tmp := t.TempDir()
 	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
@@ -1103,6 +1136,39 @@ return { before, after };`
 	for _, want := range []string{`"total": 1`, `"spent": 0`, `"remaining": 1`, `"spent": 0.25`, `"remaining": 0.75`} {
 		if !strings.Contains(result, want) {
 			t.Fatalf("budget object result missing %s: %s", want, result)
+		}
+	}
+}
+
+func TestWorkflowBudgetSpentUpdatesWithoutLimit(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_COST_USD", "0.25")
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("budget");
+const before = { total: budget.total, spent: budget.spent() };
+await agent("one", { label: "one" });
+const after = { total: budget.total, spent: budget.spent() };
+return { before, after };`
+	scriptPath, err := WriteRunScript("wf-budget-no-limit", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-budget-no-limit", Task: "budget no limit", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"total": null`, `"spent": 0`, `"spent": 0.25`} {
+		if !strings.Contains(result, want) {
+			t.Fatalf("uncapped budget result missing %s: %s", want, result)
 		}
 	}
 }

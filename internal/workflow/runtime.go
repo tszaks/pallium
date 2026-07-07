@@ -798,9 +798,12 @@ func (r *Runner) jsParallel(ctx context.Context, vm *goja.Runtime) func(goja.Fun
 		for i := 0; i < length; i++ {
 			item := items.Get(fmt.Sprintf("%d", i))
 			if mapper != nil {
+				callStart := len(capture.Calls)
 				value, err := mapper(goja.Undefined(), item, vm.ToValue(i))
 				if err != nil {
-					panic(err)
+					capture.Calls = capture.Calls[:callStart]
+					rawResults = append(rawResults, nil)
+					continue
 				}
 				rawResults = append(rawResults, value.Export())
 			} else if fn, ok := goja.AssertFunction(item); ok {
@@ -1060,9 +1063,7 @@ func (r *Runner) runAgentAtCallIndex(ctx context.Context, prompt string, opts Ag
 		r.mu.Unlock()
 		return "", fmt.Errorf("workflow budget exhausted: next agent would exceed $%.4f limit", r.budgetLimit)
 	}
-	if r.budgetLimit > 0 {
-		r.budgetSpent += r.agentCostUSD
-	}
+	r.budgetSpent += r.agentCostUSD
 	r.agentCount++
 	r.mu.Unlock()
 

@@ -1095,11 +1095,14 @@ func runWorkflowGenerate(out io.Writer, args []string, jsonOutput bool) error {
 		TestCommand: *testCommand,
 		MaxRounds:   *maxRounds,
 	})
-	if *llm {
-		script, err = generateWorkflowWithLLM(task, *style, *testCommand, *maxRounds, *codexBinary, script)
-	}
 	if err != nil {
 		return err
+	}
+	if *llm {
+		script, err = generateWorkflowWithLLM(task, *style, *testCommand, *maxRounds, *codexBinary, script)
+		if err != nil {
+			return err
+		}
 	}
 	if validation := workflow.ValidateScript(script); !validation.Valid {
 		return fmt.Errorf("generated workflow is invalid: %s", validation.Error)
