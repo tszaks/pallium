@@ -1346,16 +1346,31 @@ func runWorkflowRead(out io.Writer, args []string, jsonOutput bool) error {
 	if err != nil {
 		return err
 	}
-	payload := map[string]string{"id": run.ID, "result": run.Result, "error": run.Error}
+	payload := map[string]any{"id": run.ID, "result": run.Result, "error": run.Error, "failures": run.Failures}
 	return output.Write(out, payload, jsonOutput, func() string {
-		if run.Error != "" {
-			return run.Error
+		lines := []string{}
+		switch {
+		case run.Error != "":
+			lines = append(lines, run.Error)
+		case run.Result == "":
+			lines = append(lines, "No result recorded.")
+		default:
+			lines = append(lines, run.Result)
 		}
-		if run.Result == "" {
-			return "No result recorded."
-		}
-		return run.Result
+		lines = append(lines, renderWorkflowFailures(run.Failures)...)
+		return strings.Join(lines, "\n")
 	})
+}
+
+func renderWorkflowFailures(failures []workflow.RunFailure) []string {
+	if len(failures) == 0 {
+		return nil
+	}
+	lines := []string{"Dropped items:"}
+	for _, failure := range failures {
+		lines = append(lines, fmt.Sprintf("- %s phase=%s error=%s", firstNonEmpty(failure.Label, "item"), failure.Phase, failure.Error))
+	}
+	return lines
 }
 
 func runWorkflowReport(out io.Writer, args []string, jsonOutput bool) error {
@@ -1735,6 +1750,7 @@ type workflowStatus struct {
 	AgentsFailed    int    `json:"agents_failed"`
 	AgentsStopped   int    `json:"agents_stopped"`
 	AgentsPaused    int    `json:"agents_paused"`
+	ScriptChanged   bool   `json:"script_changed,omitempty"`
 	UpdatedAt       string `json:"updated_at"`
 	CompletedAt     string `json:"completed_at,omitempty"`
 	Error           string `json:"error,omitempty"`
@@ -1744,6 +1760,7 @@ type workflowInspectionReport struct {
 	Status       workflowStatus        `json:"status"`
 	ScriptPath   string                `json:"script_path"`
 	Result       string                `json:"result,omitempty"`
+	Failures     []workflow.RunFailure `json:"failures,omitempty"`
 	Phases       []workflow.Phase      `json:"phases"`
 	Agents       []workflow.Agent      `json:"agents"`
 	Patches      []string              `json:"patches"`
@@ -1761,14 +1778,15 @@ type phaseStats struct {
 
 func workflowStatusSummary(snapshot workflow.Snapshot) workflowStatus {
 	status := workflowStatus{
-		ID:          snapshot.Run.ID,
-		Task:        snapshot.Run.Task,
-		Status:      snapshot.Run.Status,
-		UpdatedAt:   snapshot.Run.UpdatedAt,
-		CompletedAt: snapshot.Run.CompletedAt,
-		Error:       snapshot.Run.Error,
-		PhasesTotal: len(snapshot.Phases),
-		AgentsTotal: len(snapshot.Agents),
+		ID:            snapshot.Run.ID,
+		Task:          snapshot.Run.Task,
+		Status:        snapshot.Run.Status,
+		ScriptChanged: snapshot.Run.ScriptChanged,
+		UpdatedAt:     snapshot.Run.UpdatedAt,
+		CompletedAt:   snapshot.Run.CompletedAt,
+		Error:         snapshot.Run.Error,
+		PhasesTotal:   len(snapshot.Phases),
+		AgentsTotal:   len(snapshot.Agents),
 	}
 	for _, phase := range snapshot.Phases {
 		if phase.Status == "completed" {
@@ -1797,6 +1815,7 @@ func workflowInspection(snapshot workflow.Snapshot) workflowInspectionReport {
 		Status:     workflowStatusSummary(snapshot),
 		ScriptPath: snapshot.Run.ScriptPath,
 		Result:     snapshot.Run.Result,
+		Failures:   snapshot.Run.Failures,
 		Phases:     snapshot.Phases,
 		Agents:     snapshot.Agents,
 		ByPhase:    map[string]phaseStats{},
@@ -1834,6 +1853,9 @@ func renderWorkflowStatus(status workflowStatus) string {
 		fmt.Sprintf("Agents: %d completed, %d running, %d failed, %d paused, %d stopped, %d total", status.AgentsCompleted, status.AgentsRunning, status.AgentsFailed, status.AgentsPaused, status.AgentsStopped, status.AgentsTotal),
 		"Updated: " + status.UpdatedAt,
 	}
+	if status.ScriptChanged {
+		lines = append(lines, "Script changed since original run")
+	}
 	if status.CompletedAt != "" {
 		lines = append(lines, "Completed: "+status.CompletedAt)
 	}
@@ -1868,6 +1890,7 @@ func renderWorkflowInspection(report workflowInspectionReport) string {
 			lines = append(lines, fmt.Sprintf("- %s phase=%s error=%s", label, agent.Phase, agent.Error))
 		}
 	}
+	lines = append(lines, renderWorkflowFailures(report.Failures)...)
 	if report.Result != "" {
 		lines = append(lines, "Result recorded: yes")
 	}
@@ -2109,6 +2132,7 @@ func renderWorkflowReport(report workflow.Report) string {
 			}
 		}
 	}
+	lines = append(lines, renderWorkflowFailures(report.Failures)...)
 	if report.Error != "" {
 		lines = append(lines, "Error: "+report.Error)
 	}

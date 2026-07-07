@@ -994,6 +994,90 @@ return { ok: true };`), 0o644); err != nil {
 	}
 }
 
+func TestWorkflowReadAndInspectSurfaceFailuresAndScriptChange(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_TEST_COMMAND", `if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q bad; then echo "failed intentionally" >&2; exit 7; fi; printf '{"prompt":"%s"}' "$PALLIUM_WORKFLOW_PROMPT" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	scriptPath := filepath.Join(tmp, "workflow.js")
+	script := `phase("parallel");
+const results = await parallel(["good", "bad"], item =>
+  agent("worker " + item, { label: item, provider: "test" })
+);
+return { results };`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{"run", "--id", "wf-failures", "--db", dbPath, "--cwd", tmp, "--script", scriptPath, "failure surfacing"}, false); err != nil {
+		t.Fatalf("workflow run failed: %v", err)
+	}
+
+	out.Reset()
+	if err := runWorkflow(&out, []string{"read", "wf-failures", "--db", dbPath}, true); err != nil {
+		t.Fatalf("workflow read failed: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("decode read json: %v\n%s", err, out.String())
+	}
+	failures, ok := payload["failures"].([]any)
+	if !ok || len(failures) != 1 {
+		t.Fatalf("expected one failure in read payload, got %#v", payload)
+	}
+	failure := failures[0].(map[string]any)
+	if failure["label"] != "bad" || !strings.Contains(failure["error"].(string), "failed intentionally") {
+		t.Fatalf("unexpected failure entry: %#v", failure)
+	}
+
+	store, err := workflow.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.Run("wf-failures")
+	_ = store.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedScript := script + "\n// tail edit"
+	if err := os.WriteFile(run.ScriptPath, []byte(changedScript), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := runWorkflow(&out, []string{"resume", "wf-failures", "--db", dbPath}, false); err != nil {
+		t.Fatalf("workflow resume failed: %v", err)
+	}
+
+	out.Reset()
+	if err := runWorkflow(&out, []string{"inspect", "wf-failures", "--db", dbPath}, true); err != nil {
+		t.Fatalf("workflow inspect failed: %v", err)
+	}
+	var inspection map[string]any
+	if err := json.Unmarshal(out.Bytes(), &inspection); err != nil {
+		t.Fatalf("decode inspect json: %v\n%s", err, out.String())
+	}
+	status := inspection["status"].(map[string]any)
+	if status["script_changed"] != true {
+		t.Fatalf("expected script_changed=true in inspect status, got %#v", status)
+	}
+	if failures, ok := inspection["failures"].([]any); !ok || len(failures) != 1 {
+		t.Fatalf("expected inspect failures list, got %#v", inspection["failures"])
+	}
+
+	out.Reset()
+	if err := runWorkflow(&out, []string{"report", "wf-failures", "--db", dbPath}, true); err != nil {
+		t.Fatalf("workflow report failed: %v", err)
+	}
+	var report map[string]any
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatalf("decode report json: %v\n%s", err, out.String())
+	}
+	if failures, ok := report["failures"].([]any); !ok || len(failures) != 1 {
+		t.Fatalf("expected report failures list, got %#v", report["failures"])
+	}
+}
+
 func runGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)

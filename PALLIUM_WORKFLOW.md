@@ -93,6 +93,12 @@ Provider commands receive `PALLIUM_WORKFLOW_PROMPT_FILE`, `PALLIUM_WORKFLOW_OUTP
 - Stage callback: `(prevResult, originalItem, index)`
 - Stage throw -> that item becomes `null`, others continue
 
+Dropped items are never silent: every item that `parallel`/`pipeline` converts
+to `null` (failed agent, stage throw) is logged to stderr
+(`[workflow:<run-id>] dropped <label>: <error>`) and recorded in the run-level
+`failures` list surfaced by `workflow read`, `workflow inspect`, and
+`workflow report`.
+
 ```js
 const verified = await pipeline(findings,
   f => agent(`Find issues: ${f.path}`, { label: "find-" + f.path, schema: FINDING_SCHEMA }),
@@ -171,7 +177,7 @@ const plan = await coordinator.replan("adapt after verifier findings", { label: 
 | Items per `parallel`/`pipeline` | 4096 |
 | Nested `workflow()` | 1 level |
 
-A timed-out agent fails with `workflow agent timed out after Ns`: it becomes `null` inside `parallel`/`pipeline` and throws for a direct `agent()` call, so a hung worker can never stall the run.
+A timed-out agent fails with `workflow agent timed out after Ns`: it becomes `null` inside `parallel`/`pipeline` (recorded in the run `failures` list) and throws for a direct `agent()` call, so a hung worker can never stall the run.
 
 ## Resume and caching
 
@@ -183,6 +189,7 @@ What that means:
 - Resuming a run replays the script from the top and reuses matching completed call positions.
 - Editing the tail of a script keeps the unchanged prefix cached.
 - Changing args, model, provider, repo, mode, label, prompt, or schema invalidates the affected call.
+- Resuming with an edited script warns on stderr (`script changed since original run; unchanged prefix will replay from cache`) and sets `script_changed: true` on the run snapshot and `workflow inspect` output.
 
 ```bash
 pallium workflow resume <run-id>
@@ -216,7 +223,7 @@ These are **patterns**, not built-ins. Match harness to task:
 | Native Workflow tool in-session | CLI / MCP / HTTP (`pallium workflow run`) |
 | Token `budget` | USD-shaped `budget` object |
 | `effort`, `agentType` | `provider`, `model`, `mode` |
-| Agent death -> `null` | Parallel/pipeline agent failure -> `null`; direct `agent()` failure throws |
+| Agent death -> `null` | Parallel/pipeline agent failure -> `null` plus a run-level `failures` entry; direct `agent()` failure throws |
 | `journal.jsonl` in transcript dir | SQLite store + `workflow show/inspect` |
 | MCP via ToolSearch in headless workers | Provider must bundle tools; Pallium exposes repo via `pallium.*` |
 | Permission dialog from `meta` | `meta` for naming/phases; gates run verifier agents |
