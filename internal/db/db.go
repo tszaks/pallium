@@ -12,8 +12,17 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// dbtx is the subset of database operations shared by *sql.DB and *sql.Tx,
+// letting Store methods run either directly or inside a transaction.
+type dbtx interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	Query(query string, args ...any) (*sql.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
+
 type Store struct {
 	conn     *sql.DB
+	q        dbtx
 	RepoRoot string
 	DBPath   string
 }
@@ -108,7 +117,7 @@ func OpenPath(repoRoot, dbPath string) (*Store, error) {
 	conn.SetMaxOpenConns(1)
 	conn.SetMaxIdleConns(1)
 
-	store := &Store{conn: conn, RepoRoot: repoRoot, DBPath: dbPath}
+	store := &Store{conn: conn, q: conn, RepoRoot: repoRoot, DBPath: dbPath}
 	if err := store.Init(); err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -124,12 +133,12 @@ func (s *Store) Init() error {
 		"PRAGMA synchronous = NORMAL",
 	}
 	for _, statement := range pragmas {
-		if _, err := s.conn.Exec(statement); err != nil {
+		if _, err := s.q.Exec(statement); err != nil {
 			return fmt.Errorf("initialize sqlite pragmas: %w", err)
 		}
 	}
 
-	if _, err := s.conn.Exec(schema); err != nil {
+	if _, err := s.q.Exec(schema); err != nil {
 		return fmt.Errorf("initialize schema: %w", err)
 	}
 	if err := s.migrate(); err != nil {
@@ -153,12 +162,12 @@ func (s *Store) migrate() error {
 		if _, ok := existing[column]; ok {
 			continue
 		}
-		if _, err := s.conn.Exec(statement); err != nil {
+		if _, err := s.q.Exec(statement); err != nil {
 			return fmt.Errorf("add files.%s column: %w", column, err)
 		}
 	}
 
-	if _, err := s.conn.Exec(`
+	if _, err := s.q.Exec(`
 UPDATE files
 SET author_count = COALESCE((
 	SELECT COUNT(DISTINCT c.author_email)
@@ -172,7 +181,7 @@ WHERE author_count = 0
 		return fmt.Errorf("backfill files.author_count: %w", err)
 	}
 
-	if _, err := s.conn.Exec(`
+	if _, err := s.q.Exec(`
 UPDATE files
 SET last_touched_at = COALESCE((
 	SELECT MAX(fc.committed_at)
@@ -188,7 +197,7 @@ WHERE last_touched_at = ''
 }
 
 func (s *Store) tableColumns(table string) (map[string]struct{}, error) {
-	rows, err := s.conn.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	rows, err := s.q.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
 	if err != nil {
 		return nil, err
 	}
@@ -221,8 +230,32 @@ func (s *Store) DB() *sql.DB {
 	return s.conn
 }
 
+// WithTx runs fn with a Store bound to a single transaction. The transaction
+// commits when fn returns nil and rolls back when it returns an error or
+// panics. fn must use only the tx-bound Store's query methods; it must not
+// call DB(), Close(), or a nested WithTx, because the pool holds a single
+// connection and doing so deadlocks.
+func (s *Store) WithTx(fn func(tx *Store) error) error {
+	tx, err := s.conn.Begin()
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	// Rollback after a successful Commit is a no-op (ErrTxDone), so this
+	// deferred call only releases the connection on error or panic.
+	defer func() { _ = tx.Rollback() }()
+	txStore := *s
+	txStore.q = tx
+	if err := fn(&txStore); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit transaction: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) UpsertRepo(branch, lastIndexedCommit string, indexedAt time.Time) (RepoRecord, error) {
-	if _, err := s.conn.Exec(`
+	if _, err := s.q.Exec(`
 INSERT INTO repos (root, branch, last_indexed_commit, indexed_at)
 VALUES (?, ?, ?, ?)
 ON CONFLICT(root) DO UPDATE SET
@@ -237,7 +270,7 @@ ON CONFLICT(root) DO UPDATE SET
 }
 
 func (s *Store) Repo() (RepoRecord, error) {
-	row := s.conn.QueryRow(`SELECT id, root, branch, COALESCE(last_indexed_commit, ''), indexed_at FROM repos WHERE root = ?`, s.RepoRoot)
+	row := s.q.QueryRow(`SELECT id, root, branch, COALESCE(last_indexed_commit, ''), indexed_at FROM repos WHERE root = ?`, s.RepoRoot)
 	var repo RepoRecord
 	var indexedAt string
 	if err := row.Scan(&repo.ID, &repo.Root, &repo.Branch, &repo.LastIndexedCommit, &indexedAt); err != nil {
@@ -251,9 +284,11 @@ func (s *Store) Repo() (RepoRecord, error) {
 }
 
 func (s *Store) ResetRepoData(repoID int64) error {
-	tables := []string{"files", "commits", "file_commits", "cochange_edges", "decision_notes", "active_tasks"}
+	// active_tasks is intentionally excluded: it is user state managed by
+	// `pallium task start/done`, not index data, so reindexing must not clear it.
+	tables := []string{"files", "commits", "file_commits", "cochange_edges", "decision_notes"}
 	for _, table := range tables {
-		if _, err := s.conn.Exec(fmt.Sprintf("DELETE FROM %s WHERE repo_id = ?", table), repoID); err != nil {
+		if _, err := s.q.Exec(fmt.Sprintf("DELETE FROM %s WHERE repo_id = ?", table), repoID); err != nil {
 			return fmt.Errorf("reset %s: %w", table, err)
 		}
 	}
@@ -261,7 +296,7 @@ func (s *Store) ResetRepoData(repoID int64) error {
 }
 
 func (s *Store) InsertCommit(repoID int64, commit CommitRecord) error {
-	_, err := s.conn.Exec(`
+	_, err := s.q.Exec(`
 INSERT OR REPLACE INTO commits (repo_id, sha, author_name, author_email, committed_at, subject, body)
 VALUES (?, ?, ?, ?, ?, ?, ?)
 `, repoID, commit.SHA, commit.AuthorName, commit.AuthorEmail, commit.CommittedAt.UTC().Format(time.RFC3339), commit.Subject, commit.Body)
@@ -272,7 +307,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?)
 }
 
 func (s *Store) InsertFileCommit(repoID int64, filePath, commitSHA string, committedAt time.Time) error {
-	_, err := s.conn.Exec(`
+	_, err := s.q.Exec(`
 INSERT OR REPLACE INTO file_commits (repo_id, file_path, commit_sha, committed_at)
 VALUES (?, ?, ?, ?)
 `, repoID, filePath, commitSHA, committedAt.UTC().Format(time.RFC3339))
@@ -291,7 +326,7 @@ func (s *Store) UpsertFile(repoID int64, stat FileStat) error {
 	if !stat.LastTouchedAt.IsZero() {
 		lastTouchedAt = stat.LastTouchedAt.UTC().Format(time.RFC3339)
 	}
-	_, err := s.conn.Exec(`
+	_, err := s.q.Exec(`
 INSERT OR REPLACE INTO files (repo_id, path, extension, churn_score, recent_touch_count, author_count, last_touched_at, exists_on_disk)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 `, repoID, stat.Path, stat.Extension, stat.ChurnScore, stat.RecentTouchCount, stat.AuthorCount, lastTouchedAt, exists)
@@ -302,7 +337,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 }
 
 func (s *Store) UpsertEdge(repoID int64, edge CochangeEdge) error {
-	_, err := s.conn.Exec(`
+	_, err := s.q.Exec(`
 INSERT OR REPLACE INTO cochange_edges (repo_id, source_path, related_path, cochange_count, recency_weight)
 VALUES (?, ?, ?, ?, ?)
 `, repoID, edge.SourcePath, edge.RelatedPath, edge.CochangeCount, edge.RecencyWeight)
@@ -313,7 +348,7 @@ VALUES (?, ?, ?, ?, ?)
 }
 
 func (s *Store) UpsertDecisionNote(repoID int64, note DecisionNote) error {
-	_, err := s.conn.Exec(`
+	_, err := s.q.Exec(`
 INSERT OR REPLACE INTO decision_notes (repo_id, source_type, source_ref, title, body, committed_at)
 VALUES (?, ?, ?, ?, ?, ?)
 `, repoID, note.SourceType, note.SourceRef, note.Title, note.Body, note.CommittedAt.UTC().Format(time.RFC3339))
@@ -339,7 +374,7 @@ func (s *Store) SaveActiveTask(task ActiveTask) error {
 		startedAt = time.Now().UTC()
 	}
 
-	_, err = s.conn.Exec(`
+	_, err = s.q.Exec(`
 INSERT INTO active_tasks (repo_id, goal, scope_paths, started_at)
 VALUES (?, ?, ?, ?)
 ON CONFLICT(repo_id) DO UPDATE SET
@@ -359,7 +394,7 @@ func (s *Store) ActiveTask() (ActiveTask, error) {
 		return ActiveTask{}, err
 	}
 
-	row := s.conn.QueryRow(`SELECT goal, scope_paths, started_at FROM active_tasks WHERE repo_id = ?`, repo.ID)
+	row := s.q.QueryRow(`SELECT goal, scope_paths, started_at FROM active_tasks WHERE repo_id = ?`, repo.ID)
 	var task ActiveTask
 	var scopeJSON string
 	var startedAt string
@@ -382,7 +417,7 @@ func (s *Store) ClearActiveTask() error {
 	if err != nil {
 		return err
 	}
-	if _, err := s.conn.Exec(`DELETE FROM active_tasks WHERE repo_id = ?`, repo.ID); err != nil {
+	if _, err := s.q.Exec(`DELETE FROM active_tasks WHERE repo_id = ?`, repo.ID); err != nil {
 		return fmt.Errorf("clear active task: %w", err)
 	}
 	return nil
@@ -401,7 +436,7 @@ func (s *Store) SaveVerificationRun(run VerificationRun) (VerificationRun, error
 	if ranAt == "" {
 		ranAt = time.Now().UTC().Format(time.RFC3339)
 	}
-	result, err := s.conn.Exec(`
+	result, err := s.q.Exec(`
 INSERT INTO verification_runs (repo_id, tier, command, exit_code, duration_ms, changed_files_json, cwd, ran_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 `, repo.ID, run.Tier, run.Command, run.ExitCode, run.DurationMS, string(changedJSON), run.CWD, ranAt)
@@ -421,7 +456,7 @@ func (s *Store) RecentVerificationRuns(limit int) ([]VerificationRun, error) {
 	if limit <= 0 {
 		limit = 10
 	}
-	rows, err := s.conn.Query(`
+	rows, err := s.q.Query(`
 SELECT id, tier, command, exit_code, duration_ms, changed_files_json, cwd, ran_at
 FROM verification_runs
 WHERE repo_id = ?
