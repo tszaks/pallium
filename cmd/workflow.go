@@ -890,8 +890,9 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 	maxConcurrentAgents := fs.Int("max-concurrent-agents", 16, "")
 	maxBudgetUSD := fs.String("max-budget-usd", "", "")
 	maxActiveRuns := fs.Int("max-active-runs", 0, "")
+	agentTimeout := fs.Int("agent-timeout", 600, "")
 	background := fs.Bool("background", false, "")
-	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "cwd": {}, "id": {}, "script": {}, "workflow": {}, "args": {}, "codex": {}, "max-agents": {}, "max-concurrent-agents": {}, "max-budget-usd": {}, "max-active-runs": {}}, map[string]struct{}{"background": {}}); err != nil {
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "cwd": {}, "id": {}, "script": {}, "workflow": {}, "args": {}, "codex": {}, "max-agents": {}, "max-concurrent-agents": {}, "max-budget-usd": {}, "max-active-runs": {}, "agent-timeout": {}}, map[string]struct{}{"background": {}}); err != nil {
 		return err
 	}
 	maxAgentsSet := flagWasSet(fs, "max-agents")
@@ -1011,6 +1012,7 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 			"--script", runScriptPath,
 			"--codex", *codexBinary,
 			"--max-concurrent-agents", fmt.Sprintf("%d", *maxConcurrentAgents),
+			"--agent-timeout", fmt.Sprintf("%d", *agentTimeout),
 		)
 		if effectiveMaxAgents > 0 && (maxAgentsSet || run.MaxAgents > 0) {
 			cmdArgs = append(cmdArgs, "--max-agents", fmt.Sprintf("%d", effectiveMaxAgents))
@@ -1058,6 +1060,7 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 		MaxConcurrentAgents: *maxConcurrentAgents,
 		MaxBudgetUSD:        effectiveMaxBudgetUSD,
 		CodexBinary:         *codexBinary,
+		AgentTimeoutSeconds: *agentTimeout,
 	}
 	result, err := runner.Execute(context.Background(), script, inputArgs)
 	if err != nil {
@@ -1553,8 +1556,9 @@ func runWorkflowResume(out io.Writer, args []string, jsonOutput bool) error {
 	maxAgents := fs.Int("max-agents", 1000, "")
 	maxConcurrentAgents := fs.Int("max-concurrent-agents", 16, "")
 	maxBudgetUSD := fs.String("max-budget-usd", "", "")
+	agentTimeout := fs.Int("agent-timeout", 600, "")
 	background := fs.Bool("background", false, "")
-	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "codex": {}, "max-agents": {}, "max-concurrent-agents": {}, "max-budget-usd": {}}, map[string]struct{}{"background": {}}); err != nil {
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "codex": {}, "max-agents": {}, "max-concurrent-agents": {}, "max-budget-usd": {}, "agent-timeout": {}}, map[string]struct{}{"background": {}}); err != nil {
 		return err
 	}
 	maxAgentsSet := flagWasSet(fs, "max-agents")
@@ -1571,7 +1575,7 @@ func runWorkflowResume(out io.Writer, args []string, jsonOutput bool) error {
 	if err != nil {
 		return err
 	}
-	runArgs := []string{"run", "--id", run.ID, "--cwd", run.CWD, "--script", run.ScriptPath, "--codex", *codexBinary, "--max-concurrent-agents", fmt.Sprintf("%d", *maxConcurrentAgents)}
+	runArgs := []string{"run", "--id", run.ID, "--cwd", run.CWD, "--script", run.ScriptPath, "--codex", *codexBinary, "--max-concurrent-agents", fmt.Sprintf("%d", *maxConcurrentAgents), "--agent-timeout", fmt.Sprintf("%d", *agentTimeout)}
 	if maxAgentsSet && *maxAgents > 0 {
 		runArgs = append(runArgs, "--max-agents", fmt.Sprintf("%d", *maxAgents))
 	} else if !maxAgentsSet && run.MaxAgents > 0 {
@@ -2233,7 +2237,7 @@ Usage:
   pallium workflow gate list <run-id> [--json]
   pallium workflow serve [--addr 127.0.0.1:8765] [--token token]
   pallium workflow mcp [--db path]
-  pallium workflow run "task" [--script path.js] [--workflow name] [--background] [--max-concurrent-agents 16] [--max-active-runs n] [--max-budget-usd n] [--json]
+  pallium workflow run "task" [--script path.js] [--workflow name] [--background] [--max-concurrent-agents 16] [--max-active-runs n] [--max-budget-usd n] [--agent-timeout 600] [--json]
   pallium workflow audit [--run-acceptance] [--json]
   pallium workflow run /saved-name "task input"
   pallium workflow list [--limit n] [--json]

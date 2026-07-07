@@ -77,9 +77,12 @@ const finding = await agent("Review auth middleware", {
 | `effort` | low to max | **not yet** - use prompt/provider |
 | `isolation: "worktree"` | edit isolation | same |
 | `agentType` | named agent | use `provider` |
-| `schema` | StructuredOutput | Codex `--output-schema`; providers get schema file and Pallium validates returned JSON locally |
+| `schema` | StructuredOutput | Codex `--output-schema`; providers get schema file, Pallium validates returned JSON locally and retries once with a corrective prompt before failing the agent |
+| `timeout_seconds` | - | per-call wall-clock cap; overrides `--agent-timeout` (`0` disables) |
 
 Non-Codex providers: `PALLIUM_WORKFLOW_PROVIDER_<NAME>_COMMAND`
+
+Provider commands receive `PALLIUM_WORKFLOW_PROMPT_FILE`, `PALLIUM_WORKFLOW_OUTPUT_FILE`, `PALLIUM_WORKFLOW_SCHEMA_FILE`, and `PALLIUM_WORKFLOW_USAGE_FILE`. A provider may write `{"input_tokens":N,"output_tokens":N,"cost_usd":X}` to the usage file; the reported `cost_usd` replaces the flat per-agent estimate for that agent (including budget accounting) and the raw JSON is persisted on the agent record as `usage_json`. Unreadable or absent usage files are ignored.
 
 ### `await pipeline(items, stage1, stage2, ...)`
 
@@ -145,7 +148,7 @@ if (budget.total !== null && budget.remaining() < 0.01) {
 }
 ```
 
-Set ceiling with `--max-budget-usd` and per-agent estimate with `PALLIUM_WORKFLOW_AGENT_COST_USD`. Further `agent()` calls throw when exhausted. Agent and budget caps are lifetime run limits, so resume does not reset them.
+Set ceiling with `--max-budget-usd` and per-agent estimate with `PALLIUM_WORKFLOW_AGENT_COST_USD`. Configured providers that report real usage through `PALLIUM_WORKFLOW_USAGE_FILE` replace the flat estimate with the reported `cost_usd`. Further `agent()` calls throw when exhausted. Agent and budget caps are lifetime run limits, so resume does not reset them.
 
 ## Pallium Extras
 
@@ -164,8 +167,11 @@ const plan = await coordinator.replan("adapt after verifier findings", { label: 
 |-------|-------|
 | Concurrent agents | `--max-concurrent-agents` (default 16) |
 | Lifetime agents | `--max-agents` (default 1000) |
+| Per-agent wall clock | `--agent-timeout` seconds (default 600, `0` disables) |
 | Items per `parallel`/`pipeline` | 4096 |
 | Nested `workflow()` | 1 level |
+
+A timed-out agent fails with `workflow agent timed out after Ns`: it becomes `null` inside `parallel`/`pipeline` and throws for a direct `agent()` call, so a hung worker can never stall the run.
 
 ## Resume and caching
 
