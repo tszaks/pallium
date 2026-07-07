@@ -425,3 +425,11 @@ func TestSuggestedVerificationPlanUsesPythonRepoConfigs(t *testing.T) {
 		}
 	}
 }
+
+func TestInferredVerificationPlanNonGoTargetUsesTestPackageDir(t *testing.T) {
+	plan := inferredVerificationPlan(t.TempDir(), "docs/parser.md", []string{"internal/parser/parser_test.go"})
+
+	if len(plan.Fast) == 0 || plan.Fast[0] != "go test ./internal/parser" {
+		t.Fatalf("expected fast go verification from matched test package, got %#v", plan)
+	}
+}
