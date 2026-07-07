@@ -20,20 +20,31 @@ type Store struct {
 }
 
 type Run struct {
-	ID           string `json:"id"`
-	Task         string `json:"task"`
-	CWD          string `json:"cwd"`
-	ScriptPath   string `json:"script_path"`
-	ArgsJSON     string `json:"args_json,omitempty"`
-	OwnedID      string `json:"owned_session_id,omitempty"`
-	MaxAgents    int    `json:"max_agents,omitempty"`
-	MaxBudgetUSD string `json:"max_budget_usd,omitempty"`
-	Status       string `json:"status"`
-	Result       string `json:"result,omitempty"`
-	Error        string `json:"error,omitempty"`
-	CreatedAt    string `json:"created_at"`
-	UpdatedAt    string `json:"updated_at"`
-	CompletedAt  string `json:"completed_at,omitempty"`
+	ID            string       `json:"id"`
+	Task          string       `json:"task"`
+	CWD           string       `json:"cwd"`
+	ScriptPath    string       `json:"script_path"`
+	ArgsJSON      string       `json:"args_json,omitempty"`
+	OwnedID       string       `json:"owned_session_id,omitempty"`
+	MaxAgents     int          `json:"max_agents,omitempty"`
+	MaxBudgetUSD  string       `json:"max_budget_usd,omitempty"`
+	Status        string       `json:"status"`
+	Result        string       `json:"result,omitempty"`
+	Error         string       `json:"error,omitempty"`
+	Failures      []RunFailure `json:"failures,omitempty"`
+	ScriptHash    string       `json:"script_hash,omitempty"`
+	ScriptChanged bool         `json:"script_changed,omitempty"`
+	CreatedAt     string       `json:"created_at"`
+	UpdatedAt     string       `json:"updated_at"`
+	CompletedAt   string       `json:"completed_at,omitempty"`
+}
+
+// RunFailure records an item that was dropped to null inside parallel or
+// pipeline instead of failing the run.
+type RunFailure struct {
+	Label string `json:"label,omitempty"`
+	Phase string `json:"phase,omitempty"`
+	Error string `json:"error"`
 }
 
 type Phase struct {
@@ -122,6 +133,9 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
   status TEXT NOT NULL,
   result TEXT,
   error TEXT,
+  failures TEXT,
+  script_hash TEXT,
+  script_changed INTEGER DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   completed_at TEXT
@@ -218,6 +232,9 @@ CREATE INDEX IF NOT EXISTS idx_workflow_gates_run ON workflow_gates(run_id, open
 		"ALTER TABLE workflow_agents ADD COLUMN usage_json TEXT",
 		"ALTER TABLE workflow_runs ADD COLUMN max_agents INTEGER DEFAULT 0",
 		"ALTER TABLE workflow_runs ADD COLUMN max_budget_usd TEXT",
+		"ALTER TABLE workflow_runs ADD COLUMN failures TEXT",
+		"ALTER TABLE workflow_runs ADD COLUMN script_hash TEXT",
+		"ALTER TABLE workflow_runs ADD COLUMN script_changed INTEGER DEFAULT 0",
 		"ALTER TABLE workflow_triggers ADD COLUMN last_fingerprint TEXT",
 	} {
 		if _, alterErr := s.db.Exec(stmt); alterErr != nil && !strings.Contains(alterErr.Error(), "duplicate column name") {
@@ -319,11 +336,47 @@ func (s *Store) SetRunOwnedID(id, ownedID string) error {
 	return err
 }
 
-func (s *Store) Run(id string) (Run, error) {
-	row := s.db.QueryRow(`SELECT id,task,cwd,script_path,COALESCE(args_json,''),COALESCE(owned_session_id,''),COALESCE(max_agents,0),COALESCE(max_budget_usd,''),status,COALESCE(result,''),COALESCE(error,''),created_at,updated_at,COALESCE(completed_at,'') FROM workflow_runs WHERE id=?`, id)
+const runSelectColumns = `id,task,cwd,script_path,COALESCE(args_json,''),COALESCE(owned_session_id,''),COALESCE(max_agents,0),COALESCE(max_budget_usd,''),status,COALESCE(result,''),COALESCE(error,''),COALESCE(failures,''),COALESCE(script_hash,''),COALESCE(script_changed,0),created_at,updated_at,COALESCE(completed_at,'')`
+
+func scanRun(row interface{ Scan(dest ...any) error }) (Run, error) {
 	var run Run
-	err := row.Scan(&run.ID, &run.Task, &run.CWD, &run.ScriptPath, &run.ArgsJSON, &run.OwnedID, &run.MaxAgents, &run.MaxBudgetUSD, &run.Status, &run.Result, &run.Error, &run.CreatedAt, &run.UpdatedAt, &run.CompletedAt)
-	return run, err
+	var failuresJSON string
+	var scriptChanged int
+	if err := row.Scan(&run.ID, &run.Task, &run.CWD, &run.ScriptPath, &run.ArgsJSON, &run.OwnedID, &run.MaxAgents, &run.MaxBudgetUSD, &run.Status, &run.Result, &run.Error, &failuresJSON, &run.ScriptHash, &scriptChanged, &run.CreatedAt, &run.UpdatedAt, &run.CompletedAt); err != nil {
+		return Run{}, err
+	}
+	run.ScriptChanged = scriptChanged != 0
+	if failuresJSON != "" {
+		_ = json.Unmarshal([]byte(failuresJSON), &run.Failures)
+	}
+	return run, nil
+}
+
+func (s *Store) Run(id string) (Run, error) {
+	row := s.db.QueryRow(`SELECT `+runSelectColumns+` FROM workflow_runs WHERE id=?`, id)
+	return scanRun(row)
+}
+
+func (s *Store) SetRunFailures(id string, failures []RunFailure) error {
+	raw := ""
+	if len(failures) > 0 {
+		encoded, err := json.Marshal(failures)
+		if err != nil {
+			return err
+		}
+		raw = string(encoded)
+	}
+	_, err := s.db.Exec(`UPDATE workflow_runs SET failures=?,updated_at=? WHERE id=?`, raw, nowString(), id)
+	return err
+}
+
+func (s *Store) SetRunScriptState(id, scriptHash string, scriptChanged bool) error {
+	changed := 0
+	if scriptChanged {
+		changed = 1
+	}
+	_, err := s.db.Exec(`UPDATE workflow_runs SET script_hash=?,script_changed=?,updated_at=? WHERE id=?`, scriptHash, changed, nowString(), id)
+	return err
 }
 
 func (s *Store) CountActiveRuns() (int, error) {
@@ -339,15 +392,15 @@ func (s *Store) ListRuns(limit int) ([]Run, error) {
 	if limit <= 0 {
 		limit = 50
 	}
-	rows, err := s.db.Query(`SELECT id,task,cwd,script_path,COALESCE(args_json,''),COALESCE(owned_session_id,''),COALESCE(max_agents,0),COALESCE(max_budget_usd,''),status,COALESCE(result,''),COALESCE(error,''),created_at,updated_at,COALESCE(completed_at,'') FROM workflow_runs ORDER BY updated_at DESC LIMIT ?`, limit)
+	rows, err := s.db.Query(`SELECT `+runSelectColumns+` FROM workflow_runs ORDER BY updated_at DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var runs []Run
 	for rows.Next() {
-		var run Run
-		if err := rows.Scan(&run.ID, &run.Task, &run.CWD, &run.ScriptPath, &run.ArgsJSON, &run.OwnedID, &run.MaxAgents, &run.MaxBudgetUSD, &run.Status, &run.Result, &run.Error, &run.CreatedAt, &run.UpdatedAt, &run.CompletedAt); err != nil {
+		run, err := scanRun(rows)
+		if err != nil {
 			return nil, err
 		}
 		runs = append(runs, run)

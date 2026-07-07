@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2317,6 +2318,308 @@ return "done";`
 	if agents[0].UsageJSON != `{"input_tokens":100,"output_tokens":50,"cost_usd":0.25}` {
 		t.Fatalf("expected raw usage json persisted, got %q", agents[0].UsageJSON)
 	}
+}
+
+func TestParallelAgentFailureIsTrackedInRunFailures(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_TEST_COMMAND", `if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q bad; then echo "failed intentionally" >&2; exit 7; fi; printf '{"prompt":"%s"}' "$PALLIUM_WORKFLOW_PROMPT" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("parallel");
+const results = await parallel(["good", "bad"], item =>
+  agent("worker " + item, { label: item, provider: "test" })
+);
+return { results };`
+	scriptPath, err := WriteRunScript("wf-failure-list", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-failure-list", Task: "failure list", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10, MaxConcurrentAgents: 2}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, "worker good") || !strings.Contains(result, "null") {
+		t.Fatalf("expected dropped agent to stay null in results, got %s", result)
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Run.Status != "completed" {
+		t.Fatalf("expected completed run, got %+v", snapshot.Run)
+	}
+	if len(snapshot.Run.Failures) != 1 {
+		t.Fatalf("expected one run failure, got %+v", snapshot.Run.Failures)
+	}
+	failure := snapshot.Run.Failures[0]
+	if failure.Label != "bad" || failure.Phase != "parallel" || !strings.Contains(failure.Error, "failed intentionally") {
+		t.Fatalf("unexpected run failure entry: %+v", failure)
+	}
+}
+
+func TestPipelineStageThrowIsTrackedInRunFailures(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("pipeline");
+const results = await pipeline(["keep", "drop"],
+  item => {
+    if (item === "drop") {
+      throw new Error("stage rejected this item");
+    }
+    return item.toUpperCase();
+  }
+);
+return { results };`
+	scriptPath, err := WriteRunScript("wf-pipeline-failure-list", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-pipeline-failure-list", Task: "pipeline failure list", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Run.Failures) != 1 {
+		t.Fatalf("expected one run failure, got %+v", snapshot.Run.Failures)
+	}
+	failure := snapshot.Run.Failures[0]
+	if failure.Label != "pipeline stage 0 item 1" || !strings.Contains(failure.Error, "stage rejected this item") {
+		t.Fatalf("unexpected pipeline failure entry: %+v", failure)
+	}
+}
+
+func TestParallelAgentErrorContainingBudgetPhraseIsNonFatal(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_TEST_COMMAND", `if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q bad; then echo "workflow budget exhausted" >&2; exit 7; fi; printf '{"prompt":"%s"}' "$PALLIUM_WORKFLOW_PROMPT" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("parallel");
+const results = await parallel(["good", "bad"], item =>
+  agent("worker " + item, { label: item, provider: "test" })
+);
+return { results };`
+	scriptPath, err := WriteRunScript("wf-budget-phrase", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-budget-phrase", Task: "budget phrase", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10, MaxConcurrentAgents: 2}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatalf("agent error text containing the budget phrase must not be fatal, got %v", err)
+	}
+	if !strings.Contains(result, "worker good") || !strings.Contains(result, "null") {
+		t.Fatalf("expected phrase-matching failure to become null while sibling survives, got %s", result)
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Run.Status != "completed" || len(snapshot.Run.Failures) != 1 {
+		t.Fatalf("expected completed run with one tracked drop, got %+v", snapshot.Run)
+	}
+}
+
+func TestScriptWrappedBudgetErrorFailsAsScriptError(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_TEST_COMMAND", `echo "provider boom" >&2; exit 3`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("wrap");
+try {
+  await agent("boom", { label: "boom", provider: "test" });
+} catch (e) {
+  throw new Error("workflow budget exhausted: " + e);
+}
+return "unreachable";`
+	scriptPath, err := WriteRunScript("wf-wrapped-budget", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-wrapped-budget", Task: "wrapped budget", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10, MaxBudgetUSD: "5.00"}).Execute(context.Background(), script, nil)
+	if err == nil {
+		t.Fatal("expected wrapped script error")
+	}
+	if errors.Is(err, ErrWorkflowBudgetExhausted) {
+		t.Fatalf("script-wrapped budget phrase must not classify as budget exhaustion: %v", err)
+	}
+	if !strings.Contains(err.Error(), "workflow budget exhausted") {
+		t.Fatalf("expected the wrapped script error to surface unchanged, got %v", err)
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Run.Status != "failed" {
+		t.Fatalf("expected normal failed run, got %+v", snapshot.Run)
+	}
+}
+
+func TestPhaseInsidePipelineStagesUnderRace(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"prompt":"{{PROMPT}}"}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_DELAY_MS", "5")
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `const items = ["a", "b", "c", "d", "e", "f", "g", "h"];
+phase("outer");
+const results = await pipeline(items,
+  (item, original, index) => phase("find-" + index, () => agent("inspect " + item, { label: item })),
+  (prev, original, index) => phase("verify-" + index, () => agent("verify " + prev.prompt, { label: "verify-" + original }))
+);
+return { count: results.length };`
+	scriptPath, err := WriteRunScript("wf-phase-pipeline-race", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-phase-pipeline-race", Task: "phase pipeline race", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 40, MaxConcurrentAgents: 8}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"count": 8`) {
+		t.Fatalf("unexpected result: %s", result)
+	}
+}
+
+func TestStripMetaHandlesNestedMetaObjects(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	script := `export const meta = { name: "nested", limits: { agents: 3 }, phases: ["scan"] };
+phase("scan");
+const result = await agent("inspect", { label: "inspect" });
+return { ok: result.ok };`
+	if validation := ValidateScript(script); !validation.Valid {
+		t.Fatalf("expected nested meta script to validate, got %s", validation.Error)
+	}
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	scriptPath, err := WriteRunScript("wf-nested-meta", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-nested-meta", Task: "nested meta", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"ok": true`) {
+		t.Fatalf("unexpected result: %s", result)
+	}
+}
+
+func TestResumeWithChangedScriptWarnsAndFlagsRun(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"source":"first"}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	firstScript := `phase("scan");
+const result = await agent("stable prompt", { label: "stable" });
+return result;`
+	secondScript := `phase("scan");
+const result = await agent("stable prompt", { label: "stable" });
+return { source: result.source, changed_script: true };`
+	scriptPath, err := WriteRunScript("wf-script-changed", tmp, firstScript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-script-changed", Task: "script changed", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), firstScript, nil); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Run.ScriptHash == "" || snapshot.Run.ScriptChanged {
+		t.Fatalf("expected stored hash without change flag after first run, got %+v", snapshot.Run)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"source":"second"}`)
+	stderr, result, err := captureStderr(t, func() (string, error) {
+		return (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), secondScript, nil)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr, "script changed since original run; unchanged prefix will replay from cache") {
+		t.Fatalf("expected script-change warning on stderr, got %q", stderr)
+	}
+	if !strings.Contains(result, `"source": "first"`) {
+		t.Fatalf("expected unchanged prefix to replay from cache, got %s", result)
+	}
+	snapshot, err = store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snapshot.Run.ScriptChanged {
+		t.Fatalf("expected script_changed flag after resume with edited script, got %+v", snapshot.Run)
+	}
+}
+
+func captureStderr(t *testing.T, fn func() (string, error)) (string, string, error) {
+	t.Helper()
+	original := os.Stderr
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = writer
+	result, fnErr := fn()
+	os.Stderr = original
+	_ = writer.Close()
+	captured, readErr := io.ReadAll(reader)
+	_ = reader.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	return string(captured), result, fnErr
 }
 
 func runGit(t *testing.T, dir string, args ...string) {

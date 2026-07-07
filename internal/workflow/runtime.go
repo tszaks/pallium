@@ -21,8 +21,10 @@ import (
 )
 
 var (
-	ErrWorkflowStopped = errors.New("workflow stopped")
-	ErrWorkflowPaused  = errors.New("workflow paused")
+	ErrWorkflowStopped           = errors.New("workflow stopped")
+	ErrWorkflowPaused            = errors.New("workflow paused")
+	ErrWorkflowBudgetExhausted   = errors.New("workflow budget exhausted")
+	ErrWorkflowMaxAgentsExceeded = errors.New("workflow exceeded max agents")
 )
 
 type Runner struct {
@@ -48,6 +50,8 @@ type Runner struct {
 	capture        *parallelCapture
 	scriptHash     string
 	argsHash       string
+	failures       []RunFailure
+	fatalErr       error
 }
 
 type AgentOptions struct {
@@ -140,22 +144,53 @@ func (r *Runner) Execute(ctx context.Context, script string, args any) (string, 
 	r.budgetSpent = usedBudget
 	r.agentCallIndex = 0
 	r.pipelineIndex = 0
+	r.failures = nil
+	r.fatalErr = nil
 	r.mu.Unlock()
+	if err := r.Store.SetRunFailures(r.Run.ID, nil); err != nil {
+		return "", err
+	}
+	r.checkScriptChanged(script)
 	if err := r.Store.SetRunStatus(r.Run.ID, "running", "", ""); err != nil {
 		return "", err
 	}
 	return r.executeScript(ctx, script, args, true)
 }
 
+// checkScriptChanged records the script hash on the first execution and, on
+// resume, warns when the script differs from the original run. The hash stays
+// out of the resume cache key on purpose so an unchanged prefix replays from
+// cache after a tail edit.
+func (r *Runner) checkScriptChanged(script string) {
+	stored, err := r.Store.Run(r.Run.ID)
+	if err != nil {
+		return
+	}
+	currentHash := stableHash(script)
+	if stored.ScriptHash == "" {
+		_ = r.Store.SetRunScriptState(r.Run.ID, currentHash, false)
+		return
+	}
+	changed := stored.ScriptHash != currentHash
+	if changed {
+		fmt.Fprintf(os.Stderr, "[workflow:%s] script changed since original run; unchanged prefix will replay from cache\n", r.Run.ID)
+	}
+	_ = r.Store.SetRunScriptState(r.Run.ID, stored.ScriptHash, changed)
+}
+
 func (r *Runner) executeScript(ctx context.Context, script string, args any, topLevel bool) (string, error) {
+	r.mu.Lock()
 	previousScriptHash := r.scriptHash
 	previousArgsHash := r.argsHash
-	defer func() {
-		r.scriptHash = previousScriptHash
-		r.argsHash = previousArgsHash
-	}()
 	r.scriptHash = stableHash(script)
 	r.argsHash = stableHash(args)
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		r.scriptHash = previousScriptHash
+		r.argsHash = previousArgsHash
+		r.mu.Unlock()
+	}()
 	if err := r.ensureNotStopped(ctx); err != nil {
 		return "", err
 	}
@@ -245,11 +280,15 @@ func (r *Runner) executeScript(ctx context.Context, script string, args any, top
 	}
 
 	value, err := vm.RunString("(async function(){\n" + body + "\n})()")
-	if r.currentPhase != "" {
-		_ = r.Store.FinishPhase(r.Run.ID, r.currentPhase)
-		r.currentPhase = ""
+	r.mu.Lock()
+	openPhase := r.currentPhase
+	r.currentPhase = ""
+	r.mu.Unlock()
+	if openPhase != "" {
+		_ = r.Store.FinishPhase(r.Run.ID, openPhase)
 	}
 	if err != nil {
+		err = r.classifyRunError(err)
 		if isWorkflowStoppedError(err) {
 			if topLevel {
 				_ = r.Store.SetRunStatus(r.Run.ID, "stopped", "", ErrWorkflowStopped.Error())
@@ -269,6 +308,7 @@ func (r *Runner) executeScript(ctx context.Context, script string, args any, top
 	}
 	value, err = awaitPromiseValue(value)
 	if err != nil {
+		err = r.classifyRunError(err)
 		if isWorkflowStoppedError(err) {
 			if topLevel {
 				_ = r.Store.SetRunStatus(r.Run.ID, "stopped", "", ErrWorkflowStopped.Error())
@@ -425,11 +465,13 @@ func (r *Runner) jsPhase(vm *goja.Runtime) func(goja.FunctionCall) goja.Value {
 		if name == "" {
 			name = "default"
 		}
+		r.mu.Lock()
 		previous := r.currentPhase
+		r.currentPhase = name
+		r.mu.Unlock()
 		if previous != "" {
 			_ = r.Store.FinishPhase(r.Run.ID, previous)
 		}
-		r.currentPhase = name
 		_, err := r.Store.StartPhase(r.Run.ID, name)
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
@@ -441,7 +483,9 @@ func (r *Runner) jsPhase(vm *goja.Runtime) func(goja.FunctionCall) goja.Value {
 			}
 			closePhase := func() {
 				_ = r.Store.FinishPhase(r.Run.ID, name)
+				r.mu.Lock()
 				r.currentPhase = previous
+				r.mu.Unlock()
 			}
 			value, err := fn(goja.Undefined())
 			if err != nil {
@@ -484,9 +528,9 @@ func (r *Runner) jsAgent(ctx context.Context, vm *goja.Runtime) func(goja.Functi
 				panic(vm.ToValue(err.Error()))
 			}
 		}
-		if r.capture != nil {
-			index := len(r.capture.Calls)
-			r.capture.Calls = append(r.capture.Calls, parallelAgentCall{Prompt: prompt, Opts: opts})
+		if capture := r.activeCapture(); capture != nil {
+			index := len(capture.Calls)
+			capture.Calls = append(capture.Calls, parallelAgentCall{Prompt: prompt, Opts: opts})
 			return vm.ToValue(map[string]any{parallelAgentMarkerKey: index})
 		}
 		output, err := r.runAgentAtCallIndex(ctx, prompt, opts, r.nextAgentCallIndex())
@@ -524,9 +568,9 @@ func (r *Runner) jsCheck(ctx context.Context, vm *goja.Runtime) func(goja.Functi
 			agentOpts.Schema = defaultCheckSchema()
 		}
 		prompt := buildCheckPrompt(command)
-		if r.capture != nil {
-			index := len(r.capture.Calls)
-			r.capture.Calls = append(r.capture.Calls, parallelAgentCall{Prompt: prompt, Opts: agentOpts})
+		if capture := r.activeCapture(); capture != nil {
+			index := len(capture.Calls)
+			capture.Calls = append(capture.Calls, parallelAgentCall{Prompt: prompt, Opts: agentOpts})
 			return vm.ToValue(map[string]any{parallelAgentMarkerKey: index})
 		}
 		output, err := r.runAgentAtCallIndex(ctx, prompt, agentOpts, r.nextAgentCallIndex())
@@ -792,10 +836,9 @@ func (r *Runner) jsParallel(ctx context.Context, vm *goja.Runtime) func(goja.Fun
 		}
 		rawResults := make([]any, 0, length)
 		capture := &parallelCapture{}
-		previousCapture := r.capture
-		r.capture = capture
+		previousCapture := r.swapCapture(capture)
 		defer func() {
-			r.capture = previousCapture
+			r.setCapture(previousCapture)
 		}()
 		for i := 0; i < length; i++ {
 			item := items.Get(fmt.Sprintf("%d", i))
@@ -804,6 +847,7 @@ func (r *Runner) jsParallel(ctx context.Context, vm *goja.Runtime) func(goja.Fun
 				value, err := mapper(goja.Undefined(), item, vm.ToValue(i))
 				if err != nil {
 					capture.Calls = capture.Calls[:callStart]
+					r.recordDroppedItem(fmt.Sprintf("parallel item %d", i), err.Error())
 					rawResults = append(rawResults, nil)
 					continue
 				}
@@ -818,7 +862,7 @@ func (r *Runner) jsParallel(ctx context.Context, vm *goja.Runtime) func(goja.Fun
 				rawResults = append(rawResults, item.Export())
 			}
 		}
-		r.capture = previousCapture
+		r.setCapture(previousCapture)
 
 		r.assignSequentialCallIndexes(capture.Calls)
 		agentResults, err := r.runParallelAgentCalls(ctx, capture.Calls)
@@ -879,6 +923,7 @@ func (r *Runner) jsPipeline(ctx context.Context, vm *goja.Runtime) func(goja.Fun
 				for stageIndex, stage := range stages {
 					rawResult, calls, err := r.capturePipelineStage(vm, &vmMu, stage, current, item, pipelineIndex, stageIndex, itemIndex)
 					if err != nil {
+						r.recordDroppedItem(fmt.Sprintf("pipeline stage %d item %d", stageIndex, itemIndex), err.Error())
 						results[itemIndex] = nil
 						return
 					}
@@ -910,10 +955,9 @@ func (r *Runner) capturePipelineStage(vm *goja.Runtime, vmMu *sync.Mutex, fn fun
 	defer vmMu.Unlock()
 
 	capture := &parallelCapture{}
-	previousCapture := r.capture
-	r.capture = capture
+	previousCapture := r.swapCapture(capture)
 	defer func() {
-		r.capture = previousCapture
+		r.setCapture(previousCapture)
 	}()
 
 	next, err := fn(goja.Undefined(), vm.ToValue(value), vm.ToValue(originalItem), vm.ToValue(itemIndex))
@@ -997,6 +1041,76 @@ func (r *Runner) nextAgentCallIndex() int {
 	return r.agentCallIndex
 }
 
+func (r *Runner) activeCapture() *parallelCapture {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.capture
+}
+
+func (r *Runner) swapCapture(capture *parallelCapture) *parallelCapture {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	previous := r.capture
+	r.capture = capture
+	return previous
+}
+
+func (r *Runner) setCapture(capture *parallelCapture) {
+	r.mu.Lock()
+	r.capture = capture
+	r.mu.Unlock()
+}
+
+// recordDroppedItem tracks an item that parallel/pipeline converted into a
+// null result so partial success stays visible at the run level.
+func (r *Runner) recordDroppedItem(label, errText string) {
+	r.mu.Lock()
+	r.failures = append(r.failures, RunFailure{Label: label, Phase: r.currentPhase, Error: errText})
+	failures := append([]RunFailure(nil), r.failures...)
+	r.mu.Unlock()
+	fmt.Fprintf(os.Stderr, "[workflow:%s] dropped %s: %s\n", r.Run.ID, label, errText)
+	_ = r.Store.SetRunFailures(r.Run.ID, failures)
+}
+
+// recordFatalLocked stores the first run-fatal cause; interrupts take
+// precedence over other causes. The caller must hold r.mu.
+func (r *Runner) recordFatalLocked(err error) {
+	if r.fatalErr == nil || (isWorkflowInterruptedError(err) && !isWorkflowInterruptedError(r.fatalErr)) {
+		r.fatalErr = err
+	}
+}
+
+func (r *Runner) recordFatal(err error) error {
+	r.mu.Lock()
+	r.recordFatalLocked(err)
+	r.mu.Unlock()
+	return err
+}
+
+func (r *Runner) fatalCause() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.fatalErr
+}
+
+// classifyRunError maps a script-level failure back to a recorded workflow
+// interrupt. Errors that cross the goja VM boundary arrive as plain text, so
+// classification consults the cause recorded where the interrupt originated
+// instead of parsing arbitrary error strings.
+func (r *Runner) classifyRunError(err error) error {
+	if err == nil || isWorkflowInterruptedError(err) {
+		return err
+	}
+	cause := r.fatalCause()
+	if errors.Is(cause, ErrWorkflowStopped) {
+		return ErrWorkflowStopped
+	}
+	if errors.Is(cause, ErrWorkflowPaused) {
+		return ErrWorkflowPaused
+	}
+	return err
+}
+
 func (r *Runner) assignSequentialCallIndexes(calls []parallelAgentCall) {
 	for i := range calls {
 		if calls[i].CallIndex == 0 {
@@ -1026,6 +1140,8 @@ func (r *Runner) runAgentAtCallIndex(ctx context.Context, prompt string, opts Ag
 	}
 	r.mu.Lock()
 	phase := r.currentPhase
+	scriptHash := r.scriptHash
+	argsHash := r.argsHash
 	r.mu.Unlock()
 	mode := strings.TrimSpace(opts.Mode)
 	if mode == "" {
@@ -1044,7 +1160,7 @@ func (r *Runner) runAgentAtCallIndex(ctx context.Context, prompt string, opts Ag
 		return "", err
 	}
 	schemaHash := agentSchemaHash(opts.Schema)
-	if cached, ok, err := r.Store.CompletedAgent(r.Run.ID, callIndex, phase, opts.Label, prompt, provider, absRepo, mode, opts.Isolation, opts.Model, schemaHash, r.argsHash); err != nil {
+	if cached, ok, err := r.Store.CompletedAgent(r.Run.ID, callIndex, phase, opts.Label, prompt, provider, absRepo, mode, opts.Isolation, opts.Model, schemaHash, argsHash); err != nil {
 		return "", err
 	} else if ok {
 		if _, err := parseAgentOutputWithSchema(cached.Output, opts.Schema); err != nil {
@@ -1058,12 +1174,16 @@ func (r *Runner) runAgentAtCallIndex(ctx context.Context, prompt string, opts Ag
 
 	r.mu.Lock()
 	if r.agentCount >= r.MaxAgents {
+		err := fmt.Errorf("%w: %d", ErrWorkflowMaxAgentsExceeded, r.MaxAgents)
+		r.recordFatalLocked(err)
 		r.mu.Unlock()
-		return "", fmt.Errorf("workflow exceeded max agents: %d", r.MaxAgents)
+		return "", err
 	}
 	if r.budgetLimit > 0 && r.budgetSpent+r.agentCostUSD > r.budgetLimit {
+		err := fmt.Errorf("%w: next agent would exceed $%.4f limit", ErrWorkflowBudgetExhausted, r.budgetLimit)
+		r.recordFatalLocked(err)
 		r.mu.Unlock()
-		return "", fmt.Errorf("workflow budget exhausted: next agent would exceed $%.4f limit", r.budgetLimit)
+		return "", err
 	}
 	r.budgetSpent += r.agentCostUSD
 	r.agentCount++
@@ -1081,8 +1201,8 @@ func (r *Runner) runAgentAtCallIndex(ctx context.Context, prompt string, opts Ag
 		Isolation:        opts.Isolation,
 		Model:            opts.Model,
 		SchemaHash:       schemaHash,
-		ScriptHash:       r.scriptHash,
-		ArgsHash:         r.argsHash,
+		ScriptHash:       scriptHash,
+		ArgsHash:         argsHash,
 		EstimatedCostUSD: r.agentCostUSD,
 	}
 	created, err := r.Store.CreateAgent(agent)
@@ -1169,6 +1289,7 @@ func (r *Runner) runAgentCallsWithSemaphore(ctx context.Context, calls []paralle
 			output, err := r.runAgentAtCallIndex(ctx, call.Prompt, call.Opts, call.CallIndex)
 			if err != nil {
 				if !isWorkflowFatalAgentError(err) {
+					r.recordDroppedItem(firstNonEmpty(call.Opts.Label, "agent"), err.Error())
 					results[i] = nil
 					return
 				}
@@ -1190,29 +1311,23 @@ func (r *Runner) runAgentCallsWithSemaphore(ctx context.Context, calls []paralle
 	return results, nil
 }
 
+// isWorkflowFatalAgentError only sees Go-side errors from runAgentAtCallIndex,
+// so typed sentinel checks are sufficient; error text is never parsed.
 func isWorkflowFatalAgentError(err error) bool {
-	if isWorkflowInterruptedError(err) {
-		return true
-	}
 	if err == nil {
 		return false
 	}
-	text := err.Error()
-	return strings.Contains(text, "workflow budget exhausted") || strings.Contains(text, "workflow exceeded max agents")
+	return isWorkflowInterruptedError(err) ||
+		errors.Is(err, ErrWorkflowBudgetExhausted) ||
+		errors.Is(err, ErrWorkflowMaxAgentsExceeded)
 }
 
 func isWorkflowStoppedError(err error) bool {
-	if err == nil {
-		return false
-	}
-	return errors.Is(err, ErrWorkflowStopped) || strings.TrimSpace(err.Error()) == ErrWorkflowStopped.Error()
+	return errors.Is(err, ErrWorkflowStopped)
 }
 
 func isWorkflowPausedError(err error) bool {
-	if err == nil {
-		return false
-	}
-	return errors.Is(err, ErrWorkflowPaused) || strings.TrimSpace(err.Error()) == ErrWorkflowPaused.Error()
+	return errors.Is(err, ErrWorkflowPaused)
 }
 
 func isWorkflowInterruptedError(err error) bool {
@@ -1244,10 +1359,10 @@ func (r *Runner) ensureNotStopped(ctx context.Context) error {
 		return err
 	}
 	if run.Status == "stopped" {
-		return ErrWorkflowStopped
+		return r.recordFatal(ErrWorkflowStopped)
 	}
 	if run.Status == "paused" {
-		return ErrWorkflowPaused
+		return r.recordFatal(ErrWorkflowPaused)
 	}
 	return nil
 }
@@ -1287,10 +1402,10 @@ func (r *Runner) normalizeInterruptError(ctx context.Context, err error) error {
 	}
 	if ctx.Err() != nil {
 		if run, runErr := r.Store.Run(r.Run.ID); runErr == nil && run.Status == "stopped" {
-			return ErrWorkflowStopped
+			return r.recordFatal(ErrWorkflowStopped)
 		}
 		if run, runErr := r.Store.Run(r.Run.ID); runErr == nil && run.Status == "paused" {
-			return ErrWorkflowPaused
+			return r.recordFatal(ErrWorkflowPaused)
 		}
 	}
 	return err
@@ -2024,9 +2139,44 @@ func (r *Runner) writeWorktreePatch(agentID, worktree string) (string, error) {
 	return patchPath, nil
 }
 
+var metaPrefixRe = regexp.MustCompile(`export\s+const\s+meta\s*=\s*\{`)
+
+// stripMeta removes the export const meta = {...}; block by scanning brace
+// depth from the opening brace, so meta objects with nested objects strip
+// cleanly. An unbalanced meta block is left untouched and fails compilation.
 func stripMeta(script string) string {
-	re := regexp.MustCompile(`(?s)export\s+const\s+meta\s*=\s*\{.*?\}\s*;?`)
-	return re.ReplaceAllString(script, "")
+	for {
+		loc := metaPrefixRe.FindStringIndex(script)
+		if loc == nil {
+			return script
+		}
+		depth := 1
+		end := -1
+		for i := loc[1]; i < len(script); i++ {
+			switch script[i] {
+			case '{':
+				depth++
+			case '}':
+				depth--
+				if depth == 0 {
+					end = i + 1
+				}
+			}
+			if end >= 0 {
+				break
+			}
+		}
+		if end < 0 {
+			return script
+		}
+		for end < len(script) && (script[end] == ' ' || script[end] == '\t' || script[end] == '\n' || script[end] == '\r') {
+			end++
+		}
+		if end < len(script) && script[end] == ';' {
+			end++
+		}
+		script = script[:loc[0]] + script[end:]
+	}
 }
 
 func stringifyResult(value any) string {
