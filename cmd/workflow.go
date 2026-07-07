@@ -986,6 +986,7 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 	}
 	if agentTimeoutSet {
 		runSpec.AgentTimeout = *agentTimeout
+		runSpec.AgentTimeoutExplicit = true
 	}
 	run, err := store.UpsertRun(runSpec)
 	_ = store.Close()
@@ -1000,8 +1001,12 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 	if !maxBudgetSet {
 		effectiveMaxBudgetUSD = strings.TrimSpace(run.MaxBudgetUSD)
 	}
+	// 0 is a valid persisted value meaning "timeouts disabled", so the
+	// stored value can only be trusted via the explicit flag, not a plain
+	// run.AgentTimeout > 0 check (which would drop back to the flag's
+	// 600s default whenever a run explicitly disabled timeouts).
 	effectiveAgentTimeout := *agentTimeout
-	if !agentTimeoutSet && run.AgentTimeout > 0 {
+	if !agentTimeoutSet && run.AgentTimeoutExplicit {
 		effectiveAgentTimeout = run.AgentTimeout
 	}
 	if *background {
@@ -1023,7 +1028,7 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 			"--codex", *codexBinary,
 			"--max-concurrent-agents", fmt.Sprintf("%d", *maxConcurrentAgents),
 		)
-		if agentTimeoutSet || run.AgentTimeout > 0 {
+		if agentTimeoutSet || run.AgentTimeoutExplicit {
 			cmdArgs = append(cmdArgs, "--agent-timeout", fmt.Sprintf("%d", effectiveAgentTimeout))
 		}
 		if effectiveMaxAgents > 0 && (maxAgentsSet || run.MaxAgents > 0) {
@@ -1606,7 +1611,10 @@ func runWorkflowResume(out io.Writer, args []string, jsonOutput bool) error {
 	runArgs := []string{"run", "--id", run.ID, "--cwd", run.CWD, "--script", run.ScriptPath, "--codex", *codexBinary, "--max-concurrent-agents", fmt.Sprintf("%d", *maxConcurrentAgents)}
 	if agentTimeoutSet {
 		runArgs = append(runArgs, "--agent-timeout", fmt.Sprintf("%d", *agentTimeout))
-	} else if run.AgentTimeout > 0 {
+	} else if run.AgentTimeoutExplicit {
+		// 0 is a valid stored value meaning "timeouts disabled"; forward it
+		// explicitly so the nested `workflow run` doesn't fall back to its
+		// own 600s flag default when the flag itself is omitted here.
 		runArgs = append(runArgs, "--agent-timeout", fmt.Sprintf("%d", run.AgentTimeout))
 	}
 	if maxAgentsSet && *maxAgents > 0 {
