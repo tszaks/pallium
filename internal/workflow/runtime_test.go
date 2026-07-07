@@ -330,6 +330,60 @@ func TestRunnerEnforcesBudget(t *testing.T) {
 	}
 }
 
+// TestRunnerFailsRunWhenProviderReportedCostExceedsBudget guards against a
+// regression where a configured provider's reported cost_usd could push
+// spend past --max-budget-usd after the agent already ran. The preflight
+// check only guards the flat per-agent estimate, so a single agent call with
+// no subsequent agent() call to trigger another preflight check must still
+// fail the run instead of completing successfully while over budget.
+func TestRunnerFailsRunWhenProviderReportedCostExceedsBudget(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_METERED_COMMAND", `printf '{"input_tokens":100,"output_tokens":50,"cost_usd":5.0}' > "$PALLIUM_WORKFLOW_USAGE_FILE"; printf '{"ok":true}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("budget");
+return await agent("one metered call", { label: "one", provider: "metered" });`
+	scriptPath, err := WriteRunScript("wf-budget-provider-cost", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-budget-provider-cost", Task: "budget provider cost", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10, MaxBudgetUSD: "1.00"}).Execute(context.Background(), script, nil)
+	if err == nil {
+		t.Fatal("expected the run to fail once the reported cost exceeds the budget")
+	}
+	// The error crosses the goja VM boundary as plain text (see
+	// classifyRunError), so identity checks like errors.Is don't survive a
+	// top-level script return; match the message the way other budget/max-
+	// agents tests in this file do.
+	if !strings.Contains(err.Error(), "budget exhausted") {
+		t.Fatalf("expected a budget exhausted error, got %v", err)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].Status != "failed" {
+		t.Fatalf("expected one failed agent, got %+v", agents)
+	}
+	if agents[0].EstimatedCostUSD != 5.0 {
+		t.Fatalf("expected the provider-reported cost persisted, got %+v", agents[0])
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Run.Status != "failed" {
+		t.Fatalf("expected the run itself to be marked failed, got %+v", snapshot.Run)
+	}
+}
+
 func TestRunnerComposesSavedWorkflow(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"prompt":"{{PROMPT}}"}`)
 	tmp := t.TempDir()
@@ -2416,6 +2470,61 @@ return { results };`
 	}
 }
 
+// TestConfiguredProviderSchemaRetryPropagatesRetryFailure guards against a
+// regression where a corrective schema retry's own error (nonzero exit,
+// timeout, etc.) was silently discarded, letting the agent fall through to
+// schema-validating the stale first-attempt output. The retry's real failure
+// must be the one that fails the agent, not a generic schema mismatch on
+// data that was already known to be invalid.
+func TestConfiguredProviderSchemaRetryPropagatesRetryFailure(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("SCHEMA_MARKER", filepath.Join(tmp, "marker"))
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_FLAKY_COMMAND", `if [ -f "$SCHEMA_MARKER" ]; then echo "retry boom" >&2; exit 3; else touch "$SCHEMA_MARKER"; printf 'sure, here is the JSON you asked for' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"; fi`)
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("schema");
+return await agent("structured", {
+  label: "structured",
+  provider: "flaky",
+  schema: {
+    type: "object",
+    properties: { summary: { type: "string" } },
+    required: ["summary"]
+  }
+});`
+	scriptPath, err := WriteRunScript("wf-schema-retry-error", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-schema-retry-error", Task: "schema retry error", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err == nil {
+		t.Fatal("expected the retry's failure to fail the agent")
+	}
+	if !strings.Contains(err.Error(), "workflow provider") || !strings.Contains(err.Error(), "retry boom") {
+		t.Fatalf("expected the retry's actual provider error to surface, got %v", err)
+	}
+	if strings.Contains(err.Error(), "does not match schema") {
+		t.Fatalf("retry failure must not be masked as a generic schema mismatch, got %v", err)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].Status != "failed" {
+		t.Fatalf("expected one failed agent, got %+v", agents)
+	}
+	if !strings.Contains(agents[0].Error, "workflow provider") {
+		t.Fatalf("expected persisted agent error to reflect the retry failure, got %q", agents[0].Error)
+	}
+}
+
 func TestConfiguredProviderUsageFileOverridesCostEstimate(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_METERED_COMMAND", `printf '{"input_tokens":100,"output_tokens":50,"cost_usd":0.25}' > "$PALLIUM_WORKFLOW_USAGE_FILE"; printf '{"ok":true}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
 	tmp := t.TempDir()
@@ -2861,6 +2970,112 @@ return result;`
 	}
 	if _, err := os.Stat(patchAgent.Worktree); !os.IsNotExist(err) {
 		t.Fatalf("expected loop worktree removed after completion, stat err=%v", err)
+	}
+}
+
+// TestRunnerResumeExcludesInternalUntilGreenPatchRowFromMaxAgents guards
+// against a regression where the internal bookkeeping row
+// registerUntilGreenPatch stores for the untilGreen combined patch (provider
+// "internal") counted toward the --max-agents cap on resume even though it
+// never spawned a worker. Store.AgentUsage seeds the resumed run's agent
+// count from all persisted workflow_agents rows, so a stale internal row
+// from a prior execution could trip the cap one agent early.
+func TestRunnerResumeExcludesInternalUntilGreenPatchRowFromMaxAgents(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
+	providerScript := filepath.Join(t.TempDir(), "loop-provider.sh")
+	if err := os.WriteFile(providerScript, []byte(`#!/bin/sh
+if [ "$PALLIUM_WORKFLOW_MODE" = "edit" ]; then
+  printf 'fixed\n' > marker.txt
+  printf '{"summary":"created marker"}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+elif [ -f marker.txt ]; then
+  printf '{"ok":true,"command":"check marker","summary":"marker present","output_tail":"","failures":[]}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+else
+  printf '{"ok":false,"command":"check marker","summary":"marker missing","output_tail":"no marker","failures":[{"name":"marker","message":"missing"}]}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+fi
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_LOOP_COMMAND", providerScript)
+	// "one" uses its own configured provider rather than
+	// PALLIUM_WORKFLOW_AGENT_STUB, which would short-circuit every agent call
+	// (including the "loop" provider ones) before the provider dispatch is
+	// even reached.
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_ONE_COMMAND", `printf '{"ok":true}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	// First execution: one plain agent plus an untilGreen loop that needs
+	// exactly one fix round to converge. Real spawns: "one" (1) +
+	// check-1/fix-1/check-2 (3) = 4. The loop also registers one internal
+	// "green-patch" bookkeeping row that is not a real spawn, for 5 rows
+	// total in workflow_agents.
+	firstScript := `phase("scan");
+agent("one", { label: "one", provider: "one" });
+const result = verify.untilGreen("check marker", { label: "green", maxRounds: 2, provider: "loop" });
+return result;`
+	scriptPath, err := WriteRunScript("wf-until-green-max-agents", tmp, firstScript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-until-green-max-agents", Task: "until green max agents", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 4}).Execute(context.Background(), firstScript, nil); err != nil {
+		t.Fatalf("expected first execution to converge within 4 real agents, got %v", err)
+	}
+	agentsAfterFirst, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agentsAfterFirst) != 5 {
+		t.Fatalf("expected 4 real agents plus 1 internal patch row, got %d: %+v", len(agentsAfterFirst), agentsAfterFirst)
+	}
+	usedAgents, _, err := store.AgentUsage(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usedAgents != 4 {
+		t.Fatalf("expected AgentUsage to exclude the internal patch row from the count, got %d", usedAgents)
+	}
+	// Second execution (resume): the identical prefix replays entirely from
+	// cache (including the internal patch row, via its own completed-agent
+	// cache check), so it costs zero fresh spawns. A new "two" call at the
+	// tail needs exactly one more real spawn to reach 5 total. --max-agents 5
+	// must allow it: under the old buggy counting, the seeded agent count
+	// would already be 5 (4 real + 1 internal) before "two" even runs.
+	secondScript := `phase("scan");
+agent("one", { label: "one", provider: "one" });
+const result = verify.untilGreen("check marker", { label: "green", maxRounds: 2, provider: "loop" });
+agent("two", { label: "two", provider: "one" });
+return { result, two: true };`
+	if err := os.WriteFile(scriptPath, []byte(secondScript), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 5}).Execute(context.Background(), secondScript, nil)
+	if err != nil {
+		t.Fatalf("expected resume to succeed with the internal patch row excluded from the cap, got %v", err)
+	}
+	if !strings.Contains(result, `"two": true`) {
+		t.Fatalf("expected the new agent call to run after resume, got %s", result)
+	}
+	agentsAfterSecond, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agentsAfterSecond) != 6 {
+		t.Fatalf("expected exactly one new agent row after resume (5 real + 1 internal), got %d: %+v", len(agentsAfterSecond), agentsAfterSecond)
 	}
 }
 

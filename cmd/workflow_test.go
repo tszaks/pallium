@@ -672,6 +672,66 @@ return agent("slow", { label: "slow" });`), 0o644); err != nil {
 	}
 }
 
+// TestWorkflowResumePreservesDisabledAgentTimeout guards against a
+// regression where 0 (the documented value for "no agent timeout") could
+// not survive a plain resume: a naive `stored value > 0` check cannot tell
+// "never configured" apart from "explicitly disabled", so resume without
+// --agent-timeout silently fell back to the nested run's 600s flag default
+// instead of keeping timeouts off.
+func TestWorkflowResumePreservesDisabledAgentTimeout(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	scriptPath := filepath.Join(tmp, "workflow.js")
+	if err := os.WriteFile(scriptPath, []byte(`phase("one");
+return agent("fast", { label: "fast" });`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{
+		"run",
+		"--id", "wf-resume-timeout-disabled",
+		"--db", dbPath,
+		"--cwd", tmp,
+		"--script", scriptPath,
+		"--agent-timeout", "0",
+		"timeout disabled test",
+	}, false); err != nil {
+		t.Fatalf("expected initial run with --agent-timeout 0 to succeed, got %v", err)
+	}
+	store, err := workflow.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.Run("wf-resume-timeout-disabled")
+	_ = store.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.AgentTimeout != 0 || !run.AgentTimeoutExplicit {
+		t.Fatalf("expected disabled timeout stored explicitly on the run, got %+v", run)
+	}
+	// Resume without the flag must keep the timeout disabled, not fall back
+	// to the 600s flag default.
+	out.Reset()
+	if err := runWorkflow(&out, []string{"resume", "wf-resume-timeout-disabled", "--db", dbPath}, false); err != nil {
+		t.Fatalf("expected resume to succeed with timeouts still disabled, got %v", err)
+	}
+	store, err = workflow.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err = store.Run("wf-resume-timeout-disabled")
+	_ = store.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.AgentTimeout != 0 || !run.AgentTimeoutExplicit {
+		t.Fatalf("expected resume to keep the disabled timeout explicit, got %+v", run)
+	}
+}
+
 func TestWorkflowReportSummarizesAgentOutputs(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"reviewed auth","observations":["auth flow is covered"],"risks":["missing edge test"],"next_steps":["add edge test"]}`)
 	tmp := t.TempDir()

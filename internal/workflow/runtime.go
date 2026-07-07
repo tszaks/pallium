@@ -1388,7 +1388,19 @@ func (r *Runner) runAgentAtCallIndex(ctx context.Context, prompt string, opts Ag
 	if delta := agent.EstimatedCostUSD - r.agentCostUSD; delta != 0 {
 		r.mu.Lock()
 		r.budgetSpent += delta
+		overBudget := r.budgetLimit > 0 && r.budgetSpent > r.budgetLimit
 		r.mu.Unlock()
+		// The preflight check above only guards against the flat per-agent
+		// estimate. A provider that reports a real cost_usd after the fact
+		// can push spend past the limit on its own, and a script with no
+		// later agent() call would never hit the preflight check again to
+		// notice. Fail this agent immediately so the run doesn't complete
+		// successfully while already over budget.
+		if overBudget && err == nil {
+			budgetErr := r.recordFatal(fmt.Errorf("%w: reported cost pushed spend to $%.4f over $%.4f limit", ErrWorkflowBudgetExhausted, r.budgetSpent, r.budgetLimit))
+			_ = r.Store.FinishAgent(agent, output, budgetErr.Error())
+			return "", budgetErr
+		}
 	}
 	if err != nil {
 		if normalized := r.normalizeInterruptError(agentCtx, err); isWorkflowInterruptedError(normalized) {
@@ -2104,9 +2116,7 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 			// effects twice; they fail schema validation immediately instead.
 			if _, schemaErr := parseAgentOutputWithSchema(output, opts.Schema); schemaErr != nil && isReadOnlyAgentMode(agent.Mode) {
 				_ = os.Remove(outFile)
-				if retryOutput, retryErr := r.runConfiguredProviderCommand(ctx, command, tmpDir, outFile, usageFile, cwd, buildSchemaRetryPrompt(agent.Prompt, schemaErr), agent, opts); retryErr == nil {
-					output = retryOutput
-				}
+				retryOutput, retryErr := r.runConfiguredProviderCommand(ctx, command, tmpDir, outFile, usageFile, cwd, buildSchemaRetryPrompt(agent.Prompt, schemaErr), agent, opts)
 				// Usage is read after each invocation (the file is removed in
 				// between), so the retry's cost adds to attempt one instead of
 				// overwriting it.
@@ -2117,6 +2127,16 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 						usage = mergeAgentUsage(usage, retryUsage)
 						usageRaw = ""
 					}
+				}
+				if retryErr != nil {
+					// The retry itself failed (nonzero exit, timeout, etc.).
+					// That failure is the real story here, not the stale
+					// schema-invalid output from the first attempt: surface it
+					// through the normal provider-command error path below
+					// instead of silently re-validating attempt one's output.
+					err = retryErr
+				} else {
+					output = retryOutput
 				}
 			}
 		}
