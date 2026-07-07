@@ -79,7 +79,10 @@ const finding = await agent("Review auth middleware", {
 | `agentType` | named agent | use `provider` |
 | `schema` | StructuredOutput | Codex `--output-schema`; providers get schema file and Pallium validates returned JSON locally |
 
-Non-Codex providers: `PALLIUM_WORKFLOW_PROVIDER_<NAME>_COMMAND`
+Non-Codex providers: `PALLIUM_WORKFLOW_PROVIDER_<NAME>_COMMAND`. Reference
+wrappers (Claude Code, Gemini CLI) and the full environment contract live in
+[`providers/README.md`](providers/README.md) — workers adopt whatever model
+your guiding agent uses.
 
 ### `await pipeline(items, stage1, stage2, ...)`
 
