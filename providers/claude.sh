@@ -38,38 +38,56 @@ fi
 # --disallowedTools denylist so a user's global Claude Code permission-mode
 # default (acceptEdits/auto/bypassPermissions) can't grant edits anyway.
 # NOTE: --allowedTools only skips the confirmation prompt for a tool, it does
-# not sandbox it — a Bash(cmd:*) prefix match still runs whatever args follow,
-# so keep entries narrow. `gofmt` is scoped to `-l` (list only, never `-w`)
-# and the old blanket `npx:*` entry was dropped: npx executes arbitrary
-# (possibly unpinned, unaudited) packages, which is an arbitrary-code-execution
-# hole no allowlist prefix can make safe for a non-isolated checkout. Add a
-# narrower `Bash(npx <your-tool>:*)` entry if you need a specific one.
+# not sandbox it — a Bash(cmd:*) prefix match still runs whatever args follow.
+# Keep entries to commands with no built-in mutate/execute capability: `find`
+# was dropped entirely (its own `-delete`/`-exec` actions can remove or run
+# arbitrary things, and no `Bash(find ...:*)` prefix can rule that out since
+# the flags can be appended after any fixed prefix — use the built-in Glob
+# tool for file-finding instead) and so was `gofmt -l` (the same problem:
+# `gofmt -l -w .` still matches a `Bash(gofmt -l:*)` prefix and writes files,
+# so there's no safe prefix-based way to allow gofmt without also allowing
+# `-w`). The old blanket `npx:*` entry was dropped for the same reason: npx
+# executes arbitrary, possibly unpinned/unaudited packages. Add a narrower,
+# genuinely non-mutating entry only if you've confirmed it can't be abused.
 #
 # --allowedTools/--disallowedTools alone also can't protect against a
 # checked-in project or user Claude config that has already pre-approved a
 # broader tool (a permissive `.claude/settings.json` Bash pattern, or a
 # side-effecting MCP tool) — that config would still apply underneath
 # --allowedTools, since it only pre-approves, it doesn't define the
-# available set. `--tools` is the actual hard restriction: it defines which
-# built-in tools exist for the session at all, regardless of any other
-# config, so Edit/Write/NotebookEdit and anything else not listed simply
-# aren't available to mutate the live checkout. `--strict-mcp-config` (with
-# no --mcp-config given) loads zero MCP servers, closing the "pre-approved
-# MCP tool" gap the same way for read-only/test/check.
+# available set. `--tools` is a hard restriction on which built-in tools
+# exist for the session at all, so Edit/Write/NotebookEdit and anything else
+# not listed simply aren't available. `--strict-mcp-config` (with no
+# --mcp-config given) loads zero MCP servers, closing the same gap for a
+# pre-approved MCP tool. But `--tools` only restricts at the tool-category
+# level — it can't stop a project's own `.claude/settings.json` from
+# pre-approving a broader Bash pattern (or defining a SessionStart hook that
+# runs before any of this gating even applies), since that config is still
+# loaded and merged by default. `--setting-sources user` closes that: it
+# tells Claude to load ONLY the user's own global settings, never the
+# project's `.claude/settings.json` or a `.claude/settings.local.json` in
+# the checkout, so a malicious/compromised repo can't inject either a Bash
+# allow rule or a hook into a "read-only" session. `--safe-mode` adds a
+# second layer disabling hooks/plugins/custom commands generally (verified
+# locally: a SessionStart hook that touches a file did not fire with either
+# flag present; a `.claude/settings.json` Bash allow rule was not even read
+# with --setting-sources user, vs. merely "ignored" — and only in an
+# untrusted workspace — with --safe-mode alone).
 # Adjust the allowlist for your stack.
-READ_TOOLS="Read,Grep,Glob,LS,Bash(ls:*),Bash(cat:*),Bash(grep:*),Bash(rg:*),Bash(find:*),Bash(wc:*),Bash(go doc:*)"
-TEST_TOOLS="$READ_TOOLS,Bash(go test:*),Bash(go build:*),Bash(go vet:*),Bash(gofmt -l:*),Bash(npm test:*),Bash(pytest:*)"
+READ_TOOLS="Read,Grep,Glob,LS,Bash(ls:*),Bash(cat:*),Bash(grep:*),Bash(rg:*),Bash(wc:*),Bash(go doc:*)"
+TEST_TOOLS="$READ_TOOLS,Bash(go test:*),Bash(go build:*),Bash(go vet:*),Bash(npm test:*),Bash(pytest:*)"
 EDIT_TOOLS="$TEST_TOOLS,Edit,Write"
 NON_EDIT_HARD_TOOLS="Read,Grep,Glob,LS,Bash"
+NON_EDIT_ISOLATION_ARGS=(--safe-mode --setting-sources user --tools "$NON_EDIT_HARD_TOOLS" --strict-mcp-config)
 case "${PALLIUM_WORKFLOW_MODE:-read-only}" in
   edit)
     PERM_ARGS=(--permission-mode acceptEdits --allowedTools "$EDIT_TOOLS")
     ;;
   test|check)
-    PERM_ARGS=(--tools "$NON_EDIT_HARD_TOOLS" --strict-mcp-config --allowedTools "$TEST_TOOLS" --disallowedTools "Edit,Write,NotebookEdit")
+    PERM_ARGS=("${NON_EDIT_ISOLATION_ARGS[@]}" --allowedTools "$TEST_TOOLS" --disallowedTools "Edit,Write,NotebookEdit")
     ;;
   *)
-    PERM_ARGS=(--tools "$NON_EDIT_HARD_TOOLS" --strict-mcp-config --allowedTools "$READ_TOOLS" --disallowedTools "Edit,Write,NotebookEdit")
+    PERM_ARGS=("${NON_EDIT_ISOLATION_ARGS[@]}" --allowedTools "$READ_TOOLS" --disallowedTools "Edit,Write,NotebookEdit")
     ;;
 esac
 
@@ -121,13 +139,17 @@ except (json.JSONDecodeError, ValueError):
 text = (result or "").strip()
 
 def extract_first_json_value(s):
-    """Return the first balanced {...} or [...] substring in s, honoring
-    strings/escapes so brackets inside string values don't confuse the
-    scan, and supporting array-rooted schemas as well as object-rooted
-    ones (Pallium's validator accepts either). Using text.find('{')/
-    text.rfind('}') instead would span into any brackets that show up in
-    trailing prose (e.g. '{"ok":true}\\nNote: {done}'), producing an
-    invalid, unrecoverable candidate."""
+    """Return the first balanced {...} or [...] substring in s that
+    actually parses as JSON, honoring strings/escapes so brackets inside
+    string values don't confuse the scan, and supporting array-rooted
+    schemas as well as object-rooted ones (Pallium's validator accepts
+    either). Using text.find('{')/text.rfind('}') instead would span into
+    any brackets that show up in trailing prose (e.g.
+    '{"ok":true}\\nNote: {done}'), producing an invalid, unrecoverable
+    candidate. Keeps scanning past a balanced-but-non-JSON match too (e.g.
+    bracketed prose like 'Here is [the JSON]: {"ok":true}' — the first
+    balanced span, '[the JSON]', isn't valid JSON, so this moves on to the
+    next '{'/'[' rather than giving up)."""
     opens, closes = "{[", "}]"
     pairs = {"{": "}", "[": "]"}
     pos = 0
@@ -161,7 +183,11 @@ def extract_first_json_value(s):
                     matched = s[start:i + 1]
                     break
         if matched:
-            return matched
+            try:
+                json.loads(matched)
+                return matched
+            except (json.JSONDecodeError, ValueError):
+                pass
         pos = start + 1
 
 # Structured output only: strip accidental markdown fences and, if the
@@ -178,11 +204,7 @@ if os.environ.get("PALLIUM_WORKFLOW_SCHEMA_FILE"):
     except (json.JSONDecodeError, ValueError):
         candidate = extract_first_json_value(text)
         if candidate:
-            try:
-                json.loads(candidate)
-                text = candidate
-            except (json.JSONDecodeError, ValueError):
-                pass
+            text = candidate
 
 with open(os.environ["PALLIUM_WORKFLOW_OUTPUT_FILE"], "w") as f:
     f.write(text)
