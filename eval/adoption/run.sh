@@ -10,10 +10,11 @@
 # Produces: eval/adoption/results.<condition>.jsonl — one record per task with
 # the full transcript path and detected Pallium usage. Score with score.py.
 #
-# Fidelity note: each task runs a fresh `claude -p` (no shared context) against
-# an isolated scratch checkout with its own HOME (so the Pallium SQLite store is
-# clean per run). Tool calls are read from --output-format json, so Pallium usage
-# is detected from ACTUAL invocations, not self-report.
+# Fidelity note: each task runs a fresh `claude -p` (no shared context) with its
+# cwd AND HOME set to an isolated scratch checkout (so file/context access and
+# the Pallium SQLite store are clean per run). Pallium usage is read from the
+# assistant tool_use events in --output-format json, so it reflects ACTUAL
+# invocations, not self-report or text the agent merely read.
 
 set -euo pipefail
 cond="${1:?usage: run.sh <installed|control>}"
@@ -44,21 +45,48 @@ You are working in the repository at $scratch. Task: $task"
   fi
 
   transcript="$here/transcript.$cond.$id.json"
-  HOME="$home" claude -p "$prompt" \
-    --output-format json \
-    --allowedTools "Read,Grep,Glob,LS,Bash(pallium:*),Bash(go doc:*),Bash(cat:*),Bash(ls:*)" \
+  # Run claude INSIDE the isolated checkout so its relative file/Bash access and
+  # project context resolve to $scratch, not wherever the runner was launched.
+  ( cd "$scratch" && HOME="$home" claude -p "$prompt" \
+      --output-format json \
+      --allowedTools "Read,Grep,Glob,LS,Bash(pallium:*),Bash(go doc:*),Bash(cat:*),Bash(ls:*)" ) \
     > "$transcript" 2>/dev/null || true
 
-  # Objective detection: did any tool call actually invoke `pallium`?
+  # Objective detection: did the agent ACTUALLY invoke `pallium` in a tool call?
+  # Look only at assistant `tool_use` Bash commands — never the prompt, the
+  # AGENTS block, file reads, or command output — so echoed 'pallium ' text
+  # (e.g. reading AGENTS.md or a usage dump) can't create a false positive.
   used=$(python3 - "$transcript" <<'PY'
-import json, sys
+import json, re, sys
 try:
     data = json.load(open(sys.argv[1]))
 except Exception:
     print("false"); sys.exit()
-events = data if isinstance(data, list) else data.get("messages", [data])
-text = json.dumps(events)
-print("true" if "pallium " in text or '"pallium"' in text else "false")
+
+cmds = []
+def walk(node):
+    if isinstance(node, dict):
+        if node.get("type") == "tool_use" and node.get("name") == "Bash":
+            cmd = (node.get("input") or {}).get("command")
+            if isinstance(cmd, str):
+                cmds.append(cmd)
+        for v in node.values():
+            walk(v)
+    elif isinstance(node, list):
+        for v in node:
+            walk(v)
+walk(data)
+
+def invokes_pallium(cmd):
+    # Split on shell separators so `pallium` must be the command actually run,
+    # not an argument to cat/ls (e.g. `ls pallium/`).
+    for seg in re.split(r"&&|\|\||[;|]", cmd):
+        seg = seg.strip()
+        if seg == "pallium" or seg.startswith("pallium "):
+            return True
+    return False
+
+print("true" if any(invokes_pallium(c) for c in cmds) else "false")
 PY
 )
   python3 -c "import json,sys;print(json.dumps({'id':sys.argv[1],'condition':sys.argv[2],'used_pallium_toolcall':sys.argv[3]=='true','transcript':sys.argv[4]}))" "$id" "$cond" "$used" "$transcript" >> "$out"
