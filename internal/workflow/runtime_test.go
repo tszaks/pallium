@@ -2085,7 +2085,7 @@ return pallium.decisions.record("Stable decision", "Do not duplicate this.", "re
 }
 
 func TestParallelAgentFailureReturnsNullWithoutCancellingSiblings(t *testing.T) {
-	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_TEST_COMMAND", `if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q bad; then echo "failed intentionally" >&2; exit 7; fi; printf '{"prompt":"%s"}' "$PALLIUM_WORKFLOW_PROMPT" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_TEST_COMMAND", `PALLIUM_WORKFLOW_PROMPT="$(cat "$PALLIUM_WORKFLOW_PROMPT_FILE")"; if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q bad; then echo "failed intentionally" >&2; exit 7; fi; printf '{"prompt":"%s"}' "$PALLIUM_WORKFLOW_PROMPT" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
 	tmp := t.TempDir()
 	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
 	if err != nil {
@@ -2501,7 +2501,7 @@ func TestRunArtifactDirUsesHomePalliumDirectory(t *testing.T) {
 }
 
 func TestAgentTimeoutInParallelBecomesNull(t *testing.T) {
-	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_SLOWPOKE_COMMAND", `if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q slow; then exec sleep 5; fi; printf '{"prompt":"%s"}' "$PALLIUM_WORKFLOW_PROMPT" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_SLOWPOKE_COMMAND", `PALLIUM_WORKFLOW_PROMPT="$(cat "$PALLIUM_WORKFLOW_PROMPT_FILE")"; if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q slow; then exec sleep 5; fi; printf '{"prompt":"%s"}' "$PALLIUM_WORKFLOW_PROMPT" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
 	tmp := t.TempDir()
 	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
 	if err != nil {
@@ -2582,7 +2582,7 @@ func TestAgentTimeoutOptionFailsDirectCall(t *testing.T) {
 func TestConfiguredProviderSchemaRetryCorrectsOutput(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("SCHEMA_MARKER", filepath.Join(tmp, "marker"))
-	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_FLAKY_COMMAND", `if [ -f "$SCHEMA_MARKER" ]; then if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q "schema validation"; then printf '{"summary":"corrected"}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"; else printf '{"summary":"missing-correction"}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"; fi; else touch "$SCHEMA_MARKER"; printf 'sure, here is the JSON you asked for' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"; fi`)
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_FLAKY_COMMAND", `PALLIUM_WORKFLOW_PROMPT="$(cat "$PALLIUM_WORKFLOW_PROMPT_FILE")"; if [ -f "$SCHEMA_MARKER" ]; then if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q "schema validation"; then printf '{"summary":"corrected"}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"; else printf '{"summary":"missing-correction"}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"; fi; else touch "$SCHEMA_MARKER"; printf 'sure, here is the JSON you asked for' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"; fi`)
 	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
 	if err != nil {
 		t.Fatal(err)
@@ -2626,7 +2626,7 @@ func TestConfiguredProviderSchemaRetryStillFailingIsNonFatalInParallel(t *testin
 	tmp := t.TempDir()
 	callLog := filepath.Join(tmp, "calls.log")
 	t.Setenv("SCHEMA_CALL_LOG", callLog)
-	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_PROSE_COMMAND", `echo call >> "$SCHEMA_CALL_LOG"; if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q bad; then printf 'not json at all' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"; else printf '{"summary":"good"}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"; fi`)
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_PROSE_COMMAND", `PALLIUM_WORKFLOW_PROMPT="$(cat "$PALLIUM_WORKFLOW_PROMPT_FILE")"; echo call >> "$SCHEMA_CALL_LOG"; if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q bad; then printf 'not json at all' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"; else printf '{"summary":"good"}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"; fi`)
 	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
 	if err != nil {
 		t.Fatal(err)
@@ -2864,7 +2864,7 @@ return await agent("structured", {
 }
 
 func TestParallelAgentFailureIsTrackedInRunFailures(t *testing.T) {
-	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_TEST_COMMAND", `if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q bad; then echo "failed intentionally" >&2; exit 7; fi; printf '{"prompt":"%s"}' "$PALLIUM_WORKFLOW_PROMPT" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_TEST_COMMAND", `PALLIUM_WORKFLOW_PROMPT="$(cat "$PALLIUM_WORKFLOW_PROMPT_FILE")"; if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q bad; then echo "failed intentionally" >&2; exit 7; fi; printf '{"prompt":"%s"}' "$PALLIUM_WORKFLOW_PROMPT" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
 	tmp := t.TempDir()
 	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
 	if err != nil {
@@ -3154,7 +3154,7 @@ func TestIsEmptyResult(t *testing.T) {
 }
 
 func TestParallelAgentErrorContainingBudgetPhraseIsNonFatal(t *testing.T) {
-	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_TEST_COMMAND", `if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q bad; then echo "workflow budget exhausted" >&2; exit 7; fi; printf '{"prompt":"%s"}' "$PALLIUM_WORKFLOW_PROMPT" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_TEST_COMMAND", `PALLIUM_WORKFLOW_PROMPT="$(cat "$PALLIUM_WORKFLOW_PROMPT_FILE")"; if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q bad; then echo "workflow budget exhausted" >&2; exit 7; fi; printf '{"prompt":"%s"}' "$PALLIUM_WORKFLOW_PROMPT" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
 	tmp := t.TempDir()
 	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
 	if err != nil {
