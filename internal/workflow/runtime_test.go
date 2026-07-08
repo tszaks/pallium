@@ -2948,6 +2948,211 @@ return { results };`
 	}
 }
 
+// TestPipelineThenChainDropIsTrackedWithHint reproduces the silent-failure
+// finding: a pipeline stage that chains .then() onto agent(). During the
+// capture pass agent() returns a placeholder marker (not a real promise), so
+// .then() throws and the item drops to null. The drop must be tracked in the
+// run failures list with an actionable reason, never silently absent.
+func TestPipelineThenChainDropIsTrackedWithHint(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"prompt":"{{PROMPT}}"}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("judge");
+const results = await pipeline(["alpha", "beta"],
+  item => item.toUpperCase(),
+  prev => agent("judge " + prev, { label: "judge" }).then(x => x)
+);
+return { results };`
+	scriptPath, err := WriteRunScript("wf-then-chain", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-then-chain", Task: "then chain", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, "null") {
+		t.Fatalf("expected .then-chained items to drop to null, got %s", result)
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Run.Failures) != 2 {
+		t.Fatalf("expected both .then-chained items tracked as failures, got %+v", snapshot.Run.Failures)
+	}
+	for _, failure := range snapshot.Run.Failures {
+		if failure.Phase != "judge" {
+			t.Fatalf("expected drop tagged with its phase, got %+v", failure)
+		}
+		if !strings.Contains(failure.Error, "return the agent()/check() call directly") {
+			t.Fatalf("expected actionable .then() hint in drop reason, got %q", failure.Error)
+		}
+	}
+}
+
+// TestPipelinePendingPromiseDropIsTrackedWithHint covers the async variant of
+// the same bug: a stage that returns a promise which never settles. The drop
+// must be tracked and its reason must name the likely cause and the fix.
+func TestPipelinePendingPromiseDropIsTrackedWithHint(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("pipeline");
+const results = await pipeline(["alpha"],
+  item => item,
+  prev => new Promise(() => {})
+);
+return { results };`
+	scriptPath, err := WriteRunScript("wf-pending-promise", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-pending-promise", Task: "pending promise", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Run.Failures) != 1 {
+		t.Fatalf("expected the pending-promise item tracked as a failure, got %+v", snapshot.Run.Failures)
+	}
+	failure := snapshot.Run.Failures[0]
+	if !strings.Contains(failure.Error, "unresolved (pending) promise") {
+		t.Fatalf("expected pending-promise reason, got %q", failure.Error)
+	}
+	if !strings.Contains(failure.Error, "return the agent()/check() call directly") {
+		t.Fatalf("expected actionable hint in pending-promise reason, got %q", failure.Error)
+	}
+}
+
+// TestPipelineStageThrowReasonIsNotRewritten guards the boundary of the hint
+// rewrite: an ordinary stage throw is already tracked (see
+// TestPipelineStageThrowIsTrackedInRunFailures), and its message must pass
+// through verbatim rather than being decorated with the .then() hint.
+func TestPipelineStageThrowReasonIsNotRewritten(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("pipeline");
+const results = await pipeline(["drop"],
+  item => { throw new Error("custom stage boom"); }
+);
+return { results };`
+	scriptPath, err := WriteRunScript("wf-throw-verbatim", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-throw-verbatim", Task: "throw verbatim", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Run.Failures) != 1 {
+		t.Fatalf("expected one tracked drop, got %+v", snapshot.Run.Failures)
+	}
+	failure := snapshot.Run.Failures[0]
+	if !strings.Contains(failure.Error, "custom stage boom") {
+		t.Fatalf("expected the thrown message preserved, got %q", failure.Error)
+	}
+	if strings.Contains(failure.Error, "return the agent()/check() call directly") {
+		t.Fatalf("ordinary stage throw must not get the .then() hint appended, got %q", failure.Error)
+	}
+}
+
+// TestPipelineDirectAgentStagesHaveNoSpuriousFailures is the regression guard:
+// a normal two-stage pipeline whose stages return agent() directly still works
+// and records no failures.
+func TestPipelineDirectAgentStagesHaveNoSpuriousFailures(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"prompt":"{{PROMPT}}"}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("pipeline");
+const results = await pipeline(["alpha"],
+  item => item.toUpperCase(),
+  prev => agent("inspect " + prev, { label: "inspect" })
+);
+return { result: results[0].prompt };`
+	scriptPath, err := WriteRunScript("wf-direct-agent", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-direct-agent", Task: "direct agent", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, "inspect ALPHA") {
+		t.Fatalf("expected direct agent() stage to resolve, got %s", result)
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Run.Status != "completed" {
+		t.Fatalf("expected completed run, got %+v", snapshot.Run)
+	}
+	if len(snapshot.Run.Failures) != 0 {
+		t.Fatalf("normal pipeline must not record spurious failures, got %+v", snapshot.Run.Failures)
+	}
+}
+
+func TestIsEmptyResult(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  bool
+	}{
+		{"empty string", "", true},
+		{"bare null", "null", true},
+		{"empty object", "{}", true},
+		{"empty array", "[]", true},
+		{"empty json string", `""`, true},
+		{"all-null pipeline result", `{"results":[null,null]}`, true},
+		{"nested all-null", `{"a":{"b":null},"c":[null]}`, true},
+		{"partial content", `{"results":["ok",null]}`, false},
+		{"scalar string", `"done"`, false},
+		{"non-json text", "done", false},
+	}
+	for _, tc := range cases {
+		if got := isEmptyResult(tc.input); got != tc.want {
+			t.Errorf("%s: isEmptyResult(%q) = %v, want %v", tc.name, tc.input, got, tc.want)
+		}
+	}
+}
+
 func TestParallelAgentErrorContainingBudgetPhraseIsNonFatal(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_TEST_COMMAND", `if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q bad; then echo "workflow budget exhausted" >&2; exit 7; fi; printf '{"prompt":"%s"}' "$PALLIUM_WORKFLOW_PROMPT" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
 	tmp := t.TempDir()

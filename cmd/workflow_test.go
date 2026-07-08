@@ -1605,3 +1605,26 @@ func TestWorkflowTriggerRunAllowNetwork(t *testing.T) {
 	}
 	assertNetworkRun(t, dbPath, "wf-trig-off", false, "0")
 }
+
+// TestRenderWorkflowResultSurfacesDroppedItems makes sure the immediate
+// `workflow run` output shows dropped items, so a run that nulled every
+// pipeline item is never presented as a clean success with no visible reason.
+func TestRenderWorkflowResultSurfacesDroppedItems(t *testing.T) {
+	snapshot := workflow.Snapshot{
+		Run: workflow.Run{
+			ID:     "wf-render-drops",
+			Task:   "render drops",
+			Status: "completed",
+			Failures: []workflow.RunFailure{
+				{Label: "pipeline stage 1 item 0", Phase: "judge", Error: "TypeError: Object has no member 'then' (did you chain .then()/.catch() on agent() or check()?)"},
+			},
+		},
+	}
+	out := renderWorkflowResult(snapshot, `{"results":[null]}`)
+	if !strings.Contains(out, "Dropped items:") {
+		t.Fatalf("expected dropped items section in run output, got:\n%s", out)
+	}
+	if !strings.Contains(out, "pipeline stage 1 item 0") || !strings.Contains(out, "did you chain .then()") {
+		t.Fatalf("expected dropped item label and reason in run output, got:\n%s", out)
+	}
+}
