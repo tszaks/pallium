@@ -180,8 +180,25 @@ with open(os.environ["CLAUDE_PROVIDER_RAW_FILE"], "r") as f:
 result = raw
 usage = None
 try:
-    envelope = json.loads(raw)
-    if isinstance(envelope, dict):
+    parsed = json.loads(raw)
+    # `claude --output-format json` is documented as "single result" (a
+    # dict envelope), but verified empirically against the installed CLI
+    # (2.1.203) that it actually returns a JSON array of the full event
+    # stream (system/assistant/user/result events) instead. Handle both
+    # shapes: for the array case, the last event with type "result" carries
+    # the same result/total_cost_usd/usage fields the single-envelope shape
+    # has at its top level. Without this, the array shape fell through the
+    # old `isinstance(envelope, dict)` check and the wrapper wrote the
+    # entire raw event stream to the output file instead of the answer.
+    envelope = None
+    if isinstance(parsed, dict):
+        envelope = parsed
+    elif isinstance(parsed, list):
+        for item in reversed(parsed):
+            if isinstance(item, dict) and item.get("type") == "result":
+                envelope = item
+                break
+    if envelope is not None:
         result = envelope.get("result", raw)
         cost = envelope.get("total_cost_usd")
         u = envelope.get("usage") or {}
