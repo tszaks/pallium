@@ -2060,12 +2060,19 @@ func validateUserNetwork(raw any) error {
 	if !ok {
 		return nil
 	}
-	value, ok := opts["network"]
-	if !ok {
-		return nil
-	}
-	if _, ok := value.(bool); !ok {
-		return fmt.Errorf("invalid agent network %v: must be a boolean (true or false)", value)
+	// goja preserves the JS property case, but json.Unmarshal into the Go
+	// struct matches field names case-insensitively — so `{ Network: "yes" }`
+	// still populates the bool field while a case-sensitive opts["network"]
+	// lookup would miss it and skip validation. Check any key that spells
+	// "network" regardless of case so a non-boolean can't slip past via
+	// capitalization.
+	for key, value := range opts {
+		if !strings.EqualFold(strings.TrimSpace(key), "network") {
+			continue
+		}
+		if _, ok := value.(bool); !ok {
+			return fmt.Errorf("invalid agent network %v: must be a boolean (true or false)", value)
+		}
 	}
 	return nil
 }
@@ -2225,7 +2232,13 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 	repoRoot := firstNonEmpty(agent.Repo, r.Run.CWD)
 	cwd := repoRoot
 	worktree := ""
-	if agent.Isolation != "none" && (agent.Mode == "edit" || agent.Isolation == "worktree") {
+	// Granting network forces workspace-write (network egress requires it), so
+	// a networked read-only/test/check agent would otherwise run fs-write in
+	// the operator's LIVE checkout — writes to the real tree PLUS egress. When
+	// an agent is actually granted network but has no isolated worktree, force
+	// one (treat it like edit/worktree) so its forced workspace-write access is
+	// contained to a throwaway worktree, never the live repo.
+	if networkAllowed || (agent.Isolation != "none" && (agent.Mode == "edit" || agent.Isolation == "worktree")) {
 		var err error
 		worktree, err = r.createWorktree(agent.ID, repoRoot)
 		if err != nil {
@@ -2377,12 +2390,25 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 // writes. A read-only agent that opts into network is therefore upgraded to
 // workspace-write (read-only has no per-mode network toggle) — the minimal
 // scope that can carry egress.
+//
+// The non-network workspace-write path (edit/test/check) must ALSO pin the
+// toggle, explicitly to false. Codex resolves `network_access` from the
+// operator's ambient ~/.codex/config.toml when the flag is absent, so a bare
+// `--sandbox workspace-write` would silently inherit
+// `[sandbox_workspace_write] network_access = true` and hand a worker egress
+// with no --allow-network and no network:true — defeating the safe default.
+// Forcing `-c sandbox_workspace_write.network_access=false` makes Pallium's
+// lockdown authoritative regardless of ambient config. Verified against codex
+// v0.142.5: the flag is accepted, and with an ambient config setting the key
+// true the explicit `=false` override resolves to network-disabled (a
+// sandboxed connect attempt is refused). read-only has no network regardless,
+// so it needs no pin.
 func codexSandboxArgs(mode string, networkAllowed bool) []string {
 	if networkAllowed {
 		return []string{"--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"}
 	}
 	if mode == "edit" || mode == "test" || mode == "check" {
-		return []string{"--sandbox", "workspace-write"}
+		return []string{"--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=false"}
 	}
 	return []string{"--sandbox", "read-only"}
 }
