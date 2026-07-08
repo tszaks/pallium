@@ -87,6 +87,12 @@ func (r *Runner) runProviderCommand(ctx context.Context, provider, tmpDir, outFi
 		return r.runConfiguredProviderCommand(ctx, command, tmpDir, outFile, usageFile, cwd, prompt, agent, opts, networkAllowed)
 	}
 	if provider == "claude" {
+		// The built-in claude provider has no network tool, so a double-consented
+		// networked agent still runs without egress here. Say so rather than
+		// silently degrade — resolveAgentNetwork already logged "network enabled".
+		if networkAllowed {
+			fmt.Fprintf(os.Stderr, "[workflow] agent %s requested network but the built-in claude provider has no network tool; running without egress (configure a claude wrapper via %s for networked claude)\n", firstNonEmpty(agent.Label, agent.ID), providerCommandEnvName(provider))
+		}
 		return r.runBuiltinClaudeCommand(ctx, usageFile, cwd, prompt, agent, opts)
 	}
 	return "", fmt.Errorf("workflow agent provider %q is not configured; set %s", provider, providerCommandEnvName(provider))

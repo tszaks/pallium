@@ -102,18 +102,25 @@ func runStart(out io.Writer, args []string, jsonOutput bool) error {
 		})
 	}
 
-	// Persist the resolved workflow so it stays inspectable/resumable, then run
-	// it through the normal run path (which handles preflight-in-script, the
-	// store, fleet cap, and --json output).
-	scriptPath := filepath.Join(absCWD, ".pallium", "workflows", "start-last.js")
-	if err := os.MkdirAll(filepath.Dir(scriptPath), 0o755); err != nil {
+	// Hand the resolved workflow to the normal run path via a unique temp file:
+	// runWorkflowRun copies it into the per-run store (inspectable with
+	// `pallium workflow inspect <id>`), so a fixed repo path would only invite
+	// concurrent starts to clobber each other and litter the repo.
+	tmp, err := os.CreateTemp("", "pallium-start-*.js")
+	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(scriptPath, []byte(script), 0o644); err != nil {
+	scriptPath := tmp.Name()
+	defer os.Remove(scriptPath)
+	if _, err := tmp.WriteString(script); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
 		return err
 	}
 	if !jsonOutput {
-		fmt.Fprintf(out, "Starting workflow (source: %s): %s\n", source, scriptPath)
+		fmt.Fprintf(out, "Starting workflow (source: %s)\n", source)
 	}
 	runArgs := []string{"--script", scriptPath, "--cwd", absCWD}
 	if task != "" {
