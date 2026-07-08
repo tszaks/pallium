@@ -88,15 +88,18 @@ func buildClaudePrompt(prompt string, schema map[string]any) (string, error) {
 // invoking a real claude binary, mirroring how the codex sandbox flags are
 // derived from agent.Mode in runAgentCommand.
 //
-// --strict-mcp-config and --setting-sources=user isolate the worker from the
-// checked-out repo: without them the built-in provider (the zero-config
-// default under CLAUDECODE) would inherit the repo's .claude/settings.json,
-// .claude/settings.local.json, and any project-configured MCP servers, all of
-// which could widen the allow-rules past the --allowedTools/--disallowedTools
-// set below. Only the operator's own user settings are trusted; a checked-out
-// repo cannot grant a workflow worker extra reach.
+// --safe-mode and --strict-mcp-config isolate the worker. --safe-mode disables
+// all customizations — user, project, AND local settings files plus hooks — so
+// neither a checked-out repo's .claude/settings.json nor the operator's own
+// global settings can widen the allow-rules past the explicit --allowedTools/
+// --disallowedTools set below; those CLI flags still enforce (permissions work
+// normally under safe mode). --strict-mcp-config additionally blocks any
+// ambient MCP servers, since none are passed via --mcp-config. Without these
+// the built-in provider (the zero-config default under CLAUDECODE) would
+// inherit whatever tools ambient settings/hooks/MCP grant. Verified: the -p
+// JSON flow returns normally under --safe-mode.
 func buildClaudeArgs(mode, model string) []string {
-	args := []string{"-p", "--output-format", "json", "--strict-mcp-config", "--setting-sources", "user"}
+	args := []string{"-p", "--output-format", "json", "--safe-mode", "--strict-mcp-config"}
 	if model != "" {
 		args = append(args, "--model", model)
 	}
