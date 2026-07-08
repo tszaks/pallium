@@ -6,16 +6,22 @@
 // rubric. (The workers can invoke read-only `pallium` to orient — the claude
 // wrapper's read-only allowlist includes Bash(pallium:*).)
 //
-// Run:
+// Run (from the repo checkout you want evaluated):
 //   export PALLIUM_WORKFLOW_PROVIDER_CLAUDE_COMMAND=$HOME/bin/pallium-claude-provider.sh
-//   pallium workflow run --background --script eval/adoption/eval.workflow.js "adoption baseline" --json
+//   pallium workflow run --background --script eval/adoption/eval.workflow.js "adoption baseline" \
+//     --args "{\"repo\":\"$PWD\"}" --json
+// The repo path is taken from --args {"repo":"..."}; if omitted it defaults to
+// "." (the workflow's working directory), so run it from the checkout under test.
 export const meta = {
   name: "adoption-eval-baseline",
   description: "Blind fresh worker per task (AGENTS.md trigger in context), claude-provider judge on the 4-axis rubric",
   phases: ["run", "judge"],
 };
 
-const REPO = "/Users/tyler/Projects/Pallium";
+// Derive the repo under evaluation from --args {"repo":"..."}; default to "."
+// (the workflow's working directory) so the dogfood eval is reproducible on any
+// checkout. No Date.now/Math.random/argless-new-Date — the value is static.
+const REPO = args?.repo ?? ".";
 
 const BLOCK = `<!-- pallium:agents:begin -->
 ## Pallium
