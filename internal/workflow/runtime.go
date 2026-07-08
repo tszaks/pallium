@@ -64,6 +64,10 @@ type AgentOptions struct {
 	Schema         map[string]any `json:"schema,omitempty"`
 	Model          string         `json:"model,omitempty"`
 	TimeoutSeconds *int           `json:"timeout_seconds,omitempty"`
+	// Network is the agent's opt-in request for network egress. It is only
+	// honored when the run was launched with --allow-network (the operator
+	// ceiling); otherwise the agent runs sandboxed. Default false.
+	Network bool `json:"network,omitempty"`
 }
 
 type CheckOptions struct {
@@ -588,7 +592,15 @@ func (r *Runner) jsAgent(ctx context.Context, vm *goja.Runtime) func(goja.Functi
 		}
 		opts := AgentOptions{}
 		if len(call.Arguments) > 1 && !goja.IsUndefined(call.Argument(1)) && !goja.IsNull(call.Argument(1)) {
-			raw, err := json.Marshal(call.Argument(1).Export())
+			exported := call.Argument(1).Export()
+			// Validate the boolean-typed opts against the raw JS value before
+			// the struct unmarshal: json.Unmarshal into a bool field would
+			// reject a non-boolean with an opaque type error, so check first to
+			// throw a clear script-facing message instead.
+			if err := validateUserNetwork(exported); err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			raw, err := json.Marshal(exported)
 			if err != nil {
 				panic(vm.ToValue(err.Error()))
 			}
@@ -850,7 +862,7 @@ func (r *Runner) registerUntilGreenPatch(label, command, loopID, worktree, repoR
 	callIndex := r.nextAgentCallIndex()
 	patchLabel := label + "-patch"
 	prompt := "verify.untilGreen combined patch: " + command
-	if _, ok, err := r.Store.CompletedAgent(r.Run.ID, callIndex, phase, patchLabel, prompt, "internal", repoRoot, "edit", "worktree", "", "", argsHash); err != nil {
+	if _, ok, err := r.Store.CompletedAgent(r.Run.ID, callIndex, phase, patchLabel, prompt, "internal", repoRoot, "edit", "worktree", "", "", argsHash, false); err != nil {
 		return err
 	} else if ok {
 		r.removeWorktree(repoRoot, worktree)
@@ -1451,7 +1463,13 @@ func (r *Runner) runAgentAtCallIndex(ctx context.Context, prompt string, opts Ag
 		return "", err
 	}
 	schemaHash := agentSchemaHash(opts.Schema)
-	if cached, ok, err := r.Store.CompletedAgent(r.Run.ID, callIndex, phase, opts.Label, prompt, provider, absRepo, mode, opts.Isolation, opts.Model, schemaHash, argsHash); err != nil {
+	// networkGranted is the effective egress decision (agent opt-in AND the
+	// run's --allow-network ceiling), matching resolveAgentNetwork. It is part
+	// of the cache identity so re-running the same run-id WITHOUT
+	// --allow-network cannot reuse a row produced with network on: the operator
+	// believes the rerun was sandboxed, so it must not serve networked output.
+	networkGranted := opts.Network && r.Run.AllowNetwork
+	if cached, ok, err := r.Store.CompletedAgent(r.Run.ID, callIndex, phase, opts.Label, prompt, provider, absRepo, mode, opts.Isolation, opts.Model, schemaHash, argsHash, networkGranted); err != nil {
 		return "", err
 	} else if ok {
 		if _, err := parseAgentOutputWithSchema(cached.Output, opts.Schema); err != nil {
@@ -1495,6 +1513,7 @@ func (r *Runner) runAgentAtCallIndex(ctx context.Context, prompt string, opts Ag
 		ScriptHash:       scriptHash,
 		ArgsHash:         argsHash,
 		EstimatedCostUSD: r.agentCostUSD,
+		Networked:        networkGranted,
 	}
 	created, err := r.Store.CreateAgent(agent)
 	if err != nil {
@@ -2128,6 +2147,32 @@ func validateUserIsolation(isolation string) error {
 	}
 }
 
+// validateUserNetwork guards the JS option boundary for the `network` opt:
+// scripts may only pass a boolean (true or false). A non-boolean (string,
+// number, object) is a script mistake and is rejected with a clear message
+// instead of the opaque type error json.Unmarshal would raise.
+func validateUserNetwork(raw any) error {
+	opts, ok := raw.(map[string]any)
+	if !ok {
+		return nil
+	}
+	// goja preserves the JS property case, but json.Unmarshal into the Go
+	// struct matches field names case-insensitively — so `{ Network: "yes" }`
+	// still populates the bool field while a case-sensitive opts["network"]
+	// lookup would miss it and skip validation. Check any key that spells
+	// "network" regardless of case so a non-boolean can't slip past via
+	// capitalization.
+	for key, value := range opts {
+		if !strings.EqualFold(strings.TrimSpace(key), "network") {
+			continue
+		}
+		if _, ok := value.(bool); !ok {
+			return fmt.Errorf("invalid agent network %v: must be a boolean (true or false)", value)
+		}
+	}
+	return nil
+}
+
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
@@ -2173,6 +2218,25 @@ func numberToInt(value any) (int, bool) {
 	default:
 		return 0, false
 	}
+}
+
+// resolveAgentNetwork applies the run-level --allow-network ceiling to an
+// agent's requested network setting and logs the outcome to stderr. An agent
+// only gets egress when it opts in (network: true) AND the operator launched
+// the run with --allow-network. If the agent asks but the ceiling is absent it
+// runs sandboxed and a warning is logged. Every agent that actually runs with
+// network enabled logs one greppable line so egress is auditable.
+func (r *Runner) resolveAgentNetwork(agent *Agent, opts AgentOptions) bool {
+	if !opts.Network {
+		return false
+	}
+	label := firstNonEmpty(agent.Label, agent.ID)
+	if !r.Run.AllowNetwork {
+		fmt.Fprintf(os.Stderr, "[workflow:%s] agent %s requested network but run was not started with --allow-network; running sandboxed\n", r.Run.ID, label)
+		return false
+	}
+	fmt.Fprintf(os.Stderr, "[workflow:%s] agent %s running with network access enabled\n", r.Run.ID, label)
+	return true
 }
 
 func (r *Runner) agentTimeout(opts AgentOptions) time.Duration {
@@ -2249,28 +2313,68 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 				return "", "", worktree, err
 			}
 		}
-		patchPath := ""
-		if worktree != "" {
-			var err error
-			patchPath, err = r.captureWorktreePatch(agent.ID, worktree, repoRoot)
-			if err != nil {
-				return "", "", worktree, err
-			}
+		patchPath, err := r.finalizeWorktreePatch(agent, worktree, repoRoot)
+		if err != nil {
+			return "", "", worktree, err
 		}
 		return strings.ReplaceAll(stub, "{{PROMPT}}", agent.Prompt), patchPath, worktree, nil
 	}
 	provider := ResolveProvider(agent.Provider, opts.Provider)
+	networkAllowed := r.resolveAgentNetwork(agent, opts)
 	repoRoot := firstNonEmpty(agent.Repo, r.Run.CWD)
 	cwd := repoRoot
 	worktree := ""
-	if agent.Isolation != "none" && (agent.Mode == "edit" || agent.Isolation == "worktree") {
+	// editIntent is true only when the agent is meant to produce file changes
+	// we keep: edit mode, or an explicit isolation:"worktree". Those are the
+	// ONLY worktrees whose writes get captured as a patch and applied back to
+	// the repo (see finalizeWorktreePatch).
+	editIntent := agent.Isolation != "none" && (agent.Mode == "edit" || agent.Isolation == "worktree")
+	// Granting network forces workspace-write (network egress requires it), so
+	// a networked read-only/test/check agent would otherwise run fs-write in
+	// the operator's LIVE checkout — writes to the real tree PLUS egress. When
+	// an agent is actually granted network but has no isolated worktree, force
+	// one (treat it like edit/worktree) so its forced workspace-write access is
+	// contained to a throwaway worktree, never the live repo. That containment
+	// worktree has no edit intent, so its writes are discarded, not applied.
+	if networkAllowed || editIntent {
 		var err error
 		worktree, err = r.createWorktree(agent.ID, repoRoot)
 		if err != nil {
+			// A worktree forced purely to contain a networked worker (no edit
+			// intent) needs the run to sit inside a git repo. Turn the raw git
+			// "not a git repository" failure into actionable guidance instead
+			// of leaking an opaque `exit status 128`.
+			if networkAllowed && !editIntent && strings.Contains(err.Error(), "not a git repository") {
+				return "", "", "", fmt.Errorf("network access requires the run to execute inside a git repository so the worker can be isolated in a throwaway worktree (run directory %q is not a git repo); run from a git repository or drop network access: %w", repoRoot, err)
+			}
 			return "", "", "", err
 		}
-		cwd = worktree
+		// `git worktree add` always checks out the WHOLE repo, so `worktree`
+		// is the equivalent of the repo's top level, not of repoRoot itself.
+		// When the run was launched from a subdirectory (repoRoot is that
+		// subdirectory, not the git top level), landing the agent at
+		// `worktree` would silently relocate it to the repo root and lose the
+		// subdirectory it was meant to run in. worktreeSubdirCWD maps
+		// repoRoot's offset from the real top level onto the new worktree; it
+		// falls back to the worktree root if that mapping can't be computed
+		// (e.g. `git rev-parse` fails), which reproduces today's behavior
+		// rather than failing the run over a containment nicety.
+		cwd = r.worktreeSubdirCWD(repoRoot, worktree)
 	}
+
+	// A worktree that exists ONLY to contain a networked non-edit worker holds
+	// throwaway writes. The success paths below discard it via
+	// finalizeWorktreePatch; on any error exit (setup failure, command failure,
+	// timeout, unreadable output) the early returns would otherwise leak that
+	// worktree on disk. Discard it on those error exits too. Genuine
+	// edit/worktree agents are exempt: their tree is kept for its patch or for
+	// post-failure debugging.
+	containmentWorktree := worktree != "" && !editIntent
+	defer func() {
+		if containmentWorktree {
+			r.removeWorktree(repoRoot, worktree)
+		}
+	}()
 
 	tmpDir, err := os.MkdirTemp("", "pallium-workflow-agent-*")
 	if err != nil {
@@ -2290,8 +2394,11 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 		usageFile := filepath.Join(tmpDir, "usage.json")
 		runProvider := func(runCtx context.Context, runPrompt string) (string, error) {
 			if command != "" {
-				return r.runConfiguredProviderCommand(runCtx, command, tmpDir, outFile, usageFile, cwd, runPrompt, agent, opts)
+				return r.runConfiguredProviderCommand(runCtx, command, tmpDir, outFile, usageFile, cwd, runPrompt, agent, opts, networkAllowed)
 			}
+			// The built-in claude provider runs under its own tool allowlist
+			// (curl/gh denied) and does not yet honor network:true; a networked
+			// claude worker therefore runs without raw egress rather than more.
 			return r.runBuiltinClaudeCommand(runCtx, usageFile, cwd, runPrompt, agent, opts)
 		}
 		output, err := runProvider(ctx, agent.Prompt)
@@ -2353,21 +2460,18 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 		if err != nil {
 			return output, "", worktree, agentCommandError(ctx, timeout, err)
 		}
-		patchPath := ""
-		if worktree != "" {
-			patchPath, err = r.captureWorktreePatch(agent.ID, worktree, repoRoot)
-			if err != nil {
-				return output, "", worktree, err
-			}
+		// Reached a clean provider exit: finalizeWorktreePatch now owns the
+		// worktree's disposition (discard for containment, capture for edit), so
+		// the error-path cleanup defer must stand down.
+		containmentWorktree = false
+		patchPath, err := r.finalizeWorktreePatch(agent, worktree, repoRoot)
+		if err != nil {
+			return output, "", worktree, err
 		}
 		return output, patchPath, worktree, nil
 	}
 	cmdArgs := []string{"exec", "--cd", cwd, "--output-last-message", outFile}
-	if agent.Mode == "edit" || agent.Mode == "test" || agent.Mode == "check" {
-		cmdArgs = append(cmdArgs, "--sandbox", "workspace-write")
-	} else {
-		cmdArgs = append(cmdArgs, "--sandbox", "read-only")
-	}
+	cmdArgs = append(cmdArgs, codexSandboxArgs(agent.Mode, networkAllowed)...)
 	if opts.Model != "" {
 		cmdArgs = append(cmdArgs, "--model", opts.Model)
 	}
@@ -2397,17 +2501,63 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 		return "", "", worktree, err
 	}
 	output := strings.TrimSpace(string(raw))
-	patchPath := ""
-	if worktree != "" {
-		patchPath, err = r.captureWorktreePatch(agent.ID, worktree, repoRoot)
-		if err != nil {
-			return output, "", worktree, err
-		}
+	// Reached a clean codex exit: finalizeWorktreePatch now owns the worktree's
+	// disposition (discard for containment, capture for edit), so the error-path
+	// cleanup defer must stand down.
+	containmentWorktree = false
+	patchPath, err := r.finalizeWorktreePatch(agent, worktree, repoRoot)
+	if err != nil {
+		return output, "", worktree, err
 	}
 	return output, patchPath, worktree, nil
 }
 
-func (r *Runner) runConfiguredProviderCommand(ctx context.Context, command, tmpDir, outFile, usageFile, cwd, prompt string, agent *Agent, opts AgentOptions) (string, error) {
+// codexSandboxArgs returns the `codex exec` sandbox flags for an agent.
+//
+// Default (no network): edit/test/check get workspace-write, everything else
+// read-only. Neither of these grants network egress, which is the safe
+// baseline — no worker can reach the network unless the operator explicitly
+// opted the run in.
+//
+// When network is allowed we want the most-scoped sandbox that still grants
+// egress. Codex v0.142.5 exposes a granular per-mode toggle: with
+// `--sandbox workspace-write` the filesystem stays scoped to the workspace,
+// and `-c sandbox_workspace_write.network_access=true` enables the network
+// without falling back to the far broader `--sandbox danger-full-access`
+// (which would also allow writes anywhere on the host). Evidence, from the
+// bundled codex binary's own help/config text:
+//
+//	"In `workspace-write`, network access still depends on your Codex
+//	 configuration (for example `[sandbox_workspace_write] network_access = true`)."
+//
+// So a networked worker is still confined to the workspace for filesystem
+// writes. A read-only agent that opts into network is therefore upgraded to
+// workspace-write (read-only has no per-mode network toggle) — the minimal
+// scope that can carry egress.
+//
+// The non-network workspace-write path (edit/test/check) must ALSO pin the
+// toggle, explicitly to false. Codex resolves `network_access` from the
+// operator's ambient ~/.codex/config.toml when the flag is absent, so a bare
+// `--sandbox workspace-write` would silently inherit
+// `[sandbox_workspace_write] network_access = true` and hand a worker egress
+// with no --allow-network and no network:true — defeating the safe default.
+// Forcing `-c sandbox_workspace_write.network_access=false` makes Pallium's
+// lockdown authoritative regardless of ambient config. Verified against codex
+// v0.142.5: the flag is accepted, and with an ambient config setting the key
+// true the explicit `=false` override resolves to network-disabled (a
+// sandboxed connect attempt is refused). read-only has no network regardless,
+// so it needs no pin.
+func codexSandboxArgs(mode string, networkAllowed bool) []string {
+	if networkAllowed {
+		return []string{"--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"}
+	}
+	if mode == "edit" || mode == "test" || mode == "check" {
+		return []string{"--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=false"}
+	}
+	return []string{"--sandbox", "read-only"}
+}
+
+func (r *Runner) runConfiguredProviderCommand(ctx context.Context, command, tmpDir, outFile, usageFile, cwd, prompt string, agent *Agent, opts AgentOptions, networkAllowed bool) (string, error) {
 	promptFile := filepath.Join(tmpDir, "prompt.txt")
 	if err := os.WriteFile(promptFile, []byte(prompt), 0o600); err != nil {
 		return "", err
@@ -2423,6 +2573,14 @@ func (r *Runner) runConfiguredProviderCommand(ctx context.Context, command, tmpD
 		if err := os.WriteFile(schemaFile, raw, 0o600); err != nil {
 			return "", err
 		}
+	}
+	// PALLIUM_WORKFLOW_NETWORK is the provider contract for egress: "1" only
+	// when the agent requested network AND the run granted the ceiling,
+	// otherwise "0". Wrappers use it to decide whether to grant networked
+	// tools; the default is locked down.
+	networkEnv := "0"
+	if networkAllowed {
+		networkEnv = "1"
 	}
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	cmd.Dir = cwd
@@ -2444,6 +2602,7 @@ func (r *Runner) runConfiguredProviderCommand(ctx context.Context, command, tmpD
 		"PALLIUM_WORKFLOW_OUTPUT_FILE="+outFile,
 		"PALLIUM_WORKFLOW_SCHEMA_FILE="+schemaFile,
 		"PALLIUM_WORKFLOW_USAGE_FILE="+usageFile,
+		"PALLIUM_WORKFLOW_NETWORK="+networkEnv,
 	)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -2549,6 +2708,41 @@ func (r *Runner) worktreePath(agentID string) (string, error) {
 	return filepath.Join(root, agentID), nil
 }
 
+// worktreeSubdirCWD returns where an agent should run inside a freshly
+// created worktree so a launch from a repo subdirectory keeps working from
+// that same subdirectory rather than the repo's top level. `git worktree add`
+// always checks out the entire repository, so `worktree` corresponds to the
+// git top level, not to repoRoot: if repoRoot is itself a subdirectory (e.g.
+// the run's CWD wasn't the repo root), the equivalent path inside the new
+// worktree is worktree+<repoRoot's offset from the top level>, not worktree
+// itself. Symlinks are resolved on both sides before computing that offset
+// because git resolves them internally (macOS temp dirs are a common case:
+// /var is a symlink to /private/var), and an unresolved mismatch would send
+// filepath.Rel down the wrong path or report a spurious "..". Any failure
+// (git not runnable, path outside the repo) falls back to the worktree root,
+// which matches the pre-fix behavior instead of failing the run.
+func (r *Runner) worktreeSubdirCWD(repoRoot, worktree string) string {
+	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	cmd.Dir = repoRoot
+	out, err := cmd.Output()
+	if err != nil {
+		return worktree
+	}
+	top, err := filepath.EvalSymlinks(strings.TrimSpace(string(out)))
+	if err != nil {
+		return worktree
+	}
+	absRepoRoot, err := filepath.EvalSymlinks(repoRoot)
+	if err != nil {
+		return worktree
+	}
+	rel, err := filepath.Rel(top, absRepoRoot)
+	if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
+		return worktree
+	}
+	return filepath.Join(worktree, rel)
+}
+
 func (r *Runner) createWorktree(agentID, repoRoot string) (string, error) {
 	path, err := r.worktreePath(agentID)
 	if err != nil {
@@ -2602,6 +2796,27 @@ func (r *Runner) writeWorktreePatch(agentID, worktree string) (string, error) {
 		return "", err
 	}
 	return patchPath, nil
+}
+
+// finalizeWorktreePatch decides what happens to an agent's worktree once the
+// worker exits. Only worktrees created for genuine edit intent (mode "edit" or
+// isolation "worktree") have their writes captured as a patch for later apply.
+//
+// A worktree created ONLY to contain a networked worker's forced
+// workspace-write filesystem access has no edit intent: its writes are
+// throwaway, so they are discarded (worktree removed) and no patch is captured.
+// Capturing here would defeat the containment guarantee — a prompt-injected
+// networked read-only worker could drop a payload file that ApplyPatches would
+// then git-apply onto the operator's live checkout at run completion.
+func (r *Runner) finalizeWorktreePatch(agent *Agent, worktree, repoRoot string) (string, error) {
+	if worktree == "" {
+		return "", nil
+	}
+	if agent.Mode == "edit" || agent.Isolation == "worktree" {
+		return r.captureWorktreePatch(agent.ID, worktree, repoRoot)
+	}
+	r.removeWorktree(repoRoot, worktree)
+	return "", nil
 }
 
 // captureWorktreePatch writes the agent patch from the worktree and removes

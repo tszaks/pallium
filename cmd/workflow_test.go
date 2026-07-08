@@ -643,6 +643,86 @@ func TestWorkflowHTTPAPI(t *testing.T) {
 	}
 }
 
+// TestWorkflowRunRequestArgsAllowNetwork covers workflowRunRequestArgs in
+// isolation: allow_network:true in the HTTP request body must translate to
+// --allow-network on the underlying `workflow run` args, and omitting it must
+// not add the flag (safe default).
+func TestWorkflowRunRequestArgsAllowNetwork(t *testing.T) {
+	args, err := workflowRunRequestArgs("db.sqlite", workflowRunRequest{Task: "t", AllowNetwork: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsArg(args, "--allow-network") {
+		t.Fatalf("expected --allow-network in args, got %v", args)
+	}
+
+	args, err = workflowRunRequestArgs("db.sqlite", workflowRunRequest{Task: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsArg(args, "--allow-network") {
+		t.Fatalf("expected no --allow-network by default, got %v", args)
+	}
+}
+
+func containsArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestWorkflowHTTPRunAllowNetwork verifies the POST /workflows/run HTTP path
+// exposes the operator's --allow-network ceiling: previously only the CLI
+// run/resume/trigger parsers could set it, leaving this entry point unable to
+// grant network access at all. allow_network:true in the JSON body must
+// thread through to the same --allow-network flag the CLI path uses, and
+// omitting it must keep the safe default (no egress).
+func TestWorkflowHTTPRunAllowNetwork(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	// A granted-network agent is forced into an isolated worktree, so the run
+	// cwd must be a git repo.
+	initGitRepo(t, tmp)
+	setupNetworkProvider(t, tmp)
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	scriptPath := filepath.Join(tmp, "workflow.js")
+	if err := os.WriteFile(scriptPath, []byte(`return agent("go", { provider: "net", mode: "read-only", label: "netter", network: true });`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	handler := newWorkflowHTTPHandler(dbPath, "")
+
+	rawBody, err := json.Marshal(map[string]any{
+		"id": "wf-http-net", "task": "net test", "cwd": tmp, "script_path": scriptPath, "allow_network": true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/workflows/run", bytes.NewReader(rawBody))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("run with allow_network failed: %d %s", rec.Code, rec.Body.String())
+	}
+	assertNetworkRun(t, dbPath, "wf-http-net", true, "1")
+
+	rawBody, err = json.Marshal(map[string]any{
+		"id": "wf-http-net-off", "task": "net test", "cwd": tmp, "script_path": scriptPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/workflows/run", bytes.NewReader(rawBody))
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("run without allow_network failed: %d %s", rec.Code, rec.Body.String())
+	}
+	assertNetworkRun(t, dbPath, "wf-http-net-off", false, "0")
+}
+
 func TestWorkflowHTTPAPIRequiresTokenWhenConfigured(t *testing.T) {
 	tmp := t.TempDir()
 	handler := newWorkflowHTTPHandler(filepath.Join(tmp, "sessions.sqlite"), "secret-token")
@@ -1391,6 +1471,20 @@ func runGit(t *testing.T, dir string, args ...string) {
 	}
 }
 
+// initGitRepo makes dir a committable git repo so worktree-forcing paths (e.g.
+// a granted-network agent) can branch from it.
+func initGitRepo(t *testing.T, dir string) {
+	t.Helper()
+	runGit(t, dir, "init")
+	runGit(t, dir, "config", "user.email", "test@example.com")
+	runGit(t, dir, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("root\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, dir, "add", "README.md")
+	runGit(t, dir, "commit", "-m", "initial")
+}
+
 func readFile(t *testing.T, path string) string {
 	t.Helper()
 	raw, err := os.ReadFile(path)
@@ -1398,6 +1492,198 @@ func readFile(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return string(raw)
+}
+
+// networkProviderScript writes PALLIUM_WORKFLOW_NETWORK into its output so a
+// test can assert exactly what env the configured provider saw.
+const networkProviderScript = `#!/bin/sh
+printf '{"ok":true,"network":"%s"}' "$PALLIUM_WORKFLOW_NETWORK" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+`
+
+func setupNetworkProvider(t *testing.T, tmp string) {
+	t.Helper()
+	provider := filepath.Join(tmp, "net-provider.sh")
+	if err := os.WriteFile(provider, []byte(networkProviderScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_NET_COMMAND", provider)
+}
+
+func assertNetworkRun(t *testing.T, dbPath, id string, wantAllow bool, wantNetworkVal string) {
+	t.Helper()
+	store, err := workflow.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run, err := store.Run(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.AllowNetwork != wantAllow {
+		t.Fatalf("run %s AllowNetwork = %v, want %v", id, run.AllowNetwork, wantAllow)
+	}
+	agents, err := store.ListAgents(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 {
+		t.Fatalf("expected 1 agent, got %d", len(agents))
+	}
+	want := `"network":"` + wantNetworkVal + `"`
+	if !strings.Contains(agents[0].Output, want) {
+		t.Fatalf("expected provider to see %s, got agent output %q", want, agents[0].Output)
+	}
+}
+
+// TestWorkflowRunAllowNetworkFlag verifies the operator ceiling wires end to
+// end: --allow-network on `workflow run` lets a network: true agent through
+// (provider sees PALLIUM_WORKFLOW_NETWORK=1), the ceiling is stored on the
+// run, and a plain resume preserves it (persists like AgentTimeout).
+func TestWorkflowRunAllowNetworkFlag(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	// A granted-network agent is forced into an isolated worktree (FIX 2), so
+	// the run cwd must be a git repo.
+	initGitRepo(t, tmp)
+	setupNetworkProvider(t, tmp)
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	scriptPath := filepath.Join(tmp, "workflow.js")
+	if err := os.WriteFile(scriptPath, []byte(`return agent("go", { provider: "net", mode: "read-only", label: "netter", network: true });`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{
+		"run", "--id", "wf-net-run", "--db", dbPath, "--cwd", tmp,
+		"--script", scriptPath, "--allow-network", "net test",
+	}, false); err != nil {
+		t.Fatalf("run with --allow-network failed: %v", err)
+	}
+	assertNetworkRun(t, dbPath, "wf-net-run", true, "1")
+
+	// Resume without the flag must keep the stored ceiling, not silently drop
+	// it back to sandboxed.
+	out.Reset()
+	if err := runWorkflow(&out, []string{"resume", "wf-net-run", "--db", dbPath}, false); err != nil {
+		t.Fatalf("resume failed: %v", err)
+	}
+	assertNetworkRun(t, dbPath, "wf-net-run", true, "1")
+}
+
+// TestWorkflowRunNetworkDefaultOff guards the safe default: without
+// --allow-network, a network: true agent still runs sandboxed
+// (PALLIUM_WORKFLOW_NETWORK=0) and the run records no ceiling.
+func TestWorkflowRunNetworkDefaultOff(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	setupNetworkProvider(t, tmp)
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	scriptPath := filepath.Join(tmp, "workflow.js")
+	if err := os.WriteFile(scriptPath, []byte(`return agent("go", { provider: "net", mode: "read-only", label: "netter", network: true });`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{
+		"run", "--id", "wf-net-off", "--db", dbPath, "--cwd", tmp,
+		"--script", scriptPath, "net test",
+	}, false); err != nil {
+		t.Fatalf("run without --allow-network failed: %v", err)
+	}
+	assertNetworkRun(t, dbPath, "wf-net-off", false, "0")
+}
+
+// TestWorkflowRunAllowNetworkNotLatchedOnReuse covers FIX 4: reusing a run-id
+// that once had --allow-network must NOT keep egress on when the new `run`
+// invocation omits the flag. A fresh run reflects only this invocation's flag.
+func TestWorkflowRunAllowNetworkNotLatchedOnReuse(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	// A granted-network agent is forced into an isolated worktree (FIX 2), so
+	// the run cwd must be a git repo.
+	initGitRepo(t, tmp)
+	setupNetworkProvider(t, tmp)
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	scriptPath := filepath.Join(tmp, "workflow.js")
+	if err := os.WriteFile(scriptPath, []byte(`return agent("go", { provider: "net", mode: "read-only", label: "netter", network: true });`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	// First run grants the ceiling and completes.
+	if err := runWorkflow(&out, []string{
+		"run", "--id", "wf-net-reuse", "--db", dbPath, "--cwd", tmp,
+		"--script", scriptPath, "--allow-network", "net test",
+	}, false); err != nil {
+		t.Fatalf("run with --allow-network failed: %v", err)
+	}
+	assertNetworkRun(t, dbPath, "wf-net-reuse", true, "1")
+
+	// Reusing the same id WITHOUT --allow-network must turn the stored ceiling
+	// back off (no OR-fold latch). Assert the stored AllowNetwork directly:
+	// per-agent output is cached from the first run and is not the ceiling.
+	out.Reset()
+	if err := runWorkflow(&out, []string{
+		"run", "--id", "wf-net-reuse", "--db", dbPath, "--cwd", tmp,
+		"--script", scriptPath, "net test",
+	}, false); err != nil {
+		t.Fatalf("reuse run without --allow-network failed: %v", err)
+	}
+	store, err := workflow.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run, err := store.Run("wf-net-reuse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.AllowNetwork {
+		t.Fatalf("reused run kept AllowNetwork=true; expected false when the new run omitted --allow-network")
+	}
+}
+
+// TestWorkflowTriggerRunAllowNetwork covers threading the operator ceiling
+// through the trigger path: `trigger run --allow-network` forwards the flag to
+// the launched run (so a triggered workflow can use the network path), and
+// omitting it keeps the safe default of no egress.
+func TestWorkflowTriggerRunAllowNetwork(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	// A granted-network agent is forced into an isolated worktree, so the run
+	// cwd must be a git repo.
+	initGitRepo(t, tmp)
+	setupNetworkProvider(t, tmp)
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	scriptPath := filepath.Join(tmp, "workflow.js")
+	if err := os.WriteFile(scriptPath, []byte(`return agent("go", { provider: "net", mode: "read-only", label: "netter", network: true });`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{
+		"trigger", "add", "nettrig", "net task",
+		"--script", scriptPath, "--cwd", tmp, "--db", dbPath,
+	}, false); err != nil {
+		t.Fatalf("trigger add failed: %v", err)
+	}
+
+	// With --allow-network the launched run carries the ceiling and the agent
+	// runs networked.
+	out.Reset()
+	if err := runWorkflow(&out, []string{
+		"trigger", "run", "nettrig", "--id", "wf-trig-net", "--db", dbPath, "--allow-network",
+	}, false); err != nil {
+		t.Fatalf("trigger run --allow-network failed: %v", err)
+	}
+	assertNetworkRun(t, dbPath, "wf-trig-net", true, "1")
+
+	// Without the flag the triggered run stays sandboxed (safe default).
+	out.Reset()
+	if err := runWorkflow(&out, []string{
+		"trigger", "run", "nettrig", "--id", "wf-trig-off", "--db", dbPath,
+	}, false); err != nil {
+		t.Fatalf("trigger run without --allow-network failed: %v", err)
+	}
+	assertNetworkRun(t, dbPath, "wf-trig-off", false, "0")
 }
 
 // TestRenderWorkflowResultSurfacesDroppedItems makes sure the immediate
