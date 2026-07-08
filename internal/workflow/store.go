@@ -28,12 +28,30 @@ type Run struct {
 	OwnedID      string `json:"owned_session_id,omitempty"`
 	MaxAgents    int    `json:"max_agents,omitempty"`
 	MaxBudgetUSD string `json:"max_budget_usd,omitempty"`
-	Status       string `json:"status"`
-	Result       string `json:"result,omitempty"`
-	Error        string `json:"error,omitempty"`
-	CreatedAt    string `json:"created_at"`
-	UpdatedAt    string `json:"updated_at"`
-	CompletedAt  string `json:"completed_at,omitempty"`
+	AgentTimeout int    `json:"agent_timeout_seconds,omitempty"`
+	// AgentTimeoutExplicit records whether AgentTimeout was ever explicitly
+	// configured for this run (via --agent-timeout, including 0 to disable
+	// timeouts). Callers must check this flag before trusting AgentTimeout:
+	// the field's own zero value is ambiguous between "not configured" and
+	// "explicitly disabled", so the flag is the source of truth.
+	AgentTimeoutExplicit bool         `json:"agent_timeout_explicit,omitempty"`
+	Status               string       `json:"status"`
+	Result               string       `json:"result,omitempty"`
+	Error                string       `json:"error,omitempty"`
+	Failures             []RunFailure `json:"failures,omitempty"`
+	ScriptHash           string       `json:"script_hash,omitempty"`
+	ScriptChanged        bool         `json:"script_changed,omitempty"`
+	CreatedAt            string       `json:"created_at"`
+	UpdatedAt            string       `json:"updated_at"`
+	CompletedAt          string       `json:"completed_at,omitempty"`
+}
+
+// RunFailure records an item that was dropped to null inside parallel or
+// pipeline instead of failing the run.
+type RunFailure struct {
+	Label string `json:"label,omitempty"`
+	Phase string `json:"phase,omitempty"`
+	Error string `json:"error"`
 }
 
 type Phase struct {
@@ -63,6 +81,7 @@ type Agent struct {
 	ScriptHash       string  `json:"script_hash,omitempty"`
 	ArgsHash         string  `json:"args_hash,omitempty"`
 	EstimatedCostUSD float64 `json:"estimated_cost_usd,omitempty"`
+	UsageJSON        string  `json:"usage_json,omitempty"`
 	Status           string  `json:"status"`
 	Output           string  `json:"output,omitempty"`
 	Error            string  `json:"error,omitempty"`
@@ -118,9 +137,14 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
   owned_session_id TEXT,
   max_agents INTEGER DEFAULT 0,
   max_budget_usd TEXT,
+  agent_timeout_seconds INTEGER DEFAULT 0,
+  agent_timeout_explicit INTEGER DEFAULT 0,
   status TEXT NOT NULL,
   result TEXT,
   error TEXT,
+  failures TEXT,
+  script_hash TEXT,
+  script_changed INTEGER DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   completed_at TEXT
@@ -153,6 +177,7 @@ CREATE TABLE IF NOT EXISTS workflow_agents (
   script_hash TEXT,
   args_hash TEXT,
   estimated_cost_usd REAL DEFAULT 0,
+  usage_json TEXT,
   status TEXT NOT NULL,
   output TEXT,
   error TEXT,
@@ -213,8 +238,14 @@ CREATE INDEX IF NOT EXISTS idx_workflow_gates_run ON workflow_gates(run_id, open
 		"ALTER TABLE workflow_agents ADD COLUMN script_hash TEXT",
 		"ALTER TABLE workflow_agents ADD COLUMN args_hash TEXT",
 		"ALTER TABLE workflow_agents ADD COLUMN estimated_cost_usd REAL DEFAULT 0",
+		"ALTER TABLE workflow_agents ADD COLUMN usage_json TEXT",
 		"ALTER TABLE workflow_runs ADD COLUMN max_agents INTEGER DEFAULT 0",
 		"ALTER TABLE workflow_runs ADD COLUMN max_budget_usd TEXT",
+		"ALTER TABLE workflow_runs ADD COLUMN agent_timeout_seconds INTEGER DEFAULT 0",
+		"ALTER TABLE workflow_runs ADD COLUMN agent_timeout_explicit INTEGER DEFAULT 0",
+		"ALTER TABLE workflow_runs ADD COLUMN failures TEXT",
+		"ALTER TABLE workflow_runs ADD COLUMN script_hash TEXT",
+		"ALTER TABLE workflow_runs ADD COLUMN script_changed INTEGER DEFAULT 0",
 		"ALTER TABLE workflow_triggers ADD COLUMN last_fingerprint TEXT",
 	} {
 		if _, alterErr := s.db.Exec(stmt); alterErr != nil && !strings.Contains(alterErr.Error(), "duplicate column name") {
@@ -231,6 +262,17 @@ UPDATE workflow_agents
 SET call_index=(SELECT rn FROM ordered WHERE ordered.id=workflow_agents.id)
 WHERE id IN (SELECT id FROM ordered);
 `); err != nil {
+		return err
+	}
+	// Backfill agent_timeout_explicit for rows written before that column
+	// existed. Only rows from before this change can have a positive stored
+	// timeout with explicit=0 (every write path since always sets both
+	// together), so this only ever touches genuinely pre-upgrade rows and is
+	// a no-op once applied. Without it, a pre-upgrade run with a custom
+	// timeout would silently stop honoring it on resume and fall back to the
+	// 600s flag default, since resume only forwards the stored value when
+	// AgentTimeoutExplicit is true.
+	if _, err := s.db.Exec(`UPDATE workflow_runs SET agent_timeout_explicit=1 WHERE agent_timeout_seconds>0 AND COALESCE(agent_timeout_explicit,0)=0`); err != nil {
 		return err
 	}
 	return nil
@@ -258,8 +300,8 @@ func (s *Store) CreateRun(run Run) (Run, error) {
 	if run.UpdatedAt == "" {
 		run.UpdatedAt = run.CreatedAt
 	}
-	_, err := s.db.Exec(`INSERT INTO workflow_runs(id,task,cwd,script_path,args_json,owned_session_id,max_agents,max_budget_usd,status,result,error,created_at,updated_at,completed_at)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, run.ID, run.Task, run.CWD, run.ScriptPath, run.ArgsJSON, run.OwnedID, run.MaxAgents, run.MaxBudgetUSD, run.Status, run.Result, run.Error, run.CreatedAt, run.UpdatedAt, run.CompletedAt)
+	_, err := s.db.Exec(`INSERT INTO workflow_runs(id,task,cwd,script_path,args_json,owned_session_id,max_agents,max_budget_usd,agent_timeout_seconds,agent_timeout_explicit,status,result,error,created_at,updated_at,completed_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, run.ID, run.Task, run.CWD, run.ScriptPath, run.ArgsJSON, run.OwnedID, run.MaxAgents, run.MaxBudgetUSD, run.AgentTimeout, run.AgentTimeoutExplicit, run.Status, run.Result, run.Error, run.CreatedAt, run.UpdatedAt, run.CompletedAt)
 	return run, err
 }
 
@@ -286,13 +328,22 @@ func (s *Store) UpsertRun(run Run) (Run, error) {
 		if run.MaxBudgetUSD == "" {
 			run.MaxBudgetUSD = existing.MaxBudgetUSD
 		}
+		// AgentTimeout's zero value is a legitimate explicit value ("disable
+		// timeouts"), so it cannot double as the "caller didn't set this"
+		// sentinel the other fields use. AgentTimeoutExplicit is the actual
+		// signal: only fall back to the existing stored value when this call
+		// did not explicitly configure a timeout at all.
+		if !run.AgentTimeoutExplicit {
+			run.AgentTimeout = existing.AgentTimeout
+			run.AgentTimeoutExplicit = existing.AgentTimeoutExplicit
+		}
 		if run.Status == "" {
 			run.Status = existing.Status
 		}
 		run.CreatedAt = existing.CreatedAt
 		run.UpdatedAt = nowString()
-		_, err := s.db.Exec(`UPDATE workflow_runs SET task=?,cwd=?,script_path=?,args_json=?,owned_session_id=?,max_agents=?,max_budget_usd=?,status=?,result=?,error=?,updated_at=?,completed_at=? WHERE id=?`,
-			run.Task, run.CWD, run.ScriptPath, run.ArgsJSON, run.OwnedID, run.MaxAgents, run.MaxBudgetUSD, run.Status, run.Result, run.Error, run.UpdatedAt, run.CompletedAt, run.ID)
+		_, err := s.db.Exec(`UPDATE workflow_runs SET task=?,cwd=?,script_path=?,args_json=?,owned_session_id=?,max_agents=?,max_budget_usd=?,agent_timeout_seconds=?,agent_timeout_explicit=?,status=?,result=?,error=?,updated_at=?,completed_at=? WHERE id=?`,
+			run.Task, run.CWD, run.ScriptPath, run.ArgsJSON, run.OwnedID, run.MaxAgents, run.MaxBudgetUSD, run.AgentTimeout, run.AgentTimeoutExplicit, run.Status, run.Result, run.Error, run.UpdatedAt, run.CompletedAt, run.ID)
 		return run, err
 	}
 	return s.CreateRun(run)
@@ -316,11 +367,49 @@ func (s *Store) SetRunOwnedID(id, ownedID string) error {
 	return err
 }
 
-func (s *Store) Run(id string) (Run, error) {
-	row := s.db.QueryRow(`SELECT id,task,cwd,script_path,COALESCE(args_json,''),COALESCE(owned_session_id,''),COALESCE(max_agents,0),COALESCE(max_budget_usd,''),status,COALESCE(result,''),COALESCE(error,''),created_at,updated_at,COALESCE(completed_at,'') FROM workflow_runs WHERE id=?`, id)
+const runSelectColumns = `id,task,cwd,script_path,COALESCE(args_json,''),COALESCE(owned_session_id,''),COALESCE(max_agents,0),COALESCE(max_budget_usd,''),COALESCE(agent_timeout_seconds,0),COALESCE(agent_timeout_explicit,0),status,COALESCE(result,''),COALESCE(error,''),COALESCE(failures,''),COALESCE(script_hash,''),COALESCE(script_changed,0),created_at,updated_at,COALESCE(completed_at,'')`
+
+func scanRun(row interface{ Scan(dest ...any) error }) (Run, error) {
 	var run Run
-	err := row.Scan(&run.ID, &run.Task, &run.CWD, &run.ScriptPath, &run.ArgsJSON, &run.OwnedID, &run.MaxAgents, &run.MaxBudgetUSD, &run.Status, &run.Result, &run.Error, &run.CreatedAt, &run.UpdatedAt, &run.CompletedAt)
-	return run, err
+	var failuresJSON string
+	var scriptChanged int
+	var agentTimeoutExplicit int
+	if err := row.Scan(&run.ID, &run.Task, &run.CWD, &run.ScriptPath, &run.ArgsJSON, &run.OwnedID, &run.MaxAgents, &run.MaxBudgetUSD, &run.AgentTimeout, &agentTimeoutExplicit, &run.Status, &run.Result, &run.Error, &failuresJSON, &run.ScriptHash, &scriptChanged, &run.CreatedAt, &run.UpdatedAt, &run.CompletedAt); err != nil {
+		return Run{}, err
+	}
+	run.AgentTimeoutExplicit = agentTimeoutExplicit != 0
+	run.ScriptChanged = scriptChanged != 0
+	if failuresJSON != "" {
+		_ = json.Unmarshal([]byte(failuresJSON), &run.Failures)
+	}
+	return run, nil
+}
+
+func (s *Store) Run(id string) (Run, error) {
+	row := s.db.QueryRow(`SELECT `+runSelectColumns+` FROM workflow_runs WHERE id=?`, id)
+	return scanRun(row)
+}
+
+func (s *Store) SetRunFailures(id string, failures []RunFailure) error {
+	raw := ""
+	if len(failures) > 0 {
+		encoded, err := json.Marshal(failures)
+		if err != nil {
+			return err
+		}
+		raw = string(encoded)
+	}
+	_, err := s.db.Exec(`UPDATE workflow_runs SET failures=?,updated_at=? WHERE id=?`, raw, nowString(), id)
+	return err
+}
+
+func (s *Store) SetRunScriptState(id, scriptHash string, scriptChanged bool) error {
+	changed := 0
+	if scriptChanged {
+		changed = 1
+	}
+	_, err := s.db.Exec(`UPDATE workflow_runs SET script_hash=?,script_changed=?,updated_at=? WHERE id=?`, scriptHash, changed, nowString(), id)
+	return err
 }
 
 func (s *Store) CountActiveRuns() (int, error) {
@@ -336,15 +425,15 @@ func (s *Store) ListRuns(limit int) ([]Run, error) {
 	if limit <= 0 {
 		limit = 50
 	}
-	rows, err := s.db.Query(`SELECT id,task,cwd,script_path,COALESCE(args_json,''),COALESCE(owned_session_id,''),COALESCE(max_agents,0),COALESCE(max_budget_usd,''),status,COALESCE(result,''),COALESCE(error,''),created_at,updated_at,COALESCE(completed_at,'') FROM workflow_runs ORDER BY updated_at DESC LIMIT ?`, limit)
+	rows, err := s.db.Query(`SELECT `+runSelectColumns+` FROM workflow_runs ORDER BY updated_at DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var runs []Run
 	for rows.Next() {
-		var run Run
-		if err := rows.Scan(&run.ID, &run.Task, &run.CWD, &run.ScriptPath, &run.ArgsJSON, &run.OwnedID, &run.MaxAgents, &run.MaxBudgetUSD, &run.Status, &run.Result, &run.Error, &run.CreatedAt, &run.UpdatedAt, &run.CompletedAt); err != nil {
+		run, err := scanRun(rows)
+		if err != nil {
 			return nil, err
 		}
 		runs = append(runs, run)
@@ -441,8 +530,8 @@ func (s *Store) CreateAgent(agent Agent) (Agent, error) {
 	if agent.UpdatedAt == "" {
 		agent.UpdatedAt = agent.CreatedAt
 	}
-	_, err := s.db.Exec(`INSERT INTO workflow_agents(id,run_id,call_index,phase,label,prompt,provider,repo,mode,isolation,model,schema_hash,script_hash,args_hash,estimated_cost_usd,status,output,error,patch_path,worktree,created_at,updated_at,completed_at)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, agent.ID, agent.RunID, agent.CallIndex, agent.Phase, agent.Label, agent.Prompt, agent.Provider, agent.Repo, agent.Mode, agent.Isolation, agent.Model, agent.SchemaHash, agent.ScriptHash, agent.ArgsHash, agent.EstimatedCostUSD, agent.Status, agent.Output, agent.Error, agent.PatchPath, agent.Worktree, agent.CreatedAt, agent.UpdatedAt, agent.CompletedAt)
+	_, err := s.db.Exec(`INSERT INTO workflow_agents(id,run_id,call_index,phase,label,prompt,provider,repo,mode,isolation,model,schema_hash,script_hash,args_hash,estimated_cost_usd,usage_json,status,output,error,patch_path,worktree,created_at,updated_at,completed_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, agent.ID, agent.RunID, agent.CallIndex, agent.Phase, agent.Label, agent.Prompt, agent.Provider, agent.Repo, agent.Mode, agent.Isolation, agent.Model, agent.SchemaHash, agent.ScriptHash, agent.ArgsHash, agent.EstimatedCostUSD, agent.UsageJSON, agent.Status, agent.Output, agent.Error, agent.PatchPath, agent.Worktree, agent.CreatedAt, agent.UpdatedAt, agent.CompletedAt)
 	return agent, err
 }
 
@@ -455,16 +544,16 @@ func (s *Store) FinishAgent(agent Agent, outputText, errorText string) error {
 }
 
 func (s *Store) FinishAgentStatus(agent Agent, status, outputText, errorText string) error {
-	_, err := s.db.Exec(`UPDATE workflow_agents SET status=?,output=?,error=?,patch_path=?,worktree=?,updated_at=?,completed_at=? WHERE id=?`,
-		status, outputText, errorText, agent.PatchPath, agent.Worktree, nowString(), nowString(), agent.ID)
+	_, err := s.db.Exec(`UPDATE workflow_agents SET status=?,output=?,error=?,patch_path=?,worktree=?,estimated_cost_usd=?,usage_json=?,updated_at=?,completed_at=? WHERE id=?`,
+		status, outputText, errorText, agent.PatchPath, agent.Worktree, agent.EstimatedCostUSD, agent.UsageJSON, nowString(), nowString(), agent.ID)
 	return err
 }
 
 func (s *Store) CompletedAgent(runID string, callIndex int, phase, label, prompt, provider, repo, mode, isolation, model, schemaHash, argsHash string) (Agent, bool, error) {
-	row := s.db.QueryRow(`SELECT id,run_id,COALESCE(call_index,0),COALESCE(phase,''),COALESCE(label,''),prompt,COALESCE(provider,''),COALESCE(repo,''),mode,COALESCE(isolation,''),COALESCE(model,''),COALESCE(schema_hash,''),COALESCE(script_hash,''),COALESCE(args_hash,''),COALESCE(estimated_cost_usd,0),status,COALESCE(output,''),COALESCE(error,''),COALESCE(patch_path,''),COALESCE(worktree,''),created_at,updated_at,COALESCE(completed_at,'') FROM workflow_agents WHERE run_id=? AND COALESCE(call_index,0)=? AND COALESCE(phase,'')=? AND COALESCE(label,'')=? AND prompt=? AND COALESCE(provider,'')=? AND COALESCE(repo,'')=? AND mode=? AND COALESCE(isolation,'')=? AND COALESCE(model,'')=? AND COALESCE(schema_hash,'')=? AND COALESCE(args_hash,'')=? AND status='completed' ORDER BY completed_at DESC, updated_at DESC LIMIT 1`,
+	row := s.db.QueryRow(`SELECT id,run_id,COALESCE(call_index,0),COALESCE(phase,''),COALESCE(label,''),prompt,COALESCE(provider,''),COALESCE(repo,''),mode,COALESCE(isolation,''),COALESCE(model,''),COALESCE(schema_hash,''),COALESCE(script_hash,''),COALESCE(args_hash,''),COALESCE(estimated_cost_usd,0),COALESCE(usage_json,''),status,COALESCE(output,''),COALESCE(error,''),COALESCE(patch_path,''),COALESCE(worktree,''),created_at,updated_at,COALESCE(completed_at,'') FROM workflow_agents WHERE run_id=? AND COALESCE(call_index,0)=? AND COALESCE(phase,'')=? AND COALESCE(label,'')=? AND prompt=? AND COALESCE(provider,'')=? AND COALESCE(repo,'')=? AND mode=? AND COALESCE(isolation,'')=? AND COALESCE(model,'')=? AND COALESCE(schema_hash,'')=? AND COALESCE(args_hash,'')=? AND status='completed' ORDER BY completed_at DESC, updated_at DESC LIMIT 1`,
 		runID, callIndex, phase, label, prompt, provider, repo, mode, isolation, model, schemaHash, argsHash)
 	var agent Agent
-	err := row.Scan(&agent.ID, &agent.RunID, &agent.CallIndex, &agent.Phase, &agent.Label, &agent.Prompt, &agent.Provider, &agent.Repo, &agent.Mode, &agent.Isolation, &agent.Model, &agent.SchemaHash, &agent.ScriptHash, &agent.ArgsHash, &agent.EstimatedCostUSD, &agent.Status, &agent.Output, &agent.Error, &agent.PatchPath, &agent.Worktree, &agent.CreatedAt, &agent.UpdatedAt, &agent.CompletedAt)
+	err := row.Scan(&agent.ID, &agent.RunID, &agent.CallIndex, &agent.Phase, &agent.Label, &agent.Prompt, &agent.Provider, &agent.Repo, &agent.Mode, &agent.Isolation, &agent.Model, &agent.SchemaHash, &agent.ScriptHash, &agent.ArgsHash, &agent.EstimatedCostUSD, &agent.UsageJSON, &agent.Status, &agent.Output, &agent.Error, &agent.PatchPath, &agent.Worktree, &agent.CreatedAt, &agent.UpdatedAt, &agent.CompletedAt)
 	if err == sql.ErrNoRows {
 		return Agent{}, false, nil
 	}
@@ -475,7 +564,7 @@ func (s *Store) CompletedAgent(runID string, callIndex int, phase, label, prompt
 }
 
 func (s *Store) ListAgents(runID string) ([]Agent, error) {
-	rows, err := s.db.Query(`SELECT id,run_id,COALESCE(call_index,0),COALESCE(phase,''),COALESCE(label,''),prompt,COALESCE(provider,''),COALESCE(repo,''),mode,COALESCE(isolation,''),COALESCE(model,''),COALESCE(schema_hash,''),COALESCE(script_hash,''),COALESCE(args_hash,''),COALESCE(estimated_cost_usd,0),status,COALESCE(output,''),COALESCE(error,''),COALESCE(patch_path,''),COALESCE(worktree,''),created_at,updated_at,COALESCE(completed_at,'') FROM workflow_agents WHERE run_id=? ORDER BY COALESCE(call_index,0), created_at`, runID)
+	rows, err := s.db.Query(`SELECT id,run_id,COALESCE(call_index,0),COALESCE(phase,''),COALESCE(label,''),prompt,COALESCE(provider,''),COALESCE(repo,''),mode,COALESCE(isolation,''),COALESCE(model,''),COALESCE(schema_hash,''),COALESCE(script_hash,''),COALESCE(args_hash,''),COALESCE(estimated_cost_usd,0),COALESCE(usage_json,''),status,COALESCE(output,''),COALESCE(error,''),COALESCE(patch_path,''),COALESCE(worktree,''),created_at,updated_at,COALESCE(completed_at,'') FROM workflow_agents WHERE run_id=? ORDER BY COALESCE(call_index,0), created_at`, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -483,7 +572,7 @@ func (s *Store) ListAgents(runID string) ([]Agent, error) {
 	var agents []Agent
 	for rows.Next() {
 		var agent Agent
-		if err := rows.Scan(&agent.ID, &agent.RunID, &agent.CallIndex, &agent.Phase, &agent.Label, &agent.Prompt, &agent.Provider, &agent.Repo, &agent.Mode, &agent.Isolation, &agent.Model, &agent.SchemaHash, &agent.ScriptHash, &agent.ArgsHash, &agent.EstimatedCostUSD, &agent.Status, &agent.Output, &agent.Error, &agent.PatchPath, &agent.Worktree, &agent.CreatedAt, &agent.UpdatedAt, &agent.CompletedAt); err != nil {
+		if err := rows.Scan(&agent.ID, &agent.RunID, &agent.CallIndex, &agent.Phase, &agent.Label, &agent.Prompt, &agent.Provider, &agent.Repo, &agent.Mode, &agent.Isolation, &agent.Model, &agent.SchemaHash, &agent.ScriptHash, &agent.ArgsHash, &agent.EstimatedCostUSD, &agent.UsageJSON, &agent.Status, &agent.Output, &agent.Error, &agent.PatchPath, &agent.Worktree, &agent.CreatedAt, &agent.UpdatedAt, &agent.CompletedAt); err != nil {
 			return nil, err
 		}
 		agents = append(agents, agent)
@@ -491,8 +580,16 @@ func (s *Store) ListAgents(runID string) ([]Agent, error) {
 	return agents, rows.Err()
 }
 
+// AgentUsage returns the run's spawned-agent count and total spend, used to
+// seed the --max-agents and --max-budget-usd caps on resume. The count
+// excludes provider="internal" rows (e.g. the untilGreen combined-patch
+// bookkeeping row from registerUntilGreenPatch): those rows never spawned a
+// worker, so counting them would let a resume trip --max-agents early even
+// though no extra worker actually ran. Cost stays summed across all rows for
+// audit history, though internal rows always report zero cost so this is a
+// no-op for the budget total.
 func (s *Store) AgentUsage(runID string) (int, float64, error) {
-	row := s.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(estimated_cost_usd),0) FROM workflow_agents WHERE run_id=?`, runID)
+	row := s.db.QueryRow(`SELECT COUNT(CASE WHEN COALESCE(provider,'') != 'internal' THEN 1 END), COALESCE(SUM(estimated_cost_usd),0) FROM workflow_agents WHERE run_id=?`, runID)
 	var count int
 	var cost float64
 	if err := row.Scan(&count, &cost); err != nil {

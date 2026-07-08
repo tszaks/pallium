@@ -103,12 +103,12 @@ func WorkflowTools() []ToolInfo {
 		},
 		{
 			Name:        "verify.untilGreen",
-			Signature:   `await verify.untilGreen(command, { maxRounds, label })`,
+			Signature:   `await verify.untilGreen(command, { maxRounds, label, provider })`,
 			Kind:        "verification",
 			Description: "Runs an objective check/fix loop until the command passes, max rounds are reached, or failures stop changing.",
 			Returns:     `{ ok, command, rounds, stalled }`,
 			Example:     `const result = await verify.untilGreen("go test ./...", { maxRounds: 3, label: "tests" })`,
-			Notes:       []string{"Fix workers run in edit/worktree mode and do not weaken or skip tests."},
+			Notes:       []string{"Check and fix workers share one loop worktree so every round sees earlier fixes; the combined patch registers like an edit-agent patch and auto-applies on completion."},
 		},
 		{
 			Name:        "workflow",

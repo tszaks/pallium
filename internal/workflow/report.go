@@ -17,6 +17,7 @@ type Report struct {
 	NextSteps []string      `json:"next_steps,omitempty"`
 	Patches   []string      `json:"patches,omitempty"`
 	Agents    []AgentReport `json:"agents"`
+	Failures  []RunFailure  `json:"failures,omitempty"`
 	Error     string        `json:"error,omitempty"`
 }
 
@@ -35,12 +36,13 @@ type AgentReport struct {
 
 func BuildReport(snapshot Snapshot) Report {
 	report := Report{
-		ID:      snapshot.Run.ID,
-		Task:    snapshot.Run.Task,
-		Status:  snapshot.Run.Status,
-		OwnedID: snapshot.Run.OwnedID,
-		Error:   snapshot.Run.Error,
-		Summary: defaultReportSummary(snapshot),
+		ID:       snapshot.Run.ID,
+		Task:     snapshot.Run.Task,
+		Status:   snapshot.Run.Status,
+		OwnedID:  snapshot.Run.OwnedID,
+		Failures: snapshot.Run.Failures,
+		Error:    snapshot.Run.Error,
+		Summary:  defaultReportSummary(snapshot),
 	}
 	for _, agent := range snapshot.Agents {
 		if agent.PatchPath != "" {

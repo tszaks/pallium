@@ -136,10 +136,11 @@ func shortID(s string) string {
 
 func trimText(s string, n int) string {
 	s = strings.Join(strings.Fields(s), " ")
-	if len(s) <= n {
+	runes := []rune(s)
+	if len(runes) <= n {
 		return s
 	}
-	return s[:n-1] + "…"
+	return string(runes[:n-1]) + "…"
 }
 
 func compactPath(s string) string {

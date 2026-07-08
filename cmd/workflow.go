@@ -80,6 +80,8 @@ func runWorkflow(out io.Writer, args []string, jsonOutput bool) error {
 		return runWorkflowRevert(out, args[1:], jsonOutput)
 	case "audit":
 		return runWorkflowAudit(out, args[1:], jsonOutput)
+	case "gc":
+		return runWorkflowGC(out, args[1:], jsonOutput)
 	default:
 		printWorkflowHelp(out)
 		return fmt.Errorf("unknown workflow subcommand: %s", args[0])
@@ -910,12 +912,14 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 	maxConcurrentAgents := fs.Int("max-concurrent-agents", 16, "")
 	maxBudgetUSD := fs.String("max-budget-usd", "", "")
 	maxActiveRuns := fs.Int("max-active-runs", 0, "")
+	agentTimeout := fs.Int("agent-timeout", 600, "")
 	background := fs.Bool("background", false, "")
-	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "cwd": {}, "id": {}, "script": {}, "workflow": {}, "args": {}, "codex": {}, "max-agents": {}, "max-concurrent-agents": {}, "max-budget-usd": {}, "max-active-runs": {}}, map[string]struct{}{"background": {}}); err != nil {
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "cwd": {}, "id": {}, "script": {}, "workflow": {}, "args": {}, "codex": {}, "max-agents": {}, "max-concurrent-agents": {}, "max-budget-usd": {}, "max-active-runs": {}, "agent-timeout": {}}, map[string]struct{}{"background": {}}); err != nil {
 		return err
 	}
 	maxAgentsSet := flagWasSet(fs, "max-agents")
 	maxBudgetSet := flagWasSet(fs, "max-budget-usd")
+	agentTimeoutSet := flagWasSet(fs, "agent-timeout")
 	positionals := fs.Args()
 	if *scriptPath != "" && *workflowName != "" {
 		return fmt.Errorf("use either --script or --workflow, not both")
@@ -1000,6 +1004,10 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 	if maxBudgetSet {
 		runSpec.MaxBudgetUSD = strings.TrimSpace(*maxBudgetUSD)
 	}
+	if agentTimeoutSet {
+		runSpec.AgentTimeout = *agentTimeout
+		runSpec.AgentTimeoutExplicit = true
+	}
 	run, err := store.UpsertRun(runSpec)
 	_ = store.Close()
 	if err != nil {
@@ -1012,6 +1020,14 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 	effectiveMaxBudgetUSD := strings.TrimSpace(*maxBudgetUSD)
 	if !maxBudgetSet {
 		effectiveMaxBudgetUSD = strings.TrimSpace(run.MaxBudgetUSD)
+	}
+	// 0 is a valid persisted value meaning "timeouts disabled", so the
+	// stored value can only be trusted via the explicit flag, not a plain
+	// run.AgentTimeout > 0 check (which would drop back to the flag's
+	// 600s default whenever a run explicitly disabled timeouts).
+	effectiveAgentTimeout := *agentTimeout
+	if !agentTimeoutSet && run.AgentTimeoutExplicit {
+		effectiveAgentTimeout = run.AgentTimeout
 	}
 	if *background {
 		exe, err := os.Executable()
@@ -1032,6 +1048,9 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 			"--codex", *codexBinary,
 			"--max-concurrent-agents", fmt.Sprintf("%d", *maxConcurrentAgents),
 		)
+		if agentTimeoutSet || run.AgentTimeoutExplicit {
+			cmdArgs = append(cmdArgs, "--agent-timeout", fmt.Sprintf("%d", effectiveAgentTimeout))
+		}
 		if effectiveMaxAgents > 0 && (maxAgentsSet || run.MaxAgents > 0) {
 			cmdArgs = append(cmdArgs, "--max-agents", fmt.Sprintf("%d", effectiveMaxAgents))
 		}
@@ -1078,6 +1097,7 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 		MaxConcurrentAgents: *maxConcurrentAgents,
 		MaxBudgetUSD:        effectiveMaxBudgetUSD,
 		CodexBinary:         *codexBinary,
+		AgentTimeoutSeconds: effectiveAgentTimeout,
 	}
 	result, err := runner.Execute(context.Background(), script, inputArgs)
 	if err != nil {
@@ -1115,11 +1135,14 @@ func runWorkflowGenerate(out io.Writer, args []string, jsonOutput bool) error {
 		TestCommand: *testCommand,
 		MaxRounds:   *maxRounds,
 	})
-	if *llm {
-		script, err = generateWorkflowWithLLM(task, *style, *testCommand, *maxRounds, *codexBinary, script)
-	}
 	if err != nil {
 		return err
+	}
+	if *llm {
+		script, err = generateWorkflowWithLLM(task, *style, *testCommand, *maxRounds, *codexBinary, script)
+		if err != nil {
+			return err
+		}
 	}
 	if validation := workflow.ValidateScript(script); !validation.Valid {
 		return fmt.Errorf("generated workflow is invalid: %s", validation.Error)
@@ -1360,16 +1383,31 @@ func runWorkflowRead(out io.Writer, args []string, jsonOutput bool) error {
 	if err != nil {
 		return err
 	}
-	payload := map[string]string{"id": run.ID, "result": run.Result, "error": run.Error}
+	payload := map[string]any{"id": run.ID, "result": run.Result, "error": run.Error, "failures": run.Failures}
 	return output.Write(out, payload, jsonOutput, func() string {
-		if run.Error != "" {
-			return run.Error
+		lines := []string{}
+		switch {
+		case run.Error != "":
+			lines = append(lines, run.Error)
+		case run.Result == "":
+			lines = append(lines, "No result recorded.")
+		default:
+			lines = append(lines, run.Result)
 		}
-		if run.Result == "" {
-			return "No result recorded."
-		}
-		return run.Result
+		lines = append(lines, renderWorkflowFailures(run.Failures)...)
+		return strings.Join(lines, "\n")
 	})
+}
+
+func renderWorkflowFailures(failures []workflow.RunFailure) []string {
+	if len(failures) == 0 {
+		return nil
+	}
+	lines := []string{"Dropped items:"}
+	for _, failure := range failures {
+		lines = append(lines, fmt.Sprintf("- %s phase=%s error=%s", firstNonEmpty(failure.Label, "item"), failure.Phase, failure.Error))
+	}
+	return lines
 }
 
 func runWorkflowReport(out io.Writer, args []string, jsonOutput bool) error {
@@ -1570,12 +1608,14 @@ func runWorkflowResume(out io.Writer, args []string, jsonOutput bool) error {
 	maxAgents := fs.Int("max-agents", 1000, "")
 	maxConcurrentAgents := fs.Int("max-concurrent-agents", 16, "")
 	maxBudgetUSD := fs.String("max-budget-usd", "", "")
+	agentTimeout := fs.Int("agent-timeout", 600, "")
 	background := fs.Bool("background", false, "")
-	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "codex": {}, "max-agents": {}, "max-concurrent-agents": {}, "max-budget-usd": {}}, map[string]struct{}{"background": {}}); err != nil {
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "codex": {}, "max-agents": {}, "max-concurrent-agents": {}, "max-budget-usd": {}, "agent-timeout": {}}, map[string]struct{}{"background": {}}); err != nil {
 		return err
 	}
 	maxAgentsSet := flagWasSet(fs, "max-agents")
 	maxBudgetSet := flagWasSet(fs, "max-budget-usd")
+	agentTimeoutSet := flagWasSet(fs, "agent-timeout")
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: pallium workflow resume <run-id>")
 	}
@@ -1589,6 +1629,14 @@ func runWorkflowResume(out io.Writer, args []string, jsonOutput bool) error {
 		return err
 	}
 	runArgs := []string{"run", "--id", run.ID, "--cwd", run.CWD, "--script", run.ScriptPath, "--codex", *codexBinary, "--max-concurrent-agents", fmt.Sprintf("%d", *maxConcurrentAgents)}
+	if agentTimeoutSet {
+		runArgs = append(runArgs, "--agent-timeout", fmt.Sprintf("%d", *agentTimeout))
+	} else if run.AgentTimeoutExplicit {
+		// 0 is a valid stored value meaning "timeouts disabled"; forward it
+		// explicitly so the nested `workflow run` doesn't fall back to its
+		// own 600s flag default when the flag itself is omitted here.
+		runArgs = append(runArgs, "--agent-timeout", fmt.Sprintf("%d", run.AgentTimeout))
+	}
 	if maxAgentsSet && *maxAgents > 0 {
 		runArgs = append(runArgs, "--max-agents", fmt.Sprintf("%d", *maxAgents))
 	} else if !maxAgentsSet && run.MaxAgents > 0 {
@@ -1719,6 +1767,136 @@ func runWorkflowRevert(out io.Writer, args []string, jsonOutput bool) error {
 	})
 }
 
+type workflowGCRun struct {
+	ID    string `json:"id"`
+	Path  string `json:"path"`
+	Bytes int64  `json:"bytes"`
+}
+
+type workflowGCResult struct {
+	Removed    []workflowGCRun `json:"removed"`
+	Count      int             `json:"count"`
+	BytesFreed int64           `json:"bytes_freed"`
+	DryRun     bool            `json:"dry_run,omitempty"`
+}
+
+// runWorkflowGC removes artifact directories (~/.pallium/workflow-runs/<id>)
+// for completed/stopped runs older than --older-than days and prunes stale
+// git worktree metadata in the affected repos. Failed runs are resumable, so
+// their workflow.js and patches are only removed with --include-failed.
+func runWorkflowGC(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("workflow gc")
+	dbPath := fs.String("db", "", "")
+	olderThan := fs.Int("older-than", 7, "")
+	includeFailed := fs.Bool("include-failed", false, "")
+	dryRun := fs.Bool("dry-run", false, "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "older-than": {}}, map[string]struct{}{"dry-run": {}, "include-failed": {}}); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 || *olderThan < 0 {
+		return fmt.Errorf("usage: pallium workflow gc [--older-than days] [--include-failed] [--dry-run] [--json]")
+	}
+	root, err := workflow.RunsRootDir()
+	if err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	store, err := workflow.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	cutoff := time.Now().UTC().Add(-time.Duration(*olderThan) * 24 * time.Hour)
+	result := workflowGCResult{Removed: []workflowGCRun{}, DryRun: *dryRun}
+	repos := map[string]struct{}{}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		run, err := store.Run(entry.Name())
+		if err != nil {
+			continue // not a known run: leave the directory alone
+		}
+		if !isWorkflowGCEligible(run.Status, *includeFailed) {
+			continue
+		}
+		finished := run.CompletedAt
+		if finished == "" {
+			finished = run.UpdatedAt
+		}
+		finishedAt, err := time.Parse(time.RFC3339Nano, finished)
+		if err != nil || finishedAt.After(cutoff) {
+			continue
+		}
+		path := filepath.Join(root, entry.Name())
+		size := workflowRunDirSize(path)
+		if !*dryRun {
+			if err := os.RemoveAll(path); err != nil {
+				return err
+			}
+			repos[run.CWD] = struct{}{}
+		}
+		result.Removed = append(result.Removed, workflowGCRun{ID: run.ID, Path: path, Bytes: size})
+		result.BytesFreed += size
+	}
+	result.Count = len(result.Removed)
+	if !*dryRun {
+		for repo := range repos {
+			prune := exec.Command("git", "worktree", "prune")
+			prune.Dir = repo
+			_ = prune.Run()
+		}
+	}
+	return output.Write(out, result, jsonOutput, func() string {
+		return renderWorkflowGC(result)
+	})
+}
+
+// isWorkflowGCEligible treats only completed/stopped runs as collectable by
+// default; failed runs stay resumable unless --include-failed opts in.
+func isWorkflowGCEligible(status string, includeFailed bool) bool {
+	switch status {
+	case "completed", "stopped":
+		return true
+	case "failed":
+		return includeFailed
+	default:
+		return false
+	}
+}
+
+func workflowRunDirSize(path string) int64 {
+	var total int64
+	_ = filepath.WalkDir(path, func(_ string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if info, err := d.Info(); err == nil {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
+}
+
+func renderWorkflowGC(result workflowGCResult) string {
+	verb := "removed"
+	if result.DryRun {
+		verb = "would remove"
+	}
+	if result.Count == 0 {
+		return fmt.Sprintf("Workflow gc %s no run directories.", verb)
+	}
+	lines := []string{fmt.Sprintf("Workflow gc %s %d run directories (%d bytes freed):", verb, result.Count, result.BytesFreed)}
+	for _, run := range result.Removed {
+		lines = append(lines, fmt.Sprintf("- %s (%d bytes) %s", run.ID, run.Bytes, run.Path))
+	}
+	return strings.Join(lines, "\n")
+}
+
 func renderWorkflowResult(snapshot workflow.Snapshot, result string) string {
 	text := renderWorkflowSnapshot(snapshot)
 	if result != "" {
@@ -1748,6 +1926,7 @@ type workflowStatus struct {
 	AgentsFailed    int    `json:"agents_failed"`
 	AgentsStopped   int    `json:"agents_stopped"`
 	AgentsPaused    int    `json:"agents_paused"`
+	ScriptChanged   bool   `json:"script_changed,omitempty"`
 	UpdatedAt       string `json:"updated_at"`
 	CompletedAt     string `json:"completed_at,omitempty"`
 	Error           string `json:"error,omitempty"`
@@ -1757,6 +1936,7 @@ type workflowInspectionReport struct {
 	Status       workflowStatus        `json:"status"`
 	ScriptPath   string                `json:"script_path"`
 	Result       string                `json:"result,omitempty"`
+	Failures     []workflow.RunFailure `json:"failures,omitempty"`
 	Phases       []workflow.Phase      `json:"phases"`
 	Agents       []workflow.Agent      `json:"agents"`
 	Patches      []string              `json:"patches"`
@@ -1774,14 +1954,15 @@ type phaseStats struct {
 
 func workflowStatusSummary(snapshot workflow.Snapshot) workflowStatus {
 	status := workflowStatus{
-		ID:          snapshot.Run.ID,
-		Task:        snapshot.Run.Task,
-		Status:      snapshot.Run.Status,
-		UpdatedAt:   snapshot.Run.UpdatedAt,
-		CompletedAt: snapshot.Run.CompletedAt,
-		Error:       snapshot.Run.Error,
-		PhasesTotal: len(snapshot.Phases),
-		AgentsTotal: len(snapshot.Agents),
+		ID:            snapshot.Run.ID,
+		Task:          snapshot.Run.Task,
+		Status:        snapshot.Run.Status,
+		ScriptChanged: snapshot.Run.ScriptChanged,
+		UpdatedAt:     snapshot.Run.UpdatedAt,
+		CompletedAt:   snapshot.Run.CompletedAt,
+		Error:         snapshot.Run.Error,
+		PhasesTotal:   len(snapshot.Phases),
+		AgentsTotal:   len(snapshot.Agents),
 	}
 	for _, phase := range snapshot.Phases {
 		if phase.Status == "completed" {
@@ -1810,6 +1991,7 @@ func workflowInspection(snapshot workflow.Snapshot) workflowInspectionReport {
 		Status:     workflowStatusSummary(snapshot),
 		ScriptPath: snapshot.Run.ScriptPath,
 		Result:     snapshot.Run.Result,
+		Failures:   snapshot.Run.Failures,
 		Phases:     snapshot.Phases,
 		Agents:     snapshot.Agents,
 		ByPhase:    map[string]phaseStats{},
@@ -1847,6 +2029,9 @@ func renderWorkflowStatus(status workflowStatus) string {
 		fmt.Sprintf("Agents: %d completed, %d running, %d failed, %d paused, %d stopped, %d total", status.AgentsCompleted, status.AgentsRunning, status.AgentsFailed, status.AgentsPaused, status.AgentsStopped, status.AgentsTotal),
 		"Updated: " + status.UpdatedAt,
 	}
+	if status.ScriptChanged {
+		lines = append(lines, "Script changed since original run")
+	}
 	if status.CompletedAt != "" {
 		lines = append(lines, "Completed: "+status.CompletedAt)
 	}
@@ -1881,6 +2066,7 @@ func renderWorkflowInspection(report workflowInspectionReport) string {
 			lines = append(lines, fmt.Sprintf("- %s phase=%s error=%s", label, agent.Phase, agent.Error))
 		}
 	}
+	lines = append(lines, renderWorkflowFailures(report.Failures)...)
 	if report.Result != "" {
 		lines = append(lines, "Result recorded: yes")
 	}
@@ -2122,6 +2308,7 @@ func renderWorkflowReport(report workflow.Report) string {
 			}
 		}
 	}
+	lines = append(lines, renderWorkflowFailures(report.Failures)...)
 	if report.Error != "" {
 		lines = append(lines, "Error: "+report.Error)
 	}
@@ -2250,7 +2437,7 @@ Usage:
   pallium workflow gate list <run-id> [--json]
   pallium workflow serve [--addr 127.0.0.1:8765] [--token token]
   pallium workflow mcp [--db path]
-  pallium workflow run "task" [--script path.js] [--workflow name] [--background] [--max-concurrent-agents 16] [--max-active-runs n] [--max-budget-usd n] [--json]
+  pallium workflow run "task" [--script path.js] [--workflow name] [--background] [--max-concurrent-agents 16] [--max-active-runs n] [--max-budget-usd n] [--agent-timeout 600] [--json]
   pallium workflow audit [--run-acceptance] [--json]
   pallium workflow run /saved-name "task input"
   pallium workflow list [--limit n] [--json]
@@ -2265,7 +2452,8 @@ Usage:
   pallium workflow stop <run-id> [--json]
   pallium workflow save <run-id> --name name [--user] [--json]
   pallium workflow apply <run-id> [--json]
-  pallium workflow revert <run-id> [--json]`)
+  pallium workflow revert <run-id> [--json]
+  pallium workflow gc [--older-than days] [--include-failed] [--dry-run] [--json]`)
 }
 
 func latestWorkflowRun(store *workflow.Store) (workflow.Run, error) {

@@ -3,13 +3,18 @@ package workflow
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/dop251/goja"
 )
 
 func TestRunnerExecutesScriptAndRecordsAgents(t *testing.T) {
@@ -327,6 +332,60 @@ func TestRunnerEnforcesBudget(t *testing.T) {
 	}
 }
 
+// TestRunnerFailsRunWhenProviderReportedCostExceedsBudget guards against a
+// regression where a configured provider's reported cost_usd could push
+// spend past --max-budget-usd after the agent already ran. The preflight
+// check only guards the flat per-agent estimate, so a single agent call with
+// no subsequent agent() call to trigger another preflight check must still
+// fail the run instead of completing successfully while over budget.
+func TestRunnerFailsRunWhenProviderReportedCostExceedsBudget(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_METERED_COMMAND", `printf '{"input_tokens":100,"output_tokens":50,"cost_usd":5.0}' > "$PALLIUM_WORKFLOW_USAGE_FILE"; printf '{"ok":true}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("budget");
+return await agent("one metered call", { label: "one", provider: "metered" });`
+	scriptPath, err := WriteRunScript("wf-budget-provider-cost", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-budget-provider-cost", Task: "budget provider cost", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10, MaxBudgetUSD: "1.00"}).Execute(context.Background(), script, nil)
+	if err == nil {
+		t.Fatal("expected the run to fail once the reported cost exceeds the budget")
+	}
+	// The error crosses the goja VM boundary as plain text (see
+	// classifyRunError), so identity checks like errors.Is don't survive a
+	// top-level script return; match the message the way other budget/max-
+	// agents tests in this file do.
+	if !strings.Contains(err.Error(), "budget exhausted") {
+		t.Fatalf("expected a budget exhausted error, got %v", err)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].Status != "failed" {
+		t.Fatalf("expected one failed agent, got %+v", agents)
+	}
+	if agents[0].EstimatedCostUSD != 5.0 {
+		t.Fatalf("expected the provider-reported cost persisted, got %+v", agents[0])
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Run.Status != "failed" {
+		t.Fatalf("expected the run itself to be marked failed, got %+v", snapshot.Run)
+	}
+}
+
 func TestRunnerComposesSavedWorkflow(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"prompt":"{{PROMPT}}"}`)
 	tmp := t.TempDir()
@@ -392,6 +451,7 @@ func TestRunnerRejectsDeepNestedWorkflow(t *testing.T) {
 }
 
 func TestRunnerVerifyUntilGreenFixLoop(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_SEQUENCE", `[
 		"{\"ok\":false,\"command\":\"go test ./...\",\"summary\":\"failed\",\"output_tail\":\"boom\",\"failures\":[{\"name\":\"TestOne\",\"message\":\"boom\"}]}",
@@ -434,8 +494,15 @@ return result;`
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(agents) != 3 || agents[1].Mode != "edit" {
-		t.Fatalf("expected check/fix/check agents, got %+v", agents)
+	if len(agents) != 4 || agents[1].Mode != "edit" {
+		t.Fatalf("expected check/fix/check/patch agents, got %+v", agents)
+	}
+	patchAgent := agents[3]
+	if patchAgent.Label != "green-patch" || patchAgent.Provider != "internal" || patchAgent.Status != "completed" || patchAgent.PatchPath == "" {
+		t.Fatalf("expected completed internal patch agent, got %+v", patchAgent)
+	}
+	if _, err := os.Stat(patchAgent.Worktree); !os.IsNotExist(err) {
+		t.Fatalf("expected loop worktree removed after patch capture, stat err=%v", err)
 	}
 }
 
@@ -651,6 +718,131 @@ func TestRunnerPatchIncludesNewFiles(t *testing.T) {
 	}
 	if string(raw) != "created by workflow\n" {
 		t.Fatalf("unexpected new file content: %q", string(raw))
+	}
+}
+
+func TestRunnerRemovesWorktreeAfterPatchCapture(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"edited"}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_WRITE_FILE", "note.txt")
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_WRITE_CONTENT", "changed by workflow\n")
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "note.txt"), []byte("original\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "note.txt")
+	runGit(t, tmp, "commit", "-m", "initial")
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("edit"); return agent("edit note", { label: "editor", mode: "edit", isolation: "worktree" });`
+	scriptPath, err := WriteRunScript("wf-worktree-gc", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-worktree-gc", Task: "worktree cleanup", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil); err != nil {
+		t.Fatal(err)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].PatchPath == "" || agents[0].Worktree == "" {
+		t.Fatalf("expected one edit agent with patch and worktree, got %+v", agents)
+	}
+	if _, err := os.Stat(agents[0].PatchPath); err != nil {
+		t.Fatalf("expected durable patch file: %v", err)
+	}
+	if _, err := os.Stat(agents[0].Worktree); !os.IsNotExist(err) {
+		t.Fatalf("expected worktree removed after patch capture, stat err=%v", err)
+	}
+	list := exec.Command("git", "worktree", "list", "--porcelain")
+	list.Dir = tmp
+	raw, err := list.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(raw), "worktree "); got != 1 {
+		t.Fatalf("expected only the main worktree registered, got %d:\n%s", got, string(raw))
+	}
+	if content, err := os.ReadFile(filepath.Join(tmp, "note.txt")); err != nil || string(content) != "changed by workflow\n" {
+		t.Fatalf("expected patch applied on completion, got %q err=%v", string(content), err)
+	}
+}
+
+func TestRunnerUntilGreenConvergesInLoopWorktreeAndAppliesPatch(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
+	providerScript := filepath.Join(t.TempDir(), "loop-provider.sh")
+	if err := os.WriteFile(providerScript, []byte(`#!/bin/sh
+if [ "$PALLIUM_WORKFLOW_MODE" = "edit" ]; then
+  printf 'fixed\n' > marker.txt
+  printf '{"summary":"created marker"}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+elif [ -f marker.txt ]; then
+  printf '{"ok":true,"command":"check marker","summary":"marker present","output_tail":"","failures":[]}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+else
+  printf '{"ok":false,"command":"check marker","summary":"marker missing","output_tail":"no marker","failures":[{"name":"marker","message":"missing"}]}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+fi
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_LOOP_COMMAND", providerScript)
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("verify");
+const result = verify.untilGreen("check marker", { label: "green", maxRounds: 2, provider: "loop" });
+return result;`
+	scriptPath, err := WriteRunScript("wf-until-green-worktree", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-until-green-worktree", Task: "until green worktree", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"ok": true`) || !strings.Contains(result, `"fixed": true`) {
+		t.Fatalf("expected converged fix loop, got %s", result)
+	}
+	if content, err := os.ReadFile(filepath.Join(tmp, "marker.txt")); err != nil || string(content) != "fixed\n" {
+		t.Fatalf("expected combined patch applied to repo on completion, got %q err=%v", string(content), err)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	patchAgent := agents[len(agents)-1]
+	if patchAgent.Label != "green-patch" || patchAgent.Status != "completed" || patchAgent.PatchPath == "" {
+		t.Fatalf("expected registered untilGreen patch agent, got %+v", patchAgent)
+	}
+	if raw, err := os.ReadFile(patchAgent.PatchPath); err != nil || !strings.Contains(string(raw), "marker.txt") {
+		t.Fatalf("expected combined patch to include marker.txt, err=%v patch=%s", err, string(raw))
+	}
+	if _, err := os.Stat(patchAgent.Worktree); !os.IsNotExist(err) {
+		t.Fatalf("expected loop worktree removed after patch capture, stat err=%v", err)
 	}
 }
 
@@ -1007,6 +1199,213 @@ return { results };`
 	}
 }
 
+func TestParallelMapperThrowDropsOnlyThatItem(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"prompt":"{{PROMPT}}"}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("parallel");
+const results = await parallel(["keep", "drop", "also-keep"], item => {
+  if (item === "drop") {
+    throw new Error("drop this item");
+  }
+  return agent("inspect " + item, { label: item });
+});
+return { results };`
+	scriptPath, err := WriteRunScript("wf-parallel-throw", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-parallel-throw", Task: "parallel throw", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, "inspect keep") || !strings.Contains(result, "null") || !strings.Contains(result, "inspect also-keep") {
+		t.Fatalf("parallel mapper throw did not preserve item order with null drop: %s", result)
+	}
+}
+
+func TestParallelMapperFatalErrorAbortsRun(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	// "drop" throws an ordinary error and must still be nulled out, but "fatal"
+	// synchronously calls verify.untilGreen(), which runs an agent past the
+	// MaxAgents cap (already exhausted by the earlier warmup agent() call).
+	// That fatal error must propagate and fail the whole run instead of being
+	// swallowed into a null result.
+	script := `phase("parallel-fatal");
+agent("warmup");
+const results = await parallel(["drop", "fatal"], item => {
+  if (item === "drop") {
+    throw new Error("drop this item");
+  }
+  return verify.untilGreen("stub-check", { maxRounds: 0 });
+});
+return { results };`
+	scriptPath, err := WriteRunScript("wf-parallel-fatal", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-parallel-fatal", Task: "parallel fatal", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 1}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), "exceeded max agents") {
+		t.Fatalf("expected fatal mapper error to abort the run, got %v", err)
+	}
+}
+
+// TestParallelMapperInterruptPreservesPausedStatus covers pausing a run
+// while it's synchronously inside a parallel() mapper (e.g. via
+// verify.untilGreen()): the run must end up "paused", not "failed".
+//
+// jsParallel's fatalCause()-based rethrow uses r.throwable(fatal) rather
+// than fatal.Error() alone specifically so the interrupt sentinel token
+// survives if this rethrow ever needs to cross another JS call frame that
+// does get stack-decorated by goja (the way an inner verify.untilGreen()
+// call already does — see unwrapMapperThrow and
+// TestUnwrapMapperThrowRecoversInterruptedSentinel for that decoration).
+// This specific test's exact crossing isn't decorated in practice, so
+// isWorkflowPausedError's own text-equality fallback already recognizes it
+// even without throwable — confirmed by reverting to fatal.Error() locally
+// and re-running, which still passes. The throwable() call is kept anyway
+// as the same defensive, consistent pattern used at every other point in
+// this file where a Go error is thrown into goja (see jsVerify), rather
+// than relying on a second, independent text-matching path.
+func TestParallelMapperInterruptPreservesPausedStatus(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
+	// Each check round sleeps briefly and always reports not-green, giving
+	// the test time to mark the run paused between rounds so the next
+	// round's check hits ensureNotStopped synchronously inside the
+	// parallel() mapper (verify.untilGreen never actually converges here;
+	// the pause always wins the race first).
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_LOOP_COMMAND", `sleep 0.2; printf '{"ok":false,"command":"check marker","summary":"missing","output_tail":"","failures":[]}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("parallel-pause");
+const results = parallel(["only"], item =>
+  verify.untilGreen("check marker", { label: "green", maxRounds: 5, provider: "loop" })
+);
+return { results };`
+	scriptPath, err := WriteRunScript("wf-parallel-pause", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-parallel-pause", Task: "parallel pause", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		_, execErr := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+		errCh <- execErr
+	}()
+	deadline := time.After(2 * time.Second)
+	for {
+		agents, listErr := store.ListAgents(run.ID)
+		if listErr != nil {
+			t.Fatal(listErr)
+		}
+		if len(agents) >= 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for the first check round to start")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if err := store.SetRunStatus(run.ID, "paused", "", "test pause"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case execErr := <-errCh:
+		if !errors.Is(execErr, ErrWorkflowPaused) {
+			t.Fatalf("expected ErrWorkflowPaused, got %v", execErr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("runner did not pause after run status changed to paused")
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Run.Status != "paused" {
+		t.Fatalf("expected paused run status (not failed), got %+v", snapshot.Run)
+	}
+}
+
+// TestUnwrapMapperThrowRecoversInterruptedSentinel guards against a subtler
+// variant of the same swallowing bug: when a parallel() mapper throws
+// synchronously because the workflow was stopped/paused (not just a budget
+// or max-agents cap), goja wraps the thrown value in a *goja.Exception whose
+// Error() appends call-site stack info (e.g. " at ...(native)"). That extra
+// text breaks the exact-string comparison isWorkflowStoppedError/
+// isWorkflowPausedError use for ErrWorkflowStopped/ErrWorkflowPaused, so
+// isWorkflowFatalAgentError alone misses it. unwrapMapperThrow must recover
+// the original message so the fatal check still matches.
+func TestUnwrapMapperThrowRecoversInterruptedSentinel(t *testing.T) {
+	vm := goja.New()
+	if err := vm.Set("boom", func(call goja.FunctionCall) goja.Value {
+		// Mirrors how jsVerify's untilGreen (and other JS bindings) surface a
+		// Go error to a script: panic with the error text as a plain JS value.
+		panic(vm.ToValue(ErrWorkflowStopped.Error()))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// jsParallel never calls a native-bound function directly as the
+	// "mapper" - it calls a real JS function, which in turn calls a native
+	// binding like verify.untilGreen(). That extra JS call frame is what
+	// makes goja attach stack info to the exception's Error() text, so
+	// reproduce it here instead of calling "boom" directly.
+	if _, err := vm.RunString("var mapperLike = function() { return boom(); };"); err != nil {
+		t.Fatal(err)
+	}
+	fn, ok := goja.AssertFunction(vm.Get("mapperLike"))
+	if !ok {
+		t.Fatal("expected mapperLike to be callable")
+	}
+	_, err := fn(goja.Undefined())
+	if err == nil {
+		t.Fatal("expected boom() to return an error")
+	}
+	if isWorkflowFatalAgentError(err) {
+		t.Fatalf("expected the raw goja exception to not classify as fatal without unwrapping (documents why unwrapMapperThrow is needed), got %v", err)
+	}
+	cause := unwrapMapperThrow(err)
+	if !isWorkflowFatalAgentError(cause) {
+		t.Fatalf("expected unwrapMapperThrow(%v) to recover a fatal interrupted error, got %v", err, cause)
+	}
+	if cause.Error() != ErrWorkflowStopped.Error() {
+		t.Fatalf("expected unwrapped cause to carry the clean stopped sentinel message, got %q", cause.Error())
+	}
+}
+
 func TestWorkflowCollectionItemLimit(t *testing.T) {
 	tmp := t.TempDir()
 	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
@@ -1103,6 +1502,39 @@ return { before, after };`
 	for _, want := range []string{`"total": 1`, `"spent": 0`, `"remaining": 1`, `"spent": 0.25`, `"remaining": 0.75`} {
 		if !strings.Contains(result, want) {
 			t.Fatalf("budget object result missing %s: %s", want, result)
+		}
+	}
+}
+
+func TestWorkflowBudgetSpentUpdatesWithoutLimit(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_COST_USD", "0.25")
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("budget");
+const before = { total: budget.total, spent: budget.spent() };
+await agent("one", { label: "one" });
+const after = { total: budget.total, spent: budget.spent() };
+return { before, after };`
+	scriptPath, err := WriteRunScript("wf-budget-no-limit", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-budget-no-limit", Task: "budget no limit", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"total": null`, `"spent": 0`, `"spent": 0.25`} {
+		if !strings.Contains(result, want) {
+			t.Fatalf("uncapped budget result missing %s: %s", want, result)
 		}
 	}
 }
@@ -1905,6 +2337,45 @@ func TestStoreBackfillsLegacyAgentCallIndexes(t *testing.T) {
 	}
 }
 
+// TestStoreBackfillsLegacyAgentTimeoutExplicit guards against a regression
+// where a pre-upgrade run with a positive stored agent_timeout_seconds, but
+// no agent_timeout_explicit column yet, would silently stop honoring its
+// custom timeout on resume: resume only forwards the stored value when
+// AgentTimeoutExplicit is true, and that column's own DEFAULT is 0 for rows
+// written before it existed.
+func TestStoreBackfillsLegacyAgentTimeoutExplicit(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-legacy-timeout", Task: "legacy timeout", CWD: tmp, ScriptPath: "workflow.js"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a row written before agent_timeout_explicit existed: a
+	// positive stored timeout with the column's own bare default (0).
+	if _, err := store.db.Exec(`UPDATE workflow_runs SET agent_timeout_seconds=45, agent_timeout_explicit=0 WHERE id=?`, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	reopened, err := store.Run(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reopened.AgentTimeout != 45 || !reopened.AgentTimeoutExplicit {
+		t.Fatalf("expected legacy positive timeout to be backfilled as explicit, got %+v", reopened)
+	}
+}
+
 func TestNormalizeSchemaAddsAdditionalPropertiesFalse(t *testing.T) {
 	raw := map[string]any{
 		"type": "object",
@@ -2029,6 +2500,671 @@ func TestRunArtifactDirUsesHomePalliumDirectory(t *testing.T) {
 	}
 }
 
+func TestAgentTimeoutInParallelBecomesNull(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_SLOWPOKE_COMMAND", `if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q slow; then exec sleep 5; fi; printf '{"prompt":"%s"}' "$PALLIUM_WORKFLOW_PROMPT" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("parallel");
+const results = await parallel(["slow", "fast"], item =>
+  agent("worker " + item, { label: item, provider: "slowpoke" })
+);
+return { results };`
+	scriptPath, err := WriteRunScript("wf-agent-timeout", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-agent-timeout", Task: "agent timeout", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10, MaxConcurrentAgents: 2, AgentTimeoutSeconds: 1}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, "worker fast") || !strings.Contains(result, "null") {
+		t.Fatalf("expected timed-out agent to become null while sibling completes, got %s", result)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 2 {
+		t.Fatalf("expected two agent records, got %+v", agents)
+	}
+	timedOut := 0
+	for _, agent := range agents {
+		if agent.Status == "failed" && strings.Contains(agent.Error, "workflow agent timed out after 1s") {
+			timedOut++
+		}
+	}
+	if timedOut != 1 {
+		t.Fatalf("expected one timed-out agent record, got %+v", agents)
+	}
+}
+
+func TestAgentTimeoutOptionFailsDirectCall(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_SLOWPOKE_COMMAND", `exec sleep 5`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `return await agent("slow direct", { label: "slow", provider: "slowpoke", timeout_seconds: 1 });`
+	scriptPath, err := WriteRunScript("wf-agent-timeout-direct", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-agent-timeout-direct", Task: "agent timeout direct", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), "workflow agent timed out after 1s") {
+		t.Fatalf("expected agent timeout error, got %v", err)
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Run.Status != "failed" {
+		t.Fatalf("expected failed run, got %+v", snapshot.Run)
+	}
+	if len(snapshot.Agents) != 1 || snapshot.Agents[0].Status != "failed" {
+		t.Fatalf("expected one failed agent, got %+v", snapshot.Agents)
+	}
+}
+
+func TestConfiguredProviderSchemaRetryCorrectsOutput(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("SCHEMA_MARKER", filepath.Join(tmp, "marker"))
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_FLAKY_COMMAND", `if [ -f "$SCHEMA_MARKER" ]; then if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q "schema validation"; then printf '{"summary":"corrected"}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"; else printf '{"summary":"missing-correction"}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"; fi; else touch "$SCHEMA_MARKER"; printf 'sure, here is the JSON you asked for' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"; fi`)
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("schema");
+return await agent("structured", {
+  label: "structured",
+  provider: "flaky",
+  schema: {
+    type: "object",
+    properties: { summary: { type: "string" } },
+    required: ["summary"]
+  }
+});`
+	scriptPath, err := WriteRunScript("wf-schema-retry", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-schema-retry", Task: "schema retry", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"summary": "corrected"`) {
+		t.Fatalf("expected corrective retry output, got %s", result)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].Status != "completed" {
+		t.Fatalf("expected one completed agent, got %+v", agents)
+	}
+}
+
+func TestConfiguredProviderSchemaRetryStillFailingIsNonFatalInParallel(t *testing.T) {
+	tmp := t.TempDir()
+	callLog := filepath.Join(tmp, "calls.log")
+	t.Setenv("SCHEMA_CALL_LOG", callLog)
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_PROSE_COMMAND", `echo call >> "$SCHEMA_CALL_LOG"; if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q bad; then printf 'not json at all' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"; else printf '{"summary":"good"}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"; fi`)
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("parallel");
+const results = await parallel(["good", "bad"], item =>
+  agent("worker " + item, {
+    label: item,
+    provider: "prose",
+    schema: {
+      type: "object",
+      properties: { summary: { type: "string" } },
+      required: ["summary"]
+    }
+  })
+);
+return { results };`
+	scriptPath, err := WriteRunScript("wf-schema-retry-fail", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-schema-retry-fail", Task: "schema retry fail", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10, MaxConcurrentAgents: 2}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"summary": "good"`) || !strings.Contains(result, "null") {
+		t.Fatalf("expected schema-failed agent to become null while sibling survives, got %s", result)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 2 {
+		t.Fatalf("expected two agent records, got %+v", agents)
+	}
+	failed := 0
+	for _, agent := range agents {
+		if agent.Status == "failed" && strings.Contains(agent.Error, "does not match schema") {
+			failed++
+		}
+	}
+	if failed != 1 {
+		t.Fatalf("expected one schema-failed agent record, got %+v", agents)
+	}
+	raw, err := os.ReadFile(callLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls := strings.Count(string(raw), "call"); calls != 3 {
+		t.Fatalf("expected exactly one corrective retry (3 provider calls total), got %d", calls)
+	}
+}
+
+// TestConfiguredProviderSchemaRetryPropagatesRetryFailure guards against a
+// regression where a corrective schema retry's own error (nonzero exit,
+// timeout, etc.) was silently discarded, letting the agent fall through to
+// schema-validating the stale first-attempt output. The retry's real failure
+// must be the one that fails the agent, not a generic schema mismatch on
+// data that was already known to be invalid.
+func TestConfiguredProviderSchemaRetryPropagatesRetryFailure(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("SCHEMA_MARKER", filepath.Join(tmp, "marker"))
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_FLAKY_COMMAND", `if [ -f "$SCHEMA_MARKER" ]; then echo "retry boom" >&2; exit 3; else touch "$SCHEMA_MARKER"; printf 'sure, here is the JSON you asked for' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"; fi`)
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("schema");
+return await agent("structured", {
+  label: "structured",
+  provider: "flaky",
+  schema: {
+    type: "object",
+    properties: { summary: { type: "string" } },
+    required: ["summary"]
+  }
+});`
+	scriptPath, err := WriteRunScript("wf-schema-retry-error", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-schema-retry-error", Task: "schema retry error", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err == nil {
+		t.Fatal("expected the retry's failure to fail the agent")
+	}
+	if !strings.Contains(err.Error(), "workflow provider") || !strings.Contains(err.Error(), "retry boom") {
+		t.Fatalf("expected the retry's actual provider error to surface, got %v", err)
+	}
+	if strings.Contains(err.Error(), "does not match schema") {
+		t.Fatalf("retry failure must not be masked as a generic schema mismatch, got %v", err)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].Status != "failed" {
+		t.Fatalf("expected one failed agent, got %+v", agents)
+	}
+	if !strings.Contains(agents[0].Error, "workflow provider") {
+		t.Fatalf("expected persisted agent error to reflect the retry failure, got %q", agents[0].Error)
+	}
+}
+
+func TestConfiguredProviderUsageFileOverridesCostEstimate(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_METERED_COMMAND", `printf '{"input_tokens":100,"output_tokens":50,"cost_usd":0.25}' > "$PALLIUM_WORKFLOW_USAGE_FILE"; printf '{"ok":true}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("usage");
+await agent("first metered", { label: "first", provider: "metered" });
+await agent("second metered", { label: "second", provider: "metered" });
+return "done";`
+	scriptPath, err := WriteRunScript("wf-usage", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-usage", Task: "usage", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10, MaxBudgetUSD: "0.20"}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), "budget exhausted") {
+		t.Fatalf("expected reported cost to exhaust budget, got %v", err)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 {
+		t.Fatalf("expected one agent record, got %+v", agents)
+	}
+	if agents[0].EstimatedCostUSD != 0.25 {
+		t.Fatalf("expected reported cost 0.25, got %+v", agents[0])
+	}
+	if agents[0].UsageJSON != `{"input_tokens":100,"output_tokens":50,"cost_usd":0.25}` {
+		t.Fatalf("expected raw usage json persisted, got %q", agents[0].UsageJSON)
+	}
+}
+
+// TestInternalProviderNameIsReservedForBookkeeping guards against a
+// regression where Store.AgentUsage's exclusion of provider="internal" rows
+// from the --max-agents count (added to stop registerUntilGreenPatch's
+// bookkeeping row from inflating the cap) could also silently hide a real
+// user agent that happens to choose the same provider name, letting a
+// resumed run exceed its configured agent cap.
+func TestInternalProviderNameIsReservedForBookkeeping(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("reserved");
+return await agent("use reserved provider", { label: "one", provider: "internal" });`
+	scriptPath, err := WriteRunScript("wf-reserved-provider", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-reserved-provider", Task: "reserved provider", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("expected provider \"internal\" to be rejected as reserved, got %v", err)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 0 {
+		t.Fatalf("expected no agent row created for a rejected provider name, got %+v", agents)
+	}
+}
+
+// TestSchemaRetrySkippedWhenFirstAttemptAlreadyOverBudget guards against a
+// regression where the corrective schema retry could fire a second paid
+// provider call even though the first attempt's own reported cost already
+// exhausted the budget: the retry starts before runAgentAtCallIndex ever
+// gets a chance to apply that cost and check it, so skipping the retry once
+// the first attempt is already over budget is the only place that can catch
+// it before a second bill.
+func TestSchemaRetrySkippedWhenFirstAttemptAlreadyOverBudget(t *testing.T) {
+	callLog := filepath.Join(t.TempDir(), "calls.log")
+	t.Setenv("SCHEMA_CALL_LOG", callLog)
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_PRICEY_COMMAND", `echo call >> "$SCHEMA_CALL_LOG"; printf '{"cost_usd":5.0}' > "$PALLIUM_WORKFLOW_USAGE_FILE"; printf 'not json at all' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("schema-budget");
+return await agent("structured", {
+  label: "structured",
+  provider: "pricey",
+  schema: {
+    type: "object",
+    properties: { summary: { type: "string" } },
+    required: ["summary"]
+  }
+});`
+	scriptPath, err := WriteRunScript("wf-schema-over-budget", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-schema-over-budget", Task: "schema over budget", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10, MaxBudgetUSD: "1.00"}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), "budget exhausted") {
+		t.Fatalf("expected the over-budget first attempt to fail the run as budget exhausted, got %v", err)
+	}
+	raw, err := os.ReadFile(callLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls := strings.Count(string(raw), "call"); calls != 1 {
+		t.Fatalf("expected the corrective retry to be skipped once already over budget (1 provider call), got %d", calls)
+	}
+}
+
+func TestParallelAgentFailureIsTrackedInRunFailures(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_TEST_COMMAND", `if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q bad; then echo "failed intentionally" >&2; exit 7; fi; printf '{"prompt":"%s"}' "$PALLIUM_WORKFLOW_PROMPT" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("parallel");
+const results = await parallel(["good", "bad"], item =>
+  agent("worker " + item, { label: item, provider: "test" })
+);
+return { results };`
+	scriptPath, err := WriteRunScript("wf-failure-list", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-failure-list", Task: "failure list", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10, MaxConcurrentAgents: 2}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, "worker good") || !strings.Contains(result, "null") {
+		t.Fatalf("expected dropped agent to stay null in results, got %s", result)
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Run.Status != "completed" {
+		t.Fatalf("expected completed run, got %+v", snapshot.Run)
+	}
+	if len(snapshot.Run.Failures) != 1 {
+		t.Fatalf("expected one run failure, got %+v", snapshot.Run.Failures)
+	}
+	failure := snapshot.Run.Failures[0]
+	if failure.Label != "bad" || failure.Phase != "parallel" || !strings.Contains(failure.Error, "failed intentionally") {
+		t.Fatalf("unexpected run failure entry: %+v", failure)
+	}
+}
+
+func TestPipelineStageThrowIsTrackedInRunFailures(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("pipeline");
+const results = await pipeline(["keep", "drop"],
+  item => {
+    if (item === "drop") {
+      throw new Error("stage rejected this item");
+    }
+    return item.toUpperCase();
+  }
+);
+return { results };`
+	scriptPath, err := WriteRunScript("wf-pipeline-failure-list", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-pipeline-failure-list", Task: "pipeline failure list", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Run.Failures) != 1 {
+		t.Fatalf("expected one run failure, got %+v", snapshot.Run.Failures)
+	}
+	failure := snapshot.Run.Failures[0]
+	if failure.Label != "pipeline stage 0 item 1" || !strings.Contains(failure.Error, "stage rejected this item") {
+		t.Fatalf("unexpected pipeline failure entry: %+v", failure)
+	}
+}
+
+func TestParallelAgentErrorContainingBudgetPhraseIsNonFatal(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_TEST_COMMAND", `if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q bad; then echo "workflow budget exhausted" >&2; exit 7; fi; printf '{"prompt":"%s"}' "$PALLIUM_WORKFLOW_PROMPT" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("parallel");
+const results = await parallel(["good", "bad"], item =>
+  agent("worker " + item, { label: item, provider: "test" })
+);
+return { results };`
+	scriptPath, err := WriteRunScript("wf-budget-phrase", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-budget-phrase", Task: "budget phrase", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10, MaxConcurrentAgents: 2}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatalf("agent error text containing the budget phrase must not be fatal, got %v", err)
+	}
+	if !strings.Contains(result, "worker good") || !strings.Contains(result, "null") {
+		t.Fatalf("expected phrase-matching failure to become null while sibling survives, got %s", result)
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Run.Status != "completed" || len(snapshot.Run.Failures) != 1 {
+		t.Fatalf("expected completed run with one tracked drop, got %+v", snapshot.Run)
+	}
+}
+
+func TestScriptWrappedBudgetErrorFailsAsScriptError(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_TEST_COMMAND", `echo "provider boom" >&2; exit 3`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("wrap");
+try {
+  await agent("boom", { label: "boom", provider: "test" });
+} catch (e) {
+  throw new Error("workflow budget exhausted: " + e);
+}
+return "unreachable";`
+	scriptPath, err := WriteRunScript("wf-wrapped-budget", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-wrapped-budget", Task: "wrapped budget", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10, MaxBudgetUSD: "5.00"}).Execute(context.Background(), script, nil)
+	if err == nil {
+		t.Fatal("expected wrapped script error")
+	}
+	if errors.Is(err, ErrWorkflowBudgetExhausted) {
+		t.Fatalf("script-wrapped budget phrase must not classify as budget exhaustion: %v", err)
+	}
+	if !strings.Contains(err.Error(), "workflow budget exhausted") {
+		t.Fatalf("expected the wrapped script error to surface unchanged, got %v", err)
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Run.Status != "failed" {
+		t.Fatalf("expected normal failed run, got %+v", snapshot.Run)
+	}
+}
+
+func TestPhaseInsidePipelineStagesUnderRace(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"prompt":"{{PROMPT}}"}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_DELAY_MS", "5")
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `const items = ["a", "b", "c", "d", "e", "f", "g", "h"];
+phase("outer");
+const results = await pipeline(items,
+  (item, original, index) => phase("find-" + index, () => agent("inspect " + item, { label: item })),
+  (prev, original, index) => phase("verify-" + index, () => agent("verify " + prev.prompt, { label: "verify-" + original }))
+);
+return { count: results.length };`
+	scriptPath, err := WriteRunScript("wf-phase-pipeline-race", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-phase-pipeline-race", Task: "phase pipeline race", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 40, MaxConcurrentAgents: 8}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"count": 8`) {
+		t.Fatalf("unexpected result: %s", result)
+	}
+}
+
+func TestStripMetaHandlesNestedMetaObjects(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	script := `export const meta = { name: "nested", limits: { agents: 3 }, phases: ["scan"] };
+phase("scan");
+const result = await agent("inspect", { label: "inspect" });
+return { ok: result.ok };`
+	if validation := ValidateScript(script); !validation.Valid {
+		t.Fatalf("expected nested meta script to validate, got %s", validation.Error)
+	}
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	scriptPath, err := WriteRunScript("wf-nested-meta", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-nested-meta", Task: "nested meta", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"ok": true`) {
+		t.Fatalf("unexpected result: %s", result)
+	}
+}
+
+func TestResumeWithChangedScriptWarnsAndFlagsRun(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"source":"first"}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	firstScript := `phase("scan");
+const result = await agent("stable prompt", { label: "stable" });
+return result;`
+	secondScript := `phase("scan");
+const result = await agent("stable prompt", { label: "stable" });
+return { source: result.source, changed_script: true };`
+	scriptPath, err := WriteRunScript("wf-script-changed", tmp, firstScript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-script-changed", Task: "script changed", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), firstScript, nil); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Run.ScriptHash == "" || snapshot.Run.ScriptChanged {
+		t.Fatalf("expected stored hash without change flag after first run, got %+v", snapshot.Run)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"source":"second"}`)
+	stderr, result, err := captureStderr(t, func() (string, error) {
+		return (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), secondScript, nil)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr, "script changed since original run; unchanged prefix will replay from cache") {
+		t.Fatalf("expected script-change warning on stderr, got %q", stderr)
+	}
+	if !strings.Contains(result, `"source": "first"`) {
+		t.Fatalf("expected unchanged prefix to replay from cache, got %s", result)
+	}
+	snapshot, err = store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snapshot.Run.ScriptChanged {
+		t.Fatalf("expected script_changed flag after resume with edited script, got %+v", snapshot.Run)
+	}
+}
+
+func captureStderr(t *testing.T, fn func() (string, error)) (string, string, error) {
+	t.Helper()
+	original := os.Stderr
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = writer
+	result, fnErr := fn()
+	os.Stderr = original
+	_ = writer.Close()
+	captured, readErr := io.ReadAll(reader)
+	_ = reader.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	return string(captured), result, fnErr
+}
+
 func runGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
@@ -2036,5 +3172,488 @@ func runGit(t *testing.T, dir string, args ...string) {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
+	}
+}
+
+func TestUntilGreenResumeRestoresFixEditsAfterMidLoopError(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
+	providerScript := filepath.Join(t.TempDir(), "loop-provider.sh")
+	if err := os.WriteFile(providerScript, []byte(`#!/bin/sh
+if [ "$PALLIUM_WORKFLOW_MODE" = "edit" ]; then
+  printf 'fixed\n' > marker.txt
+  printf '{"summary":"created marker"}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+elif [ -f marker.txt ]; then
+  printf '{"ok":true,"command":"check marker","summary":"marker present","output_tail":"","failures":[]}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+else
+  printf '{"ok":false,"command":"check marker","summary":"marker missing","output_tail":"no marker","failures":[{"name":"marker","message":"missing"}]}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+fi
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_LOOP_COMMAND", providerScript)
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("verify");
+const result = verify.untilGreen("check marker", { label: "green", maxRounds: 2, provider: "loop" });
+return result;`
+	scriptPath, err := WriteRunScript("wf-until-green-resume", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-until-green-resume", Task: "until green resume", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// First execution: the budget covers check-1 and fix-1 only, so check-2
+	// aborts the loop mid-flight after the fix agent already edited the
+	// worktree.
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10, MaxBudgetUSD: "0.025"}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), "budget exhausted") {
+		t.Fatalf("expected mid-loop budget exhaustion, got %v", err)
+	}
+	worktreeRoot, err := RunArtifactDir(run.ID, "worktrees")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := os.ReadDir(worktreeRoot); err == nil && len(entries) > 0 {
+		t.Fatalf("expected no leftover loop worktree after mid-loop error, got %v", entries)
+	}
+	patchRoot, err := RunArtifactDir(run.ID, "patches")
+	if err != nil {
+		t.Fatal(err)
+	}
+	patchEntries, err := os.ReadDir(patchRoot)
+	if err != nil || len(patchEntries) != 1 {
+		t.Fatalf("expected one durable loop patch after mid-loop error, got %v err=%v", patchEntries, err)
+	}
+	durable, err := os.ReadFile(filepath.Join(patchRoot, patchEntries[0].Name()))
+	if err != nil || !strings.Contains(string(durable), "marker.txt") {
+		t.Fatalf("expected durable patch to keep the fix edits, err=%v patch=%s", err, string(durable))
+	}
+	// Second execution: check-1 and fix-1 replay from cache (output only);
+	// the durable patch must restore the fix edits so the loop goes green and
+	// the registered combined patch is not empty.
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"ok": true`) {
+		t.Fatalf("expected resumed loop to converge, got %s", result)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	patchAgent := agents[len(agents)-1]
+	if patchAgent.Label != "green-patch" || patchAgent.Status != "completed" || patchAgent.PatchPath == "" {
+		t.Fatalf("expected completed untilGreen patch agent, got %+v", patchAgent)
+	}
+	raw, err := os.ReadFile(patchAgent.PatchPath)
+	if err != nil || !strings.Contains(string(raw), "marker.txt") {
+		t.Fatalf("expected non-empty combined patch with prior fix edits, err=%v patch=%s", err, string(raw))
+	}
+	if content, err := os.ReadFile(filepath.Join(tmp, "marker.txt")); err != nil || string(content) != "fixed\n" {
+		t.Fatalf("expected restored fix applied to repo on completion, got %q err=%v", string(content), err)
+	}
+	if _, err := os.Stat(patchAgent.Worktree); !os.IsNotExist(err) {
+		t.Fatalf("expected loop worktree removed after completion, stat err=%v", err)
+	}
+}
+
+// TestRunnerResumeExcludesInternalUntilGreenPatchRowFromMaxAgents guards
+// against a regression where the internal bookkeeping row
+// registerUntilGreenPatch stores for the untilGreen combined patch (provider
+// "internal") counted toward the --max-agents cap on resume even though it
+// never spawned a worker. Store.AgentUsage seeds the resumed run's agent
+// count from all persisted workflow_agents rows, so a stale internal row
+// from a prior execution could trip the cap one agent early.
+func TestRunnerResumeExcludesInternalUntilGreenPatchRowFromMaxAgents(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
+	providerScript := filepath.Join(t.TempDir(), "loop-provider.sh")
+	if err := os.WriteFile(providerScript, []byte(`#!/bin/sh
+if [ "$PALLIUM_WORKFLOW_MODE" = "edit" ]; then
+  printf 'fixed\n' > marker.txt
+  printf '{"summary":"created marker"}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+elif [ -f marker.txt ]; then
+  printf '{"ok":true,"command":"check marker","summary":"marker present","output_tail":"","failures":[]}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+else
+  printf '{"ok":false,"command":"check marker","summary":"marker missing","output_tail":"no marker","failures":[{"name":"marker","message":"missing"}]}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+fi
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_LOOP_COMMAND", providerScript)
+	// "one" uses its own configured provider rather than
+	// PALLIUM_WORKFLOW_AGENT_STUB, which would short-circuit every agent call
+	// (including the "loop" provider ones) before the provider dispatch is
+	// even reached.
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_ONE_COMMAND", `printf '{"ok":true}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	// First execution: one plain agent plus an untilGreen loop that needs
+	// exactly one fix round to converge. Real spawns: "one" (1) +
+	// check-1/fix-1/check-2 (3) = 4. The loop also registers one internal
+	// "green-patch" bookkeeping row that is not a real spawn, for 5 rows
+	// total in workflow_agents.
+	firstScript := `phase("scan");
+agent("one", { label: "one", provider: "one" });
+const result = verify.untilGreen("check marker", { label: "green", maxRounds: 2, provider: "loop" });
+return result;`
+	scriptPath, err := WriteRunScript("wf-until-green-max-agents", tmp, firstScript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-until-green-max-agents", Task: "until green max agents", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 4}).Execute(context.Background(), firstScript, nil); err != nil {
+		t.Fatalf("expected first execution to converge within 4 real agents, got %v", err)
+	}
+	agentsAfterFirst, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agentsAfterFirst) != 5 {
+		t.Fatalf("expected 4 real agents plus 1 internal patch row, got %d: %+v", len(agentsAfterFirst), agentsAfterFirst)
+	}
+	usedAgents, _, err := store.AgentUsage(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usedAgents != 4 {
+		t.Fatalf("expected AgentUsage to exclude the internal patch row from the count, got %d", usedAgents)
+	}
+	// Second execution (resume): the identical prefix replays entirely from
+	// cache (including the internal patch row, via its own completed-agent
+	// cache check), so it costs zero fresh spawns. A new "two" call at the
+	// tail needs exactly one more real spawn to reach 5 total. --max-agents 5
+	// must allow it: under the old buggy counting, the seeded agent count
+	// would already be 5 (4 real + 1 internal) before "two" even runs.
+	secondScript := `phase("scan");
+agent("one", { label: "one", provider: "one" });
+const result = verify.untilGreen("check marker", { label: "green", maxRounds: 2, provider: "loop" });
+agent("two", { label: "two", provider: "one" });
+return { result, two: true };`
+	if err := os.WriteFile(scriptPath, []byte(secondScript), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 5}).Execute(context.Background(), secondScript, nil)
+	if err != nil {
+		t.Fatalf("expected resume to succeed with the internal patch row excluded from the cap, got %v", err)
+	}
+	if !strings.Contains(result, `"two": true`) {
+		t.Fatalf("expected the new agent call to run after resume, got %s", result)
+	}
+	agentsAfterSecond, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agentsAfterSecond) != 6 {
+		t.Fatalf("expected exactly one new agent row after resume (5 real + 1 internal), got %d: %+v", len(agentsAfterSecond), agentsAfterSecond)
+	}
+}
+
+func TestUntilGreenAlreadyGreenSkipsWorktreeAndPatch(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"command":"go test ./...","summary":"passed","output_tail":"","failures":[]}`)
+	// The cwd is intentionally not a git repo: an already-green check must
+	// succeed without ever creating a worktree.
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("verify");
+const result = verify.untilGreen("go test ./...", { label: "green", maxRounds: 2 });
+return result;`
+	scriptPath, err := WriteRunScript("wf-until-green-lazy", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-until-green-lazy", Task: "until green lazy", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"ok": true`) {
+		t.Fatalf("expected green result, got %s", result)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].Mode != "test" {
+		t.Fatalf("expected a single check agent and no patch row, got %+v", agents)
+	}
+	worktreeRoot, err := RunArtifactDir(run.ID, "worktrees")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(worktreeRoot); !os.IsNotExist(err) {
+		t.Fatalf("expected no worktree directory for an already-green check, stat err=%v", err)
+	}
+}
+
+func TestRecordDroppedItemPersistsAllConcurrentDrops(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run, err := store.CreateRun(Run{ID: "wf-drop-race", Task: "drop race", CWD: tmp, ScriptPath: filepath.Join(tmp, "workflow.js")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &Runner{Store: store, Run: run}
+	const drops = 64
+	var wg sync.WaitGroup
+	for i := 0; i < drops; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			runner.recordDroppedItem(fmt.Sprintf("item-%d", i), "boom")
+		}(i)
+	}
+	wg.Wait()
+	stored, err := store.Run(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.mu.Lock()
+	inMemory := len(runner.failures)
+	runner.mu.Unlock()
+	if inMemory != drops {
+		t.Fatalf("expected %d in-memory failures, got %d", drops, inMemory)
+	}
+	if len(stored.Failures) != drops {
+		t.Fatalf("expected %d persisted failures, got %d", drops, len(stored.Failures))
+	}
+}
+
+func TestConfiguredProviderUsageAccumulatesAcrossSchemaRetry(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("SCHEMA_MARKER", filepath.Join(tmp, "marker"))
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_METERED_COMMAND", `printf '{"input_tokens":100,"output_tokens":50,"cost_usd":0.1}' > "$PALLIUM_WORKFLOW_USAGE_FILE"; if [ -f "$SCHEMA_MARKER" ]; then printf '{"summary":"corrected"}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"; else touch "$SCHEMA_MARKER"; printf 'not json at all' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"; fi`)
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("usage");
+return await agent("structured", {
+  label: "structured",
+  provider: "metered",
+  schema: {
+    type: "object",
+    properties: { summary: { type: "string" } },
+    required: ["summary"]
+  }
+});`
+	scriptPath, err := WriteRunScript("wf-usage-retry", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-usage-retry", Task: "usage retry", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"summary": "corrected"`) {
+		t.Fatalf("expected corrective retry output, got %s", result)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].Status != "completed" {
+		t.Fatalf("expected one completed agent, got %+v", agents)
+	}
+	if agents[0].EstimatedCostUSD != 0.2 {
+		t.Fatalf("expected cost summed across both attempts (0.2), got %+v", agents[0])
+	}
+	if agents[0].UsageJSON != `{"cost_usd":0.2,"input_tokens":200,"output_tokens":100}` {
+		t.Fatalf("expected merged usage json across attempts, got %q", agents[0].UsageJSON)
+	}
+}
+
+func TestEditModeSchemaFailureSkipsCorrectiveRetry(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
+	callLog := filepath.Join(t.TempDir(), "calls.log")
+	t.Setenv("EDIT_CALL_LOG", callLog)
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_EDITY_COMMAND", `echo call >> "$EDIT_CALL_LOG"; printf 'not json at all' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("edit");
+return await agent("edit something", {
+  label: "editor",
+  provider: "edity",
+  mode: "edit",
+  schema: {
+    type: "object",
+    properties: { summary: { type: "string" } },
+    required: ["summary"]
+  }
+});`
+	scriptPath, err := WriteRunScript("wf-edit-no-retry", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-edit-no-retry", Task: "edit no retry", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), "does not match schema") {
+		t.Fatalf("expected schema validation failure, got %v", err)
+	}
+	raw, err := os.ReadFile(callLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls := strings.Count(string(raw), "call"); calls != 1 {
+		t.Fatalf("edit-mode agent must not run the corrective retry, expected 1 provider call, got %d", calls)
+	}
+}
+
+func TestScriptCannotUseIsolationNone(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"x"}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("iso");
+return agent("edit the live repo", { label: "live", mode: "edit", isolation: "none" });`
+	scriptPath, err := WriteRunScript("wf-isolation-none", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-isolation-none", Task: "isolation none", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), `invalid agent isolation "none"`) {
+		t.Fatalf("expected isolation validation error, got %v", err)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 0 {
+		t.Fatalf("expected no agent to launch, got %+v", agents)
+	}
+}
+
+func TestCaughtPauseInterruptThenScriptErrorFailsAsScriptError(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_DELAY_MS", "2000")
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("catch");
+try {
+  await agent("slow", { label: "slow" });
+} catch (e) {
+  throw new Error("unrelated script failure");
+}
+return "unreachable";`
+	scriptPath, err := WriteRunScript("wf-caught-pause", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-caught-pause", Task: "caught pause", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+		errCh <- err
+	}()
+	deadline := time.After(2 * time.Second)
+	for {
+		agents, err := store.ListAgents(run.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(agents) == 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for running agent, got %d", len(agents))
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if err := store.SetRunStatus(run.ID, "paused", "", "test pause"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-errCh:
+		if err == nil || errors.Is(err, ErrWorkflowPaused) {
+			t.Fatalf("caught interrupt followed by a script error must not classify as paused, got %v", err)
+		}
+		if !strings.Contains(err.Error(), "unrelated script failure") {
+			t.Fatalf("expected the script's own error to surface, got %v", err)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("runner did not finish after pause")
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Run.Status != "failed" {
+		t.Fatalf("expected failed run, got %+v", snapshot.Run)
 	}
 }

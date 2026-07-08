@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestSessionsIndexHelpDoesNotStartIndex(t *testing.T) {
@@ -76,6 +77,29 @@ func TestSessionsStatsHelpDoesNotReadStats(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "pallium sessions") {
 		t.Fatalf("expected sessions help, got %q", out.String())
+	}
+}
+
+func TestTrimTextKeepsMultiByteRunesIntact(t *testing.T) {
+	got := trimText(strings.Repeat("é", 60), 90)
+	if !utf8.ValidString(got) {
+		t.Fatalf("trimText produced invalid UTF-8: %q", got)
+	}
+	if n := utf8.RuneCountInString(got); n > 90 {
+		t.Fatalf("rune count = %d, want <= 90", n)
+	}
+	truncated := trimText(strings.Repeat("é", 120), 90)
+	if !utf8.ValidString(truncated) {
+		t.Fatalf("trimText produced invalid UTF-8: %q", truncated)
+	}
+	if n := utf8.RuneCountInString(truncated); n != 90 {
+		t.Fatalf("rune count = %d, want 90", n)
+	}
+	if !strings.HasSuffix(truncated, "…") {
+		t.Fatalf("truncated result missing ellipsis: %q", truncated)
+	}
+	if got := trimText("hello world", 90); got != "hello world" {
+		t.Fatalf("ASCII input changed: %q", got)
 	}
 }
 
