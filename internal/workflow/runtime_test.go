@@ -3869,6 +3869,117 @@ func TestNetworkWorktreeRequiresGitRepo(t *testing.T) {
 	}
 }
 
+// TestNetworkedReadOnlyAgentCleansWorktreeOnError covers the containment-worktree
+// leak on a FAILED networked agent: network forces a read-only worker into a
+// throwaway worktree, and if its command then errors, that worktree must still
+// be removed from disk rather than leaked. The success path removes it via
+// finalizeWorktreePatch; the error path relies on the cleanup defer.
+func TestNetworkedReadOnlyAgentCleansWorktreeOnError(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("root\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
+
+	// Provider exits nonzero and writes no output, so the provider command path
+	// returns an error after the containment worktree has been created.
+	provider := filepath.Join(tmp, "fail-provider.sh")
+	if err := os.WriteFile(provider, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_FAIL_COMMAND", provider)
+
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `return agent("go", { provider: "fail", mode: "read-only", label: "netter", network: true });`
+	scriptPath, err := WriteRunScript("wf-net-fail", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-net-fail", Task: "net fail", CWD: tmp, ScriptPath: scriptPath, AllowNetwork: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil); err == nil {
+		t.Fatal("expected execute to fail when the networked provider errors")
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 {
+		t.Fatalf("expected 1 agent, got %d", len(agents))
+	}
+	// A containment worktree was forced (network + read-only), so the row must
+	// record one distinct from the repo root...
+	if agents[0].Worktree == "" || agents[0].Worktree == tmp {
+		t.Fatalf("expected a forced containment worktree != repo root %q, got %q", tmp, agents[0].Worktree)
+	}
+	// ...and it must not survive the failure on disk.
+	if _, statErr := os.Stat(agents[0].Worktree); !os.IsNotExist(statErr) {
+		t.Fatalf("containment worktree %q leaked after a failed networked agent; want it removed", agents[0].Worktree)
+	}
+}
+
+// TestNetworkedEditAgentKeepsWorktreeOnError is the over-reach guard for the
+// cleanup: a networked EDIT agent has genuine edit intent, so a command failure
+// must NOT delete its worktree — that tree holds the edits and is kept for
+// debugging (matching non-networked edit-agent failure behavior).
+func TestNetworkedEditAgentKeepsWorktreeOnError(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("root\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
+
+	provider := filepath.Join(tmp, "faildit-provider.sh")
+	if err := os.WriteFile(provider, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_FAILEDIT_COMMAND", provider)
+
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `return agent("go", { provider: "failedit", mode: "edit", isolation: "worktree", label: "editor", network: true });`
+	scriptPath, err := WriteRunScript("wf-net-editfail", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-net-editfail", Task: "net editfail", CWD: tmp, ScriptPath: scriptPath, AllowNetwork: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil); err == nil {
+		t.Fatal("expected execute to fail when the edit provider errors")
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].Worktree == "" {
+		t.Fatalf("expected one agent with a recorded worktree, got %#v", agents)
+	}
+	if _, statErr := os.Stat(agents[0].Worktree); statErr != nil {
+		t.Fatalf("edit-agent worktree %q should be preserved on failure, stat error: %v", agents[0].Worktree, statErr)
+	}
+}
+
 // TestNetworkOffRerunIgnoresStaleNetworkedCache covers the completed-agent
 // cache identity: rerunning the same run-id via `workflow run` WITHOUT
 // --allow-network must NOT reuse output produced by an earlier networked run.

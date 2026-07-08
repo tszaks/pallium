@@ -2263,6 +2263,20 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 		cwd = worktree
 	}
 
+	// A worktree that exists ONLY to contain a networked non-edit worker holds
+	// throwaway writes. The success paths below discard it via
+	// finalizeWorktreePatch; on any error exit (setup failure, command failure,
+	// timeout, unreadable output) the early returns would otherwise leak that
+	// worktree on disk. Discard it on those error exits too. Genuine
+	// edit/worktree agents are exempt: their tree is kept for its patch or for
+	// post-failure debugging.
+	containmentWorktree := worktree != "" && !editIntent
+	defer func() {
+		if containmentWorktree {
+			r.removeWorktree(repoRoot, worktree)
+		}
+	}()
+
 	tmpDir, err := os.MkdirTemp("", "pallium-workflow-agent-*")
 	if err != nil {
 		return "", "", worktree, err
@@ -2334,6 +2348,10 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 		if err != nil {
 			return output, "", worktree, agentCommandError(ctx, timeout, err)
 		}
+		// Reached a clean provider exit: finalizeWorktreePatch now owns the
+		// worktree's disposition (discard for containment, capture for edit), so
+		// the error-path cleanup defer must stand down.
+		containmentWorktree = false
 		patchPath, err := r.finalizeWorktreePatch(agent, worktree, repoRoot)
 		if err != nil {
 			return output, "", worktree, err
@@ -2371,6 +2389,10 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 		return "", "", worktree, err
 	}
 	output := strings.TrimSpace(string(raw))
+	// Reached a clean codex exit: finalizeWorktreePatch now owns the worktree's
+	// disposition (discard for containment, capture for edit), so the error-path
+	// cleanup defer must stand down.
+	containmentWorktree = false
 	patchPath, err := r.finalizeWorktreePatch(agent, worktree, repoRoot)
 	if err != nil {
 		return output, "", worktree, err
