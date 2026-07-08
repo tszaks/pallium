@@ -1031,8 +1031,10 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 	if !agentTimeoutSet && run.AgentTimeoutExplicit {
 		effectiveAgentTimeout = run.AgentTimeout
 	}
-	// UpsertRun persists and preserves the ceiling, so run.AllowNetwork is
-	// authoritative here (it already OR-folds the flag with any stored value).
+	// A fresh `workflow run` reflects only this invocation's --allow-network
+	// flag (UpsertRun no longer OR-folds it with any stored value), so
+	// run.AllowNetwork is authoritative here. resume preserves a stored ceiling
+	// by forwarding --allow-network into this run, which sets the flag above.
 	effectiveAllowNetwork := run.AllowNetwork
 	if *background {
 		exe, err := os.Executable()

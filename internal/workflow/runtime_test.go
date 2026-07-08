@@ -3670,9 +3670,9 @@ func TestCodexSandboxArgsRespectsNetwork(t *testing.T) {
 		want           []string
 	}{
 		{"read-only default", "", false, []string{"--sandbox", "read-only"}},
-		{"edit default", "edit", false, []string{"--sandbox", "workspace-write"}},
-		{"test default", "test", false, []string{"--sandbox", "workspace-write"}},
-		{"check default", "check", false, []string{"--sandbox", "workspace-write"}},
+		{"edit default", "edit", false, []string{"--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=false"}},
+		{"test default", "test", false, []string{"--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=false"}},
+		{"check default", "check", false, []string{"--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=false"}},
 		{"read-only with network", "", true, []string{"--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"}},
 		{"edit with network", "edit", true, []string{"--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"}},
 	}
@@ -3689,7 +3689,74 @@ func TestCodexSandboxArgsRespectsNetwork(t *testing.T) {
 			if tc.networkAllowed != hasToggle {
 				t.Fatalf("network toggle presence = %v, want %v (args %v)", hasToggle, tc.networkAllowed, got)
 			}
+			// A non-network workspace-write worker must explicitly pin the
+			// toggle OFF so an ambient config can't grant silent egress.
+			if !tc.networkAllowed && (tc.mode == "edit" || tc.mode == "test" || tc.mode == "check") {
+				if !strings.Contains(joined, "sandbox_workspace_write.network_access=false") {
+					t.Fatalf("non-network %q workspace-write must pin network_access=false, got %v", tc.mode, got)
+				}
+			}
 		})
+	}
+}
+
+// TestAgentNetworkForcesWorktree covers FIX 2: a read-only agent that is
+// actually granted network (network:true on an --allow-network run) must be
+// forced into an isolated worktree, because network forces workspace-write
+// filesystem access that must never land on the operator's live checkout.
+func TestAgentNetworkForcesWorktree(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("root\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
+
+	// Provider records the cwd it actually ran in so we can prove the worker
+	// did not execute in the live repo root.
+	provider := filepath.Join(tmp, "cwd-provider.sh")
+	if err := os.WriteFile(provider, []byte("#!/bin/sh\nprintf '{\"ok\":true,\"cwd\":\"%s\"}' \"$PALLIUM_WORKFLOW_CWD\" > \"$PALLIUM_WORKFLOW_OUTPUT_FILE\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_CWD_COMMAND", provider)
+
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `return agent("go", { provider: "cwd", mode: "read-only", label: "netter", network: true });`
+	scriptPath, err := WriteRunScript("wf-net-worktree", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-net-worktree", Task: "net worktree", CWD: tmp, ScriptPath: scriptPath, AllowNetwork: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil); err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 {
+		t.Fatalf("expected 1 agent, got %d", len(agents))
+	}
+	if agents[0].Worktree == "" || agents[0].Worktree == tmp {
+		t.Fatalf("expected networked read-only agent to get an isolated worktree != repo root %q, got %q", tmp, agents[0].Worktree)
+	}
+	// The recorded run cwd must be the worktree, not the live repo root.
+	if strings.Contains(agents[0].Output, `"cwd":"`+tmp+`"`) {
+		t.Fatalf("networked agent ran in live repo root, output=%q", agents[0].Output)
+	}
+	if !strings.Contains(agents[0].Output, `"cwd":"`+agents[0].Worktree+`"`) {
+		t.Fatalf("expected agent cwd to be worktree %q, output=%q", agents[0].Worktree, agents[0].Output)
 	}
 }
 
@@ -3711,6 +3778,16 @@ func writeNetworkProvider(t *testing.T, dir string) {
 func runNetworkAgent(t *testing.T, allowNetwork bool, script string) (string, string) {
 	t.Helper()
 	tmp := t.TempDir()
+	// A granted-network agent is now forced into an isolated worktree (FIX 2),
+	// so the run cwd must be a git repo it can branch from.
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("root\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
 	writeNetworkProvider(t, tmp)
 	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
 	if err != nil {
@@ -3757,6 +3834,33 @@ func TestAgentNetworkRejectsNonBoolean(t *testing.T) {
 	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
 	if err == nil || !strings.Contains(err.Error(), "must be a boolean") {
 		t.Fatalf("expected non-boolean network to be rejected, got %v", err)
+	}
+}
+
+// TestAgentNetworkRejectsNonBooleanCapitalKey covers FIX 5: goja preserves JS
+// property case and json.Unmarshal matches case-insensitively, so a
+// capitalized `Network` key with a non-boolean value must still be rejected —
+// it cannot bypass validation via casing.
+func TestAgentNetworkRejectsNonBooleanCapitalKey(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `return agent("go", { Network: "yes" });`
+	scriptPath, err := WriteRunScript("wf-net-bad-cap", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-net-bad-cap", Task: "net", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), "must be a boolean") {
+		t.Fatalf("expected capitalized non-boolean network to be rejected, got %v", err)
 	}
 }
 

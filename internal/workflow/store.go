@@ -344,14 +344,13 @@ func (s *Store) UpsertRun(run Run) (Run, error) {
 			run.AgentTimeout = existing.AgentTimeout
 			run.AgentTimeoutExplicit = existing.AgentTimeoutExplicit
 		}
-		// AllowNetwork's safe default is false, and the only way to reach true
-		// is an explicit --allow-network, so a false here means "this caller
-		// didn't set the ceiling" and we keep whatever the run already had.
-		// This is what makes the ceiling persist across resume (which replays
-		// the stored value) without an "explicit" companion flag.
-		if !run.AllowNetwork {
-			run.AllowNetwork = existing.AllowNetwork
-		}
+		// AllowNetwork is NOT OR-folded with the existing stored value: a fresh
+		// `workflow run` must reflect only THIS invocation's --allow-network
+		// flag (default false), so reusing a run-id that once had the ceiling
+		// does not silently keep egress on. `workflow resume` preserves the
+		// stored ceiling by explicitly reading it and forwarding
+		// --allow-network to the nested run, so persistence does not depend on
+		// folding here.
 		if run.Status == "" {
 			run.Status = existing.Status
 		}
