@@ -293,6 +293,19 @@ func runOwnedProcess(store *console.Store, session console.OwnedSession, out io.
 	if restore != nil {
 		restore()
 	}
+	// Drain the PTY before closing it. Once the child exits, reading the
+	// master returns EOF (macOS) or EIO (Linux) after its buffered output is
+	// consumed, so the io.Copy goroutine finishes on its own and the log
+	// captures the child's final bytes. Closing first races ahead of that
+	// drain and can discard a fast child's entire output (the flaky-CI
+	// "expected log output, got \"\"" failure). The timeout keeps a wedged
+	// reader (e.g. a lingering grandchild holding the slave open) from
+	// hanging the runner: Close then unblocks the copy and the second receive
+	// returns once the goroutine exits.
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+	}
 	_ = ptmx.Close()
 	<-done
 	exitCode := exitCodeFromError(err)
