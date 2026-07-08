@@ -48,6 +48,7 @@ Pallium sets these variables for every provider invocation:
 | `PALLIUM_WORKFLOW_SCHEMA_FILE` | Path to a JSON Schema when the call requested structured output; empty otherwise. Pallium validates the returned JSON against it. |
 | `PALLIUM_WORKFLOW_MODE` | `read-only`, `edit`, `test`, or `check`. Wrappers are responsible for honoring it (e.g. restricting tools for `read-only`). |
 | `PALLIUM_WORKFLOW_MODEL` | Model override from the `agent()` call, empty if none. |
+| `PALLIUM_WORKFLOW_NETWORK` | `1` when this agent is allowed network egress (the `agent()` call passed `network: true` **and** the run was started with `--allow-network`), `0` otherwise. Default `0`. Wrappers should only expose networked tools (web fetch, `gh`, `curl`, etc.) when this is `1`; the default keeps workers sandboxed. |
 | `PALLIUM_WORKFLOW_RUN_ID`, `_AGENT_ID`, `_PROVIDER`, `_LABEL`, `_REPO`, `_CWD` | Run metadata for logging or routing. |
 | `PALLIUM_WORKFLOW_USAGE_FILE` | Optional (newer versions): if the wrapper writes `{"input_tokens":N,"output_tokens":N,"cost_usd":X}` here, Pallium records real usage and counts `cost_usd` toward the run budget instead of the flat per-agent estimate. |
 

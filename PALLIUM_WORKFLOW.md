@@ -80,6 +80,7 @@ const finding = await agent("Review auth middleware", {
 | `agentType` | named agent | use `provider` |
 | `schema` | StructuredOutput | Codex `--output-schema`; providers get schema file, Pallium validates returned JSON locally and, for read-only agents only, retries once with a corrective prompt before failing the agent. Edit/test/check agents fail schema validation immediately: the retry re-runs the full provider command in the same cwd, which could apply side effects twice |
 | `timeout_seconds` | - | per-call wall-clock cap; overrides `--agent-timeout` (`0` disables) |
+| `network` | - | opt into network egress (default `false`); honored only when the run was started with `--allow-network`. See [Network access](#network-access) |
 
 Edit and worktree-isolated agents run in a detached git worktree under
 `~/.pallium/workflow-runs/<run-id>/worktrees/`. The worktree is removed as soon
@@ -214,10 +215,59 @@ lost.
 | Concurrent agents | `--max-concurrent-agents` (default 16) |
 | Lifetime agents | `--max-agents` (default 1000) |
 | Per-agent wall clock | `--agent-timeout` seconds (default 600, `0` disables); stored on the run and reused by `resume` unless the flag is passed again |
+| Network egress | off unless `--allow-network` (run ceiling) **and** `network: true` (per-agent); stored on the run and reused by `resume`. See [Network access](#network-access) |
 | Items per `parallel`/`pipeline` | 4096 |
 | Nested `workflow()` | 1 level |
 
 A timed-out agent fails with `workflow agent timed out after Ns`: it becomes `null` inside `parallel`/`pipeline` (recorded in the run `failures` list) and throws for a direct `agent()` call, so a hung worker can never stall the run.
+
+## Network access
+
+Workers have **no network access by default**. A default Codex worker runs
+`--sandbox read-only` (or `workspace-write` for edit/test/check) and neither
+level grants egress, so no worker can reach GitHub, package registries, or the
+web unless you deliberately turn it on. This is the safe baseline: an
+autonomous worker with network access is an exfiltration and supply-chain
+surface (it can read secrets in the checkout and POST them out, or pull an
+unpinned dependency), so egress is opt-in and logged rather than implicit.
+
+Turning it on takes **two** independent yeses:
+
+1. **The operator** launches the run with `--allow-network` (a ceiling on
+   `workflow run` / `workflow resume`, default off). This is stored on the run
+   and reused by `resume`.
+2. **The script** opts a specific agent in with `network: true`.
+
+An agent gets network only when both are true. If a script requests
+`network: true` but the run was not started with `--allow-network`, the agent
+runs sandboxed and a warning is logged to stderr
+(`agent <label> requested network but run was not started with --allow-network; running sandboxed`).
+Every agent that does run with network enabled logs one greppable line:
+`[workflow:<run-id>] agent <label> running with network access enabled`.
+
+```bash
+# operator grants the ceiling
+pallium workflow run --allow-network --script review.js "review PR #42"
+```
+
+```js
+// script opts this worker in; others stay sandboxed
+const review = await agent("Review PR #42 using `gh pr diff`", {
+  provider: "codex",
+  mode: "read-only",
+  network: true,
+});
+```
+
+**Codex sandbox implication.** When network is granted, the Codex worker runs
+`--sandbox workspace-write -c sandbox_workspace_write.network_access=true`. This
+is the most-scoped option that grants egress in the installed Codex
+(v0.142.5): filesystem writes stay confined to the workspace while the network
+opens up, rather than the far broader `--sandbox danger-full-access`. A
+read-only agent that opts into network is therefore upgraded to workspace-write
+(read-only has no per-mode network toggle). For configured providers, Pallium
+exports `PALLIUM_WORKFLOW_NETWORK=1` (else `0`) so the wrapper can decide
+whether to expose networked tools.
 
 ## Resume and caching
 

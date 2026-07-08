@@ -914,7 +914,8 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 	maxActiveRuns := fs.Int("max-active-runs", 0, "")
 	agentTimeout := fs.Int("agent-timeout", 600, "")
 	background := fs.Bool("background", false, "")
-	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "cwd": {}, "id": {}, "script": {}, "workflow": {}, "args": {}, "codex": {}, "max-agents": {}, "max-concurrent-agents": {}, "max-budget-usd": {}, "max-active-runs": {}, "agent-timeout": {}}, map[string]struct{}{"background": {}}); err != nil {
+	allowNetwork := fs.Bool("allow-network", false, "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "cwd": {}, "id": {}, "script": {}, "workflow": {}, "args": {}, "codex": {}, "max-agents": {}, "max-concurrent-agents": {}, "max-budget-usd": {}, "max-active-runs": {}, "agent-timeout": {}}, map[string]struct{}{"background": {}, "allow-network": {}}); err != nil {
 		return err
 	}
 	maxAgentsSet := flagWasSet(fs, "max-agents")
@@ -1008,6 +1009,7 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 		runSpec.AgentTimeout = *agentTimeout
 		runSpec.AgentTimeoutExplicit = true
 	}
+	runSpec.AllowNetwork = *allowNetwork
 	run, err := store.UpsertRun(runSpec)
 	_ = store.Close()
 	if err != nil {
@@ -1029,6 +1031,9 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 	if !agentTimeoutSet && run.AgentTimeoutExplicit {
 		effectiveAgentTimeout = run.AgentTimeout
 	}
+	// UpsertRun persists and preserves the ceiling, so run.AllowNetwork is
+	// authoritative here (it already OR-folds the flag with any stored value).
+	effectiveAllowNetwork := run.AllowNetwork
 	if *background {
 		exe, err := os.Executable()
 		if err != nil {
@@ -1053,6 +1058,9 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 		}
 		if effectiveMaxAgents > 0 && (maxAgentsSet || run.MaxAgents > 0) {
 			cmdArgs = append(cmdArgs, "--max-agents", fmt.Sprintf("%d", effectiveMaxAgents))
+		}
+		if effectiveAllowNetwork {
+			cmdArgs = append(cmdArgs, "--allow-network")
 		}
 		if *dbPath != "" {
 			cmdArgs = append(cmdArgs, "--db", *dbPath)
@@ -1610,7 +1618,8 @@ func runWorkflowResume(out io.Writer, args []string, jsonOutput bool) error {
 	maxBudgetUSD := fs.String("max-budget-usd", "", "")
 	agentTimeout := fs.Int("agent-timeout", 600, "")
 	background := fs.Bool("background", false, "")
-	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "codex": {}, "max-agents": {}, "max-concurrent-agents": {}, "max-budget-usd": {}, "agent-timeout": {}}, map[string]struct{}{"background": {}}); err != nil {
+	allowNetwork := fs.Bool("allow-network", false, "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "codex": {}, "max-agents": {}, "max-concurrent-agents": {}, "max-budget-usd": {}, "agent-timeout": {}}, map[string]struct{}{"background": {}, "allow-network": {}}); err != nil {
 		return err
 	}
 	maxAgentsSet := flagWasSet(fs, "max-agents")
@@ -1652,6 +1661,14 @@ func runWorkflowResume(out io.Writer, args []string, jsonOutput bool) error {
 		runArgs = append(runArgs, "--max-budget-usd", strings.TrimSpace(*maxBudgetUSD))
 	} else if !maxBudgetSet && strings.TrimSpace(run.MaxBudgetUSD) != "" {
 		runArgs = append(runArgs, "--max-budget-usd", strings.TrimSpace(run.MaxBudgetUSD))
+	}
+	// Forward the network ceiling if the stored run had it, or if this resume
+	// explicitly escalates with --allow-network. It can only be granted, not
+	// revoked, on resume (a fresh run is the way to lock it back down), which
+	// matches the safe-by-default posture: a resume never silently drops a
+	// ceiling the operator already approved.
+	if *allowNetwork || run.AllowNetwork {
+		runArgs = append(runArgs, "--allow-network")
 	}
 	if *background {
 		runArgs = append(runArgs, "--background")

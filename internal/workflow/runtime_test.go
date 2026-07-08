@@ -3657,3 +3657,147 @@ return "unreachable";`
 		t.Fatalf("expected failed run, got %+v", snapshot.Run)
 	}
 }
+
+// TestCodexSandboxArgsRespectsNetwork locks in the codex `exec` sandbox flag
+// construction. The default (no network) mapping must not regress, and a
+// network-allowed agent must get the granular workspace-scoped network toggle
+// rather than danger-full-access.
+func TestCodexSandboxArgsRespectsNetwork(t *testing.T) {
+	cases := []struct {
+		name           string
+		mode           string
+		networkAllowed bool
+		want           []string
+	}{
+		{"read-only default", "", false, []string{"--sandbox", "read-only"}},
+		{"edit default", "edit", false, []string{"--sandbox", "workspace-write"}},
+		{"test default", "test", false, []string{"--sandbox", "workspace-write"}},
+		{"check default", "check", false, []string{"--sandbox", "workspace-write"}},
+		{"read-only with network", "", true, []string{"--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"}},
+		{"edit with network", "edit", true, []string{"--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := codexSandboxArgs(tc.mode, tc.networkAllowed)
+			if strings.Join(got, " ") != strings.Join(tc.want, " ") {
+				t.Fatalf("codexSandboxArgs(%q,%v) = %v, want %v", tc.mode, tc.networkAllowed, got, tc.want)
+			}
+			// The network-enabling toggle must never appear in the default,
+			// locked-down mappings.
+			joined := strings.Join(got, " ")
+			hasToggle := strings.Contains(joined, "network_access=true")
+			if tc.networkAllowed != hasToggle {
+				t.Fatalf("network toggle presence = %v, want %v (args %v)", hasToggle, tc.networkAllowed, got)
+			}
+		})
+	}
+}
+
+// networkProviderScript writes the value of PALLIUM_WORKFLOW_NETWORK so a test
+// can assert exactly what env the configured provider saw.
+const networkProviderScript = `#!/bin/sh
+printf '{"ok":true,"network":"%s"}' "$PALLIUM_WORKFLOW_NETWORK" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+`
+
+func writeNetworkProvider(t *testing.T, dir string) {
+	t.Helper()
+	path := filepath.Join(dir, "net-provider.sh")
+	if err := os.WriteFile(path, []byte(networkProviderScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_NET_COMMAND", path)
+}
+
+func runNetworkAgent(t *testing.T, allowNetwork bool, script string) (string, string) {
+	t.Helper()
+	tmp := t.TempDir()
+	writeNetworkProvider(t, tmp)
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	scriptPath, err := WriteRunScript("wf-net", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-net", Task: "net", CWD: tmp, ScriptPath: scriptPath, AllowNetwork: allowNetwork})
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs, result, runErr := captureStderr(t, func() (string, error) {
+		return (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	})
+	if runErr != nil {
+		t.Fatalf("execute failed: %v", runErr)
+	}
+	return result, logs
+}
+
+// TestAgentNetworkRejectsNonBoolean covers the JS option boundary: a
+// non-boolean `network` value is a script error, not a silently coerced truthy
+// value.
+func TestAgentNetworkRejectsNonBoolean(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `return agent("go", { network: "yes" });`
+	scriptPath, err := WriteRunScript("wf-net-bad", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-net-bad", Task: "net", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), "must be a boolean") {
+		t.Fatalf("expected non-boolean network to be rejected, got %v", err)
+	}
+}
+
+// TestAgentNetworkParsedWithCeiling covers the happy path: network: true is
+// parsed, the run granted the ceiling, so the provider sees
+// PALLIUM_WORKFLOW_NETWORK=1 and the enabled line is logged.
+func TestAgentNetworkParsedWithCeiling(t *testing.T) {
+	script := `return agent("go", { provider: "net", mode: "read-only", label: "netter", network: true });`
+	result, logs := runNetworkAgent(t, true, script)
+	if !strings.Contains(result, `"network": "1"`) {
+		t.Fatalf("expected provider to see PALLIUM_WORKFLOW_NETWORK=1, got %s", result)
+	}
+	if !strings.Contains(logs, "agent netter running with network access enabled") {
+		t.Fatalf("expected network-enabled log line, got stderr: %s", logs)
+	}
+}
+
+// TestAgentNetworkWithoutCeilingRunsSandboxed covers the operator-consent
+// requirement: a script asking for network on a run that lacks --allow-network
+// runs sandboxed (NETWORK=0) and a warning is logged.
+func TestAgentNetworkWithoutCeilingRunsSandboxed(t *testing.T) {
+	script := `return agent("go", { provider: "net", mode: "read-only", label: "netter", network: true });`
+	result, logs := runNetworkAgent(t, false, script)
+	if !strings.Contains(result, `"network": "0"`) {
+		t.Fatalf("expected no network granted (PALLIUM_WORKFLOW_NETWORK=0), got %s", result)
+	}
+	if !strings.Contains(logs, "requested network but run was not started with --allow-network") {
+		t.Fatalf("expected sandboxed warning, got stderr: %s", logs)
+	}
+}
+
+// TestAgentNetworkDefaultOff guards the safe default: an agent that does not
+// opt into network never gets it, even on a run that granted the ceiling, and
+// no network-enabled log is emitted.
+func TestAgentNetworkDefaultOff(t *testing.T) {
+	script := `return agent("go", { provider: "net", mode: "read-only", label: "netter" });`
+	result, logs := runNetworkAgent(t, true, script)
+	if !strings.Contains(result, `"network": "0"`) {
+		t.Fatalf("expected default PALLIUM_WORKFLOW_NETWORK=0, got %s", result)
+	}
+	if strings.Contains(logs, "running with network access enabled") {
+		t.Fatalf("did not expect network-enabled log for a non-opted agent, got stderr: %s", logs)
+	}
+}
