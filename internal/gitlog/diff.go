@@ -14,44 +14,45 @@ type WorkingTreeFile struct {
 }
 
 func ChangedFilesBetween(repoRoot, baseRef, headRef string) ([]string, error) {
-	cmd := exec.Command("git", "-C", repoRoot, "diff", "--name-only", baseRef, headRef)
+	cmd := exec.Command("git", "-C", repoRoot, "diff", "--name-only", "-z", baseRef, headRef)
 	output, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("failed to diff changed files: %w", err)
+		return nil, wrapGitError("failed to diff changed files", err)
 	}
 
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	out := make([]string, 0, len(lines))
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
+	entries := strings.Split(string(output), "\x00")
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry == "" {
 			continue
 		}
-		out = append(out, filepath.ToSlash(line))
+		out = append(out, filepath.ToSlash(entry))
 	}
 	return out, nil
 }
 
 func WorkingTreeChanges(repoRoot string) ([]WorkingTreeFile, error) {
-	cmd := exec.Command("git", "-C", repoRoot, "status", "--short")
+	cmd := exec.Command("git", "-C", repoRoot, "status", "--porcelain", "-z")
 	output, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("failed to read working tree changes: %w", err)
+		return nil, wrapGitError("failed to read working tree changes", err)
 	}
 
-	lines := strings.Split(string(output), "\n")
-	out := make([]WorkingTreeFile, 0, len(lines))
-	for _, line := range lines {
-		line = strings.TrimRight(line, "\r\n")
-		if strings.TrimSpace(line) == "" || len(line) < 4 {
+	entries := strings.Split(string(output), "\x00")
+	out := make([]WorkingTreeFile, 0, len(entries))
+	for i := 0; i < len(entries); i++ {
+		entry := entries[i]
+		if len(entry) < 4 {
 			continue
 		}
-		status := strings.TrimSpace(line[:2])
-		path := strings.TrimSpace(line[3:])
-		if idx := strings.Index(path, " -> "); idx >= 0 {
-			path = path[idx+4:]
+		status := strings.TrimSpace(entry[:2])
+		path := filepath.ToSlash(entry[3:])
+		if strings.ContainsAny(status, "RC") {
+			// Rename/copy entries emit the new path first, then the
+			// original path as a separate NUL-terminated entry. Keep the
+			// new path and skip the original.
+			i++
 		}
-		path = filepath.ToSlash(path)
 		if ignoredWorkingTreePath(path) {
 			continue
 		}
