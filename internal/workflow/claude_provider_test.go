@@ -11,6 +11,7 @@ func TestBuildClaudeArgsReadOnlyMode(t *testing.T) {
 		got := buildClaudeArgs(mode, "")
 		want := []string{
 			"-p", "--output-format", "json",
+			"--strict-mcp-config", "--setting-sources", "user",
 			"--allowedTools", claudeReadOnlyAllowedTools,
 			"--disallowedTools", claudeReadOnlyDisallowedTools,
 		}
@@ -25,6 +26,7 @@ func TestBuildClaudeArgsEditTestCheckModes(t *testing.T) {
 		got := buildClaudeArgs(mode, "")
 		want := []string{
 			"-p", "--output-format", "json",
+			"--strict-mcp-config", "--setting-sources", "user",
 			"--permission-mode", "acceptEdits",
 			"--allowedTools", claudeEditAllowedTools,
 			"--disallowedTools", claudeEditDisallowedTools,
@@ -39,6 +41,7 @@ func TestBuildClaudeArgsIncludesModel(t *testing.T) {
 	got := buildClaudeArgs("read-only", "claude-sonnet-5")
 	want := []string{
 		"-p", "--output-format", "json",
+		"--strict-mcp-config", "--setting-sources", "user",
 		"--model", "claude-sonnet-5",
 		"--allowedTools", claudeReadOnlyAllowedTools,
 		"--disallowedTools", claudeReadOnlyDisallowedTools,
@@ -96,8 +99,76 @@ func allowedToolsArg(args []string) string {
 	return ""
 }
 
+func TestReadOnlyModeNeverReachesPallium(t *testing.T) {
+	// A read-only agent must not reach the pallium CLI: a Bash(pallium:*) grant
+	// would permit `pallium workflow run` (nested paid agents) and index/task
+	// mutations, so it is not read-only.
+	for _, mode := range []string{"", "read-only"} {
+		if allowed := allowedToolsArg(buildClaudeArgs(mode, "")); strings.Contains(allowed, "pallium") {
+			t.Fatalf("mode %q: read-only allowlist reaches pallium: %q", mode, allowed)
+		}
+	}
+}
+
+func TestBuildClaudeArgsIsolatesAmbientSettings(t *testing.T) {
+	// Every mode must block ambient MCP and load only the operator's user
+	// settings, so a checked-out repo's .claude config can't widen the allowlist.
+	for _, mode := range []string{"", "read-only", "edit", "test", "check"} {
+		args := buildClaudeArgs(mode, "")
+		if !containsArg(args, "--strict-mcp-config") {
+			t.Fatalf("mode %q: missing --strict-mcp-config: %v", mode, args)
+		}
+		found := false
+		for i, a := range args {
+			if a == "--setting-sources" && i+1 < len(args) && args[i+1] == "user" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("mode %q: --setting-sources user missing: %v", mode, args)
+		}
+	}
+}
+
+func containsArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestExtractClaudeOutputSurfacesIsError(t *testing.T) {
+	// A CLI that exits 0 but reports is_error must not be treated as success.
+	if _, _, err := extractClaudeOutput(`{"type":"result","subtype":"error_max_turns","is_error":true}`, false); err == nil {
+		t.Fatal("expected error when envelope has is_error=true")
+	}
+	// The array/event-stream shape is handled the same way.
+	if _, _, err := extractClaudeOutput(`[{"type":"result","is_error":true,"subtype":"error_during_execution"}]`, false); err == nil {
+		t.Fatal("expected error for is_error in event-stream array")
+	}
+	// A non-error envelope with a real result still works.
+	if text, _, err := extractClaudeOutput(`{"type":"result","is_error":false,"result":"ok"}`, false); err != nil || text != "ok" {
+		t.Fatalf("text=%q err=%v", text, err)
+	}
+}
+
+func TestTruncateForError(t *testing.T) {
+	if got := truncateForError("short"); got != "short" {
+		t.Fatalf("short string changed: %q", got)
+	}
+	got := truncateForError(strings.Repeat("x", maxErrorOutputBytes+100))
+	if len(got) <= maxErrorOutputBytes || !strings.Contains(got, "truncated") {
+		t.Fatalf("truncate failed: len=%d", len(got))
+	}
+}
+
 func TestBuildClaudePromptNoSchema(t *testing.T) {
-	got := buildClaudePrompt("review the code", nil)
+	got, err := buildClaudePrompt("review the code", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got != "review the code" {
 		t.Fatalf("buildClaudePrompt = %q, want unchanged prompt", got)
 	}
@@ -105,7 +176,10 @@ func TestBuildClaudePromptNoSchema(t *testing.T) {
 
 func TestBuildClaudePromptWithSchema(t *testing.T) {
 	schema := map[string]any{"type": "object", "properties": map[string]any{"ok": map[string]any{"type": "boolean"}}}
-	got := buildClaudePrompt("review the code", schema)
+	got, err := buildClaudePrompt("review the code", schema)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got == "review the code" {
 		t.Fatal("buildClaudePrompt did not append schema instruction")
 	}

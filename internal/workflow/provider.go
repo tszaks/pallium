@@ -28,6 +28,19 @@ func ResolveProvider(agentProvider, optsProvider string) string {
 	return "codex"
 }
 
+// ProviderForDisplay resolves an agent's provider for reporting/analytics of
+// an already-executed run. Unlike ResolveProvider it never re-runs live
+// steering-agent detection: a historical run must report the provider it
+// actually used, not whatever agent happens to be inspecting it later. The
+// resolved provider is persisted on each agent row, so an empty value only
+// occurs for pre-adoption records, which default to the historical "codex".
+func ProviderForDisplay(agentProvider string) string {
+	if p := normalizeProvider(agentProvider); p != "" {
+		return p
+	}
+	return "codex"
+}
+
 func normalizeProvider(provider string) string {
 	provider = strings.TrimSpace(provider)
 	if provider == "" || provider == "default" {

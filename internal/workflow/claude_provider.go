@@ -23,11 +23,15 @@ var claudeCLIName = "claude"
 // ripgrep's `--pre COMMAND` and find's `-exec`/`-delete` run arbitrary
 // commands, and a `Bash(rg:*)`/`Bash(find:*)` prefix match can't rule that
 // out since the dangerous flags can be appended after the fixed prefix (the
-// built-in Grep/Glob tools already cover the same need). See
+// built-in Grep/Glob tools already cover the same need). `Bash(pallium:*)` is
+// likewise excluded from the read-only set: a `Bash(pallium:*)` prefix would
+// allow `pallium workflow run` (spawns nested paid agents, risking cost blowups
+// and recursion) and `pallium index`/`task` (mutate the store) — not read-only
+// at all. Read/Grep/Glob/LS already cover code orientation. See
 // providers/claude.sh for the empirically-verified writeup this mirrors.
 //
-// The edit set spans the common ecosystems (Go, Node, Python, Rust, Make,
-// Apple/Swift) so edit agents can build/test/lint on non-Go repos too. Note
+// The edit set spans the common ecosystems (Go, Node, Deno, Python, Rust,
+// Make, Apple/Swift) so edit agents can build/test/lint on non-Go repos too. Note
 // that any build runner (make, npm run, cargo, xcodebuild) executes
 // repo-authored scripts, so the curl/gh denial is a speed bump, not a
 // sandbox: edit mode trusts the repo's own tooling. Repos needing a tool
@@ -36,9 +40,9 @@ var claudeCLIName = "claude"
 // (a comma-separated list of extra `--allowedTools` entries) rather than
 // editing this list.
 const (
-	claudeReadOnlyAllowedTools    = "Read,Grep,Glob,LS,Bash(ls:*),Bash(cat:*),Bash(grep:*),Bash(wc:*),Bash(pallium:*)"
+	claudeReadOnlyAllowedTools    = "Read,Grep,Glob,LS,Bash(ls:*),Bash(cat:*),Bash(grep:*),Bash(wc:*)"
 	claudeReadOnlyDisallowedTools = "Edit,Write,NotebookEdit"
-	claudeEditAllowedTools        = "Read,Grep,Glob,LS,Edit,Write,Bash(go test:*),Bash(go build:*),Bash(go vet:*),Bash(gofmt:*),Bash(npm test:*),Bash(npm run:*),Bash(yarn:*),Bash(pnpm:*),Bash(pytest:*),Bash(cargo:*),Bash(make:*),Bash(xcodebuild:*),Bash(swift:*),Bash(swiftlint:*),Bash(ls:*),Bash(cat:*),Bash(grep:*),Bash(wc:*)"
+	claudeEditAllowedTools        = "Read,Grep,Glob,LS,Edit,Write,Bash(go test:*),Bash(go build:*),Bash(go vet:*),Bash(gofmt:*),Bash(npm test:*),Bash(npm run:*),Bash(yarn:*),Bash(pnpm:*),Bash(deno test:*),Bash(deno fmt:*),Bash(deno lint:*),Bash(deno check:*),Bash(deno task:*),Bash(pytest:*),Bash(cargo:*),Bash(make:*),Bash(xcodebuild:*),Bash(swift:*),Bash(swiftlint:*),Bash(ls:*),Bash(cat:*),Bash(grep:*),Bash(wc:*)"
 	claudeEditDisallowedTools     = "Bash(curl:*),Bash(gh:*)"
 	claudeExtraAllowedToolsEnv    = "PALLIUM_WORKFLOW_CLAUDE_ALLOWED_TOOLS"
 )
@@ -47,6 +51,12 @@ const (
 // extras from PALLIUM_WORKFLOW_CLAUDE_ALLOWED_TOOLS, so a non-Go repo can add
 // its own build/lint commands (e.g. "Bash(sh scripts/lint.sh:*),Bash(xcrun:*)")
 // without a code change. Returns the base set unchanged when the env is unset.
+//
+// The env value is operator-controlled configuration, trusted at the same
+// level as the workflow script itself, and is appended verbatim (no
+// validation). It cannot re-enable the curl/gh denial: --disallowedTools takes
+// precedence over --allowedTools in the claude CLI, so claudeEditDisallowedTools
+// still blocks those even if an entry here names them.
 func editAllowedTools() string {
 	if extra := strings.TrimSpace(os.Getenv(claudeExtraAllowedToolsEnv)); extra != "" {
 		return claudeEditAllowedTools + "," + extra
@@ -58,15 +68,18 @@ func editAllowedTools() string {
 // prompt when a schema is set, matching the instruction configured provider
 // wrappers use (see providers/claude.sh) so Pallium's local schema
 // validation sees the same bare-JSON contract either way.
-func buildClaudePrompt(prompt string, schema map[string]any) string {
+func buildClaudePrompt(prompt string, schema map[string]any) (string, error) {
 	if len(schema) == 0 {
-		return prompt
+		return prompt, nil
 	}
 	raw, err := json.MarshalIndent(normalizeSchema(schema), "", "  ")
 	if err != nil {
-		return prompt
+		// Dropping the schema instruction silently would make the model
+		// return prose and fail Pallium's later schema validation for an
+		// invisible reason; surface it instead.
+		return "", fmt.Errorf("encode schema for claude prompt: %w", err)
 	}
-	return prompt + "\n\nRespond with ONLY a single JSON object conforming to this JSON Schema — no markdown fences, no prose:\n" + string(raw)
+	return prompt + "\n\nRespond with ONLY a single JSON object conforming to this JSON Schema — no markdown fences, no prose:\n" + string(raw), nil
 }
 
 // buildClaudeArgs builds the `claude` CLI argv (excluding the binary name
@@ -74,8 +87,16 @@ func buildClaudePrompt(prompt string, schema map[string]any) string {
 // and model. A pure function so argv construction is testable without
 // invoking a real claude binary, mirroring how the codex sandbox flags are
 // derived from agent.Mode in runAgentCommand.
+//
+// --strict-mcp-config and --setting-sources=user isolate the worker from the
+// checked-out repo: without them the built-in provider (the zero-config
+// default under CLAUDECODE) would inherit the repo's .claude/settings.json,
+// .claude/settings.local.json, and any project-configured MCP servers, all of
+// which could widen the allow-rules past the --allowedTools/--disallowedTools
+// set below. Only the operator's own user settings are trusted; a checked-out
+// repo cannot grant a workflow worker extra reach.
 func buildClaudeArgs(mode, model string) []string {
-	args := []string{"-p", "--output-format", "json"}
+	args := []string{"-p", "--output-format", "json", "--strict-mcp-config", "--setting-sources", "user"}
 	if model != "" {
 		args = append(args, "--model", model)
 	}
@@ -101,7 +122,10 @@ func buildClaudeArgs(mode, model string) []string {
 // PATH. Parallels the codex exec block: same cwd (worktree for edit/
 // isolation, else the run cwd), same last-message-style return contract.
 func (r *Runner) runBuiltinClaudeCommand(ctx context.Context, usageFile, cwd, prompt string, agent *Agent, opts AgentOptions) (string, error) {
-	fullPrompt := buildClaudePrompt(prompt, opts.Schema)
+	fullPrompt, err := buildClaudePrompt(prompt, opts.Schema)
+	if err != nil {
+		return "", fmt.Errorf("workflow provider \"claude\": %w", err)
+	}
 	args := buildClaudeArgs(agent.Mode, opts.Model)
 	cmd := exec.CommandContext(ctx, claudeCLIName, args...)
 	cmd.Dir = cwd
@@ -116,7 +140,9 @@ func (r *Runner) runBuiltinClaudeCommand(ctx context.Context, usageFile, cwd, pr
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return strings.TrimSpace(stdout.String()), fmt.Errorf("workflow provider \"claude\" failed: %w: %s", err, strings.TrimSpace(stderr.String()))
+		// Cap the embedded CLI output so a huge or malformed response can't
+		// bloat the stored error record.
+		return truncateForError(strings.TrimSpace(stdout.String())), fmt.Errorf("workflow provider \"claude\" failed: %w: %s", err, truncateForError(strings.TrimSpace(stderr.String())))
 	}
 	text, usage, err := extractClaudeOutput(stdout.String(), len(opts.Schema) > 0)
 	if err != nil {
@@ -128,6 +154,17 @@ func (r *Runner) runBuiltinClaudeCommand(ctx context.Context, usageFile, cwd, pr
 		}
 	}
 	return text, nil
+}
+
+// maxErrorOutputBytes caps CLI stdout/stderr embedded in a provider error so
+// a huge or malformed response can't bloat the stored error record.
+const maxErrorOutputBytes = 4096
+
+func truncateForError(s string) string {
+	if len(s) <= maxErrorOutputBytes {
+		return s
+	}
+	return s[:maxErrorOutputBytes] + fmt.Sprintf("... [truncated %d bytes]", len(s)-maxErrorOutputBytes)
 }
 
 // extractClaudeOutput pulls the final answer text (and, if present, usage/
@@ -150,6 +187,20 @@ func extractClaudeOutput(raw string, hasSchema bool) (string, map[string]any, er
 	text := raw
 	var usage map[string]any
 	if envelope := parseClaudeEnvelope(raw); envelope != nil {
+		// The CLI can exit 0 yet report a failure in the envelope (e.g.
+		// {"is_error":true,"subtype":"error_max_turns"}), often with no usable
+		// "result" string. Treat that as an error rather than returning the
+		// raw envelope JSON as if it were the answer.
+		if isErr, _ := envelope["is_error"].(bool); isErr {
+			msg, _ := envelope["result"].(string)
+			if strings.TrimSpace(msg) == "" {
+				msg, _ = envelope["subtype"].(string)
+			}
+			if strings.TrimSpace(msg) == "" {
+				msg = "unspecified error"
+			}
+			return "", nil, fmt.Errorf("claude CLI reported an error: %s", strings.TrimSpace(msg))
+		}
 		if result, ok := envelope["result"].(string); ok {
 			text = result
 		}
