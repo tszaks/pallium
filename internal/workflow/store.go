@@ -34,16 +34,21 @@ type Run struct {
 	// timeouts). Callers must check this flag before trusting AgentTimeout:
 	// the field's own zero value is ambiguous between "not configured" and
 	// "explicitly disabled", so the flag is the source of truth.
-	AgentTimeoutExplicit bool         `json:"agent_timeout_explicit,omitempty"`
-	Status               string       `json:"status"`
-	Result               string       `json:"result,omitempty"`
-	Error                string       `json:"error,omitempty"`
-	Failures             []RunFailure `json:"failures,omitempty"`
-	ScriptHash           string       `json:"script_hash,omitempty"`
-	ScriptChanged        bool         `json:"script_changed,omitempty"`
-	CreatedAt            string       `json:"created_at"`
-	UpdatedAt            string       `json:"updated_at"`
-	CompletedAt          string       `json:"completed_at,omitempty"`
+	AgentTimeoutExplicit bool `json:"agent_timeout_explicit,omitempty"`
+	// AllowNetwork is the run-level ceiling for worker network egress, set by
+	// --allow-network. An agent's network: true request is only honored when
+	// this is true. Default false keeps every worker sandboxed unless the
+	// operator explicitly opted the run in.
+	AllowNetwork  bool         `json:"allow_network,omitempty"`
+	Status        string       `json:"status"`
+	Result        string       `json:"result,omitempty"`
+	Error         string       `json:"error,omitempty"`
+	Failures      []RunFailure `json:"failures,omitempty"`
+	ScriptHash    string       `json:"script_hash,omitempty"`
+	ScriptChanged bool         `json:"script_changed,omitempty"`
+	CreatedAt     string       `json:"created_at"`
+	UpdatedAt     string       `json:"updated_at"`
+	CompletedAt   string       `json:"completed_at,omitempty"`
 }
 
 // RunFailure records an item that was dropped to null inside parallel or
@@ -139,6 +144,7 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
   max_budget_usd TEXT,
   agent_timeout_seconds INTEGER DEFAULT 0,
   agent_timeout_explicit INTEGER DEFAULT 0,
+  allow_network INTEGER DEFAULT 0,
   status TEXT NOT NULL,
   result TEXT,
   error TEXT,
@@ -243,6 +249,7 @@ CREATE INDEX IF NOT EXISTS idx_workflow_gates_run ON workflow_gates(run_id, open
 		"ALTER TABLE workflow_runs ADD COLUMN max_budget_usd TEXT",
 		"ALTER TABLE workflow_runs ADD COLUMN agent_timeout_seconds INTEGER DEFAULT 0",
 		"ALTER TABLE workflow_runs ADD COLUMN agent_timeout_explicit INTEGER DEFAULT 0",
+		"ALTER TABLE workflow_runs ADD COLUMN allow_network INTEGER DEFAULT 0",
 		"ALTER TABLE workflow_runs ADD COLUMN failures TEXT",
 		"ALTER TABLE workflow_runs ADD COLUMN script_hash TEXT",
 		"ALTER TABLE workflow_runs ADD COLUMN script_changed INTEGER DEFAULT 0",
@@ -300,8 +307,8 @@ func (s *Store) CreateRun(run Run) (Run, error) {
 	if run.UpdatedAt == "" {
 		run.UpdatedAt = run.CreatedAt
 	}
-	_, err := s.db.Exec(`INSERT INTO workflow_runs(id,task,cwd,script_path,args_json,owned_session_id,max_agents,max_budget_usd,agent_timeout_seconds,agent_timeout_explicit,status,result,error,created_at,updated_at,completed_at)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, run.ID, run.Task, run.CWD, run.ScriptPath, run.ArgsJSON, run.OwnedID, run.MaxAgents, run.MaxBudgetUSD, run.AgentTimeout, run.AgentTimeoutExplicit, run.Status, run.Result, run.Error, run.CreatedAt, run.UpdatedAt, run.CompletedAt)
+	_, err := s.db.Exec(`INSERT INTO workflow_runs(id,task,cwd,script_path,args_json,owned_session_id,max_agents,max_budget_usd,agent_timeout_seconds,agent_timeout_explicit,allow_network,status,result,error,created_at,updated_at,completed_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, run.ID, run.Task, run.CWD, run.ScriptPath, run.ArgsJSON, run.OwnedID, run.MaxAgents, run.MaxBudgetUSD, run.AgentTimeout, run.AgentTimeoutExplicit, run.AllowNetwork, run.Status, run.Result, run.Error, run.CreatedAt, run.UpdatedAt, run.CompletedAt)
 	return run, err
 }
 
@@ -337,13 +344,21 @@ func (s *Store) UpsertRun(run Run) (Run, error) {
 			run.AgentTimeout = existing.AgentTimeout
 			run.AgentTimeoutExplicit = existing.AgentTimeoutExplicit
 		}
+		// AllowNetwork's safe default is false, and the only way to reach true
+		// is an explicit --allow-network, so a false here means "this caller
+		// didn't set the ceiling" and we keep whatever the run already had.
+		// This is what makes the ceiling persist across resume (which replays
+		// the stored value) without an "explicit" companion flag.
+		if !run.AllowNetwork {
+			run.AllowNetwork = existing.AllowNetwork
+		}
 		if run.Status == "" {
 			run.Status = existing.Status
 		}
 		run.CreatedAt = existing.CreatedAt
 		run.UpdatedAt = nowString()
-		_, err := s.db.Exec(`UPDATE workflow_runs SET task=?,cwd=?,script_path=?,args_json=?,owned_session_id=?,max_agents=?,max_budget_usd=?,agent_timeout_seconds=?,agent_timeout_explicit=?,status=?,result=?,error=?,updated_at=?,completed_at=? WHERE id=?`,
-			run.Task, run.CWD, run.ScriptPath, run.ArgsJSON, run.OwnedID, run.MaxAgents, run.MaxBudgetUSD, run.AgentTimeout, run.AgentTimeoutExplicit, run.Status, run.Result, run.Error, run.UpdatedAt, run.CompletedAt, run.ID)
+		_, err := s.db.Exec(`UPDATE workflow_runs SET task=?,cwd=?,script_path=?,args_json=?,owned_session_id=?,max_agents=?,max_budget_usd=?,agent_timeout_seconds=?,agent_timeout_explicit=?,allow_network=?,status=?,result=?,error=?,updated_at=?,completed_at=? WHERE id=?`,
+			run.Task, run.CWD, run.ScriptPath, run.ArgsJSON, run.OwnedID, run.MaxAgents, run.MaxBudgetUSD, run.AgentTimeout, run.AgentTimeoutExplicit, run.AllowNetwork, run.Status, run.Result, run.Error, run.UpdatedAt, run.CompletedAt, run.ID)
 		return run, err
 	}
 	return s.CreateRun(run)
@@ -367,17 +382,19 @@ func (s *Store) SetRunOwnedID(id, ownedID string) error {
 	return err
 }
 
-const runSelectColumns = `id,task,cwd,script_path,COALESCE(args_json,''),COALESCE(owned_session_id,''),COALESCE(max_agents,0),COALESCE(max_budget_usd,''),COALESCE(agent_timeout_seconds,0),COALESCE(agent_timeout_explicit,0),status,COALESCE(result,''),COALESCE(error,''),COALESCE(failures,''),COALESCE(script_hash,''),COALESCE(script_changed,0),created_at,updated_at,COALESCE(completed_at,'')`
+const runSelectColumns = `id,task,cwd,script_path,COALESCE(args_json,''),COALESCE(owned_session_id,''),COALESCE(max_agents,0),COALESCE(max_budget_usd,''),COALESCE(agent_timeout_seconds,0),COALESCE(agent_timeout_explicit,0),COALESCE(allow_network,0),status,COALESCE(result,''),COALESCE(error,''),COALESCE(failures,''),COALESCE(script_hash,''),COALESCE(script_changed,0),created_at,updated_at,COALESCE(completed_at,'')`
 
 func scanRun(row interface{ Scan(dest ...any) error }) (Run, error) {
 	var run Run
 	var failuresJSON string
 	var scriptChanged int
 	var agentTimeoutExplicit int
-	if err := row.Scan(&run.ID, &run.Task, &run.CWD, &run.ScriptPath, &run.ArgsJSON, &run.OwnedID, &run.MaxAgents, &run.MaxBudgetUSD, &run.AgentTimeout, &agentTimeoutExplicit, &run.Status, &run.Result, &run.Error, &failuresJSON, &run.ScriptHash, &scriptChanged, &run.CreatedAt, &run.UpdatedAt, &run.CompletedAt); err != nil {
+	var allowNetwork int
+	if err := row.Scan(&run.ID, &run.Task, &run.CWD, &run.ScriptPath, &run.ArgsJSON, &run.OwnedID, &run.MaxAgents, &run.MaxBudgetUSD, &run.AgentTimeout, &agentTimeoutExplicit, &allowNetwork, &run.Status, &run.Result, &run.Error, &failuresJSON, &run.ScriptHash, &scriptChanged, &run.CreatedAt, &run.UpdatedAt, &run.CompletedAt); err != nil {
 		return Run{}, err
 	}
 	run.AgentTimeoutExplicit = agentTimeoutExplicit != 0
+	run.AllowNetwork = allowNetwork != 0
 	run.ScriptChanged = scriptChanged != 0
 	if failuresJSON != "" {
 		_ = json.Unmarshal([]byte(failuresJSON), &run.Failures)

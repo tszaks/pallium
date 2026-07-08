@@ -64,6 +64,10 @@ type AgentOptions struct {
 	Schema         map[string]any `json:"schema,omitempty"`
 	Model          string         `json:"model,omitempty"`
 	TimeoutSeconds *int           `json:"timeout_seconds,omitempty"`
+	// Network is the agent's opt-in request for network egress. It is only
+	// honored when the run was launched with --allow-network (the operator
+	// ceiling); otherwise the agent runs sandboxed. Default false.
+	Network bool `json:"network,omitempty"`
 }
 
 type CheckOptions struct {
@@ -521,7 +525,15 @@ func (r *Runner) jsAgent(ctx context.Context, vm *goja.Runtime) func(goja.Functi
 		}
 		opts := AgentOptions{}
 		if len(call.Arguments) > 1 && !goja.IsUndefined(call.Argument(1)) && !goja.IsNull(call.Argument(1)) {
-			raw, err := json.Marshal(call.Argument(1).Export())
+			exported := call.Argument(1).Export()
+			// Validate the boolean-typed opts against the raw JS value before
+			// the struct unmarshal: json.Unmarshal into a bool field would
+			// reject a non-boolean with an opaque type error, so check first to
+			// throw a clear script-facing message instead.
+			if err := validateUserNetwork(exported); err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			raw, err := json.Marshal(exported)
 			if err != nil {
 				panic(vm.ToValue(err.Error()))
 			}
@@ -2039,6 +2051,25 @@ func validateUserIsolation(isolation string) error {
 	}
 }
 
+// validateUserNetwork guards the JS option boundary for the `network` opt:
+// scripts may only pass a boolean (true or false). A non-boolean (string,
+// number, object) is a script mistake and is rejected with a clear message
+// instead of the opaque type error json.Unmarshal would raise.
+func validateUserNetwork(raw any) error {
+	opts, ok := raw.(map[string]any)
+	if !ok {
+		return nil
+	}
+	value, ok := opts["network"]
+	if !ok {
+		return nil
+	}
+	if _, ok := value.(bool); !ok {
+		return fmt.Errorf("invalid agent network %v: must be a boolean (true or false)", value)
+	}
+	return nil
+}
+
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
@@ -2084,6 +2115,25 @@ func numberToInt(value any) (int, bool) {
 	default:
 		return 0, false
 	}
+}
+
+// resolveAgentNetwork applies the run-level --allow-network ceiling to an
+// agent's requested network setting and logs the outcome to stderr. An agent
+// only gets egress when it opts in (network: true) AND the operator launched
+// the run with --allow-network. If the agent asks but the ceiling is absent it
+// runs sandboxed and a warning is logged. Every agent that actually runs with
+// network enabled logs one greppable line so egress is auditable.
+func (r *Runner) resolveAgentNetwork(agent *Agent, opts AgentOptions) bool {
+	if !opts.Network {
+		return false
+	}
+	label := firstNonEmpty(agent.Label, agent.ID)
+	if !r.Run.AllowNetwork {
+		fmt.Fprintf(os.Stderr, "[workflow:%s] agent %s requested network but run was not started with --allow-network; running sandboxed\n", r.Run.ID, label)
+		return false
+	}
+	fmt.Fprintf(os.Stderr, "[workflow:%s] agent %s running with network access enabled\n", r.Run.ID, label)
+	return true
 }
 
 func (r *Runner) agentTimeout(opts AgentOptions) time.Duration {
@@ -2171,6 +2221,7 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 		return strings.ReplaceAll(stub, "{{PROMPT}}", agent.Prompt), patchPath, worktree, nil
 	}
 	provider := firstNonEmpty(agent.Provider, opts.Provider, "codex")
+	networkAllowed := r.resolveAgentNetwork(agent, opts)
 	repoRoot := firstNonEmpty(agent.Repo, r.Run.CWD)
 	cwd := repoRoot
 	worktree := ""
@@ -2195,7 +2246,7 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 			return "", "", worktree, fmt.Errorf("workflow agent provider %q is not configured; set %s", provider, providerCommandEnvName(provider))
 		}
 		usageFile := filepath.Join(tmpDir, "usage.json")
-		output, err := r.runConfiguredProviderCommand(ctx, command, tmpDir, outFile, usageFile, cwd, agent.Prompt, agent, opts)
+		output, err := r.runConfiguredProviderCommand(ctx, command, tmpDir, outFile, usageFile, cwd, agent.Prompt, agent, opts, networkAllowed)
 		usageRaw, usage := readAndRemoveAgentUsage(usageFile)
 		// If the first attempt's own reported cost already exhausts the
 		// budget, skip the (paid) corrective retry entirely rather than
@@ -2216,7 +2267,7 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 			// effects twice; they fail schema validation immediately instead.
 			if _, schemaErr := parseAgentOutputWithSchema(output, opts.Schema); schemaErr != nil && isReadOnlyAgentMode(agent.Mode) {
 				_ = os.Remove(outFile)
-				retryOutput, retryErr := r.runConfiguredProviderCommand(ctx, command, tmpDir, outFile, usageFile, cwd, buildSchemaRetryPrompt(agent.Prompt, schemaErr), agent, opts)
+				retryOutput, retryErr := r.runConfiguredProviderCommand(ctx, command, tmpDir, outFile, usageFile, cwd, buildSchemaRetryPrompt(agent.Prompt, schemaErr), agent, opts, networkAllowed)
 				// Usage is read after each invocation (the file is removed in
 				// between), so the retry's cost adds to attempt one instead of
 				// overwriting it.
@@ -2264,11 +2315,7 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 		return output, patchPath, worktree, nil
 	}
 	cmdArgs := []string{"exec", "--cd", cwd, "--output-last-message", outFile}
-	if agent.Mode == "edit" || agent.Mode == "test" || agent.Mode == "check" {
-		cmdArgs = append(cmdArgs, "--sandbox", "workspace-write")
-	} else {
-		cmdArgs = append(cmdArgs, "--sandbox", "read-only")
-	}
+	cmdArgs = append(cmdArgs, codexSandboxArgs(agent.Mode, networkAllowed)...)
 	if opts.Model != "" {
 		cmdArgs = append(cmdArgs, "--model", opts.Model)
 	}
@@ -2308,7 +2355,39 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 	return output, patchPath, worktree, nil
 }
 
-func (r *Runner) runConfiguredProviderCommand(ctx context.Context, command, tmpDir, outFile, usageFile, cwd, prompt string, agent *Agent, opts AgentOptions) (string, error) {
+// codexSandboxArgs returns the `codex exec` sandbox flags for an agent.
+//
+// Default (no network): edit/test/check get workspace-write, everything else
+// read-only. Neither of these grants network egress, which is the safe
+// baseline — no worker can reach the network unless the operator explicitly
+// opted the run in.
+//
+// When network is allowed we want the most-scoped sandbox that still grants
+// egress. Codex v0.142.5 exposes a granular per-mode toggle: with
+// `--sandbox workspace-write` the filesystem stays scoped to the workspace,
+// and `-c sandbox_workspace_write.network_access=true` enables the network
+// without falling back to the far broader `--sandbox danger-full-access`
+// (which would also allow writes anywhere on the host). Evidence, from the
+// bundled codex binary's own help/config text:
+//
+//	"In `workspace-write`, network access still depends on your Codex
+//	 configuration (for example `[sandbox_workspace_write] network_access = true`)."
+//
+// So a networked worker is still confined to the workspace for filesystem
+// writes. A read-only agent that opts into network is therefore upgraded to
+// workspace-write (read-only has no per-mode network toggle) — the minimal
+// scope that can carry egress.
+func codexSandboxArgs(mode string, networkAllowed bool) []string {
+	if networkAllowed {
+		return []string{"--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"}
+	}
+	if mode == "edit" || mode == "test" || mode == "check" {
+		return []string{"--sandbox", "workspace-write"}
+	}
+	return []string{"--sandbox", "read-only"}
+}
+
+func (r *Runner) runConfiguredProviderCommand(ctx context.Context, command, tmpDir, outFile, usageFile, cwd, prompt string, agent *Agent, opts AgentOptions, networkAllowed bool) (string, error) {
 	promptFile := filepath.Join(tmpDir, "prompt.txt")
 	if err := os.WriteFile(promptFile, []byte(prompt), 0o600); err != nil {
 		return "", err
@@ -2324,6 +2403,14 @@ func (r *Runner) runConfiguredProviderCommand(ctx context.Context, command, tmpD
 		if err := os.WriteFile(schemaFile, raw, 0o600); err != nil {
 			return "", err
 		}
+	}
+	// PALLIUM_WORKFLOW_NETWORK is the provider contract for egress: "1" only
+	// when the agent requested network AND the run granted the ceiling,
+	// otherwise "0". Wrappers use it to decide whether to grant networked
+	// tools; the default is locked down.
+	networkEnv := "0"
+	if networkAllowed {
+		networkEnv = "1"
 	}
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	cmd.Dir = cwd
@@ -2342,6 +2429,7 @@ func (r *Runner) runConfiguredProviderCommand(ctx context.Context, command, tmpD
 		"PALLIUM_WORKFLOW_OUTPUT_FILE="+outFile,
 		"PALLIUM_WORKFLOW_SCHEMA_FILE="+schemaFile,
 		"PALLIUM_WORKFLOW_USAGE_FILE="+usageFile,
+		"PALLIUM_WORKFLOW_NETWORK="+networkEnv,
 	)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

@@ -1399,3 +1399,98 @@ func readFile(t *testing.T, path string) string {
 	}
 	return string(raw)
 }
+
+// networkProviderScript writes PALLIUM_WORKFLOW_NETWORK into its output so a
+// test can assert exactly what env the configured provider saw.
+const networkProviderScript = `#!/bin/sh
+printf '{"ok":true,"network":"%s"}' "$PALLIUM_WORKFLOW_NETWORK" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+`
+
+func setupNetworkProvider(t *testing.T, tmp string) {
+	t.Helper()
+	provider := filepath.Join(tmp, "net-provider.sh")
+	if err := os.WriteFile(provider, []byte(networkProviderScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_NET_COMMAND", provider)
+}
+
+func assertNetworkRun(t *testing.T, dbPath, id string, wantAllow bool, wantNetworkVal string) {
+	t.Helper()
+	store, err := workflow.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run, err := store.Run(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.AllowNetwork != wantAllow {
+		t.Fatalf("run %s AllowNetwork = %v, want %v", id, run.AllowNetwork, wantAllow)
+	}
+	agents, err := store.ListAgents(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 {
+		t.Fatalf("expected 1 agent, got %d", len(agents))
+	}
+	want := `"network":"` + wantNetworkVal + `"`
+	if !strings.Contains(agents[0].Output, want) {
+		t.Fatalf("expected provider to see %s, got agent output %q", want, agents[0].Output)
+	}
+}
+
+// TestWorkflowRunAllowNetworkFlag verifies the operator ceiling wires end to
+// end: --allow-network on `workflow run` lets a network: true agent through
+// (provider sees PALLIUM_WORKFLOW_NETWORK=1), the ceiling is stored on the
+// run, and a plain resume preserves it (persists like AgentTimeout).
+func TestWorkflowRunAllowNetworkFlag(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	setupNetworkProvider(t, tmp)
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	scriptPath := filepath.Join(tmp, "workflow.js")
+	if err := os.WriteFile(scriptPath, []byte(`return agent("go", { provider: "net", mode: "read-only", label: "netter", network: true });`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{
+		"run", "--id", "wf-net-run", "--db", dbPath, "--cwd", tmp,
+		"--script", scriptPath, "--allow-network", "net test",
+	}, false); err != nil {
+		t.Fatalf("run with --allow-network failed: %v", err)
+	}
+	assertNetworkRun(t, dbPath, "wf-net-run", true, "1")
+
+	// Resume without the flag must keep the stored ceiling, not silently drop
+	// it back to sandboxed.
+	out.Reset()
+	if err := runWorkflow(&out, []string{"resume", "wf-net-run", "--db", dbPath}, false); err != nil {
+		t.Fatalf("resume failed: %v", err)
+	}
+	assertNetworkRun(t, dbPath, "wf-net-run", true, "1")
+}
+
+// TestWorkflowRunNetworkDefaultOff guards the safe default: without
+// --allow-network, a network: true agent still runs sandboxed
+// (PALLIUM_WORKFLOW_NETWORK=0) and the run records no ceiling.
+func TestWorkflowRunNetworkDefaultOff(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	setupNetworkProvider(t, tmp)
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	scriptPath := filepath.Join(tmp, "workflow.js")
+	if err := os.WriteFile(scriptPath, []byte(`return agent("go", { provider: "net", mode: "read-only", label: "netter", network: true });`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{
+		"run", "--id", "wf-net-off", "--db", dbPath, "--cwd", tmp,
+		"--script", scriptPath, "net test",
+	}, false); err != nil {
+		t.Fatalf("run without --allow-network failed: %v", err)
+	}
+	assertNetworkRun(t, dbPath, "wf-net-off", false, "0")
+}
