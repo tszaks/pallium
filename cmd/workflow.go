@@ -1899,6 +1899,9 @@ func renderWorkflowGC(result workflowGCResult) string {
 
 func renderWorkflowResult(snapshot workflow.Snapshot, result string) string {
 	text := renderWorkflowSnapshot(snapshot)
+	if failures := renderWorkflowFailures(snapshot.Run.Failures); len(failures) > 0 {
+		text += "\n" + strings.Join(failures, "\n")
+	}
 	if result != "" {
 		text += "\n\nResult:\n" + result
 	}
