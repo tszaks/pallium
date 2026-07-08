@@ -1433,10 +1433,7 @@ func (r *Runner) runAgentAtCallIndex(ctx context.Context, prompt string, opts Ag
 	if mode == "" {
 		mode = "read-only"
 	}
-	provider := strings.TrimSpace(opts.Provider)
-	if provider == "" || provider == "default" {
-		provider = "codex"
-	}
+	provider := ResolveProvider("", opts.Provider)
 	if provider == "internal" {
 		// "internal" is reserved for registerUntilGreenPatch's own
 		// bookkeeping rows, which Store.AgentUsage excludes from the
@@ -2262,7 +2259,7 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 		}
 		return strings.ReplaceAll(stub, "{{PROMPT}}", agent.Prompt), patchPath, worktree, nil
 	}
-	provider := firstNonEmpty(agent.Provider, opts.Provider, "codex")
+	provider := ResolveProvider(agent.Provider, opts.Provider)
 	repoRoot := firstNonEmpty(agent.Repo, r.Run.CWD)
 	cwd := repoRoot
 	worktree := ""
@@ -2283,11 +2280,21 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 	outFile := filepath.Join(tmpDir, "last-message.txt")
 	if provider != "codex" {
 		command := strings.TrimSpace(os.Getenv(providerCommandEnvName(provider)))
-		if command == "" {
+		// An explicitly configured wrapper command always wins. Otherwise
+		// "claude" gets a built-in invocation of the `claude` CLI so
+		// detection (see ResolveProvider) works with zero setup; any other
+		// unconfigured provider is still an error.
+		if command == "" && provider != "claude" {
 			return "", "", worktree, fmt.Errorf("workflow agent provider %q is not configured; set %s", provider, providerCommandEnvName(provider))
 		}
 		usageFile := filepath.Join(tmpDir, "usage.json")
-		output, err := r.runConfiguredProviderCommand(ctx, command, tmpDir, outFile, usageFile, cwd, agent.Prompt, agent, opts)
+		runProvider := func(runCtx context.Context, runPrompt string) (string, error) {
+			if command != "" {
+				return r.runConfiguredProviderCommand(runCtx, command, tmpDir, outFile, usageFile, cwd, runPrompt, agent, opts)
+			}
+			return r.runBuiltinClaudeCommand(runCtx, usageFile, cwd, runPrompt, agent, opts)
+		}
+		output, err := runProvider(ctx, agent.Prompt)
 		usageRaw, usage := readAndRemoveAgentUsage(usageFile)
 		// If the first attempt's own reported cost already exhausts the
 		// budget, skip the (paid) corrective retry entirely rather than
@@ -2308,7 +2315,7 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 			// effects twice; they fail schema validation immediately instead.
 			if _, schemaErr := parseAgentOutputWithSchema(output, opts.Schema); schemaErr != nil && isReadOnlyAgentMode(agent.Mode) {
 				_ = os.Remove(outFile)
-				retryOutput, retryErr := r.runConfiguredProviderCommand(ctx, command, tmpDir, outFile, usageFile, cwd, buildSchemaRetryPrompt(agent.Prompt, schemaErr), agent, opts)
+				retryOutput, retryErr := runProvider(ctx, buildSchemaRetryPrompt(agent.Prompt, schemaErr))
 				// Usage is read after each invocation (the file is removed in
 				// between), so the retry's cost adds to attempt one instead of
 				// overwriting it.
@@ -2429,7 +2436,10 @@ func (r *Runner) runConfiguredProviderCommand(ctx context.Context, command, tmpD
 		"PALLIUM_WORKFLOW_MODEL="+agent.Model,
 		"PALLIUM_WORKFLOW_REPO="+agent.Repo,
 		"PALLIUM_WORKFLOW_CWD="+cwd,
-		"PALLIUM_WORKFLOW_PROMPT="+prompt,
+		// The prompt is passed ONLY via the file below, never inline in the
+		// environment: a large prompt (a diff, a pasted log) would push the
+		// exec argv+env block past ARG_MAX and fail the spawn with E2BIG
+		// ("argument list too long"). Wrappers read PALLIUM_WORKFLOW_PROMPT_FILE.
 		"PALLIUM_WORKFLOW_PROMPT_FILE="+promptFile,
 		"PALLIUM_WORKFLOW_OUTPUT_FILE="+outFile,
 		"PALLIUM_WORKFLOW_SCHEMA_FILE="+schemaFile,
