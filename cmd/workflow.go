@@ -511,6 +511,13 @@ func runWorkflowTriggerRun(out io.Writer, args []string, jsonOutput bool) error 
 		_ = store.Close()
 		return err
 	}
+	// Persist the fingerprint before launching so concurrent invokers and
+	// watch cycles see the change as consumed. If the launch fails before a
+	// run row is created, the previous state is restored below so the next
+	// cycle retries; a run that starts and then fails mid-run keeps the
+	// fingerprint consumed.
+	prevRunID := trigger.LastRunID
+	prevFingerprint := trigger.LastFingerprint
 	if err := store.SetTriggerRun(trigger.Name, *runID, fingerprint); err != nil {
 		_ = store.Close()
 		return err
@@ -531,7 +538,20 @@ func runWorkflowTriggerRun(out io.Writer, args []string, jsonOutput bool) error 
 		runArgs = append(runArgs, "--args", trigger.ArgsJSON)
 	}
 	runArgs = append(runArgs, trigger.Task)
-	return runWorkflowRun(out, runArgs[1:], jsonOutput)
+	if runErr := runWorkflowRun(out, runArgs[1:], jsonOutput); runErr != nil {
+		// Restore the previous trigger state only when the run never
+		// started (no run row exists), so the missed change fires again.
+		store, err := workflow.Open(*dbPath)
+		if err != nil {
+			return runErr
+		}
+		if _, lookupErr := store.Run(*runID); lookupErr == sql.ErrNoRows {
+			_ = store.SetTriggerRun(trigger.Name, prevRunID, prevFingerprint)
+		}
+		_ = store.Close()
+		return runErr
+	}
+	return nil
 }
 
 type workflowTriggerWatchResult struct {

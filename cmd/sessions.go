@@ -226,7 +226,7 @@ func runSessionsList(out io.Writer, args []string, jsonOutput bool) error {
 }
 
 func runSessionsSearch(out io.Writer, args []string, jsonOutput bool) error {
-	if hasHelpArg(args) {
+	if hasHelpQuery(args) {
 		printSessionsHelp(out)
 		return nil
 	}
@@ -302,7 +302,7 @@ func runSessionsRelated(out io.Writer, args []string, jsonOutput bool) error {
 }
 
 func runSessionsGrep(out io.Writer, args []string, jsonOutput bool) error {
-	if hasHelpArg(args) {
+	if hasHelpQuery(args) {
 		printSessionsHelp(out)
 		return nil
 	}
@@ -390,7 +390,7 @@ func runSessionsEmbed(out io.Writer, args []string, jsonOutput bool) error {
 }
 
 func runSessionsSemantic(out io.Writer, args []string, jsonOutput bool) error {
-	if hasHelpArg(args) {
+	if hasHelpQuery(args) {
 		printSessionsHelp(out)
 		return nil
 	}
@@ -550,6 +550,16 @@ func reorderSessionFlags(args []string, valueFlags, boolFlags map[string]struct{
 
 func hasHelpArg(args []string) bool {
 	return slices.Contains(args, "help") || slices.Contains(args, "-h") || slices.Contains(args, "--help")
+}
+
+// hasHelpQuery is for commands whose positional arguments form a free-text
+// query: the literal word "help" only counts when it is the sole argument, so
+// queries like `sessions search help with auth` still run a search.
+func hasHelpQuery(args []string) bool {
+	if len(args) == 1 && args[0] == "help" {
+		return true
+	}
+	return slices.Contains(args, "-h") || slices.Contains(args, "--help")
 }
 
 type multiStringFlag []string

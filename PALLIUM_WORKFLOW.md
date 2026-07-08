@@ -91,7 +91,12 @@ the count and bytes freed, and prunes stale git worktree metadata. Failed runs
 are resumable, so their workflow.js and patches are kept unless
 `--include-failed` is passed.
 
-Non-Codex providers: `PALLIUM_WORKFLOW_PROVIDER_<NAME>_COMMAND`
+Non-Codex providers: `PALLIUM_WORKFLOW_PROVIDER_<NAME>_COMMAND`. Reference
+wrappers (Claude Code, Gemini CLI) and the full environment contract live in
+[`providers/README.md`](providers/README.md). Model selection is still
+per-call: pass `model` to `agent()` and the wrapper maps it to
+`PALLIUM_WORKFLOW_MODEL`; leave it out and the worker runs its CLI's own
+default model, not necessarily the guiding agent's.
 
 Provider commands receive `PALLIUM_WORKFLOW_PROMPT_FILE`, `PALLIUM_WORKFLOW_OUTPUT_FILE`, `PALLIUM_WORKFLOW_SCHEMA_FILE`, and `PALLIUM_WORKFLOW_USAGE_FILE`. A provider may write `{"input_tokens":N,"output_tokens":N,"cost_usd":X}` to the usage file; the reported `cost_usd` replaces the flat per-agent estimate for that agent (including budget accounting) and the raw JSON is persisted on the agent record as `usage_json`. The usage file is read (and removed) after each provider invocation, so when the corrective schema retry runs, `cost_usd` and token counts are summed across both attempts. Unreadable or absent usage files are ignored.
 
