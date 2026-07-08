@@ -2,7 +2,7 @@
 
 This file is written for AI agents. It answers three questions: what Pallium is, when to reach for it, and which capability to reach for. For workflow-script details, read `PALLIUM_WORKFLOW.md` after this.
 
-Pallium is a local-first control plane for coding agents. It keeps orchestration, repo memory, verification, and run state **outside** your context window, in a CLI plus SQLite store, so long or multi-agent work survives context limits, session restarts, and model switches. Workers are provider-agnostic: they adopt whatever model the guiding agent uses (see `providers/README.md`).
+Pallium is a local-first control plane for coding agents. It keeps orchestration, repo memory, verification, and run state **outside** your context window, in a CLI plus SQLite store, so long or multi-agent work survives context limits, session restarts, and model switches. Workers default to Codex; other CLIs (Claude Code, Gemini) plug in via a wrapper script and the `provider` option on `agent()` — see `providers/README.md` for the environment contract and reference wrappers.
 
 ## When to use Pallium
 

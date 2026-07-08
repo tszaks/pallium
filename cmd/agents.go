@@ -48,11 +48,13 @@ func runAgents(out io.Writer, args []string, jsonOutput bool) error {
 	}
 	switch args[0] {
 	case "guide":
-		_, err := fmt.Fprint(out, agentdocs.Guide)
-		return err
+		return output.Write(out, map[string]string{"guide": agentdocs.Guide}, jsonOutput, func() string {
+			return agentdocs.Guide
+		})
 	case "block":
-		_, err := fmt.Fprintln(out, agentsBlock)
-		return err
+		return output.Write(out, map[string]string{"block": agentsBlock}, jsonOutput, func() string {
+			return agentsBlock
+		})
 	case "install":
 		return runAgentsInstall(out, args[1:], jsonOutput)
 	default:
