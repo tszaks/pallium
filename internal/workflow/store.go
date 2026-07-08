@@ -264,6 +264,17 @@ WHERE id IN (SELECT id FROM ordered);
 `); err != nil {
 		return err
 	}
+	// Backfill agent_timeout_explicit for rows written before that column
+	// existed. Only rows from before this change can have a positive stored
+	// timeout with explicit=0 (every write path since always sets both
+	// together), so this only ever touches genuinely pre-upgrade rows and is
+	// a no-op once applied. Without it, a pre-upgrade run with a custom
+	// timeout would silently stop honoring it on resume and fall back to the
+	// 600s flag default, since resume only forwards the stored value when
+	// AgentTimeoutExplicit is true.
+	if _, err := s.db.Exec(`UPDATE workflow_runs SET agent_timeout_explicit=1 WHERE agent_timeout_seconds>0 AND COALESCE(agent_timeout_explicit,0)=0`); err != nil {
+		return err
+	}
 	return nil
 }
 
