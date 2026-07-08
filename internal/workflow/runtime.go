@@ -2352,7 +2352,17 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 			}
 			return "", "", "", err
 		}
-		cwd = worktree
+		// `git worktree add` always checks out the WHOLE repo, so `worktree`
+		// is the equivalent of the repo's top level, not of repoRoot itself.
+		// When the run was launched from a subdirectory (repoRoot is that
+		// subdirectory, not the git top level), landing the agent at
+		// `worktree` would silently relocate it to the repo root and lose the
+		// subdirectory it was meant to run in. worktreeSubdirCWD maps
+		// repoRoot's offset from the real top level onto the new worktree; it
+		// falls back to the worktree root if that mapping can't be computed
+		// (e.g. `git rev-parse` fails), which reproduces today's behavior
+		// rather than failing the run over a containment nicety.
+		cwd = r.worktreeSubdirCWD(repoRoot, worktree)
 	}
 
 	// A worktree that exists ONLY to contain a networked non-edit worker holds
@@ -2683,6 +2693,41 @@ func (r *Runner) worktreePath(agentID string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(root, agentID), nil
+}
+
+// worktreeSubdirCWD returns where an agent should run inside a freshly
+// created worktree so a launch from a repo subdirectory keeps working from
+// that same subdirectory rather than the repo's top level. `git worktree add`
+// always checks out the entire repository, so `worktree` corresponds to the
+// git top level, not to repoRoot: if repoRoot is itself a subdirectory (e.g.
+// the run's CWD wasn't the repo root), the equivalent path inside the new
+// worktree is worktree+<repoRoot's offset from the top level>, not worktree
+// itself. Symlinks are resolved on both sides before computing that offset
+// because git resolves them internally (macOS temp dirs are a common case:
+// /var is a symlink to /private/var), and an unresolved mismatch would send
+// filepath.Rel down the wrong path or report a spurious "..". Any failure
+// (git not runnable, path outside the repo) falls back to the worktree root,
+// which matches the pre-fix behavior instead of failing the run.
+func (r *Runner) worktreeSubdirCWD(repoRoot, worktree string) string {
+	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	cmd.Dir = repoRoot
+	out, err := cmd.Output()
+	if err != nil {
+		return worktree
+	}
+	top, err := filepath.EvalSymlinks(strings.TrimSpace(string(out)))
+	if err != nil {
+		return worktree
+	}
+	absRepoRoot, err := filepath.EvalSymlinks(repoRoot)
+	if err != nil {
+		return worktree
+	}
+	rel, err := filepath.Rel(top, absRepoRoot)
+	if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
+		return worktree
+	}
+	return filepath.Join(worktree, rel)
 }
 
 func (r *Runner) createWorktree(agentID, repoRoot string) (string, error) {

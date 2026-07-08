@@ -130,27 +130,26 @@ EDIT_HARD_TOOLS="Read,Grep,Glob,LS,Bash,Edit,Write"
 # Network access is OFF by default. Pallium sets PALLIUM_WORKFLOW_NETWORK=1
 # only when this agent both requested `network: true` AND the run was started
 # with `--allow-network` (the operator ceiling); it is "0" otherwise. When
-# granted, expose networked tools — but scoped by mode, because only "edit"
-# runs in an isolated worktree; test/check/read-only run against the LIVE
-# checkout.
-#
-# Non-edit modes (read-only/test/check) get ONLY WebFetch: Claude's native,
-# side-effect-free fetch. They deliberately do NOT get raw `Bash(curl:*)` or
-# `Bash(gh:*)` — on a live checkout those are prefix matches that enable raw
-# exfiltration (`curl -d @secret host`) and write operations (`gh api -X POST`,
-# `curl -o` clobbering a tracked file). The broader curl/gh escape hatch is
-# reserved for "edit" mode, whose blast radius is a disposable worktree.
+# granted, expose ONLY WebFetch — Claude's native, side-effect-free fetch —
+# for EVERY mode, including "edit". Raw `Bash(curl:*)`/`Bash(gh:*)` used to be
+# granted to "edit" on the theory that its worktree contains the blast radius,
+# but the worktree is a `cwd` change, not an OS-level network sandbox: it
+# limits which FILES an agent can touch, not what a process launched from
+# inside it can reach or exfiltrate over the network. A prompt-injected edit
+# agent with raw curl/gh could read anything in its worktree (or the wider
+# host, since nothing here sandboxes network egress at the OS level) and POST
+# it out, or run `gh api -X POST` against the operator's real GitHub account.
+# WebFetch has no such escape hatch, so it's the only networked tool granted
+# anywhere.
 #
 # WebFetch is also added to the hard `--tools` set below because `--tools` is a
 # hard cap on which built-in tools exist at all — listing WebFetch only in
 # --allowedTools would leave it unavailable. The mode-based filesystem gating
 # (Edit/Write still denied for non-edit modes) is left intact; network only
 # widens egress, not write scope.
-NET_EDIT_TOOLS=""
-NET_NONEDIT_TOOLS=""
+NET_TOOLS=""
 if [ "${PALLIUM_WORKFLOW_NETWORK:-0}" = "1" ]; then
-  NET_NONEDIT_TOOLS=",WebFetch"
-  NET_EDIT_TOOLS=",WebFetch,Bash(gh:*),Bash(curl:*)"
+  NET_TOOLS=",WebFetch"
   NON_EDIT_HARD_TOOLS="$NON_EDIT_HARD_TOOLS,WebFetch"
   EDIT_HARD_TOOLS="$EDIT_HARD_TOOLS,WebFetch"
 fi
@@ -159,7 +158,26 @@ HARDENING_ARGS=(--safe-mode --setting-sources user --strict-mcp-config)
 NON_EDIT_ISOLATION_ARGS=("${HARDENING_ARGS[@]}" --permission-mode plan --tools "$NON_EDIT_HARD_TOOLS")
 case "${PALLIUM_WORKFLOW_MODE:-read-only}" in
   edit)
-    PERM_ARGS=("${HARDENING_ARGS[@]}" --tools "$EDIT_HARD_TOOLS" --permission-mode acceptEdits --allowedTools "$EDIT_TOOLS$NET_EDIT_TOOLS")
+    # EDIT_HARD_TOOLS keeps bare, unscoped "Bash" in the hard --tools set
+    # (verified empirically: --tools only recognizes plain tool names like
+    # "Bash", not "Bash(cmd:*)" patterns — passing a patterned entry there
+    # silently drops the whole Bash tool, which would break go build/test/vet
+    # too). That means --allowedTools' toolchain scoping alone does not stop
+    # an out-of-allowlist Bash command: verified empirically that under
+    # --permission-mode acceptEdits, a `curl` call not present in
+    # --allowedTools still executed with zero permission_denials, because
+    # acceptEdits only guarantees auto-accept for file edits, not a hard deny
+    # for everything else (same gap already documented above for
+    # manual/dontAsk/default). --disallowedTools is what actually closes it:
+    # verified empirically that adding `Bash(curl:*),Bash(gh:*)` there blocks
+    # both with an explicit permission denial even under acceptEdits, while
+    # leaving allowlisted commands like `go build` unaffected. Applied
+    # unconditionally (not just when networked), since bare Bash already
+    # permits curl/gh regardless of PALLIUM_WORKFLOW_NETWORK — that env var is
+    # only this wrapper's own tool-scoping signal, not an OS-level network
+    # block, so the exfiltration channel exists whether or not this run
+    # requested network.
+    PERM_ARGS=("${HARDENING_ARGS[@]}" --tools "$EDIT_HARD_TOOLS" --permission-mode acceptEdits --allowedTools "$EDIT_TOOLS$NET_TOOLS" --disallowedTools "Bash(curl:*),Bash(gh:*)")
     ;;
   test|check)
     # NOTE: npm test/pytest execute the repo's own test code, which is
@@ -171,10 +189,10 @@ case "${PALLIUM_WORKFLOW_MODE:-read-only}" in
     # the run a disposable checkout; it doesn't and can't limit the test
     # code itself. Only use test/check against repos whose test code you
     # trust, and prefer isolation: "worktree" for anything you don't.
-    PERM_ARGS=("${NON_EDIT_ISOLATION_ARGS[@]}" --allowedTools "$TEST_TOOLS$NET_NONEDIT_TOOLS" --disallowedTools "Edit,Write,NotebookEdit")
+    PERM_ARGS=("${NON_EDIT_ISOLATION_ARGS[@]}" --allowedTools "$TEST_TOOLS$NET_TOOLS" --disallowedTools "Edit,Write,NotebookEdit")
     ;;
   *)
-    PERM_ARGS=("${NON_EDIT_ISOLATION_ARGS[@]}" --allowedTools "$READ_TOOLS$NET_NONEDIT_TOOLS" --disallowedTools "Edit,Write,NotebookEdit")
+    PERM_ARGS=("${NON_EDIT_ISOLATION_ARGS[@]}" --allowedTools "$READ_TOOLS$NET_TOOLS" --disallowedTools "Edit,Write,NotebookEdit")
     ;;
 esac
 
