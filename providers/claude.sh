@@ -58,51 +58,83 @@ fi
 # side-effecting MCP tool) — that config would still apply underneath
 # --allowedTools, since it only pre-approves, it doesn't define the
 # available set. `--tools` is a hard restriction on which built-in tools
-# exist for the session at all, so Edit/Write/NotebookEdit and anything else
-# not listed simply aren't available. `--strict-mcp-config` (with no
-# --mcp-config given) loads zero MCP servers, closing the same gap for a
-# pre-approved MCP tool. But `--tools` only restricts at the tool-category
-# level — it can't stop a project's own `.claude/settings.json` from
-# pre-approving a broader Bash pattern (or defining a SessionStart hook that
-# runs before any of this gating even applies), since that config is still
-# loaded and merged by default. `--setting-sources user` closes that: it
-# tells Claude to load ONLY the user's own global settings, never the
-# project's `.claude/settings.json` or a `.claude/settings.local.json` in
-# the checkout, so a malicious/compromised repo can't inject either a Bash
-# allow rule or a hook into a "read-only" session. `--safe-mode` adds a
-# second layer disabling hooks/plugins/custom commands generally.
+# exist for the session at all, so anything not listed simply isn't
+# available. `--strict-mcp-config` (with no --mcp-config given) loads zero
+# MCP servers, closing the same gap for a pre-approved MCP tool. But
+# `--tools` only restricts at the tool-category level — it can't stop a
+# project's own `.claude/settings.json` from pre-approving a broader Bash
+# pattern (or defining a SessionStart hook that runs before any of this
+# gating even applies), since that config is still loaded and merged by
+# default. `--setting-sources user` closes that: it tells Claude to load
+# ONLY the user's own global settings, never the project's
+# `.claude/settings.json` or a `.claude/settings.local.json` in the
+# checkout, so a malicious/compromised repo can't inject either a Bash
+# allow rule or a hook. `--safe-mode` adds a second layer disabling hooks/
+# plugins/custom commands generally. Applied to ALL modes, including
+# "edit": Pallium's worktree isolation only gives edit agents a disposable
+# checkout, it doesn't sandbox a hook/MCP process the repo's own config
+# could launch, which could still reach outside the worktree onto the real
+# host — isolation limits blast radius for the model's own actions, not
+# for a project config that runs before the model does anything. Verified
+# this doesn't break edit mode's actual purpose: a live test with all of
+# --safe-mode/--setting-sources user/--strict-mcp-config/--tools added
+# still successfully created a file via Edit/Write and returned normal
+# output. Trade-off worth knowing: --safe-mode also disables reading the
+# project's CLAUDE.md, so an edit agent loses that convention/context too.
 #
-# `--permission-mode plan` is also required here, and this reverses an
-# earlier decision in this file to avoid it. Verified empirically: even
-# with --tools/--strict-mcp-config/--setting-sources/--disallowedTools all
-# present, if the *effective* permission mode ends up being something
-# permissive (e.g. the invoking user's own ~/.claude/settings.json sets
-# permissions.defaultMode to bypassPermissions or auto — a setting
-# --setting-sources user deliberately still honors, since it's the user's
-# own trusted config), an out-of-allowlist Bash command (e.g. a bare
-# `touch file`) still executes; --disallowedTools alone does not stop this
-# because it only denies the tools explicitly listed there (Edit/Write/
-# NotebookEdit), not arbitrary Bash. --permission-mode plan is the only
-# mode that reliably fails an unapproved action closed regardless of the
-# effective default: verified it still runs already-allowlisted commands
-# normally (a plain read-only query, and an allowlisted `go vet` test
-# command, both completed and returned real output), while a request to
-# write an unapproved file was refused with a plain-text explanation
-# instead of executing. `manual`/`dontAsk`/`default` were all tested and do
-# NOT reliably block this the same way.
+# `--permission-mode plan` (read-only/test/check only) is also required,
+# and this reverses an earlier decision in this file to avoid it. Verified
+# empirically: even with --tools/--strict-mcp-config/--setting-sources/
+# --disallowedTools all present, if the *effective* permission mode ends
+# up being something permissive (e.g. the invoking user's own
+# ~/.claude/settings.json sets permissions.defaultMode to bypassPermissions
+# or auto — a setting --setting-sources user deliberately still honors,
+# since it's the user's own trusted config), an out-of-allowlist Bash
+# command (e.g. a bare `touch file`) still executes; --disallowedTools
+# alone does not stop this because it only denies the tools explicitly
+# listed there (Edit/Write/NotebookEdit), not arbitrary Bash.
+# --permission-mode plan is the only mode that reliably fails an unapproved
+# action closed regardless of the effective default: verified it still
+# runs already-allowlisted commands normally (a plain read-only query, and
+# an allowlisted `go vet` test command, both completed and returned real
+# output), while a request to write an unapproved file was refused with a
+# plain-text explanation instead of executing. `manual`/`dontAsk`/`default`
+# were all tested and do NOT reliably block this the same way. Not used
+# for "edit", which needs acceptEdits to actually write without prompting.
+#
+# `go build`/`go test`/`go vet` were dropped from the non-isolated
+# TEST_TOOLS allowlist for the same unfixable-by-prefix reason as
+# find/gofmt/rg: verified empirically that neither a wildcard pattern
+# (`Bash(go test:*)`) nor an exact-looking one with no trailing `:*`
+# (`Bash(go test ./...)`) stops extra flags from being appended and
+# executed — `go test ./... -exec /bin/echo` still ran under both
+# --permission-mode plan and --permission-mode default with only
+# `Bash(go test ./...)` allowed, proving Claude's Bash pattern matching is
+# a prefix match regardless of a trailing wildcard, not an anchored exact
+# match. `go build -toolexec`/`-o`, `go test -exec`/`-o`/profile-output
+# flags, and `go vet -vettool` can all write or execute arbitrary things,
+# so there is no pattern that allows the safe form without also allowing
+# the dangerous one. They remain available in EDIT_TOOLS (isolated
+# worktree, where the model already has full Edit/Write access and the
+# blast radius is a disposable checkout) but not in the live-checkout
+# TEST_TOOLS. npm test/pytest stay in TEST_TOOLS — Go-specific test/check
+# workers on a live checkout currently have no safe built-in test-runner
+# entry; add one only behind a real sandbox, not a Bash allowlist pattern.
 # Adjust the allowlist for your stack.
 READ_TOOLS="Read,Grep,Glob,LS,Bash(ls:*),Bash(cat:*),Bash(grep:*),Bash(wc:*),Bash(go doc:*)"
-TEST_TOOLS="$READ_TOOLS,Bash(go test:*),Bash(go build:*),Bash(go vet:*),Bash(npm test:*),Bash(pytest:*)"
-EDIT_TOOLS="$TEST_TOOLS,Edit,Write"
+TEST_TOOLS="$READ_TOOLS,Bash(npm test:*),Bash(pytest:*)"
+EDIT_TOOLS="$TEST_TOOLS,Bash(go test:*),Bash(go build:*),Bash(go vet:*),Edit,Write"
 NON_EDIT_HARD_TOOLS="Read,Grep,Glob,LS,Bash"
-NON_EDIT_ISOLATION_ARGS=(--safe-mode --setting-sources user --permission-mode plan --tools "$NON_EDIT_HARD_TOOLS" --strict-mcp-config)
+EDIT_HARD_TOOLS="Read,Grep,Glob,LS,Bash,Edit,Write"
+HARDENING_ARGS=(--safe-mode --setting-sources user --strict-mcp-config)
+NON_EDIT_ISOLATION_ARGS=("${HARDENING_ARGS[@]}" --permission-mode plan --tools "$NON_EDIT_HARD_TOOLS")
 case "${PALLIUM_WORKFLOW_MODE:-read-only}" in
   edit)
-    PERM_ARGS=(--permission-mode acceptEdits --allowedTools "$EDIT_TOOLS")
+    PERM_ARGS=("${HARDENING_ARGS[@]}" --tools "$EDIT_HARD_TOOLS" --permission-mode acceptEdits --allowedTools "$EDIT_TOOLS")
     ;;
   test|check)
-    # NOTE: go test/npm test/pytest execute the repo's own test code, which
-    # is inherently capable of doing anything the language runtime can do
+    # NOTE: npm test/pytest execute the repo's own test code, which is
+    # inherently capable of doing anything the language runtime can do
     # (writing files, deleting things, network calls) — that's true of any
     # test suite, isolated or not, and no allowlist or permission-mode can
     # change it without breaking the ability to actually run the tests.
