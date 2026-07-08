@@ -2382,179 +2382,78 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 	}
 	defer os.RemoveAll(tmpDir)
 	outFile := filepath.Join(tmpDir, "last-message.txt")
-	if provider != "codex" {
-		command := strings.TrimSpace(os.Getenv(providerCommandEnvName(provider)))
-		// An explicitly configured wrapper command always wins. Otherwise
-		// "claude" gets a built-in invocation of the `claude` CLI so
-		// detection (see ResolveProvider) works with zero setup; any other
-		// unconfigured provider is still an error.
-		if command == "" && provider != "claude" {
-			return "", "", worktree, fmt.Errorf("workflow agent provider %q is not configured; set %s", provider, providerCommandEnvName(provider))
-		}
-		usageFile := filepath.Join(tmpDir, "usage.json")
-		runProvider := func(runCtx context.Context, runPrompt string) (string, error) {
-			if command != "" {
-				return r.runConfiguredProviderCommand(runCtx, command, tmpDir, outFile, usageFile, cwd, runPrompt, agent, opts, networkAllowed)
-			}
-			// The built-in claude provider runs under its own tool allowlist
-			// (curl/gh denied) and does not yet honor network:true; a networked
-			// claude worker therefore runs without raw egress rather than more.
-			return r.runBuiltinClaudeCommand(runCtx, usageFile, cwd, runPrompt, agent, opts)
-		}
-		output, err := runProvider(ctx, agent.Prompt)
-		usageRaw, usage := readAndRemoveAgentUsage(usageFile)
-		// If the first attempt's own reported cost already exhausts the
-		// budget, skip the (paid) corrective retry entirely rather than
-		// billing a second call before the caller ever gets a chance to
-		// check: the caller only applies this attempt's cost delta and
-		// checks it against the budget after runAgentCommand returns, which
-		// is too late to stop a retry that already started.
-		firstAttemptOverBudget := false
-		if cost, ok := usage["cost_usd"].(float64); ok && cost >= 0 {
-			r.mu.Lock()
-			firstAttemptOverBudget = r.budgetLimit > 0 && r.budgetSpent+(cost-r.agentCostUSD) > r.budgetLimit
-			r.mu.Unlock()
-		}
-		if err == nil && len(opts.Schema) > 0 && !firstAttemptOverBudget {
-			// The corrective retry re-executes the full provider command in
-			// the same cwd with no workspace reset, so it is limited to
-			// read-only agents. Edit/test/check agents could apply their side
-			// effects twice; they fail schema validation immediately instead.
-			if _, schemaErr := parseAgentOutputWithSchema(output, opts.Schema); schemaErr != nil && isReadOnlyAgentMode(agent.Mode) {
-				_ = os.Remove(outFile)
-				retryOutput, retryErr := runProvider(ctx, buildSchemaRetryPrompt(agent.Prompt, schemaErr))
-				// Usage is read after each invocation (the file is removed in
-				// between), so the retry's cost adds to attempt one instead of
-				// overwriting it.
-				if retryRaw, retryUsage := readAndRemoveAgentUsage(usageFile); retryUsage != nil {
-					if usage == nil {
-						usageRaw, usage = retryRaw, retryUsage
-					} else {
-						usage = mergeAgentUsage(usage, retryUsage)
-						usageRaw = ""
-					}
-				}
-				if retryErr != nil {
-					// The retry itself failed (nonzero exit, timeout, etc.).
-					// That failure is the real story here, not the stale
-					// schema-invalid output from the first attempt: surface it
-					// through the normal provider-command error path below
-					// instead of silently re-validating attempt one's output.
-					err = retryErr
+	usageFile := filepath.Join(tmpDir, "usage.json")
+	runProvider := func(runCtx context.Context, runPrompt string) (string, error) {
+		return r.runProviderCommand(runCtx, provider, tmpDir, outFile, usageFile, cwd, runPrompt, agent, opts, networkAllowed)
+	}
+	output, err := runProvider(ctx, agent.Prompt)
+	usageRaw, usage := readAndRemoveAgentUsage(usageFile)
+	// If the first attempt's own reported cost already exhausts the
+	// budget, skip the (paid) corrective retry entirely rather than
+	// billing a second call before the caller ever gets a chance to
+	// check: the caller only applies this attempt's cost delta and
+	// checks it against the budget after runAgentCommand returns, which
+	// is too late to stop a retry that already started.
+	firstAttemptOverBudget := false
+	if cost, ok := usage["cost_usd"].(float64); ok && cost >= 0 {
+		r.mu.Lock()
+		firstAttemptOverBudget = r.budgetLimit > 0 && r.budgetSpent+(cost-r.agentCostUSD) > r.budgetLimit
+		r.mu.Unlock()
+	}
+	if err == nil && len(opts.Schema) > 0 && !firstAttemptOverBudget {
+		// The corrective retry re-executes the full provider command in
+		// the same cwd with no workspace reset, so it is limited to
+		// read-only agents. Edit/test/check agents could apply their side
+		// effects twice; they fail schema validation immediately instead.
+		if _, schemaErr := parseAgentOutputWithSchema(output, opts.Schema); schemaErr != nil && isReadOnlyAgentMode(agent.Mode) {
+			_ = os.Remove(outFile)
+			retryOutput, retryErr := runProvider(ctx, buildSchemaRetryPrompt(agent.Prompt, schemaErr))
+			// Usage is read after each invocation (the file is removed in
+			// between), so the retry's cost adds to attempt one instead of
+			// overwriting it.
+			if retryRaw, retryUsage := readAndRemoveAgentUsage(usageFile); retryUsage != nil {
+				if usage == nil {
+					usageRaw, usage = retryRaw, retryUsage
 				} else {
-					output = retryOutput
+					usage = mergeAgentUsage(usage, retryUsage)
+					usageRaw = ""
 				}
 			}
-		}
-		if usage != nil {
-			if usageRaw == "" {
-				if raw, marshalErr := json.Marshal(usage); marshalErr == nil {
-					usageRaw = string(raw)
-				}
+			if retryErr != nil {
+				// The retry itself failed (nonzero exit, timeout, etc.).
+				// That failure is the real story here, not the stale
+				// schema-invalid output from the first attempt: surface it
+				// through the normal provider-command error path below
+				// instead of silently re-validating attempt one's output.
+				err = retryErr
+			} else {
+				output = retryOutput
 			}
-			agent.UsageJSON = usageRaw
-			if cost, ok := usage["cost_usd"].(float64); ok && cost >= 0 {
-				agent.EstimatedCostUSD = cost
+		}
+	}
+	if usage != nil {
+		if usageRaw == "" {
+			if raw, marshalErr := json.Marshal(usage); marshalErr == nil {
+				usageRaw = string(raw)
 			}
 		}
-		if err != nil {
-			return output, "", worktree, agentCommandError(ctx, timeout, err)
+		agent.UsageJSON = usageRaw
+		if cost, ok := usage["cost_usd"].(float64); ok && cost >= 0 {
+			agent.EstimatedCostUSD = cost
 		}
-		// Reached a clean provider exit: finalizeWorktreePatch now owns the
-		// worktree's disposition (discard for containment, capture for edit), so
-		// the error-path cleanup defer must stand down.
-		containmentWorktree = false
-		patchPath, err := r.finalizeWorktreePatch(agent, worktree, repoRoot)
-		if err != nil {
-			return output, "", worktree, err
-		}
-		return output, patchPath, worktree, nil
 	}
-	cmdArgs := []string{"exec", "--cd", cwd, "--output-last-message", outFile}
-	cmdArgs = append(cmdArgs, codexSandboxArgs(agent.Mode, networkAllowed)...)
-	if opts.Model != "" {
-		cmdArgs = append(cmdArgs, "--model", opts.Model)
-	}
-	if len(opts.Schema) > 0 {
-		schemaPath := filepath.Join(tmpDir, "schema.json")
-		normalizedSchema := normalizeSchema(opts.Schema)
-		raw, err := json.MarshalIndent(normalizedSchema, "", "  ")
-		if err != nil {
-			return "", "", worktree, err
-		}
-		if err := os.WriteFile(schemaPath, raw, 0o644); err != nil {
-			return "", "", worktree, err
-		}
-		cmdArgs = append(cmdArgs, "--output-schema", schemaPath)
-	}
-	cmdArgs = append(cmdArgs, agent.Prompt)
-	cmd := exec.CommandContext(ctx, r.CodexBinary, cmdArgs...)
-	cmd.Dir = cwd
-	cmd.WaitDelay = 5 * time.Second
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return "", "", worktree, agentCommandError(ctx, timeout, fmt.Errorf("codex agent failed: %w: %s", err, strings.TrimSpace(stderr.String())))
-	}
-	raw, err := os.ReadFile(outFile)
 	if err != nil {
-		return "", "", worktree, err
+		return output, "", worktree, agentCommandError(ctx, timeout, err)
 	}
-	output := strings.TrimSpace(string(raw))
-	// Reached a clean codex exit: finalizeWorktreePatch now owns the worktree's
-	// disposition (discard for containment, capture for edit), so the error-path
-	// cleanup defer must stand down.
+	// Reached a clean provider exit: finalizeWorktreePatch now owns the
+	// worktree's disposition (discard for containment, capture for edit), so
+	// the error-path cleanup defer must stand down.
 	containmentWorktree = false
 	patchPath, err := r.finalizeWorktreePatch(agent, worktree, repoRoot)
 	if err != nil {
 		return output, "", worktree, err
 	}
 	return output, patchPath, worktree, nil
-}
-
-// codexSandboxArgs returns the `codex exec` sandbox flags for an agent.
-//
-// Default (no network): edit/test/check get workspace-write, everything else
-// read-only. Neither of these grants network egress, which is the safe
-// baseline — no worker can reach the network unless the operator explicitly
-// opted the run in.
-//
-// When network is allowed we want the most-scoped sandbox that still grants
-// egress. Codex v0.142.5 exposes a granular per-mode toggle: with
-// `--sandbox workspace-write` the filesystem stays scoped to the workspace,
-// and `-c sandbox_workspace_write.network_access=true` enables the network
-// without falling back to the far broader `--sandbox danger-full-access`
-// (which would also allow writes anywhere on the host). Evidence, from the
-// bundled codex binary's own help/config text:
-//
-//	"In `workspace-write`, network access still depends on your Codex
-//	 configuration (for example `[sandbox_workspace_write] network_access = true`)."
-//
-// So a networked worker is still confined to the workspace for filesystem
-// writes. A read-only agent that opts into network is therefore upgraded to
-// workspace-write (read-only has no per-mode network toggle) — the minimal
-// scope that can carry egress.
-//
-// The non-network workspace-write path (edit/test/check) must ALSO pin the
-// toggle, explicitly to false. Codex resolves `network_access` from the
-// operator's ambient ~/.codex/config.toml when the flag is absent, so a bare
-// `--sandbox workspace-write` would silently inherit
-// `[sandbox_workspace_write] network_access = true` and hand a worker egress
-// with no --allow-network and no network:true — defeating the safe default.
-// Forcing `-c sandbox_workspace_write.network_access=false` makes Pallium's
-// lockdown authoritative regardless of ambient config. Verified against codex
-// v0.142.5: the flag is accepted, and with an ambient config setting the key
-// true the explicit `=false` override resolves to network-disabled (a
-// sandboxed connect attempt is refused). read-only has no network regardless,
-// so it needs no pin.
-func codexSandboxArgs(mode string, networkAllowed bool) []string {
-	if networkAllowed {
-		return []string{"--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"}
-	}
-	if mode == "edit" || mode == "test" || mode == "check" {
-		return []string{"--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=false"}
-	}
-	return []string{"--sandbox", "read-only"}
 }
 
 func (r *Runner) runConfiguredProviderCommand(ctx context.Context, command, tmpDir, outFile, usageFile, cwd, prompt string, agent *Agent, opts AgentOptions, networkAllowed bool) (string, error) {
