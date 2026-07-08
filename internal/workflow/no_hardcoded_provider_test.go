@@ -28,7 +28,12 @@ var allowedProviderExecFiles = map[string]bool{
 // providerBinaryIndicatorRe matches an exec.Command/exec.CommandContext
 // call's argument text that names a codex or claude binary, whether via a Go
 // identifier (r.CodexBinary, claudeCLIName, codexBinary) or a bare string
-// literal ("codex", "claude").
+// literal ("codex", "claude"). Known limitation: it only inspects the call
+// text itself, so a codex exec laundered through an opaquely-named local
+// (bin := codexPath(); exec.Command(bin, ...)) would slip past. That is a
+// deliberate exec obfuscation, not the accidental copy-paste regression this
+// tripwire guards against; the realistic reintroduction — exec.Command(
+// codexBinary/"codex"/r.CodexBinary, ...) — is caught.
 var providerBinaryIndicatorRe = regexp.MustCompile(`(?i)codex|claude`)
 
 // TestNoHardcodedProviderExecOutsideProviderFiles walks every non-test .go
