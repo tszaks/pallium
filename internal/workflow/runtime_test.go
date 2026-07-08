@@ -3700,10 +3700,12 @@ func TestCodexSandboxArgsRespectsNetwork(t *testing.T) {
 	}
 }
 
-// TestAgentNetworkForcesWorktree covers FIX 2: a read-only agent that is
-// actually granted network (network:true on an --allow-network run) must be
-// forced into an isolated worktree, because network forces workspace-write
-// filesystem access that must never land on the operator's live checkout.
+// TestAgentNetworkForcesWorktree covers the containment guarantee for a
+// networked read-only agent: it is forced into an isolated worktree (network
+// forces workspace-write filesystem access that must never touch the live
+// checkout), AND any file it writes there is DISCARDED, not captured as a
+// patch and auto-applied to the operator's live repo at run completion. The
+// provider here writes a real repo file to prove the write is thrown away.
 func TestAgentNetworkForcesWorktree(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	tmp := t.TempDir()
@@ -3716,10 +3718,12 @@ func TestAgentNetworkForcesWorktree(t *testing.T) {
 	runGit(t, tmp, "add", "README.md")
 	runGit(t, tmp, "commit", "-m", "initial")
 
-	// Provider records the cwd it actually ran in so we can prove the worker
-	// did not execute in the live repo root.
+	// Provider writes a real file into its cwd (simulating a prompt-injected
+	// networked worker dropping a payload) and records the cwd it ran in, so we
+	// can prove both that it ran in an isolated worktree and that its write was
+	// discarded rather than applied to the live repo.
 	provider := filepath.Join(tmp, "cwd-provider.sh")
-	if err := os.WriteFile(provider, []byte("#!/bin/sh\nprintf '{\"ok\":true,\"cwd\":\"%s\"}' \"$PALLIUM_WORKFLOW_CWD\" > \"$PALLIUM_WORKFLOW_OUTPUT_FILE\"\n"), 0o755); err != nil {
+	if err := os.WriteFile(provider, []byte("#!/bin/sh\nprintf 'pwned by networked worker\\n' > \"$PALLIUM_WORKFLOW_CWD/payload.txt\"\nprintf '{\"ok\":true,\"cwd\":\"%s\"}' \"$PALLIUM_WORKFLOW_CWD\" > \"$PALLIUM_WORKFLOW_OUTPUT_FILE\"\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_CWD_COMMAND", provider)
@@ -3757,6 +3761,173 @@ func TestAgentNetworkForcesWorktree(t *testing.T) {
 	}
 	if !strings.Contains(agents[0].Output, `"cwd":"`+agents[0].Worktree+`"`) {
 		t.Fatalf("expected agent cwd to be worktree %q, output=%q", agents[0].Worktree, agents[0].Output)
+	}
+	// KEY containment guard: the worktree existed ONLY to contain the networked
+	// worker's forced workspace-write access. Execute() runs ApplyPatches at
+	// completion, so if this write had been captured as a patch it would now be
+	// in the live repo. It must not be.
+	if _, statErr := os.Stat(filepath.Join(tmp, "payload.txt")); !os.IsNotExist(statErr) {
+		t.Fatalf("networked read-only agent's worktree write leaked into the live repo (payload.txt present); want it discarded")
+	}
+	// No patch should have been captured for a containment-only worktree.
+	if agents[0].PatchPath != "" {
+		t.Fatalf("expected no patch for containment-only worktree, got %q", agents[0].PatchPath)
+	}
+	if !agents[0].Networked {
+		t.Fatalf("expected agent row to record networked=true")
+	}
+}
+
+// TestNetworkedEditAgentAppliesPatch is the regression guard for the other
+// side of the containment fix: an EDIT agent that also has network still has
+// genuine edit intent, so its worktree writes ARE captured as a patch and
+// applied to the live repo at completion. Network forcing the worktree must
+// not suppress a real edit agent's output.
+func TestNetworkedEditAgentAppliesPatch(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("root\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
+
+	provider := filepath.Join(tmp, "editnet-provider.sh")
+	if err := os.WriteFile(provider, []byte("#!/bin/sh\nprintf 'edited by agent\\n' > \"$PALLIUM_WORKFLOW_CWD/edited.txt\"\nprintf '{\"ok\":true}' > \"$PALLIUM_WORKFLOW_OUTPUT_FILE\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_EDITNET_COMMAND", provider)
+
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `return agent("go", { provider: "editnet", mode: "edit", isolation: "worktree", label: "editor", network: true });`
+	scriptPath, err := WriteRunScript("wf-net-edit", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-net-edit", Task: "net edit", CWD: tmp, ScriptPath: scriptPath, AllowNetwork: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil); err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(tmp, "edited.txt"))
+	if err != nil {
+		t.Fatalf("expected edit agent patch applied to live repo: %v", err)
+	}
+	if string(raw) != "edited by agent\n" {
+		t.Fatalf("unexpected applied content: %q", string(raw))
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].PatchPath == "" {
+		t.Fatalf("expected one agent with a captured patch, got %#v", agents)
+	}
+}
+
+// TestNetworkWorktreeRequiresGitRepo covers the improved error when network
+// forces a containment worktree but the run cwd is not a git repository. The
+// raw `git ... exit status 128` is replaced with actionable guidance.
+func TestNetworkWorktreeRequiresGitRepo(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir() // deliberately NOT a git repo
+	provider := filepath.Join(tmp, "ok-provider.sh")
+	if err := os.WriteFile(provider, []byte("#!/bin/sh\nprintf '{\"ok\":true}' > \"$PALLIUM_WORKFLOW_OUTPUT_FILE\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_OK_COMMAND", provider)
+
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `return agent("go", { provider: "ok", mode: "read-only", label: "netter", network: true });`
+	scriptPath, err := WriteRunScript("wf-net-nogit", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-net-nogit", Task: "net nogit", CWD: tmp, ScriptPath: scriptPath, AllowNetwork: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err == nil {
+		t.Fatal("expected error when networked run cwd is not a git repo")
+	}
+	if !strings.Contains(err.Error(), "network access requires the run to execute inside a git repository") {
+		t.Fatalf("expected actionable git-repo guidance, got %v", err)
+	}
+}
+
+// TestNetworkOffRerunIgnoresStaleNetworkedCache covers the completed-agent
+// cache identity: rerunning the same run-id via `workflow run` WITHOUT
+// --allow-network must NOT reuse output produced by an earlier networked run.
+// The operator believes the rerun is sandboxed, so it must actually re-run the
+// worker with network off rather than serving networked-origin output.
+func TestNetworkOffRerunIgnoresStaleNetworkedCache(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("root\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
+	writeNetworkProvider(t, tmp)
+
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `return agent("go", { provider: "net", mode: "read-only", label: "netter", network: true });`
+	scriptPath, err := WriteRunScript("wf-cache-net", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Run 1: --allow-network on. The worker sees network=1 and the row is
+	// stored with networked=true.
+	run, err := store.CreateRun(Run{ID: "wf-cache-net", Task: "cache", CWD: tmp, ScriptPath: scriptPath, AllowNetwork: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, out1, err := captureStderr(t, func() (string, error) {
+		return (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	})
+	if err != nil {
+		t.Fatalf("run 1 failed: %v", err)
+	}
+	if !strings.Contains(out1, `"network": "1"`) {
+		t.Fatalf("expected run 1 to run networked, got %q", out1)
+	}
+
+	// Run 2: same run-id reused via `workflow run` WITHOUT --allow-network,
+	// which resets the ceiling to off (UpsertRun does not fold the old value).
+	run2, err := store.UpsertRun(Run{ID: "wf-cache-net", Task: "cache", CWD: tmp, ScriptPath: scriptPath, AllowNetwork: false, Status: "running"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, out2, err := captureStderr(t, func() (string, error) {
+		return (&Runner{Store: store, Run: run2, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	})
+	if err != nil {
+		t.Fatalf("run 2 failed: %v", err)
+	}
+	if !strings.Contains(out2, `"network": "0"`) {
+		t.Fatalf("network-off rerun reused stale networked output; want sandboxed re-run, got %q", out2)
 	}
 }
 

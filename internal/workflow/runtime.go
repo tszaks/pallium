@@ -795,7 +795,7 @@ func (r *Runner) registerUntilGreenPatch(label, command, loopID, worktree, repoR
 	callIndex := r.nextAgentCallIndex()
 	patchLabel := label + "-patch"
 	prompt := "verify.untilGreen combined patch: " + command
-	if _, ok, err := r.Store.CompletedAgent(r.Run.ID, callIndex, phase, patchLabel, prompt, "internal", repoRoot, "edit", "worktree", "", "", argsHash); err != nil {
+	if _, ok, err := r.Store.CompletedAgent(r.Run.ID, callIndex, phase, patchLabel, prompt, "internal", repoRoot, "edit", "worktree", "", "", argsHash, false); err != nil {
 		return err
 	} else if ok {
 		r.removeWorktree(repoRoot, worktree)
@@ -1399,7 +1399,13 @@ func (r *Runner) runAgentAtCallIndex(ctx context.Context, prompt string, opts Ag
 		return "", err
 	}
 	schemaHash := agentSchemaHash(opts.Schema)
-	if cached, ok, err := r.Store.CompletedAgent(r.Run.ID, callIndex, phase, opts.Label, prompt, provider, absRepo, mode, opts.Isolation, opts.Model, schemaHash, argsHash); err != nil {
+	// networkGranted is the effective egress decision (agent opt-in AND the
+	// run's --allow-network ceiling), matching resolveAgentNetwork. It is part
+	// of the cache identity so re-running the same run-id WITHOUT
+	// --allow-network cannot reuse a row produced with network on: the operator
+	// believes the rerun was sandboxed, so it must not serve networked output.
+	networkGranted := opts.Network && r.Run.AllowNetwork
+	if cached, ok, err := r.Store.CompletedAgent(r.Run.ID, callIndex, phase, opts.Label, prompt, provider, absRepo, mode, opts.Isolation, opts.Model, schemaHash, argsHash, networkGranted); err != nil {
 		return "", err
 	} else if ok {
 		if _, err := parseAgentOutputWithSchema(cached.Output, opts.Schema); err != nil {
@@ -1443,6 +1449,7 @@ func (r *Runner) runAgentAtCallIndex(ctx context.Context, prompt string, opts Ag
 		ScriptHash:       scriptHash,
 		ArgsHash:         argsHash,
 		EstimatedCostUSD: r.agentCostUSD,
+		Networked:        networkGranted,
 	}
 	created, err := r.Store.CreateAgent(agent)
 	if err != nil {
@@ -2217,13 +2224,9 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 				return "", "", worktree, err
 			}
 		}
-		patchPath := ""
-		if worktree != "" {
-			var err error
-			patchPath, err = r.captureWorktreePatch(agent.ID, worktree, repoRoot)
-			if err != nil {
-				return "", "", worktree, err
-			}
+		patchPath, err := r.finalizeWorktreePatch(agent, worktree, repoRoot)
+		if err != nil {
+			return "", "", worktree, err
 		}
 		return strings.ReplaceAll(stub, "{{PROMPT}}", agent.Prompt), patchPath, worktree, nil
 	}
@@ -2232,16 +2235,29 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 	repoRoot := firstNonEmpty(agent.Repo, r.Run.CWD)
 	cwd := repoRoot
 	worktree := ""
+	// editIntent is true only when the agent is meant to produce file changes
+	// we keep: edit mode, or an explicit isolation:"worktree". Those are the
+	// ONLY worktrees whose writes get captured as a patch and applied back to
+	// the repo (see finalizeWorktreePatch).
+	editIntent := agent.Isolation != "none" && (agent.Mode == "edit" || agent.Isolation == "worktree")
 	// Granting network forces workspace-write (network egress requires it), so
 	// a networked read-only/test/check agent would otherwise run fs-write in
 	// the operator's LIVE checkout — writes to the real tree PLUS egress. When
 	// an agent is actually granted network but has no isolated worktree, force
 	// one (treat it like edit/worktree) so its forced workspace-write access is
-	// contained to a throwaway worktree, never the live repo.
-	if networkAllowed || (agent.Isolation != "none" && (agent.Mode == "edit" || agent.Isolation == "worktree")) {
+	// contained to a throwaway worktree, never the live repo. That containment
+	// worktree has no edit intent, so its writes are discarded, not applied.
+	if networkAllowed || editIntent {
 		var err error
 		worktree, err = r.createWorktree(agent.ID, repoRoot)
 		if err != nil {
+			// A worktree forced purely to contain a networked worker (no edit
+			// intent) needs the run to sit inside a git repo. Turn the raw git
+			// "not a git repository" failure into actionable guidance instead
+			// of leaking an opaque `exit status 128`.
+			if networkAllowed && !editIntent && strings.Contains(err.Error(), "not a git repository") {
+				return "", "", "", fmt.Errorf("network access requires the run to execute inside a git repository so the worker can be isolated in a throwaway worktree (run directory %q is not a git repo); run from a git repository or drop network access: %w", repoRoot, err)
+			}
 			return "", "", "", err
 		}
 		cwd = worktree
@@ -2318,12 +2334,9 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 		if err != nil {
 			return output, "", worktree, agentCommandError(ctx, timeout, err)
 		}
-		patchPath := ""
-		if worktree != "" {
-			patchPath, err = r.captureWorktreePatch(agent.ID, worktree, repoRoot)
-			if err != nil {
-				return output, "", worktree, err
-			}
+		patchPath, err := r.finalizeWorktreePatch(agent, worktree, repoRoot)
+		if err != nil {
+			return output, "", worktree, err
 		}
 		return output, patchPath, worktree, nil
 	}
@@ -2358,12 +2371,9 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 		return "", "", worktree, err
 	}
 	output := strings.TrimSpace(string(raw))
-	patchPath := ""
-	if worktree != "" {
-		patchPath, err = r.captureWorktreePatch(agent.ID, worktree, repoRoot)
-		if err != nil {
-			return output, "", worktree, err
-		}
+	patchPath, err := r.finalizeWorktreePatch(agent, worktree, repoRoot)
+	if err != nil {
+		return output, "", worktree, err
 	}
 	return output, patchPath, worktree, nil
 }
@@ -2614,6 +2624,27 @@ func (r *Runner) writeWorktreePatch(agentID, worktree string) (string, error) {
 		return "", err
 	}
 	return patchPath, nil
+}
+
+// finalizeWorktreePatch decides what happens to an agent's worktree once the
+// worker exits. Only worktrees created for genuine edit intent (mode "edit" or
+// isolation "worktree") have their writes captured as a patch for later apply.
+//
+// A worktree created ONLY to contain a networked worker's forced
+// workspace-write filesystem access has no edit intent: its writes are
+// throwaway, so they are discarded (worktree removed) and no patch is captured.
+// Capturing here would defeat the containment guarantee — a prompt-injected
+// networked read-only worker could drop a payload file that ApplyPatches would
+// then git-apply onto the operator's live checkout at run completion.
+func (r *Runner) finalizeWorktreePatch(agent *Agent, worktree, repoRoot string) (string, error) {
+	if worktree == "" {
+		return "", nil
+	}
+	if agent.Mode == "edit" || agent.Isolation == "worktree" {
+		return r.captureWorktreePatch(agent.ID, worktree, repoRoot)
+	}
+	r.removeWorktree(repoRoot, worktree)
+	return "", nil
 }
 
 // captureWorktreePatch writes the agent patch from the worktree and removes
