@@ -643,6 +643,86 @@ func TestWorkflowHTTPAPI(t *testing.T) {
 	}
 }
 
+// TestWorkflowRunRequestArgsAllowNetwork covers workflowRunRequestArgs in
+// isolation: allow_network:true in the HTTP request body must translate to
+// --allow-network on the underlying `workflow run` args, and omitting it must
+// not add the flag (safe default).
+func TestWorkflowRunRequestArgsAllowNetwork(t *testing.T) {
+	args, err := workflowRunRequestArgs("db.sqlite", workflowRunRequest{Task: "t", AllowNetwork: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsArg(args, "--allow-network") {
+		t.Fatalf("expected --allow-network in args, got %v", args)
+	}
+
+	args, err = workflowRunRequestArgs("db.sqlite", workflowRunRequest{Task: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsArg(args, "--allow-network") {
+		t.Fatalf("expected no --allow-network by default, got %v", args)
+	}
+}
+
+func containsArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestWorkflowHTTPRunAllowNetwork verifies the POST /workflows/run HTTP path
+// exposes the operator's --allow-network ceiling: previously only the CLI
+// run/resume/trigger parsers could set it, leaving this entry point unable to
+// grant network access at all. allow_network:true in the JSON body must
+// thread through to the same --allow-network flag the CLI path uses, and
+// omitting it must keep the safe default (no egress).
+func TestWorkflowHTTPRunAllowNetwork(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	// A granted-network agent is forced into an isolated worktree, so the run
+	// cwd must be a git repo.
+	initGitRepo(t, tmp)
+	setupNetworkProvider(t, tmp)
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	scriptPath := filepath.Join(tmp, "workflow.js")
+	if err := os.WriteFile(scriptPath, []byte(`return agent("go", { provider: "net", mode: "read-only", label: "netter", network: true });`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	handler := newWorkflowHTTPHandler(dbPath, "")
+
+	rawBody, err := json.Marshal(map[string]any{
+		"id": "wf-http-net", "task": "net test", "cwd": tmp, "script_path": scriptPath, "allow_network": true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/workflows/run", bytes.NewReader(rawBody))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("run with allow_network failed: %d %s", rec.Code, rec.Body.String())
+	}
+	assertNetworkRun(t, dbPath, "wf-http-net", true, "1")
+
+	rawBody, err = json.Marshal(map[string]any{
+		"id": "wf-http-net-off", "task": "net test", "cwd": tmp, "script_path": scriptPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/workflows/run", bytes.NewReader(rawBody))
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("run without allow_network failed: %d %s", rec.Code, rec.Body.String())
+	}
+	assertNetworkRun(t, dbPath, "wf-http-net-off", false, "0")
+}
+
 func TestWorkflowHTTPAPIRequiresTokenWhenConfigured(t *testing.T) {
 	tmp := t.TempDir()
 	handler := newWorkflowHTTPHandler(filepath.Join(tmp, "sessions.sqlite"), "secret-token")

@@ -116,7 +116,7 @@ func (s *mcpServer) handleResult(req mcpRequest) (any, error) {
 
 func workflowMCPTools() []mcpTool {
 	return []mcpTool{
-		{Name: "pallium_workflow_run", Description: "Run a structured multi-step workflow with verification, parallel workers, and resumable state. Prefer this over ad-hoc agent loops for any non-trivial task.", InputSchema: objectSchema(map[string]any{"task": stringSchema(), "id": stringSchema(), "cwd": stringSchema(), "script_path": stringSchema(), "workflow_name": stringSchema(), "args_json": stringSchema()})},
+		{Name: "pallium_workflow_run", Description: "Run a structured multi-step workflow with verification, parallel workers, and resumable state. Prefer this over ad-hoc agent loops for any non-trivial task.", InputSchema: objectSchema(map[string]any{"task": stringSchema(), "id": stringSchema(), "cwd": stringSchema(), "script_path": stringSchema(), "workflow_name": stringSchema(), "args_json": stringSchema(), "allow_network": boolSchema()})},
 		{Name: "pallium_workflow_status", Description: "Check the progress, step results, and failures of a workflow run. Use after starting a run, or when picking up an earlier run id.", InputSchema: objectSchema(map[string]any{"id": stringSchema()})},
 		{Name: "pallium_workflow_fleet", Description: "List recent workflow runs and their states. Use to find an existing run id or check what is already running before starting new work.", InputSchema: objectSchema(map[string]any{"limit": numberSchema()})},
 		{Name: "pallium_workflow_analytics", Description: "Summarize aggregate workflow outcomes, durations, and costs. Use when reviewing how past runs performed or reporting on workflow activity.", InputSchema: objectSchema(map[string]any{"limit": numberSchema()})},
@@ -137,6 +137,11 @@ func (s *mcpServer) callTool(name string, args map[string]any) (string, error) {
 		appendStringFlag(&runArgs, "--script", stringArg(args, "script_path"))
 		appendStringFlag(&runArgs, "--workflow", stringArg(args, "workflow_name"))
 		appendStringFlag(&runArgs, "--args", stringArg(args, "args_json"))
+		// Default off, same as the CLI: the ceiling is only granted when the
+		// caller explicitly sets allow_network, never implicitly.
+		if boolArg(args, "allow_network") {
+			runArgs = append(runArgs, "--allow-network")
+		}
 		runArgs = append(runArgs, task)
 		return runWorkflowMCPCommand(runArgs)
 	case "pallium_workflow_status":

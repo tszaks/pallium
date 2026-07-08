@@ -3983,6 +3983,70 @@ func TestAgentNetworkForcesWorktree(t *testing.T) {
 	}
 }
 
+// TestAgentNetworkContainmentPreservesSubdirCWD covers a gap in the
+// containment worktree fix: `git worktree add` always checks out the WHOLE
+// repo, so when the run's CWD is a subdirectory of the repo (not the repo
+// root), landing the agent at the worktree's root silently relocates it out
+// of that subdirectory. The agent must land at the same relative subdirectory
+// inside the new worktree, matching where it would have run without
+// containment.
+func TestAgentNetworkContainmentPreservesSubdirCWD(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	subdir := filepath.Join(tmp, "services", "api")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subdir, "main.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", ".")
+	runGit(t, tmp, "commit", "-m", "initial")
+
+	provider := filepath.Join(tmp, "cwd-provider.sh")
+	if err := os.WriteFile(provider, []byte("#!/bin/sh\nprintf '{\"ok\":true,\"cwd\":\"%s\"}' \"$PALLIUM_WORKFLOW_CWD\" > \"$PALLIUM_WORKFLOW_OUTPUT_FILE\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_CWD_COMMAND", provider)
+
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	// The run's CWD is the subdirectory, not the repo root, matching a CLI
+	// invocation launched from inside that subdirectory.
+	script := `return agent("go", { provider: "cwd", mode: "read-only", label: "netter", network: true });`
+	scriptPath, err := WriteRunScript("wf-net-subdir", subdir, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-net-subdir", Task: "net subdir", CWD: subdir, ScriptPath: scriptPath, AllowNetwork: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil); err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 {
+		t.Fatalf("expected 1 agent, got %d", len(agents))
+	}
+	if agents[0].Worktree == "" {
+		t.Fatalf("expected networked read-only agent to get an isolated worktree")
+	}
+	wantCWD := filepath.Join(agents[0].Worktree, "services", "api")
+	if !strings.Contains(agents[0].Output, `"cwd":"`+wantCWD+`"`) {
+		t.Fatalf("expected agent to run in worktree subdir %q (preserving the launch subdirectory), got output=%q", wantCWD, agents[0].Output)
+	}
+}
+
 // TestNetworkedEditAgentAppliesPatch is the regression guard for the other
 // side of the containment fix: an EDIT agent that also has network still has
 // genuine edit intent, so its worktree writes ARE captured as a patch and
