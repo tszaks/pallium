@@ -11,7 +11,7 @@ func TestBuildClaudeArgsReadOnlyMode(t *testing.T) {
 		got := buildClaudeArgs(mode, "")
 		want := []string{
 			"-p", "--output-format", "json",
-			"--strict-mcp-config", "--setting-sources", "user",
+			"--safe-mode", "--strict-mcp-config",
 			"--allowedTools", claudeReadOnlyAllowedTools,
 			"--disallowedTools", claudeReadOnlyDisallowedTools,
 		}
@@ -26,7 +26,7 @@ func TestBuildClaudeArgsEditTestCheckModes(t *testing.T) {
 		got := buildClaudeArgs(mode, "")
 		want := []string{
 			"-p", "--output-format", "json",
-			"--strict-mcp-config", "--setting-sources", "user",
+			"--safe-mode", "--strict-mcp-config",
 			"--permission-mode", "acceptEdits",
 			"--allowedTools", claudeEditAllowedTools,
 			"--disallowedTools", claudeEditDisallowedTools,
@@ -41,7 +41,7 @@ func TestBuildClaudeArgsIncludesModel(t *testing.T) {
 	got := buildClaudeArgs("read-only", "claude-sonnet-5")
 	want := []string{
 		"-p", "--output-format", "json",
-		"--strict-mcp-config", "--setting-sources", "user",
+		"--safe-mode", "--strict-mcp-config",
 		"--model", "claude-sonnet-5",
 		"--allowedTools", claudeReadOnlyAllowedTools,
 		"--disallowedTools", claudeReadOnlyDisallowedTools,
@@ -111,21 +111,17 @@ func TestReadOnlyModeNeverReachesPallium(t *testing.T) {
 }
 
 func TestBuildClaudeArgsIsolatesAmbientSettings(t *testing.T) {
-	// Every mode must block ambient MCP and load only the operator's user
-	// settings, so a checked-out repo's .claude config can't widen the allowlist.
+	// Every mode must disable ambient customizations (settings files + hooks)
+	// via --safe-mode and block ambient MCP via --strict-mcp-config, so neither
+	// a checked-out repo's .claude config nor the operator's global settings can
+	// widen the allowlist.
 	for _, mode := range []string{"", "read-only", "edit", "test", "check"} {
 		args := buildClaudeArgs(mode, "")
+		if !containsArg(args, "--safe-mode") {
+			t.Fatalf("mode %q: missing --safe-mode: %v", mode, args)
+		}
 		if !containsArg(args, "--strict-mcp-config") {
 			t.Fatalf("mode %q: missing --strict-mcp-config: %v", mode, args)
-		}
-		found := false
-		for i, a := range args {
-			if a == "--setting-sources" && i+1 < len(args) && args[i+1] == "user" {
-				found = true
-			}
-		}
-		if !found {
-			t.Fatalf("mode %q: --setting-sources user missing: %v", mode, args)
 		}
 	}
 }
