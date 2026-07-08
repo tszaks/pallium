@@ -269,6 +269,24 @@ read-only agent that opts into network is therefore upgraded to workspace-write
 exports `PALLIUM_WORKFLOW_NETWORK=1` (else `0`) so the wrapper can decide
 whether to expose networked tools.
 
+**Known limitations (inherent to the Codex sandbox).** These are accepted
+tradeoffs of running a networked worker safely, not bugs:
+
+- **A networked "read-only" agent is not read-only on the filesystem.** Codex
+  only carries network egress on `workspace-write` / `danger-full-access`, never
+  on `read-only`. So opting a read-only agent into network forces it to
+  `workspace-write`. Pallium contains that write access by running the agent in
+  a throwaway worktree (discarded after the run, never applied back), but inside
+  that worktree the agent can write files.
+- **A networked agent does not see uncommitted changes.** The containment
+  worktree is created from `HEAD`, so a networked reader sees the last commit,
+  not the operator's dirty working tree. Commit (or stash and restore) local
+  changes first if a networked worker must see them.
+- **A networked agent requires the run to be in a git repository.** Isolation is
+  implemented with `git worktree`, so a networked agent launched from a non-git
+  directory fails fast with actionable guidance (run from a git repo or drop
+  network access) rather than an opaque git error.
+
 ## Resume and caching
 
 Completed `agent()` calls reuse cache by deterministic call position plus prompt, provider, repo, mode, model, schema, and args hash.

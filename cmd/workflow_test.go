@@ -1560,3 +1560,48 @@ func TestWorkflowRunAllowNetworkNotLatchedOnReuse(t *testing.T) {
 		t.Fatalf("reused run kept AllowNetwork=true; expected false when the new run omitted --allow-network")
 	}
 }
+
+// TestWorkflowTriggerRunAllowNetwork covers threading the operator ceiling
+// through the trigger path: `trigger run --allow-network` forwards the flag to
+// the launched run (so a triggered workflow can use the network path), and
+// omitting it keeps the safe default of no egress.
+func TestWorkflowTriggerRunAllowNetwork(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	// A granted-network agent is forced into an isolated worktree, so the run
+	// cwd must be a git repo.
+	initGitRepo(t, tmp)
+	setupNetworkProvider(t, tmp)
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	scriptPath := filepath.Join(tmp, "workflow.js")
+	if err := os.WriteFile(scriptPath, []byte(`return agent("go", { provider: "net", mode: "read-only", label: "netter", network: true });`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{
+		"trigger", "add", "nettrig", "net task",
+		"--script", scriptPath, "--cwd", tmp, "--db", dbPath,
+	}, false); err != nil {
+		t.Fatalf("trigger add failed: %v", err)
+	}
+
+	// With --allow-network the launched run carries the ceiling and the agent
+	// runs networked.
+	out.Reset()
+	if err := runWorkflow(&out, []string{
+		"trigger", "run", "nettrig", "--id", "wf-trig-net", "--db", dbPath, "--allow-network",
+	}, false); err != nil {
+		t.Fatalf("trigger run --allow-network failed: %v", err)
+	}
+	assertNetworkRun(t, dbPath, "wf-trig-net", true, "1")
+
+	// Without the flag the triggered run stays sandboxed (safe default).
+	out.Reset()
+	if err := runWorkflow(&out, []string{
+		"trigger", "run", "nettrig", "--id", "wf-trig-off", "--db", dbPath,
+	}, false); err != nil {
+		t.Fatalf("trigger run without --allow-network failed: %v", err)
+	}
+	assertNetworkRun(t, dbPath, "wf-trig-off", false, "0")
+}

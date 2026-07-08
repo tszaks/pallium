@@ -469,11 +469,12 @@ func runWorkflowTriggerRun(out io.Writer, args []string, jsonOutput bool) error 
 	dbPath := fs.String("db", "", "")
 	runID := fs.String("id", "", "")
 	background := fs.Bool("background", false, "")
-	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "id": {}}, map[string]struct{}{"background": {}}); err != nil {
+	allowNetwork := fs.Bool("allow-network", false, "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "id": {}}, map[string]struct{}{"background": {}, "allow-network": {}}); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: pallium workflow trigger run <name> [--background]")
+		return fmt.Errorf("usage: pallium workflow trigger run <name> [--background] [--allow-network]")
 	}
 	store, err := workflow.Open(*dbPath)
 	if err != nil {
@@ -527,6 +528,13 @@ func runWorkflowTriggerRun(out io.Writer, args []string, jsonOutput bool) error 
 	runArgs := []string{"run", "--id", *runID, "--db", *dbPath, "--cwd", trigger.CWD}
 	if *background {
 		runArgs = append(runArgs, "--background")
+	}
+	// Forward the operator network ceiling like the run path: default off, and
+	// granted only when this invocation passes --allow-network. The automated
+	// `trigger watch` path never sets it, so an unattended watcher can't hand a
+	// triggered workflow egress without an explicit operator yes.
+	if *allowNetwork {
+		runArgs = append(runArgs, "--allow-network")
 	}
 	if trigger.WorkflowName != "" {
 		runArgs = append(runArgs, "--workflow", trigger.WorkflowName)
