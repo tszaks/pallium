@@ -804,7 +804,7 @@ func buildWorkflowAnalytics(store *workflow.Store, limit int) (workflowAnalytics
 		for _, agent := range agents {
 			analytics.AgentsTotal++
 			analytics.AgentsByStatus[agent.Status]++
-			analytics.AgentsByProvider[firstNonEmpty(agent.Provider, "codex")]++
+			analytics.AgentsByProvider[workflow.ProviderForDisplay(agent.Provider)]++
 			analytics.AgentsByMode[firstNonEmpty(agent.Mode, "read-only")]++
 			if strings.TrimSpace(agent.PatchPath) != "" {
 				analytics.PatchesProduced++
@@ -2301,7 +2301,7 @@ func renderWorkflowReport(report workflow.Report) string {
 	if len(report.Agents) > 0 {
 		lines = append(lines, "Agents:")
 		for _, agent := range report.Agents {
-			provider := firstNonEmpty(agent.Provider, "codex")
+			provider := workflow.ProviderForDisplay(agent.Provider)
 			lines = append(lines, fmt.Sprintf("- %s %s provider=%s mode=%s phase=%s", agent.Label, agent.Status, provider, agent.Mode, agent.Phase))
 			if agent.Summary != "" {
 				lines = append(lines, "  summary: "+agent.Summary)

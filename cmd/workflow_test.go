@@ -1212,7 +1212,7 @@ return { ok: true };`), 0o644); err != nil {
 
 func TestWorkflowReadAndInspectSurfaceFailuresAndScriptChange(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_TEST_COMMAND", `if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q bad; then echo "failed intentionally" >&2; exit 7; fi; printf '{"prompt":"%s"}' "$PALLIUM_WORKFLOW_PROMPT" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_TEST_COMMAND", `PALLIUM_WORKFLOW_PROMPT="$(cat "$PALLIUM_WORKFLOW_PROMPT_FILE")"; if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q bad; then echo "failed intentionally" >&2; exit 7; fi; printf '{"prompt":"%s"}' "$PALLIUM_WORKFLOW_PROMPT" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
 	tmp := t.TempDir()
 	dbPath := filepath.Join(tmp, "sessions.sqlite")
 	scriptPath := filepath.Join(tmp, "workflow.js")

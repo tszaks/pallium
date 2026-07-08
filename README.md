@@ -205,10 +205,14 @@ Provider commands run through `sh -c` in the worker cwd and receive:
 - `PALLIUM_WORKFLOW_MODEL`
 - `PALLIUM_WORKFLOW_REPO`
 - `PALLIUM_WORKFLOW_CWD`
-- `PALLIUM_WORKFLOW_PROMPT`
 - `PALLIUM_WORKFLOW_PROMPT_FILE`
 - `PALLIUM_WORKFLOW_OUTPUT_FILE`
 - `PALLIUM_WORKFLOW_SCHEMA_FILE`
+
+The prompt is delivered **only** as a file (`PALLIUM_WORKFLOW_PROMPT_FILE`);
+read it with `PROMPT=$(cat "$PALLIUM_WORKFLOW_PROMPT_FILE")`. It is not passed
+inline in the environment — a large prompt would exceed the OS `ARG_MAX` limit
+on the environment block and fail the spawn with "argument list too long".
 
 The provider should write its final worker message to
 `PALLIUM_WORKFLOW_OUTPUT_FILE`. Stdout is used as a fallback.
