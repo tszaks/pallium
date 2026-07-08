@@ -1029,7 +1029,15 @@ func (r *Runner) jsParallel(ctx context.Context, vm *goja.Runtime) func(goja.Fun
 					// condition (interrupt, budget, or max-agents), with no
 					// text parsing at all.
 					if fatal := r.fatalCause(); fatal != nil && fatal != fatalBefore {
-						panic(vm.ToValue(fatal.Error()))
+						// r.throwable, not fatal.Error() directly: a fatal
+						// cause can be a stop/pause interrupt, and
+						// classifyRunError only recognizes one crossing the
+						// goja boundary if it still carries the interrupt
+						// sentinel token throwable appends. Without it, a
+						// mapper hitting a pause/stop mid-loop (e.g. via
+						// verify.untilGreen()) would get misclassified as an
+						// ordinary "failed" run instead of paused/stopped.
+						panic(vm.ToValue(r.throwable(fatal)))
 					}
 					capture.Calls = capture.Calls[:callStart]
 					r.recordDroppedItem(fmt.Sprintf("parallel item %d", i), err.Error())
@@ -1362,6 +1370,14 @@ func (r *Runner) runAgentAtCallIndex(ctx context.Context, prompt string, opts Ag
 	if provider == "" || provider == "default" {
 		provider = "codex"
 	}
+	if provider == "internal" {
+		// "internal" is reserved for registerUntilGreenPatch's own
+		// bookkeeping rows, which Store.AgentUsage excludes from the
+		// --max-agents count because they never spawn a worker. Letting a
+		// user agent share that provider name would make its real spawns
+		// invisible to that same cap on resume.
+		return "", fmt.Errorf("workflow agent provider %q is reserved", provider)
+	}
 	repo := strings.TrimSpace(opts.Repo)
 	if repo == "" {
 		repo = r.Run.CWD
@@ -1433,16 +1449,27 @@ func (r *Runner) runAgentAtCallIndex(ctx context.Context, prompt string, opts Ag
 	if delta := agent.EstimatedCostUSD - r.agentCostUSD; delta != 0 {
 		r.mu.Lock()
 		r.budgetSpent += delta
-		overBudget := r.budgetLimit > 0 && r.budgetSpent > r.budgetLimit
+		spent, limit := r.budgetSpent, r.budgetLimit
+		overBudget := limit > 0 && spent > limit
 		r.mu.Unlock()
 		// The preflight check above only guards against the flat per-agent
 		// estimate. A provider that reports a real cost_usd after the fact
 		// can push spend past the limit on its own, and a script with no
 		// later agent() call would never hit the preflight check again to
 		// notice. Fail this agent immediately so the run doesn't complete
-		// successfully while already over budget.
-		if overBudget && err == nil {
-			budgetErr := r.recordFatal(fmt.Errorf("%w: reported cost pushed spend to $%.4f over $%.4f limit", ErrWorkflowBudgetExhausted, r.budgetSpent, r.budgetLimit))
+		// successfully while already over budget — regardless of whether the
+		// provider call itself also errored (a provider that exits nonzero
+		// or times out after reporting an over-budget cost is still over
+		// budget; that must not be swallowed as an ordinary dropped item in
+		// parallel()/pipeline()). spent/limit are captured under the lock
+		// above rather than read again here, since a concurrent agent call
+		// can mutate r.budgetSpent between unlock and use.
+		if overBudget {
+			budgetErr := fmt.Errorf("%w: reported cost pushed spend to $%.4f over $%.4f limit", ErrWorkflowBudgetExhausted, spent, limit)
+			if err != nil {
+				budgetErr = fmt.Errorf("%w (agent also failed: %v)", budgetErr, err)
+			}
+			budgetErr = r.recordFatal(budgetErr)
 			_ = r.Store.FinishAgent(agent, output, budgetErr.Error())
 			return "", budgetErr
 		}
@@ -2170,7 +2197,19 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 		usageFile := filepath.Join(tmpDir, "usage.json")
 		output, err := r.runConfiguredProviderCommand(ctx, command, tmpDir, outFile, usageFile, cwd, agent.Prompt, agent, opts)
 		usageRaw, usage := readAndRemoveAgentUsage(usageFile)
-		if err == nil && len(opts.Schema) > 0 {
+		// If the first attempt's own reported cost already exhausts the
+		// budget, skip the (paid) corrective retry entirely rather than
+		// billing a second call before the caller ever gets a chance to
+		// check: the caller only applies this attempt's cost delta and
+		// checks it against the budget after runAgentCommand returns, which
+		// is too late to stop a retry that already started.
+		firstAttemptOverBudget := false
+		if cost, ok := usage["cost_usd"].(float64); ok && cost >= 0 {
+			r.mu.Lock()
+			firstAttemptOverBudget = r.budgetLimit > 0 && r.budgetSpent+(cost-r.agentCostUSD) > r.budgetLimit
+			r.mu.Unlock()
+		}
+		if err == nil && len(opts.Schema) > 0 && !firstAttemptOverBudget {
 			// The corrective retry re-executes the full provider command in
 			// the same cwd with no workspace reset, so it is limited to
 			// read-only agents. Edit/test/check agents could apply their side

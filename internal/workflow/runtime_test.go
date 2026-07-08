@@ -1268,6 +1268,98 @@ return { results };`
 	}
 }
 
+// TestParallelMapperInterruptPreservesPausedStatus covers pausing a run
+// while it's synchronously inside a parallel() mapper (e.g. via
+// verify.untilGreen()): the run must end up "paused", not "failed".
+//
+// jsParallel's fatalCause()-based rethrow uses r.throwable(fatal) rather
+// than fatal.Error() alone specifically so the interrupt sentinel token
+// survives if this rethrow ever needs to cross another JS call frame that
+// does get stack-decorated by goja (the way an inner verify.untilGreen()
+// call already does — see unwrapMapperThrow and
+// TestUnwrapMapperThrowRecoversInterruptedSentinel for that decoration).
+// This specific test's exact crossing isn't decorated in practice, so
+// isWorkflowPausedError's own text-equality fallback already recognizes it
+// even without throwable — confirmed by reverting to fatal.Error() locally
+// and re-running, which still passes. The throwable() call is kept anyway
+// as the same defensive, consistent pattern used at every other point in
+// this file where a Go error is thrown into goja (see jsVerify), rather
+// than relying on a second, independent text-matching path.
+func TestParallelMapperInterruptPreservesPausedStatus(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "README.md")
+	runGit(t, tmp, "commit", "-m", "initial")
+	// Each check round sleeps briefly and always reports not-green, giving
+	// the test time to mark the run paused between rounds so the next
+	// round's check hits ensureNotStopped synchronously inside the
+	// parallel() mapper (verify.untilGreen never actually converges here;
+	// the pause always wins the race first).
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_LOOP_COMMAND", `sleep 0.2; printf '{"ok":false,"command":"check marker","summary":"missing","output_tail":"","failures":[]}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("parallel-pause");
+const results = parallel(["only"], item =>
+  verify.untilGreen("check marker", { label: "green", maxRounds: 5, provider: "loop" })
+);
+return { results };`
+	scriptPath, err := WriteRunScript("wf-parallel-pause", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-parallel-pause", Task: "parallel pause", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		_, execErr := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+		errCh <- execErr
+	}()
+	deadline := time.After(2 * time.Second)
+	for {
+		agents, listErr := store.ListAgents(run.ID)
+		if listErr != nil {
+			t.Fatal(listErr)
+		}
+		if len(agents) >= 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for the first check round to start")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if err := store.SetRunStatus(run.ID, "paused", "", "test pause"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case execErr := <-errCh:
+		if !errors.Is(execErr, ErrWorkflowPaused) {
+			t.Fatalf("expected ErrWorkflowPaused, got %v", execErr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("runner did not pause after run status changed to paused")
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Run.Status != "paused" {
+		t.Fatalf("expected paused run status (not failed), got %+v", snapshot.Run)
+	}
+}
+
 // TestUnwrapMapperThrowRecoversInterruptedSentinel guards against a subtler
 // variant of the same swallowing bug: when a parallel() mapper throws
 // synchronously because the workflow was stopped/paused (not just a budget
@@ -2245,6 +2337,45 @@ func TestStoreBackfillsLegacyAgentCallIndexes(t *testing.T) {
 	}
 }
 
+// TestStoreBackfillsLegacyAgentTimeoutExplicit guards against a regression
+// where a pre-upgrade run with a positive stored agent_timeout_seconds, but
+// no agent_timeout_explicit column yet, would silently stop honoring its
+// custom timeout on resume: resume only forwards the stored value when
+// AgentTimeoutExplicit is true, and that column's own DEFAULT is 0 for rows
+// written before it existed.
+func TestStoreBackfillsLegacyAgentTimeoutExplicit(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-legacy-timeout", Task: "legacy timeout", CWD: tmp, ScriptPath: "workflow.js"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a row written before agent_timeout_explicit existed: a
+	// positive stored timeout with the column's own bare default (0).
+	if _, err := store.db.Exec(`UPDATE workflow_runs SET agent_timeout_seconds=45, agent_timeout_explicit=0 WHERE id=?`, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	reopened, err := store.Run(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reopened.AgentTimeout != 45 || !reopened.AgentTimeoutExplicit {
+		t.Fatalf("expected legacy positive timeout to be backfilled as explicit, got %+v", reopened)
+	}
+}
+
 func TestNormalizeSchemaAddsAdditionalPropertiesFalse(t *testing.T) {
 	raw := map[string]any{
 		"type": "object",
@@ -2645,6 +2776,90 @@ return "done";`
 	}
 	if agents[0].UsageJSON != `{"input_tokens":100,"output_tokens":50,"cost_usd":0.25}` {
 		t.Fatalf("expected raw usage json persisted, got %q", agents[0].UsageJSON)
+	}
+}
+
+// TestInternalProviderNameIsReservedForBookkeeping guards against a
+// regression where Store.AgentUsage's exclusion of provider="internal" rows
+// from the --max-agents count (added to stop registerUntilGreenPatch's
+// bookkeeping row from inflating the cap) could also silently hide a real
+// user agent that happens to choose the same provider name, letting a
+// resumed run exceed its configured agent cap.
+func TestInternalProviderNameIsReservedForBookkeeping(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("reserved");
+return await agent("use reserved provider", { label: "one", provider: "internal" });`
+	scriptPath, err := WriteRunScript("wf-reserved-provider", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-reserved-provider", Task: "reserved provider", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("expected provider \"internal\" to be rejected as reserved, got %v", err)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 0 {
+		t.Fatalf("expected no agent row created for a rejected provider name, got %+v", agents)
+	}
+}
+
+// TestSchemaRetrySkippedWhenFirstAttemptAlreadyOverBudget guards against a
+// regression where the corrective schema retry could fire a second paid
+// provider call even though the first attempt's own reported cost already
+// exhausted the budget: the retry starts before runAgentAtCallIndex ever
+// gets a chance to apply that cost and check it, so skipping the retry once
+// the first attempt is already over budget is the only place that can catch
+// it before a second bill.
+func TestSchemaRetrySkippedWhenFirstAttemptAlreadyOverBudget(t *testing.T) {
+	callLog := filepath.Join(t.TempDir(), "calls.log")
+	t.Setenv("SCHEMA_CALL_LOG", callLog)
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_PRICEY_COMMAND", `echo call >> "$SCHEMA_CALL_LOG"; printf '{"cost_usd":5.0}' > "$PALLIUM_WORKFLOW_USAGE_FILE"; printf 'not json at all' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("schema-budget");
+return await agent("structured", {
+  label: "structured",
+  provider: "pricey",
+  schema: {
+    type: "object",
+    properties: { summary: { type: "string" } },
+    required: ["summary"]
+  }
+});`
+	scriptPath, err := WriteRunScript("wf-schema-over-budget", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-schema-over-budget", Task: "schema over budget", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10, MaxBudgetUSD: "1.00"}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), "budget exhausted") {
+		t.Fatalf("expected the over-budget first attempt to fail the run as budget exhausted, got %v", err)
+	}
+	raw, err := os.ReadFile(callLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls := strings.Count(string(raw), "call"); calls != 1 {
+		t.Fatalf("expected the corrective retry to be skipped once already over budget (1 provider call), got %d", calls)
 	}
 }
 
