@@ -36,6 +36,8 @@ func (a *App) Run(args []string) error {
 	case "help", "-h", "--help":
 		a.printHelp()
 		return nil
+	case "start":
+		return runStart(a.stdout, filtered[1:], jsonOutput)
 	case "index":
 		return runIndex(a.stdout, filtered[1:], jsonOutput)
 	case "doctor":
@@ -82,6 +84,7 @@ func (a *App) printHelp() {
 	fmt.Fprintln(a.stdout, `pallium
 
 Usage:
+  pallium start <task> [--workflow name] [--style auto|review|test-fix|research] [--cwd repo-path] [--dry-run] [--json]
   pallium index [repo-path] [--json]
   pallium doctor [repo-path] [--json]
   pallium version [--json]
