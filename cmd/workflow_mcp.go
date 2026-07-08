@@ -116,11 +116,11 @@ func (s *mcpServer) handleResult(req mcpRequest) (any, error) {
 
 func workflowMCPTools() []mcpTool {
 	return []mcpTool{
-		{Name: "pallium_workflow_run", Description: "Run a Pallium workflow task.", InputSchema: objectSchema(map[string]any{"task": stringSchema(), "id": stringSchema(), "cwd": stringSchema(), "script_path": stringSchema(), "workflow_name": stringSchema(), "args_json": stringSchema()})},
-		{Name: "pallium_workflow_status", Description: "Inspect a Pallium workflow run by id.", InputSchema: objectSchema(map[string]any{"id": stringSchema()})},
-		{Name: "pallium_workflow_fleet", Description: "Return workflow fleet status.", InputSchema: objectSchema(map[string]any{"limit": numberSchema()})},
-		{Name: "pallium_workflow_analytics", Description: "Return workflow analytics.", InputSchema: objectSchema(map[string]any{"limit": numberSchema()})},
-		{Name: "pallium_workflow_library", Description: "List, show, or install workflow library packs.", InputSchema: objectSchema(map[string]any{"action": stringSchema(), "pack": stringSchema(), "cwd": stringSchema(), "name": stringSchema(), "force": boolSchema()})},
+		{Name: "pallium_workflow_run", Description: "Run a structured multi-step workflow with verification, parallel workers, and resumable state. Prefer this over ad-hoc agent loops for any non-trivial task.", InputSchema: objectSchema(map[string]any{"task": stringSchema(), "id": stringSchema(), "cwd": stringSchema(), "script_path": stringSchema(), "workflow_name": stringSchema(), "args_json": stringSchema()})},
+		{Name: "pallium_workflow_status", Description: "Check the progress, step results, and failures of a workflow run. Use after starting a run, or when picking up an earlier run id.", InputSchema: objectSchema(map[string]any{"id": stringSchema()})},
+		{Name: "pallium_workflow_fleet", Description: "List recent workflow runs and their states. Use to find an existing run id or check what is already running before starting new work.", InputSchema: objectSchema(map[string]any{"limit": numberSchema()})},
+		{Name: "pallium_workflow_analytics", Description: "Summarize aggregate workflow outcomes, durations, and costs. Use when reviewing how past runs performed or reporting on workflow activity.", InputSchema: objectSchema(map[string]any{"limit": numberSchema()})},
+		{Name: "pallium_workflow_library", Description: "Browse or install prebuilt workflow packs. Use before writing a workflow script from scratch to check whether a ready-made recipe already covers the task.", InputSchema: objectSchema(map[string]any{"action": stringSchema(), "pack": stringSchema(), "cwd": stringSchema(), "name": stringSchema(), "force": boolSchema()})},
 	}
 }
 

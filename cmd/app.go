@@ -70,6 +70,8 @@ func (a *App) Run(args []string) error {
 		return runConsole(a.stdout, filtered[1:], jsonOutput)
 	case "workflow":
 		return runWorkflow(a.stdout, filtered[1:], jsonOutput)
+	case "agents":
+		return runAgents(a.stdout, filtered[1:], jsonOutput)
 	default:
 		a.printHelp()
 		return fmt.Errorf("unknown command: %s", filtered[0])
@@ -98,7 +100,8 @@ Usage:
   pallium task clear [--json]
 	  pallium sessions <live|watch|index|list|search|related|grep|show|embed|semantic|stats> [--json]
 	  pallium console <ls|watch|show|manifest|handoff|claim|action|authority|gate|review> [--json]
-	  pallium workflow <preflight|generate|validate|tools|template|trigger|fleet|run|list|status|inspect|show|read|report|watch|pause|resume|stop|save|apply> [--json]`)
+	  pallium workflow <preflight|generate|validate|tools|template|trigger|fleet|run|list|status|inspect|show|read|report|watch|pause|resume|stop|save|apply> [--json]
+	  pallium agents <guide|block|install> [--dir path] [--json]`)
 }
 
 func requireArg(args []string, field string) (string, error) {
