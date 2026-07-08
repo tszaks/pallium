@@ -7,7 +7,10 @@
 export const meta = {
   name: "adversarial-review",
   description: "Per-file find, per-finding skeptic verify, synthesized report",
-  phases: ["scope", "find", "verify", "synthesize"],
+  // "find" covers both the find and skeptic-verify steps: they run
+  // interleaved per file inside one pipeline() call, and phase() only
+  // tracks a single run-wide current phase, so both are recorded together.
+  phases: ["scope", "find", "synthesize"],
 };
 
 const task = args?.task ?? "Review this change set for concrete defects";
@@ -18,13 +21,17 @@ const preflight = await pallium.preflight(task);
 const files = (preflight.files_to_inspect ?? []).slice(0, 20);
 log("inspecting", files.length, "files");
 
+phase("find");
 // pipeline() streams: file A can be in verify while file B is still in find.
+// AgentOptions has no per-call "phase" field — phase() only tracks a single
+// run-wide current phase, and since pipeline() interleaves find and verify
+// work across items concurrently, both stages are recorded under this one
+// "find" phase in `pallium workflow report`/`status` rather than split out.
 const results = await pipeline(
   files,
   (file) =>
     agent(`Find up to 3 concrete issues in ${file}. Task: ${task}. Quote evidence; no style nits.`, {
       label: "find-" + file,
-      phase: "find",
       mode: "read-only",
       schema: {
         type: "object",
@@ -42,7 +49,6 @@ const results = await pipeline(
       `Try to refute each claimed issue. Default to refuted if uncertain or behavior-by-design.\n${JSON.stringify(found)}`,
       {
         label: "skeptic-" + file,
-        phase: "verify",
         mode: "read-only",
         schema: {
           type: "object",

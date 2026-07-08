@@ -33,6 +33,14 @@ phase("verify");
 // its internal loop repeats check (mode: "test") and fix (mode: "edit",
 // isolated worktree) rounds against the failing command itself, with stall
 // detection, until it converges or gives up.
+//
+// Known limitation: today each fix round's isolated-worktree patch is also
+// not visible to the *next* round's check (same ApplyPatches timing as
+// above), so a genuinely failing initial command can still end this loop
+// with `ok: false` / stalled rather than converging within one run. A fix
+// (a persistent loop worktree shared by check and fix rounds) is in
+// progress on the `feat/workflow-reliability` branch (PR #15, commit
+// a573216); once merged this recipe converges without changes here.
 const green = await verify.untilGreen(testCommand, { maxRounds: 3, label: "tests" });
 if (!green.ok) {
   // Fail before the gate/return so no patches are applied on an
