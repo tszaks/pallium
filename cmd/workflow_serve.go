@@ -22,6 +22,7 @@ type workflowRunRequest struct {
 	WorkflowName string         `json:"workflow_name,omitempty"`
 	Args         map[string]any `json:"args,omitempty"`
 	ArgsJSON     string         `json:"args_json,omitempty"`
+	AllowNetwork bool           `json:"allow_network,omitempty"`
 }
 
 type workflowLibraryInstallRequest struct {
@@ -238,6 +239,11 @@ func workflowRunRequestArgs(dbPath string, req workflowRunRequest) ([]string, er
 	}
 	if argsJSON != "" {
 		args = append(args, "--args", argsJSON)
+	}
+	// Default off, same as the CLI and MCP paths: the ceiling is only granted
+	// when the caller explicitly sets allow_network, never implicitly.
+	if req.AllowNetwork {
+		args = append(args, "--allow-network")
 	}
 	args = append(args, req.Task)
 	return args, nil
