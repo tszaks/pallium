@@ -1222,23 +1222,12 @@ Return only executable JavaScript. Use top-level await. Prefer phase(), parallel
 
 Deterministic fallback script for reference:
 %s`, task, style, testCommand, maxRounds, workflow.MarshalJSON(tools), workflow.MarshalJSON(templates), fallback)
-	tmpDir, err := os.MkdirTemp("", "pallium-workflow-generate-*")
+	runner := &workflow.Runner{CodexBinary: codexBinary}
+	output, err := runner.RunProviderText(context.Background(), prompt)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("workflow generation failed: %w", err)
 	}
-	defer os.RemoveAll(tmpDir)
-	outFile := filepath.Join(tmpDir, "workflow.js")
-	cmd := exec.Command(codexBinary, "exec", "--output-last-message", outFile, "--sandbox", "read-only", prompt)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("codex workflow generation failed: %w: %s", err, strings.TrimSpace(stderr.String()))
-	}
-	raw, err := os.ReadFile(outFile)
-	if err != nil {
-		return "", err
-	}
-	return stripMarkdownFence(strings.TrimSpace(string(raw))), nil
+	return stripMarkdownFence(strings.TrimSpace(output)), nil
 }
 
 func stripMarkdownFence(text string) string {

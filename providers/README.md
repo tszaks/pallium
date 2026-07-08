@@ -62,6 +62,32 @@ Pallium sets these variables for every provider invocation:
 | `PALLIUM_WORKFLOW_RUN_ID`, `_AGENT_ID`, `_PROVIDER`, `_LABEL`, `_REPO`, `_CWD` | Run metadata for logging or routing. |
 | `PALLIUM_WORKFLOW_USAGE_FILE` | Optional (newer versions): if the wrapper writes `{"input_tokens":N,"output_tokens":N,"cost_usd":X}` here, Pallium records real usage and counts `cost_usd` toward the run budget instead of the flat per-agent estimate. |
 
+## Bring your own model
+
+Any model CLI can power Pallium workers — grok, gemini, moonshot, a local
+Ollama model, whatever you've got a CLI for. A wrapper is the whole
+integration; there's no code change and no special-casing in Pallium itself.
+Minimal copy-paste starting point:
+
+```bash
+#!/bin/sh
+set -eu
+PROMPT=$(cat "$PALLIUM_WORKFLOW_PROMPT_FILE")
+ARGS=""
+[ "$PALLIUM_WORKFLOW_MODE" = "edit" ] && ARGS="--yolo"           # trust the model in an isolated worktree
+[ "$PALLIUM_WORKFLOW_NETWORK" = "1" ] && ARGS="$ARGS --allow-net" # only when the run opted in
+printf '%s' "$PROMPT" | your-model-cli $ARGS > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+```
+
+Save it, `chmod +x`, then point Pallium at it:
+
+```bash
+export PALLIUM_WORKFLOW_PROVIDER_GROK_COMMAND="$(pwd)/providers/grok.sh"
+```
+
+Now `agent("...", { provider: "grok" })` runs on Grok. Same pattern for any
+other CLI — swap the binary and its flags for mode/network mapping.
+
 ## Writing your own wrapper
 
 1. Read the prompt from `PALLIUM_WORKFLOW_PROMPT_FILE`.
