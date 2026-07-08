@@ -1,7 +1,10 @@
 package workflow
 
 import (
+	"context"
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -59,4 +62,58 @@ func DetectSteeringProvider() string {
 		return "claude"
 	}
 	return ""
+}
+
+// runProviderCommand is the single dispatch point for a raw provider
+// invocation. provider is already resolved (via ResolveProvider) by the
+// caller; this only decides which of the three raw-invocation
+// implementations actually runs a process: codex (codex_provider.go), an
+// explicitly configured wrapper command (runConfiguredProviderCommand), or
+// the built-in claude CLI (claude_provider.go). An explicitly configured
+// wrapper always wins over the codex/claude built-ins for any provider name
+// other than "codex" itself, so operators can override "claude" with a
+// hardened wrapper (see providers/claude.sh) without a code change. Any
+// other provider with no configured wrapper is a clear configuration error
+// naming the env var it expects.
+//
+// Both a live agent call (runAgentCommand) and a one-off text call
+// (RunProviderText, used by workflow generation) route through this same
+// function, so no caller special-cases codex or any other provider.
+func (r *Runner) runProviderCommand(ctx context.Context, provider, tmpDir, outFile, usageFile, cwd, prompt string, agent *Agent, opts AgentOptions, networkAllowed bool) (string, error) {
+	if provider == "codex" {
+		return r.runCodexCommand(ctx, tmpDir, outFile, cwd, prompt, agent, opts, networkAllowed)
+	}
+	if command := strings.TrimSpace(os.Getenv(providerCommandEnvName(provider))); command != "" {
+		return r.runConfiguredProviderCommand(ctx, command, tmpDir, outFile, usageFile, cwd, prompt, agent, opts, networkAllowed)
+	}
+	if provider == "claude" {
+		return r.runBuiltinClaudeCommand(ctx, usageFile, cwd, prompt, agent, opts)
+	}
+	return "", fmt.Errorf("workflow agent provider %q is not configured; set %s", provider, providerCommandEnvName(provider))
+}
+
+// RunProviderText resolves a provider via ResolveProvider and runs a single
+// read-only, schema-less text-out call — no worktree, no retry, no usage
+// accounting, just "run this prompt and give me the text back". It exists so
+// callers outside a live workflow run (currently `pallium workflow generate
+// --llm`) dispatch through the exact same codex/wrapper/claude resolution a
+// running agent uses, instead of hardcoding a provider.
+func (r *Runner) RunProviderText(ctx context.Context, prompt string) (string, error) {
+	if r.CodexBinary == "" {
+		r.CodexBinary = "codex"
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	tmpDir, err := os.MkdirTemp("", "pallium-workflow-text-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(tmpDir)
+	outFile := filepath.Join(tmpDir, "last-message.txt")
+	usageFile := filepath.Join(tmpDir, "usage.json")
+	provider := ResolveProvider("", "")
+	agent := &Agent{Mode: "read-only", Prompt: prompt, Provider: provider}
+	return r.runProviderCommand(ctx, provider, tmpDir, outFile, usageFile, cwd, prompt, agent, AgentOptions{}, false)
 }

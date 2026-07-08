@@ -249,6 +249,35 @@ func TestWorkflowGenerateLLMReturnsStyleError(t *testing.T) {
 	}
 }
 
+// TestWorkflowGenerateLLMIsProviderAgnostic proves `workflow generate --llm`
+// dispatches through the same provider resolution as a live agent call
+// instead of hardcoding codex: forcing PALLIUM_WORKFLOW_PROVIDER at a
+// configured wrapper makes generation return the wrapper's output, with no
+// codex binary involved at all.
+func TestWorkflowGenerateLLMIsProviderAgnostic(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_GENERATE_STUB", "")
+	tmp := t.TempDir()
+	wrapperScript := filepath.Join(tmp, "fake-wrapper.sh")
+	if err := os.WriteFile(wrapperScript, []byte("#!/bin/sh\nprintf 'phase(\"llm-wrapper\");\\nreturn { ok: true };' > \"$PALLIUM_WORKFLOW_OUTPUT_FILE\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER", "grok")
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_GROK_COMMAND", wrapperScript)
+
+	outputPath := filepath.Join(tmp, "llm.workflow.js")
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{"generate", "--llm", "--output", outputPath, "write custom workflow"}, true); err != nil {
+		t.Fatalf("llm generate failed: %v", err)
+	}
+	raw, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `phase("llm-wrapper")`) {
+		t.Fatalf("expected wrapper-generated script, got %s", string(raw))
+	}
+}
+
 func TestWorkflowValidateScript(t *testing.T) {
 	tmp := t.TempDir()
 	validPath := filepath.Join(tmp, "valid.js")
