@@ -356,11 +356,78 @@ func (r *Runner) executeScript(ctx context.Context, script string, args any, top
 	result := value.Export()
 	resultText := stringifyResult(result)
 	if topLevel {
+		r.warnOnDropsAtCompletion(resultText)
 		if err := r.Store.SetRunStatus(r.Run.ID, "completed", resultText, ""); err != nil {
 			return "", err
 		}
 	}
 	return resultText, nil
+}
+
+// warnOnDropsAtCompletion emits a consolidated stderr warning when a run
+// finishes "completed" despite dropping items to null. Individual drops
+// already log at the moment they happen, but those lines scroll away; this
+// summary makes the partial (or total) failure loud at the end. When the
+// result is also empty the run produced nothing usable, so the warning says
+// so explicitly. The run status stays "completed" on purpose: a stage drop is
+// documented to null only that item and continue, and flipping to "failed"
+// would wrongly punish workflows that legitimately return empty/void or that
+// succeeded on their surviving items — the failures list plus this warning are
+// how the drop stays visible.
+func (r *Runner) warnOnDropsAtCompletion(resultText string) {
+	r.mu.Lock()
+	count := len(r.failures)
+	r.mu.Unlock()
+	if count == 0 {
+		return
+	}
+	if isEmptyResult(resultText) {
+		fmt.Fprintf(os.Stderr, "[workflow:%s] WARNING: run completed with an EMPTY result after dropping %d item(s) to null; nothing usable was produced. See the failures list for reasons.\n", r.Run.ID, count)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[workflow:%s] WARNING: run completed but dropped %d item(s) to null. See the failures list for reasons.\n", r.Run.ID, count)
+}
+
+// isEmptyResult reports whether a stringified workflow result carries no usable
+// output: empty/void, a bare null, or an empty/all-null object or array (e.g.
+// {"results":[null,null]} from a pipeline whose every item dropped).
+func isEmptyResult(resultText string) bool {
+	trimmed := strings.TrimSpace(resultText)
+	switch trimmed {
+	case "", "null", "undefined", "{}", "[]", `""`:
+		return true
+	}
+	var parsed any
+	if json.Unmarshal([]byte(trimmed), &parsed) != nil {
+		return false
+	}
+	return isEmptyValue(parsed)
+}
+
+// isEmptyValue reports whether a decoded JSON value is null or a container in
+// which every leaf is null/empty, so a pipeline result that is all-null counts
+// as producing nothing.
+func isEmptyValue(v any) bool {
+	switch typed := v.(type) {
+	case nil:
+		return true
+	case []any:
+		for _, item := range typed {
+			if !isEmptyValue(item) {
+				return false
+			}
+		}
+		return true
+	case map[string]any:
+		for _, item := range typed {
+			if !isEmptyValue(item) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
 }
 
 func (r *Runner) executeSavedWorkflow(ctx context.Context, name string, input any) (string, error) {
@@ -1052,7 +1119,7 @@ func (r *Runner) jsParallel(ctx context.Context, vm *goja.Runtime) func(goja.Fun
 						panic(vm.ToValue(r.throwable(fatal)))
 					}
 					capture.Calls = capture.Calls[:callStart]
-					r.recordDroppedItem(fmt.Sprintf("parallel item %d", i), err.Error())
+					r.recordDroppedItem(fmt.Sprintf("parallel item %d", i), describeStageDrop(err))
 					rawResults = append(rawResults, nil)
 					continue
 				}
@@ -1127,7 +1194,7 @@ func (r *Runner) jsPipeline(ctx context.Context, vm *goja.Runtime) func(goja.Fun
 				for stageIndex, stage := range stages {
 					rawResult, calls, err := r.capturePipelineStage(vm, &vmMu, stage, current, item, pipelineIndex, stageIndex, itemIndex)
 					if err != nil {
-						r.recordDroppedItem(fmt.Sprintf("pipeline stage %d item %d", stageIndex, itemIndex), err.Error())
+						r.recordDroppedItem(fmt.Sprintf("pipeline stage %d item %d", stageIndex, itemIndex), describeStageDrop(err))
 						results[itemIndex] = nil
 						return
 					}
@@ -1696,6 +1763,15 @@ func (r *Runner) normalizeInterruptError(ctx context.Context, err error) error {
 	return err
 }
 
+// stageChainHint explains the single most common way a pipeline/parallel stage
+// silently drops to null: chaining a JS promise combinator onto an agent()/
+// check() call. During the capture pass those calls return a placeholder
+// marker (not a real promise), so .then()/.catch() either throws a bare
+// "Object has no member 'then'" TypeError or leaves an unresolved promise that
+// awaitPromiseValue can't settle. Both surface here so the operator sees the
+// fix instead of a cryptic goja error.
+const stageChainHint = "did you chain .then()/.catch() on agent() or check()? return the agent()/check() call directly and post-process its result after the pipeline/parallel"
+
 func awaitPromiseValue(value goja.Value) (goja.Value, error) {
 	promise, ok := value.Export().(*goja.Promise)
 	if !ok {
@@ -1707,8 +1783,24 @@ func awaitPromiseValue(value goja.Value) (goja.Value, error) {
 	case goja.PromiseStateRejected:
 		return nil, fmt.Errorf("%s", promise.Result().String())
 	default:
-		return nil, fmt.Errorf("workflow returned a pending promise")
+		return nil, fmt.Errorf("workflow stage returned an unresolved (pending) promise; %s", stageChainHint)
 	}
+}
+
+// describeStageDrop turns a stage/mapper drop error into an operator-facing
+// reason. Chaining .then()/.catch() on a captured agent()/check() marker
+// throws a bare goja TypeError ("Object has no member 'then'"); this appends
+// the actionable hint so a dropped item never carries only that cryptic text.
+// Ordinary stage throws and provider failures pass through unchanged.
+func describeStageDrop(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "has no member 'then'") || strings.Contains(msg, "has no member 'catch'") {
+		return msg + " (" + stageChainHint + ")"
+	}
+	return msg
 }
 
 func parseAgentOutput(output string) any {
