@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tszaks/pallium/internal/workflow"
 )
@@ -621,6 +622,116 @@ return agent("second", { label: "second" });`
 	}
 }
 
+func TestWorkflowResumePersistsAgentTimeout(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_DELAY_MS", "1500")
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	scriptPath := filepath.Join(tmp, "workflow.js")
+	if err := os.WriteFile(scriptPath, []byte(`phase("one");
+return agent("slow", { label: "slow" });`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	err := runWorkflow(&out, []string{
+		"run",
+		"--id", "wf-resume-timeout",
+		"--db", dbPath,
+		"--cwd", tmp,
+		"--script", scriptPath,
+		"--agent-timeout", "1",
+		"timeout test",
+	}, false)
+	if err == nil || !strings.Contains(err.Error(), "timed out after 1s") {
+		t.Fatalf("expected initial run to hit the 1s agent timeout, got %v", err)
+	}
+	store, err := workflow.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.Run("wf-resume-timeout")
+	_ = store.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.AgentTimeout != 1 {
+		t.Fatalf("expected agent timeout stored on the run, got %+v", run)
+	}
+	// Resume without the flag must reuse the stored 1s timeout, not the 600s
+	// flag default.
+	out.Reset()
+	err = runWorkflow(&out, []string{"resume", "wf-resume-timeout", "--db", dbPath}, false)
+	if err == nil || !strings.Contains(err.Error(), "timed out after 1s") {
+		t.Fatalf("expected resume to reuse the stored agent timeout, got %v", err)
+	}
+	// An explicit flag on resume overrides the stored value.
+	out.Reset()
+	if err := runWorkflow(&out, []string{"resume", "wf-resume-timeout", "--db", dbPath, "--agent-timeout", "30"}, false); err != nil {
+		t.Fatalf("expected explicit --agent-timeout to override stored value, got %v", err)
+	}
+}
+
+// TestWorkflowResumePreservesDisabledAgentTimeout guards against a
+// regression where 0 (the documented value for "no agent timeout") could
+// not survive a plain resume: a naive `stored value > 0` check cannot tell
+// "never configured" apart from "explicitly disabled", so resume without
+// --agent-timeout silently fell back to the nested run's 600s flag default
+// instead of keeping timeouts off.
+func TestWorkflowResumePreservesDisabledAgentTimeout(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	scriptPath := filepath.Join(tmp, "workflow.js")
+	if err := os.WriteFile(scriptPath, []byte(`phase("one");
+return agent("fast", { label: "fast" });`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{
+		"run",
+		"--id", "wf-resume-timeout-disabled",
+		"--db", dbPath,
+		"--cwd", tmp,
+		"--script", scriptPath,
+		"--agent-timeout", "0",
+		"timeout disabled test",
+	}, false); err != nil {
+		t.Fatalf("expected initial run with --agent-timeout 0 to succeed, got %v", err)
+	}
+	store, err := workflow.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.Run("wf-resume-timeout-disabled")
+	_ = store.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.AgentTimeout != 0 || !run.AgentTimeoutExplicit {
+		t.Fatalf("expected disabled timeout stored explicitly on the run, got %+v", run)
+	}
+	// Resume without the flag must keep the timeout disabled, not fall back
+	// to the 600s flag default.
+	out.Reset()
+	if err := runWorkflow(&out, []string{"resume", "wf-resume-timeout-disabled", "--db", dbPath}, false); err != nil {
+		t.Fatalf("expected resume to succeed with timeouts still disabled, got %v", err)
+	}
+	store, err = workflow.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err = store.Run("wf-resume-timeout-disabled")
+	_ = store.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.AgentTimeout != 0 || !run.AgentTimeoutExplicit {
+		t.Fatalf("expected resume to keep the disabled timeout explicit, got %+v", run)
+	}
+}
+
 func TestWorkflowReportSummarizesAgentOutputs(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"reviewed auth","observations":["auth flow is covered"],"risks":["missing edge test"],"next_steps":["add edge test"]}`)
 	tmp := t.TempDir()
@@ -991,6 +1102,178 @@ return { ok: true };`), 0o644); err != nil {
 	}
 	if !strings.Contains(err.Error(), "workflow fleet limit reached") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestWorkflowReadAndInspectSurfaceFailuresAndScriptChange(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_TEST_COMMAND", `if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q bad; then echo "failed intentionally" >&2; exit 7; fi; printf '{"prompt":"%s"}' "$PALLIUM_WORKFLOW_PROMPT" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	scriptPath := filepath.Join(tmp, "workflow.js")
+	script := `phase("parallel");
+const results = await parallel(["good", "bad"], item =>
+  agent("worker " + item, { label: item, provider: "test" })
+);
+return { results };`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{"run", "--id", "wf-failures", "--db", dbPath, "--cwd", tmp, "--script", scriptPath, "failure surfacing"}, false); err != nil {
+		t.Fatalf("workflow run failed: %v", err)
+	}
+
+	out.Reset()
+	if err := runWorkflow(&out, []string{"read", "wf-failures", "--db", dbPath}, true); err != nil {
+		t.Fatalf("workflow read failed: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("decode read json: %v\n%s", err, out.String())
+	}
+	failures, ok := payload["failures"].([]any)
+	if !ok || len(failures) != 1 {
+		t.Fatalf("expected one failure in read payload, got %#v", payload)
+	}
+	failure := failures[0].(map[string]any)
+	if failure["label"] != "bad" || !strings.Contains(failure["error"].(string), "failed intentionally") {
+		t.Fatalf("unexpected failure entry: %#v", failure)
+	}
+
+	store, err := workflow.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.Run("wf-failures")
+	_ = store.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedScript := script + "\n// tail edit"
+	if err := os.WriteFile(run.ScriptPath, []byte(changedScript), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := runWorkflow(&out, []string{"resume", "wf-failures", "--db", dbPath}, false); err != nil {
+		t.Fatalf("workflow resume failed: %v", err)
+	}
+
+	out.Reset()
+	if err := runWorkflow(&out, []string{"inspect", "wf-failures", "--db", dbPath}, true); err != nil {
+		t.Fatalf("workflow inspect failed: %v", err)
+	}
+	var inspection map[string]any
+	if err := json.Unmarshal(out.Bytes(), &inspection); err != nil {
+		t.Fatalf("decode inspect json: %v\n%s", err, out.String())
+	}
+	status := inspection["status"].(map[string]any)
+	if status["script_changed"] != true {
+		t.Fatalf("expected script_changed=true in inspect status, got %#v", status)
+	}
+	if failures, ok := inspection["failures"].([]any); !ok || len(failures) != 1 {
+		t.Fatalf("expected inspect failures list, got %#v", inspection["failures"])
+	}
+
+	out.Reset()
+	if err := runWorkflow(&out, []string{"report", "wf-failures", "--db", dbPath}, true); err != nil {
+		t.Fatalf("workflow report failed: %v", err)
+	}
+	var report map[string]any
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatalf("decode report json: %v\n%s", err, out.String())
+	}
+	if failures, ok := report["failures"].([]any); !ok || len(failures) != 1 {
+		t.Fatalf("expected report failures list, got %#v", report["failures"])
+	}
+}
+
+func TestWorkflowGCRemovesOldTerminalRunArtifacts(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	store, err := workflow.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().UTC().Add(-10 * 24 * time.Hour).Format(time.RFC3339Nano)
+	recent := time.Now().UTC().Format(time.RFC3339Nano)
+	runs := []workflow.Run{
+		{ID: "wf-gc-old-done", Status: "completed", CreatedAt: old, UpdatedAt: old, CompletedAt: old},
+		{ID: "wf-gc-new-done", Status: "completed", CreatedAt: recent, UpdatedAt: recent, CompletedAt: recent},
+		{ID: "wf-gc-old-running", Status: "running", CreatedAt: old, UpdatedAt: old},
+		{ID: "wf-gc-old-failed", Status: "failed", CreatedAt: old, UpdatedAt: old, CompletedAt: old},
+	}
+	for _, run := range runs {
+		run.Task = "gc test"
+		run.CWD = tmp
+		run.ScriptPath = filepath.Join(tmp, "workflow.js")
+		if _, err := store.CreateRun(run); err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Join(home, ".pallium", "workflow-runs", run.ID, "patches")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "agent.patch"), []byte("data\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{"gc", "--db", dbPath, "--dry-run"}, true); err != nil {
+		t.Fatalf("workflow gc --dry-run failed: %v", err)
+	}
+	var dry map[string]any
+	if err := json.Unmarshal(out.Bytes(), &dry); err != nil {
+		t.Fatalf("decode gc dry-run json: %v\n%s", err, out.String())
+	}
+	if dry["count"] != float64(1) || dry["dry_run"] != true || dry["bytes_freed"] != float64(5) {
+		t.Fatalf("expected dry run to report one old terminal run, got %#v", dry)
+	}
+	for _, run := range runs {
+		if _, err := os.Stat(filepath.Join(home, ".pallium", "workflow-runs", run.ID)); err != nil {
+			t.Fatalf("dry run must not remove artifacts for %s: %v", run.ID, err)
+		}
+	}
+
+	out.Reset()
+	if err := runWorkflow(&out, []string{"gc", "--db", dbPath}, false); err != nil {
+		t.Fatalf("workflow gc failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "removed 1 run directories (5 bytes freed)") || !strings.Contains(out.String(), "wf-gc-old-done") {
+		t.Fatalf("unexpected gc output: %s", out.String())
+	}
+	if _, err := os.Stat(filepath.Join(home, ".pallium", "workflow-runs", "wf-gc-old-done")); !os.IsNotExist(err) {
+		t.Fatalf("expected old terminal run artifacts removed, stat err=%v", err)
+	}
+	// Failed runs are resumable, so their artifacts stay unless
+	// --include-failed opts in.
+	for _, keep := range []string{"wf-gc-new-done", "wf-gc-old-running", "wf-gc-old-failed"} {
+		if _, err := os.Stat(filepath.Join(home, ".pallium", "workflow-runs", keep)); err != nil {
+			t.Fatalf("expected %s artifacts kept: %v", keep, err)
+		}
+	}
+
+	out.Reset()
+	if err := runWorkflow(&out, []string{"gc", "--db", dbPath, "--include-failed"}, false); err != nil {
+		t.Fatalf("workflow gc --include-failed failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "wf-gc-old-failed") {
+		t.Fatalf("expected --include-failed to collect the old failed run: %s", out.String())
+	}
+	if _, err := os.Stat(filepath.Join(home, ".pallium", "workflow-runs", "wf-gc-old-failed")); !os.IsNotExist(err) {
+		t.Fatalf("expected old failed run artifacts removed with --include-failed, stat err=%v", err)
+	}
+	for _, keep := range []string{"wf-gc-new-done", "wf-gc-old-running"} {
+		if _, err := os.Stat(filepath.Join(home, ".pallium", "workflow-runs", keep)); err != nil {
+			t.Fatalf("expected %s artifacts kept: %v", keep, err)
+		}
 	}
 }
 
