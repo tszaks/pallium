@@ -2,14 +2,17 @@
 
 Pallium workflows are provider-agnostic: the engine orchestrates, and any
 agent CLI can do the work. Whichever model your guiding agent runs, Pallium
-workers can adopt it. Codex is the built-in default; everything else plugs in
-through a small wrapper script.
+workers can adopt it. Codex and Claude Code both have a built-in Go
+invocation (no wrapper script needed) — Pallium even auto-detects Claude
+Code as the steering agent and switches workers to it with zero
+configuration (see `PALLIUM_WORKFLOW.md`). Everything else plugs in through a
+small wrapper script.
 
 This directory ships reference wrappers:
 
 | Provider | Wrapper | Notes |
 |----------|---------|-------|
-| Claude Code | `claude.sh` | Structured output, mode-scoped permissions, token/cost reporting |
+| Claude Code | `claude.sh` | Optional: the built-in claude provider covers the common case. Use this wrapper instead when you need its extra hardening (`--safe-mode`, `--setting-sources user`, `--strict-mcp-config`, `--permission-mode plan`) — set `PALLIUM_WORKFLOW_PROVIDER_CLAUDE_COMMAND` to it to override the built-in path |
 | Gemini CLI | `gemini.sh` | Structured output via prompt contract; see security note below |
 
 **Security note on `gemini.sh`:** Gemini CLI runs `SessionStart` hooks from
@@ -21,9 +24,8 @@ at repos whose committed Gemini config you've reviewed.
 
 ## Quick start
 
-```bash
-export PALLIUM_WORKFLOW_PROVIDER_CLAUDE_COMMAND="$(pwd)/providers/claude.sh"
-```
+`claude` needs no setup beyond having the CLI on PATH — Pallium's built-in
+provider handles it:
 
 ```js
 const review = await agent("Review the auth middleware for missing checks", {
@@ -31,6 +33,14 @@ const review = await agent("Review the auth middleware for missing checks", {
   mode: "read-only",
   schema: { type: "object", properties: { findings: { type: "array", items: { type: "string" } } }, required: ["findings"] },
 });
+```
+
+To use `claude.sh` (or any other wrapper) instead, point the matching env var
+at it — an explicitly configured command always overrides a built-in
+provider:
+
+```bash
+export PALLIUM_WORKFLOW_PROVIDER_CLAUDE_COMMAND="$(pwd)/providers/claude.sh"
 ```
 
 Provider names map to env vars as `PALLIUM_WORKFLOW_PROVIDER_<UPPER_SNAKE>_COMMAND`.
