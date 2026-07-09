@@ -7,9 +7,61 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+// TestTasksForPromptFiltersToOpenPlusRecentCompletions is the regression
+// test for a P3 found by review: buildTeamTurnPrompt used to dump the FULL
+// task board — including every completed task ever, full result text — into
+// EVERY turn's prompt, growing without bound as a long-running team
+// accumulates history. tasksForPrompt keeps all open work in full, but caps
+// completed tasks to the most recent few with truncated results.
+func TestTasksForPromptFiltersToOpenPlusRecentCompletions(t *testing.T) {
+	tasks := []TeamTask{
+		{ID: "open-1", Status: "pending"},
+		{ID: "open-2", Status: "in_progress"},
+	}
+	for i := 0; i < teamPromptRecentCompletedTasks+3; i++ {
+		tasks = append(tasks, TeamTask{
+			ID:          fmt.Sprintf("done-%d", i),
+			Status:      "completed",
+			CompletedAt: fmt.Sprintf("2026-01-01T00:00:%02dZ", i),
+			Result:      strings.Repeat("x", teamPromptResultTruncateChars+50),
+		})
+	}
+
+	visible := tasksForPrompt(tasks)
+
+	var openCount, completedCount int
+	seenMostRecent := false
+	for _, v := range visible {
+		if v.Status == "completed" {
+			completedCount++
+			if len(v.Result) > teamPromptResultTruncateChars+len("... [truncated]") {
+				t.Fatalf("expected completed task %q result truncated, got %d chars", v.ID, len(v.Result))
+			}
+			// The most recently completed task (highest index/CompletedAt)
+			// must survive the cap — an unordered or wrong-direction cap
+			// would silently keep the OLDEST completions instead.
+			if v.ID == fmt.Sprintf("done-%d", teamPromptRecentCompletedTasks+2) {
+				seenMostRecent = true
+			}
+		} else {
+			openCount++
+		}
+	}
+	if openCount != 2 {
+		t.Fatalf("expected both open tasks preserved in full, got %d", openCount)
+	}
+	if completedCount != teamPromptRecentCompletedTasks {
+		t.Fatalf("expected completed tasks capped to %d, got %d", teamPromptRecentCompletedTasks, completedCount)
+	}
+	if !seenMostRecent {
+		t.Fatalf("expected the MOST RECENTLY completed task to survive the cap, it did not: %+v", visible)
+	}
+}
 
 func newTeamTestStore(t *testing.T) (*Store, string) {
 	t.Helper()
@@ -491,6 +543,70 @@ func TestRunTeamConcurrentTurnsAreRaceFree(t *testing.T) {
 		if m.TurnCount != 1 || m.Status != "idle" {
 			t.Fatalf("member %s did not converge cleanly: %+v", m.Name, m)
 		}
+	}
+}
+
+// TestRunTeamConcurrentRunsTurnsTakenCountsOnlyActualTurns is the regression
+// test for a P3 found by review: TurnsTaken used to be incremented by
+// len(eligible) — the number of members OFFERED a turn this round — not the
+// number that actually got one. A member offered a turn by TWO concurrent
+// `team run` invocations (a real scenario: `team attach` + `team run` from
+// two processes/agents) has ONE of them lose BeginMemberTurn's CAS
+// (ranTurn=false, see errMemberTurnInFlight); the old code counted it as a
+// turn taken anyway, in EVERY concurrent caller's own summary, inflating
+// TurnsTaken above the number of provider calls actually made — misleading
+// anyone using it as a cost/activity proxy. This races N=4 independent
+// `RunTeam` calls (on N=4 independent *Runner instances, same store/team) over
+// a SINGLE member and checks the summed TurnsTaken across all of them.
+func TestRunTeamConcurrentRunsTurnsTakenCountsOnlyActualTurns(t *testing.T) {
+	store, _ := newTeamTestStore(t)
+	repo := newTeamTestRepo(t)
+	team, err := store.CreateTeam("goal", repo, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SpawnMember(team.ID, "worker-1", "claude", "", "", "read-only"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PersistMemberSession(team.ID, "worker-1", "sess-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SendTeamMessage(team.ID, "lead", "worker-1", "go"); err != nil {
+		t.Fatal(err)
+	}
+	setClaudeCLI(t, fakeClaudeBinary(t, `{"result":"{\"status\":\"idle\",\"summary\":\"ok\"}"}`))
+
+	const n = 4
+	var wg sync.WaitGroup
+	summaries := make([]TeamRunSummary, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			r := &Runner{}
+			s, rerr := r.RunTeam(context.Background(), store, team.ID, TeamTurnOptions{})
+			if rerr != nil {
+				t.Error(rerr)
+				return
+			}
+			summaries[i] = s
+		}(i)
+	}
+	wg.Wait()
+
+	total := 0
+	for _, s := range summaries {
+		total += s.TurnsTaken
+	}
+	if total != 1 {
+		t.Fatalf("expected exactly 1 real turn summed across %d concurrent RunTeam calls (one member, one turn), got %d: %+v", n, total, summaries)
+	}
+	member, err := store.GetMember(team.ID, "worker-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if member.TurnCount != 1 {
+		t.Fatalf("expected the member to have actually taken exactly one turn, got TurnCount=%d", member.TurnCount)
 	}
 }
 
