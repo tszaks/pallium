@@ -60,10 +60,12 @@ CREATE TABLE IF NOT EXISTS decision_notes (
 );
 
 CREATE TABLE IF NOT EXISTS active_tasks (
-  repo_id INTEGER PRIMARY KEY,
+  repo_id INTEGER NOT NULL,
+  branch TEXT NOT NULL DEFAULT '',
   goal TEXT NOT NULL,
   scope_paths TEXT NOT NULL,
-  started_at TEXT NOT NULL
+  started_at TEXT NOT NULL,
+  PRIMARY KEY (repo_id, branch)
 );
 
 CREATE TABLE IF NOT EXISTS verification_runs (
