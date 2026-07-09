@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -47,7 +48,26 @@ func runTeam(out io.Writer, args []string, jsonOutput bool) error {
 	}
 }
 
+// openTeamStore is the single chokepoint every `pallium team` subcommand
+// opens its store through. Without --db, workflow.Open falls back to the
+// real, shared, global ~/.pallium/codex-sessions.sqlite — fine for a genuine
+// long-lived team, but a landmine for throwaway/test teams: this is the
+// exact mistake that polluted Tyler's real production DB with test-team rows
+// during Agent Teams M1 development, requiring a manual SQL cleanup.
+// PALLIUM_TEST_DB is the safety net: set it ONCE per test/dogfood session
+// (e.g. export PALLIUM_TEST_DB=/tmp/throwaway.sqlite) and every subsequent
+// `team ...` call that forgets --db lands there instead of the real global
+// DB. It is deliberately opt-in (never silently redirects a genuine user who
+// hasn't set it) and never silent when active (always warns to stderr so a
+// forgotten env var from an earlier session can't quietly redirect real
+// work either).
 func openTeamStore(dbPath string) (*workflow.Store, error) {
+	if dbPath == "" {
+		if testDB := strings.TrimSpace(os.Getenv("PALLIUM_TEST_DB")); testDB != "" {
+			fmt.Fprintf(os.Stderr, "[team] PALLIUM_TEST_DB is set: using %s instead of the default global DB (no --db was passed)\n", testDB)
+			dbPath = testDB
+		}
+	}
 	return workflow.Open(dbPath)
 }
 
