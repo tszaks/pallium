@@ -162,8 +162,12 @@ func (r *Runner) runBuiltinClaudeCommand(ctx context.Context, usageFile, cwd, pr
 
 // buildClaudeTeamArgs builds argv for one team-turn invocation. isFirstTurn
 // picks --session-id (claude lets the caller MINT a session id, so team.go
-// generates one at spawn time and this is its very first use) vs --resume
-// (every later turn continues that same native conversation). The tool
+// generates one at spawn time) vs --resume (every later turn continues that
+// same native conversation). isFirstTurn means "no turn has SUCCEEDED yet",
+// not "no turn has been ATTEMPTED yet" — see Store.FinishMemberTurn's
+// session_established field: a failed attempt retries with --session-id
+// again rather than falling through to --resume against a session claude
+// may never have actually created. The tool
 // allowlist is unchanged from the normal worker split: coordination
 // (messaging, task claim/complete) happens via a structured end-of-turn
 // decision Pallium parses and applies itself (see teamDecisionSchema in

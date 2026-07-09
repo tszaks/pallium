@@ -20,8 +20,16 @@ type Team struct {
 	Status         string  `json:"status"` // active | parked | stopped
 	BudgetUSDLimit float64 `json:"budget_usd_limit,omitempty"`
 	SpendUSD       float64 `json:"spend_usd"`
-	CreatedAt      string  `json:"created_at"`
-	UpdatedAt      string  `json:"updated_at"`
+	// TasksUpdatedAt is a team-wide watermark bumped on every task-board
+	// mutation (create/claim/complete/revert-to-pending) — NOT the same as
+	// any single task's own updated_at, because completing task A can make
+	// task B newly claimable (a dependency satisfied) without touching B's
+	// row at all. The scheduler (see RunTeam) compares this against a
+	// member's LastTurnAt to decide whether "claimable work exists" is NEW
+	// information for that member or the same board it already declined.
+	TasksUpdatedAt string `json:"tasks_updated_at,omitempty"`
+	CreatedAt      string `json:"created_at"`
+	UpdatedAt      string `json:"updated_at"`
 }
 
 // TeamMember is a named, persistent teammate identity. Its life is a series
@@ -33,25 +41,32 @@ type Team struct {
 // so an interrupted turn (the owning process died mid-turn) is detectable
 // and resumable rather than looking like a live member that never responds.
 type TeamMember struct {
-	ID             string  `json:"id"`
-	TeamID         string  `json:"team_id"`
-	Name           string  `json:"name"`
-	Provider       string  `json:"provider"`
-	Model          string  `json:"model,omitempty"`
-	Role           string  `json:"role,omitempty"`
-	Mode           string  `json:"mode"`   // read-only | edit
-	Status         string  `json:"status"` // idle | active | blocked | interrupted | stale | stopped | error
-	SessionToken   string  `json:"session_token,omitempty"`
-	Worktree       string  `json:"worktree,omitempty"`
-	TurnCount      int     `json:"turn_count"`
-	TurnStartedAt  string  `json:"turn_started_at,omitempty"`
-	LastTurnAt     string  `json:"last_turn_at,omitempty"`
-	LastTurnStatus string  `json:"last_turn_status,omitempty"`
-	LastTurnError  string  `json:"last_turn_error,omitempty"`
-	NudgedAt       string  `json:"nudged_at,omitempty"`
-	SpendUSD       float64 `json:"spend_usd"`
-	CreatedAt      string  `json:"created_at"`
-	UpdatedAt      string  `json:"updated_at"`
+	ID           string `json:"id"`
+	TeamID       string `json:"team_id"`
+	Name         string `json:"name"`
+	Provider     string `json:"provider"`
+	Model        string `json:"model,omitempty"`
+	Role         string `json:"role,omitempty"`
+	Mode         string `json:"mode"`   // read-only | edit
+	Status       string `json:"status"` // idle | active | blocked | interrupted | stale | stopped | error
+	SessionToken string `json:"session_token,omitempty"`
+	// SessionEstablished is sticky-true once a turn has ever completed with
+	// a status other than "error" (see FinishMemberTurn). It is deliberately
+	// NOT the same as TurnCount>0: TurnCount increments even on a failed
+	// turn, but a failed claude turn may never have actually created the
+	// native session claude expects `--resume` to find. dispatchTeamTurn
+	// uses THIS field, not TurnCount, to decide `--session-id` vs `--resume`.
+	SessionEstablished bool    `json:"session_established"`
+	Worktree           string  `json:"worktree,omitempty"`
+	TurnCount          int     `json:"turn_count"`
+	TurnStartedAt      string  `json:"turn_started_at,omitempty"`
+	LastTurnAt         string  `json:"last_turn_at,omitempty"`
+	LastTurnStatus     string  `json:"last_turn_status,omitempty"`
+	LastTurnError      string  `json:"last_turn_error,omitempty"`
+	NudgedAt           string  `json:"nudged_at,omitempty"`
+	SpendUSD           float64 `json:"spend_usd"`
+	CreatedAt          string  `json:"created_at"`
+	UpdatedAt          string  `json:"updated_at"`
 }
 
 // TeamTask is one item on the shared task board. DependsOn holds task ids
@@ -96,6 +111,7 @@ CREATE TABLE IF NOT EXISTS teams (
   status TEXT NOT NULL,
   budget_usd_limit REAL DEFAULT 0,
   spend_usd REAL DEFAULT 0,
+  tasks_updated_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -111,6 +127,7 @@ CREATE TABLE IF NOT EXISTS team_members (
   mode TEXT NOT NULL,
   status TEXT NOT NULL,
   session_token TEXT,
+  session_established INTEGER NOT NULL DEFAULT 0,
   worktree TEXT,
   turn_count INTEGER DEFAULT 0,
   turn_started_at TEXT,
@@ -180,12 +197,26 @@ func (s *Store) CreateTeam(goal, cwd string, budgetUSDLimit float64) (Team, erro
 
 func (s *Store) GetTeam(id string) (Team, error) {
 	var t Team
-	err := s.db.QueryRow(`SELECT id,goal,cwd,status,budget_usd_limit,spend_usd,created_at,updated_at FROM teams WHERE id=?`, id).
-		Scan(&t.ID, &t.Goal, &t.CWD, &t.Status, &t.BudgetUSDLimit, &t.SpendUSD, &t.CreatedAt, &t.UpdatedAt)
+	var tasksUpdatedAt sql.NullString
+	err := s.db.QueryRow(`SELECT id,goal,cwd,status,budget_usd_limit,spend_usd,tasks_updated_at,created_at,updated_at FROM teams WHERE id=?`, id).
+		Scan(&t.ID, &t.Goal, &t.CWD, &t.Status, &t.BudgetUSDLimit, &t.SpendUSD, &tasksUpdatedAt, &t.CreatedAt, &t.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return Team{}, fmt.Errorf("team %q not found", id)
 	}
+	t.TasksUpdatedAt = tasksUpdatedAt.String
 	return t, err
+}
+
+// bumpTeamTasksUpdated advances the team-wide task-board watermark (see
+// Team.TasksUpdatedAt) — called after every task mutation that can change
+// what's claimable, even one that touches a DIFFERENT task's row than the
+// one whose claimability actually changed (completing a dependency doesn't
+// write to the task it unblocks).
+func bumpTeamTasksUpdated(exec interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}, teamID, now string) error {
+	_, err := exec.Exec(`UPDATE teams SET tasks_updated_at=? WHERE id=?`, now, teamID)
+	return err
 }
 
 func (s *Store) SetTeamStatus(id, status string) error {
@@ -245,7 +276,7 @@ func (s *Store) SpawnMember(teamID, name, provider, model, role, mode string) (T
 func scanMember(row *sql.Row) (TeamMember, error) {
 	var m TeamMember
 	var model, role, session, worktree, turnStarted, lastAt, lastStatus, lastErr, nudged sql.NullString
-	err := row.Scan(&m.ID, &m.TeamID, &m.Name, &m.Provider, &model, &role, &m.Mode, &m.Status, &session, &worktree,
+	err := row.Scan(&m.ID, &m.TeamID, &m.Name, &m.Provider, &model, &role, &m.Mode, &m.Status, &session, &m.SessionEstablished, &worktree,
 		&m.TurnCount, &turnStarted, &lastAt, &lastStatus, &lastErr, &nudged, &m.SpendUSD, &m.CreatedAt, &m.UpdatedAt)
 	if err != nil {
 		return TeamMember{}, err
@@ -255,7 +286,7 @@ func scanMember(row *sql.Row) (TeamMember, error) {
 	return m, nil
 }
 
-const memberSelectCols = `id,team_id,name,provider,model,role,mode,status,session_token,worktree,turn_count,turn_started_at,last_turn_at,last_turn_status,last_turn_error,nudged_at,spend_usd,created_at,updated_at`
+const memberSelectCols = `id,team_id,name,provider,model,role,mode,status,session_token,session_established,worktree,turn_count,turn_started_at,last_turn_at,last_turn_status,last_turn_error,nudged_at,spend_usd,created_at,updated_at`
 
 func (s *Store) GetMember(teamID, name string) (TeamMember, error) {
 	m, err := scanMember(s.db.QueryRow(`SELECT `+memberSelectCols+` FROM team_members WHERE team_id=? AND name=?`, teamID, name))
@@ -275,7 +306,7 @@ func (s *Store) ListMembers(teamID string) ([]TeamMember, error) {
 	for rows.Next() {
 		var m TeamMember
 		var model, role, session, worktree, turnStarted, lastAt, lastStatus, lastErr, nudged sql.NullString
-		if err := rows.Scan(&m.ID, &m.TeamID, &m.Name, &m.Provider, &model, &role, &m.Mode, &m.Status, &session, &worktree,
+		if err := rows.Scan(&m.ID, &m.TeamID, &m.Name, &m.Provider, &model, &role, &m.Mode, &m.Status, &session, &m.SessionEstablished, &worktree,
 			&m.TurnCount, &turnStarted, &lastAt, &lastStatus, &lastErr, &nudged, &m.SpendUSD, &m.CreatedAt, &m.UpdatedAt); err != nil {
 			return nil, err
 		}
@@ -341,6 +372,17 @@ func (s *Store) BeginMemberTurn(teamID, name string, staleAfter string) (lease s
 // checks turn_started_at=lease (not merely IS NOT NULL), so a call whose
 // lease has since been reassigned (stale takeover, or reconciled as
 // interrupted) cannot finish — or silently corrupt — a turn it no longer owns.
+//
+// turn_count increments unconditionally, on error or success — it is a
+// how-many-attempts counter, not a success counter. session_established is
+// the field that means "success": it flips true (and stays true — the OR is
+// sticky, never reset) the first time status != "error". This split matters
+// because a claude member's SessionToken is pre-minted at spawn (see
+// SpawnTeamMember), not left empty until first success the way codex's is —
+// so if turn 1 fails before claude ever actually creates that session,
+// TurnCount alone would say "not the first turn anymore" while claude's side
+// never established anything for `--resume` to find. dispatchTeamTurn must
+// key `--session-id` vs `--resume` off SessionEstablished, not TurnCount==0.
 func (s *Store) FinishMemberTurn(teamID, name, lease, status, sessionToken, turnError string, spendDelta float64) error {
 	now := nowString()
 	tx, err := s.db.Begin()
@@ -359,9 +401,10 @@ func (s *Store) FinishMemberTurn(teamID, name, lease, status, sessionToken, turn
 	}
 	res, err := tx.Exec(
 		`UPDATE team_members SET turn_started_at=NULL, status=?, session_token=?, turn_count=turn_count+1,
-		 last_turn_at=?, last_turn_status=?, last_turn_error=?, spend_usd=spend_usd+?, updated_at=?
+		 last_turn_at=?, last_turn_status=?, last_turn_error=?, spend_usd=spend_usd+?, updated_at=?,
+		 session_established = session_established OR (? <> 'error')
 		 WHERE team_id=? AND name=? AND turn_started_at=?`,
-		status, token, now, status, turnError, spendDelta, now, teamID, name, lease)
+		status, token, now, status, turnError, spendDelta, now, status, teamID, name, lease)
 	if err != nil {
 		return err
 	}
@@ -504,8 +547,18 @@ func (s *Store) ReconcileInterruptedMembers(teamID, staleAfter string) ([]string
 			if sessions[name] != "" {
 				return tx.Commit()
 			}
-			if _, err := tx.Exec(`UPDATE team_tasks SET status='pending', owner=NULL, updated_at=? WHERE team_id=? AND owner=? AND status='in_progress'`, now, teamID, name); err != nil {
+			revertRes, err := tx.Exec(`UPDATE team_tasks SET status='pending', owner=NULL, updated_at=? WHERE team_id=? AND owner=? AND status='in_progress'`, now, teamID, name)
+			if err != nil {
 				return err
+			}
+			if n, _ := revertRes.RowsAffected(); n > 0 {
+				// A task just became claimable again (owner cleared) — bump
+				// the board watermark so the scheduler doesn't treat this as
+				// the same unchanged board every other idle member already
+				// declined (see RunTeam / Team.TasksUpdatedAt).
+				if err := bumpTeamTasksUpdated(tx, teamID, now); err != nil {
+					return err
+				}
 			}
 			return tx.Commit()
 		}(); err != nil {
@@ -532,6 +585,9 @@ func (s *Store) CreateTeamTask(teamID, title, description string, dependsOn []st
 	_, err = s.db.Exec(`INSERT INTO team_tasks(id,team_id,title,description,status,depends_on,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`,
 		t.ID, t.TeamID, t.Title, t.Description, t.Status, string(deps), t.CreatedAt, t.UpdatedAt)
 	if err != nil {
+		return TeamTask{}, err
+	}
+	if err := bumpTeamTasksUpdated(s.db, teamID, now); err != nil {
 		return TeamTask{}, err
 	}
 	return t, nil
@@ -617,6 +673,12 @@ func (s *Store) ClaimTask(teamID, taskID, owner string) (TeamTask, error) {
 	if n, _ := res.RowsAffected(); n == 0 {
 		return TeamTask{}, errTaskNotClaimable
 	}
+	// A claimed task leaves the claimable pool — bump the board watermark so
+	// members who already saw (and declined) this exact task before it was
+	// claimed don't need to re-examine an unchanged board (see RunTeam).
+	if err := bumpTeamTasksUpdated(s.db, teamID, now); err != nil {
+		return TeamTask{}, err
+	}
 	return s.GetTeamTask(teamID, taskID)
 }
 
@@ -633,6 +695,13 @@ func (s *Store) CompleteTask(teamID, taskID, owner, result string) (TeamTask, er
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return TeamTask{}, fmt.Errorf("team task %q is not owned by %q (or already completed); cannot complete it", taskID, owner)
+	}
+	// Completing a task can make a DIFFERENT task newly claimable (a
+	// dependency just got satisfied) without ever touching that other
+	// task's own row — bump the team-wide watermark, not just this task's
+	// updated_at, so the scheduler notices (see RunTeam).
+	if err := bumpTeamTasksUpdated(s.db, teamID, now); err != nil {
+		return TeamTask{}, err
 	}
 	return s.GetTeamTask(teamID, taskID)
 }
