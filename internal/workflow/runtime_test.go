@@ -1041,6 +1041,266 @@ func TestConcurrentStaleTakeoverOnlyOneWins(t *testing.T) {
 	}
 }
 
+// writeConflictingPatch creates a scratch worktree of repoRoot checked out
+// from HEAD, writes newContent to filename, and returns a patch file
+// capturing that change. Independent of any Runner/staging state so two
+// calls with different newContent for the same filename both generate their
+// diff against the SAME original HEAD — a genuine 3-way conflict when both
+// are applied in sequence onto one worktree, not just two edits that happen
+// to touch the same line via different intermediate states.
+func writeConflictingPatch(t *testing.T, dir, repoRoot, filename, newContent string) string {
+	t.Helper()
+	scratch := filepath.Join(dir, "scratch-"+strconv.Itoa(len(newContent))+"-"+filename)
+	runGit(t, repoRoot, "worktree", "add", "--detach", scratch, "HEAD")
+	defer func() {
+		rm := exec.Command("git", "worktree", "remove", "--force", scratch)
+		rm.Dir = repoRoot
+		_ = rm.Run()
+	}()
+	if err := os.WriteFile(filepath.Join(scratch, filename), []byte(newContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	add := exec.Command("git", "add", "-N", "--", ".")
+	add.Dir = scratch
+	if out, err := add.CombinedOutput(); err != nil {
+		t.Fatalf("git add -N: %v: %s", err, out)
+	}
+	diffCmd := exec.Command("git", "diff", "--binary")
+	diffCmd.Dir = scratch
+	raw, err := diffCmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	patchPath := filepath.Join(dir, filename+"-"+strconv.Itoa(len(newContent))+".patch")
+	if err := os.WriteFile(patchPath, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return patchPath
+}
+
+// TestMergeIntoStagingRestoresSnapshotOnConflict is the regression test for
+// the adversarial-review finding that a failed `git apply --3way` (a real
+// conflict between two edit-intent agents touching the same lines) left
+// staging's shared, long-lived worktree with literal conflict markers and a
+// dirty index — silently corrupting every later mergeIntoStaging/
+// seedFromStaging read for the rest of the run. The fix snapshots staging
+// before each merge attempt and restores it on failure.
+func TestMergeIntoStagingRestoresSnapshotOnConflict(t *testing.T) {
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "shared.txt"), []byte("line1\nline2\nline3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "shared.txt")
+	runGit(t, tmp, "commit", "-m", "initial")
+
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run, err := store.CreateRun(Run{ID: "wf-merge-conflict", Task: "merge conflict", CWD: tmp, ScriptPath: "unused.js"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &Runner{Store: store, Run: run}
+
+	patchDir := t.TempDir()
+	patchA := writeConflictingPatch(t, patchDir, tmp, "shared.txt", "line1\nCHANGED-A\nline3\n")
+	if err := r.mergeIntoStaging(tmp, patchA); err != nil {
+		t.Fatalf("first merge should succeed cleanly: %v", err)
+	}
+	stagingPath := r.stagingPathFor(tmp)
+	before, err := worktreeDiff(stagingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	patchB := writeConflictingPatch(t, patchDir, tmp, "shared.txt", "line1\nCHANGED-B\nline3\n")
+	if err := r.mergeIntoStaging(tmp, patchB); err == nil {
+		t.Fatal("expected the conflicting second merge to fail")
+	}
+
+	after, err := worktreeDiff(stagingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("expected staging restored to its pre-conflict snapshot after the failed merge, got a different diff:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+	raw, err := os.ReadFile(filepath.Join(stagingPath, "shared.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "<<<<<<<") {
+		t.Fatalf("expected no conflict markers left in staging after the restore, got:\n%s", raw)
+	}
+}
+
+// TestNonEditWorktreeDiscardedWhenSeedFromStagingFails is the regression
+// test for the adversarial-review finding that the real dispatch path's
+// containment-worktree discard defer was registered AFTER the
+// seedFromStaging call, so a seed failure returned before the defer ever
+// existed and leaked the freshly created worktree on disk permanently.
+func TestNonEditWorktreeDiscardedWhenSeedFromStagingFails(t *testing.T) {
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "file.txt"), []byte("original\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "file.txt")
+	runGit(t, tmp, "commit", "-m", "initial")
+
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run, err := store.CreateRun(Run{ID: "wf-seed-fail-leak", Task: "seed fail leak", CWD: tmp, ScriptPath: "unused.js"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &Runner{Store: store, Run: run}
+	// A broken staging entry (pointing at a path that is not a valid git
+	// worktree at all) makes seedFromStaging fail deterministically without
+	// needing to construct a genuine merge conflict — the specific trigger
+	// doesn't matter for this test, only that ANY seedFromStaging failure
+	// must not leak the fresh containment worktree runAgentCommand created
+	// immediately before calling it.
+	r.staging = map[string]*stagingWorktree{
+		tmp: {path: filepath.Join(tmp, "not-a-real-worktree")},
+	}
+
+	agent := &Agent{ID: "check-agent-1", RunID: run.ID, Repo: tmp, Mode: "test"}
+	_, _, worktree, err := r.runAgentCommand(context.Background(), agent, AgentOptions{})
+	if err == nil {
+		t.Fatal("expected seedFromStaging's failure to propagate")
+	}
+	if worktree == "" {
+		t.Fatal("expected runAgentCommand to report the worktree path it had created before the seed failure")
+	}
+	if _, statErr := os.Stat(worktree); !os.IsNotExist(statErr) {
+		t.Fatalf("expected the containment worktree removed from disk after the seed failure, stat err=%v", statErr)
+	}
+	list := exec.Command("git", "worktree", "list", "--porcelain")
+	list.Dir = tmp
+	raw, err := list.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(raw), "worktree "); got != 1 {
+		t.Fatalf("expected only the main worktree registered after the leak fix, got %d:\n%s", got, string(raw))
+	}
+}
+
+// TestStubPathNonEditWorktreeDiscardedWhenSeedFromStagingFails is the same
+// regression as above for the PALLIUM_WORKFLOW_AGENT_STUB test-stub
+// dispatch path, which had no discard mechanism at all for this case.
+func TestStubPathNonEditWorktreeDiscardedWhenSeedFromStagingFails(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "file.txt"), []byte("original\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "file.txt")
+	runGit(t, tmp, "commit", "-m", "initial")
+
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run, err := store.CreateRun(Run{ID: "wf-seed-fail-leak-stub", Task: "seed fail leak stub", CWD: tmp, ScriptPath: "unused.js"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &Runner{Store: store, Run: run}
+	r.staging = map[string]*stagingWorktree{
+		tmp: {path: filepath.Join(tmp, "not-a-real-worktree")},
+	}
+
+	agent := &Agent{ID: "check-agent-2", RunID: run.ID, Repo: tmp, Mode: "test"}
+	_, _, worktree, err := r.runAgentCommand(context.Background(), agent, AgentOptions{})
+	if err == nil {
+		t.Fatal("expected seedFromStaging's failure to propagate")
+	}
+	if worktree == "" {
+		t.Fatal("expected runAgentCommand to report the worktree path it had created before the seed failure")
+	}
+	if _, statErr := os.Stat(worktree); !os.IsNotExist(statErr) {
+		t.Fatalf("expected the containment worktree removed from disk after the seed failure, stat err=%v", statErr)
+	}
+	list := exec.Command("git", "worktree", "list", "--porcelain")
+	list.Dir = tmp
+	raw, err := list.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(raw), "worktree "); got != 1 {
+		t.Fatalf("expected only the main worktree registered after the leak fix, got %d:\n%s", got, string(raw))
+	}
+}
+
+// TestRepoLockContentionInsideParallelHaltsRunInsteadOfBeingDropped is the
+// regression test for the adversarial-review finding that acquireRepoLock's
+// contention error had no distinguishable sentinel, so parallel()/pipeline()
+// silently dropped every contended edit-intent agent call to null via the
+// same path as an ordinary per-item provider failure — masking cross-run
+// lock contention as N unrelated failures instead of halting the run with
+// one clear cause.
+func TestRepoLockContentionInsideParallelHaltsRunInsteadOfBeingDropped(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"edited"}`)
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "note.txt"), []byte("original\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "note.txt")
+	runGit(t, tmp, "commit", "-m", "initial")
+
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `const results = parallel(["a", "b"], item => agent("edit " + item, { label: item, mode: "edit", isolation: "worktree" }));
+return { count: results.length };`
+	scriptPath, err := WriteRunScript("wf-lock-parallel", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-lock-parallel", Task: "lock contention in parallel", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	canonical, err := gitlog.CanonicalRepoRoot(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := store.AcquireRepoLock(canonical, "other-run", time.Hour); err != nil || !ok {
+		t.Fatalf("seed contending lock: ok=%v err=%v", ok, err)
+	}
+
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err == nil {
+		t.Fatal("expected the run to fail outright on lock contention, not silently drop both items to null")
+	}
+	if !strings.Contains(err.Error(), "workflow repo edit lock contended") {
+		t.Fatalf("expected the lock-contention sentinel to surface as the run's error, got: %v", err)
+	}
+}
+
 // TestConcurrentEditRunsOnSameRepoOneFailsFast is bug #34's non-negotiable
 // race test: two concurrent edit runs against the same repo, using two
 // separate Store handles onto the same sqlite file (mirroring two separate
