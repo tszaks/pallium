@@ -4,9 +4,20 @@ import (
 	"database/sql"
 	"errors"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 )
+
+func runGitDB(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v failed: %v\n%s", args, err, string(output))
+	}
+}
 
 func TestSchemaInitializes(t *testing.T) {
 	repo := t.TempDir()
@@ -170,7 +181,10 @@ func TestActiveTaskRoundTrip(t *testing.T) {
 	task := ActiveTask{
 		Goal:       "Tighten review output",
 		ScopePaths: []string{"cmd/review.go", "internal/analysis"},
-		StartedAt:  time.Date(2026, 3, 13, 12, 30, 0, 0, time.UTC),
+		// Recent, not a fixed historical date: ActiveTask() now ages out
+		// anything older than activeTaskStaleAfter (see
+		// TestActiveTaskAgesOutAfterStaleWindow for that behavior itself).
+		StartedAt: time.Now().UTC().Add(-1 * time.Minute),
 	}
 	if err := store.SaveActiveTask(task); err != nil {
 		t.Fatalf("SaveActiveTask failed: %v", err)
@@ -192,6 +206,129 @@ func TestActiveTaskRoundTrip(t *testing.T) {
 	}
 	if _, err := store.ActiveTask(); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("expected sql.ErrNoRows after clear, got %v", err)
+	}
+}
+
+// TestActiveTaskScopedPerBranch is the regression test for the P1 leak
+// found dogfooding: two sessions working the SAME checkout path on
+// DIFFERENT branches used to share one repo-only-keyed active_tasks row —
+// whichever session ran `task start` most recently silently overwrote the
+// other's task, and `workflow preflight` could present either session's
+// task_scope depending on write order, not which one was actually asking.
+func TestActiveTaskScopedPerBranch(t *testing.T) {
+	repo := t.TempDir()
+	runGitDB(t, repo, "init", "-q", "-b", "main")
+	runGitDB(t, repo, "config", "user.email", "test@example.com")
+	runGitDB(t, repo, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitDB(t, repo, "add", "f.txt")
+	runGitDB(t, repo, "commit", "-q", "-m", "initial")
+	runGitDB(t, repo, "checkout", "-q", "-b", "feature-a")
+	runGitDB(t, repo, "checkout", "-q", "main")
+
+	store, err := OpenPath(repo, filepath.Join(t.TempDir(), "test.sqlite"))
+	if err != nil {
+		t.Fatalf("OpenPath failed: %v", err)
+	}
+	defer store.Close()
+	if _, err := store.DB().Exec(`INSERT INTO repos (root, branch, last_indexed_commit, indexed_at) VALUES (?, 'main', 'abc123', '2026-03-13T12:00:00Z')`, repo); err != nil {
+		t.Fatalf("insert repo: %v", err)
+	}
+
+	// Session on "main" starts a task.
+	mainTask := ActiveTask{Goal: "main branch task", StartedAt: time.Now().UTC()}
+	if err := store.SaveActiveTask(mainTask); err != nil {
+		t.Fatal(err)
+	}
+
+	// A DIFFERENT session, same checkout, switches to "feature-a" — it must
+	// see NO task at all (not main's), since it never started one on this branch.
+	runGitDB(t, repo, "checkout", "-q", "feature-a")
+	if _, err := store.ActiveTask(); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected feature-a to see no leaked task from main, got err=%v", err)
+	}
+	featureTask := ActiveTask{Goal: "feature-a branch task", StartedAt: time.Now().UTC()}
+	if err := store.SaveActiveTask(featureTask); err != nil {
+		t.Fatal(err)
+	}
+
+	// Switching back to "main" must show MAIN's own task, untouched by
+	// feature-a's save — not overwritten, not feature-a's task leaking back.
+	runGitDB(t, repo, "checkout", "-q", "main")
+	got, err := store.ActiveTask()
+	if err != nil {
+		t.Fatalf("expected main's own task to still be present, got err=%v", err)
+	}
+	if got.Goal != mainTask.Goal {
+		t.Fatalf("expected main's task %q, got %q (feature-a's task leaked across branches)", mainTask.Goal, got.Goal)
+	}
+}
+
+// TestActiveTaskAgesOutAfterStaleWindow is the second half of the leak fix:
+// even ON the same branch, a task left over from a genuinely abandoned past
+// session must not keep surfacing forever.
+func TestActiveTaskAgesOutAfterStaleWindow(t *testing.T) {
+	repo := t.TempDir()
+	store, err := OpenPath(repo, filepath.Join(t.TempDir(), "test.sqlite"))
+	if err != nil {
+		t.Fatalf("OpenPath failed: %v", err)
+	}
+	defer store.Close()
+	if _, err := store.DB().Exec(`INSERT INTO repos (root, branch, last_indexed_commit, indexed_at) VALUES (?, 'main', 'abc123', '2026-03-13T12:00:00Z')`, repo); err != nil {
+		t.Fatalf("insert repo: %v", err)
+	}
+
+	old := ActiveTask{Goal: "abandoned task", StartedAt: time.Now().UTC().Add(-activeTaskStaleAfter - time.Hour)}
+	if err := store.SaveActiveTask(old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ActiveTask(); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected a task older than activeTaskStaleAfter to be aged out, got err=%v", err)
+	}
+}
+
+// TestMigrateActiveTasksBranchScopingPreservesOldRows proves the migration
+// from the original repo-only PRIMARY KEY to (repo_id, branch) doesn't lose
+// data: an old-shaped row survives with branch='' (its true branch at
+// migration time is unknowable — see the migration's own doc comment for
+// why '' is a safe placeholder, not silent data loss).
+func TestMigrateActiveTasksBranchScopingPreservesOldRows(t *testing.T) {
+	repo := t.TempDir()
+	store, err := OpenPath(repo, filepath.Join(t.TempDir(), "test.sqlite"))
+	if err != nil {
+		t.Fatalf("OpenPath failed: %v", err)
+	}
+	defer store.Close()
+
+	// Simulate a PRE-migration database: drop the (already new-shaped)
+	// table and recreate it in the original single-column-PK shape, with a
+	// row that predates this fix.
+	if _, err := store.DB().Exec(`DROP TABLE active_tasks`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`CREATE TABLE active_tasks (repo_id INTEGER PRIMARY KEY, goal TEXT NOT NULL, scope_paths TEXT NOT NULL, started_at TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`INSERT INTO active_tasks (repo_id, goal, scope_paths, started_at) VALUES (42, 'pre-migration task', '[]', ?)`, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.migrateActiveTasksBranchScoping(); err != nil {
+		t.Fatalf("migration failed: %v", err)
+	}
+
+	var goal, branch string
+	row := store.DB().QueryRow(`SELECT goal, branch FROM active_tasks WHERE repo_id = 42`)
+	if err := row.Scan(&goal, &branch); err != nil {
+		t.Fatalf("expected the pre-migration row to survive, got: %v", err)
+	}
+	if goal != "pre-migration task" {
+		t.Fatalf("expected the row's goal preserved, got %q", goal)
+	}
+	if branch != "" {
+		t.Fatalf("expected the migrated row's branch to be the '' placeholder, got %q", branch)
 	}
 }
 

@@ -802,7 +802,7 @@ func buildWorkflowAnalytics(store *workflow.Store, limit int) (workflowAnalytics
 	completed := 0
 	for _, run := range runs {
 		analytics.RunsByStatus[run.Status]++
-		if run.Status == "completed" {
+		if run.Status == "completed" || run.Status == "completed_with_failures" {
 			completed++
 		}
 		agents, err := store.ListAgents(run.ID)
@@ -1172,6 +1172,7 @@ func workflowRunFailedEntirely(snapshot workflow.Snapshot) bool {
 
 func runWorkflowGenerate(out io.Writer, args []string, jsonOutput bool) error {
 	fs := newSessionFlagSet("workflow generate")
+	cwd := fs.String("cwd", "", "")
 	outputPath := fs.String("output", "", "")
 	style := fs.String("style", "auto", "")
 	testCommand := fs.String("test-command", "", "")
@@ -1180,13 +1181,14 @@ func runWorkflowGenerate(out io.Writer, args []string, jsonOutput bool) error {
 	codexBinary := fs.String("codex", "codex", "")
 	llm := fs.Bool("llm", false, "")
 	user := fs.Bool("user", false, "")
-	if err := parseSessionFlags(fs, args, map[string]struct{}{"output": {}, "style": {}, "test-command": {}, "max-rounds": {}, "save": {}, "codex": {}}, map[string]struct{}{"user": {}, "llm": {}}); err != nil {
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"cwd": {}, "output": {}, "style": {}, "test-command": {}, "max-rounds": {}, "save": {}, "codex": {}}, map[string]struct{}{"user": {}, "llm": {}}); err != nil {
 		return err
 	}
 	task := strings.TrimSpace(strings.Join(fs.Args(), " "))
 	if task == "" {
 		return fmt.Errorf("workflow generate requires a task")
 	}
+	repoPath := firstNonEmpty(*cwd, ".")
 	script, err := workflow.GenerateScript(workflow.GenerateOptions{
 		Task:        task,
 		Style:       *style,
@@ -1197,7 +1199,7 @@ func runWorkflowGenerate(out io.Writer, args []string, jsonOutput bool) error {
 		return err
 	}
 	if *llm {
-		script, err = generateWorkflowWithLLM(task, *style, *testCommand, *maxRounds, *codexBinary, script)
+		script, err = generateWorkflowWithLLM(task, *style, *testCommand, *maxRounds, *codexBinary, repoPath, script)
 		if err != nil {
 			return err
 		}
@@ -1206,11 +1208,14 @@ func runWorkflowGenerate(out io.Writer, args []string, jsonOutput bool) error {
 		return fmt.Errorf("generated workflow is invalid: %s", validation.Error)
 	}
 	dest := strings.TrimSpace(*outputPath)
+	if dest != "" && !filepath.IsAbs(dest) {
+		dest = filepath.Join(repoPath, dest)
+	}
 	if strings.TrimSpace(*saveName) != "" {
 		if err := workflow.ValidateID(*saveName); err != nil {
 			return err
 		}
-		root := filepath.Join(".pallium", "workflows")
+		root := filepath.Join(repoPath, ".pallium", "workflows")
 		if *user {
 			home, err := os.UserHomeDir()
 			if err != nil {
@@ -1242,7 +1247,7 @@ func runWorkflowGenerate(out io.Writer, args []string, jsonOutput bool) error {
 	})
 }
 
-func generateWorkflowWithLLM(task, style, testCommand string, maxRounds int, codexBinary, fallback string) (string, error) {
+func generateWorkflowWithLLM(task, style, testCommand string, maxRounds int, codexBinary, repoPath, fallback string) (string, error) {
 	if stub := strings.TrimSpace(os.Getenv("PALLIUM_WORKFLOW_GENERATE_STUB")); stub != "" {
 		return stub, nil
 	}
@@ -1262,7 +1267,7 @@ Return only executable JavaScript. Use top-level await. Prefer phase(), parallel
 
 Deterministic fallback script for reference:
 %s`, task, style, testCommand, maxRounds, workflow.MarshalJSON(tools), workflow.MarshalJSON(templates), fallback)
-	runner := &workflow.Runner{CodexBinary: codexBinary}
+	runner := &workflow.Runner{CodexBinary: codexBinary, Run: workflow.Run{CWD: repoPath}}
 	output, err := runner.RunProviderText(context.Background(), prompt)
 	if err != nil {
 		return "", fmt.Errorf("workflow generation failed: %w", err)
@@ -1460,11 +1465,12 @@ func renderWorkflowFailures(failures []workflow.RunFailure) []string {
 func runWorkflowReport(out io.Writer, args []string, jsonOutput bool) error {
 	fs := newSessionFlagSet("workflow report")
 	dbPath := fs.String("db", "", "")
-	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}}, nil); err != nil {
+	related := fs.Bool("related", false, "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}}, map[string]struct{}{"related": {}}); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: pallium workflow report <run-id>")
+		return fmt.Errorf("usage: pallium workflow report <run-id> [--related]")
 	}
 	store, err := workflow.Open(*dbPath)
 	if err != nil {
@@ -1481,12 +1487,21 @@ func runWorkflowReport(out io.Writer, args []string, jsonOutput bool) error {
 		envelope.Decisions = decisions
 	}
 	_ = store.Close()
-	if related, err := sessionmemory.Related(sessionmemory.RelatedOptions{
-		Query:    snapshot.Run.Task,
-		RepoRoot: snapshot.Run.CWD,
-		Limit:    5,
-	}); err == nil {
-		envelope.RelatedSessions = related
+	// Opt-in only (found dogfooding): sessionmemory.Related searches the
+	// GLOBAL cross-repo session store and fuzzy-scores every indexed
+	// session against the run's task text — RepoRoot is only a ranking
+	// signal, not a hard filter, so unrelated Codex/Claude transcripts from
+	// OTHER repos could bleed into what should be a report scoped to ONE
+	// run. --related is for a caller who genuinely wants that cross-session
+	// context; the default report never includes it.
+	if *related {
+		if sessions, err := sessionmemory.Related(sessionmemory.RelatedOptions{
+			Query:    snapshot.Run.Task,
+			RepoRoot: snapshot.Run.CWD,
+			Limit:    5,
+		}); err == nil {
+			envelope.RelatedSessions = sessions
+		}
 	}
 	return output.Write(out, envelope, jsonOutput, func() string {
 		return renderWorkflowReportEnvelope(envelope)
@@ -1917,7 +1932,7 @@ func isWorkflowGCEligible(status string, includeFailed bool) bool {
 	switch status {
 	case "completed", "stopped":
 		return true
-	case "failed":
+	case "failed", "completed_with_failures":
 		return includeFailed
 	default:
 		return false
@@ -1966,7 +1981,7 @@ func renderWorkflowResult(snapshot workflow.Snapshot, result string) string {
 
 func isWorkflowTerminalOrPaused(status string) bool {
 	switch status {
-	case "completed", "failed", "stopped", "paused":
+	case "completed", "completed_with_failures", "failed", "stopped", "paused":
 		return true
 	default:
 		return false
@@ -2261,7 +2276,7 @@ func renderWorkflowFleetStatus(status workflowFleetStatus) string {
 	}
 	if len(status.RunsByStatus) > 0 {
 		lines = append(lines, "Runs by status:")
-		for _, key := range []string{"queued", "running", "paused", "completed", "failed", "stopped"} {
+		for _, key := range []string{"queued", "running", "paused", "completed", "completed_with_failures", "failed", "stopped"} {
 			if count := status.RunsByStatus[key]; count > 0 {
 				lines = append(lines, fmt.Sprintf("- %s: %d", key, count))
 			}
@@ -2285,7 +2300,7 @@ func renderWorkflowAnalytics(analytics workflowAnalytics) string {
 	}
 	if len(analytics.RunsByStatus) > 0 {
 		lines = append(lines, "Runs by status:")
-		for _, key := range []string{"queued", "running", "paused", "completed", "failed", "stopped"} {
+		for _, key := range []string{"queued", "running", "paused", "completed", "completed_with_failures", "failed", "stopped"} {
 			if count := analytics.RunsByStatus[key]; count > 0 {
 				lines = append(lines, fmt.Sprintf("- %s: %d", key, count))
 			}
@@ -2478,7 +2493,7 @@ func printWorkflowHelp(out io.Writer) {
 
 Usage:
   pallium workflow preflight "task" [--scope path] [--cwd repo-path] [--json]
-  pallium workflow generate "task" [--style review|test-fix|research] [--llm] [--output path.js] [--save name] [--json]
+  pallium workflow generate "task" [--cwd repo-path] [--style review|test-fix|research] [--llm] [--output path.js] [--save name] [--json]
   pallium workflow validate <path.js> [--json]
   pallium workflow tools list [--kind control|agent|verification|pallium] [--json]
   pallium workflow template list [--json]
@@ -2504,7 +2519,7 @@ Usage:
   pallium workflow inspect <run-id> [--json]
   pallium workflow show <run-id> [--json]
   pallium workflow read <run-id> [--json]
-  pallium workflow report <run-id> [--json]
+  pallium workflow report <run-id> [--related] [--json]
   pallium workflow watch <run-id>
   pallium workflow pause <run-id> [--json]
   pallium workflow resume <run-id> [--background] [--json]
