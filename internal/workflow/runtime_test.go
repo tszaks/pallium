@@ -2169,7 +2169,7 @@ return await agent("structured", {
 	}
 }
 
-func TestRunnerDoesNotApplyPatchFromSchemaFailedParallelAgent(t *testing.T) {
+func TestSchemaFailedEditAgentPreservesAndAppliesPatch(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"status":"edited"}`)
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_WRITE_FILE", "note.txt")
@@ -2210,22 +2210,30 @@ return results;`
 	if err != nil {
 		t.Fatalf("parallel schema failure should be nonfatal, got %v", err)
 	}
-	if !strings.Contains(result, "null") {
-		t.Fatalf("expected failed parallel agent to return null, got %s", result)
-	}
+	_ = result
+	// The structured output failed schema validation, but the edit is completed
+	// WORK: the patch must LAND (the data-loss bug is fixed) and the schema
+	// failure must be reported in the run failures, not silently discarded.
 	raw, err := os.ReadFile(filepath.Join(tmp, "note.txt"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(raw) != "original\n" {
-		t.Fatalf("schema-failed patch was applied: %q", string(raw))
+	if string(raw) != "changed\n" {
+		t.Fatalf("schema-failed edit patch was discarded; note.txt=%q (want %q)", string(raw), "changed\n")
 	}
 	agents, err := store.ListAgents(run.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(agents) != 1 || agents[0].Status != "failed" || agents[0].PatchPath != "" {
-		t.Fatalf("expected failed agent with no patch path, got %+v", agents)
+	if len(agents) != 1 || agents[0].Status == "failed" || agents[0].PatchPath == "" {
+		t.Fatalf("expected a completed edit agent with a preserved patch, got %+v", agents)
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Run.Failures) != 1 {
+		t.Fatalf("expected the schema failure to be reported in run failures, got %+v", snapshot.Run.Failures)
 	}
 }
 
@@ -3753,8 +3761,19 @@ return await agent("edit something", {
 		t.Fatal(err)
 	}
 	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
-	if err == nil || !strings.Contains(err.Error(), "does not match schema") {
-		t.Fatalf("expected schema validation failure, got %v", err)
+	// An edit agent's schema failure is now NON-fatal: the completed edit is
+	// preserved and the schema failure is reported in run failures, rather than
+	// discarding the work by raising. (It still must not run the corrective
+	// retry — that stays read-only-only.)
+	if err != nil {
+		t.Fatalf("edit-mode schema failure must be non-fatal (edit preserved), got %v", err)
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Run.Failures) != 1 || !strings.Contains(snapshot.Run.Failures[0].Error, "schema") {
+		t.Fatalf("expected the schema failure reported in run failures, got %+v", snapshot.Run.Failures)
 	}
 	raw, err := os.ReadFile(callLog)
 	if err != nil {

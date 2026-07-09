@@ -145,7 +145,8 @@ func (r *Runner) runBuiltinClaudeCommand(ctx context.Context, usageFile, cwd, pr
 	if err := cmd.Run(); err != nil {
 		// Cap the embedded CLI output so a huge or malformed response can't
 		// bloat the stored error record.
-		return truncateForError(strings.TrimSpace(stdout.String())), fmt.Errorf("workflow provider \"claude\" failed: %w: %s", err, truncateForError(strings.TrimSpace(stderr.String())))
+		baseErr := fmt.Errorf("workflow provider \"claude\" failed: %w: %s", err, truncateForError(strings.TrimSpace(stderr.String())))
+		return truncateForError(strings.TrimSpace(stdout.String())), wrapProviderCommandError(baseErr, stdout.String()+stderr.String())
 	}
 	text, usage, err := extractClaudeOutput(stdout.String(), len(opts.Schema) > 0)
 	if err != nil {
