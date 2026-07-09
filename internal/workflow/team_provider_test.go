@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestBuildClaudeTeamArgsFirstTurnUsesSessionID(t *testing.T) {
@@ -135,5 +136,40 @@ func TestRunCodexTeamTurnPropagatesMeaningfulError(t *testing.T) {
 	_, err := r.runCodexTeamTurn(context.Background(), tmp, filepath.Join(tmp, "last.txt"), t.TempDir(), "", "", "read-only", false, "hi", nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "usage limit") {
 		t.Fatalf("expected the meaningful quota error surfaced, got %v", err)
+	}
+}
+
+// TestRunCodexTeamTurnSurfacesScanTooLongError is the regression test for a
+// P3 found by review: scanner.Err() was never checked after the scan loop.
+// A single unterminated line over the scanner's 4MB cap makes Scan() return
+// false the same way a clean EOF does — without this check, a truncated/
+// corrupted stream with a zero exit code would silently fall through to
+// "success" on whatever partial last-message file happened to exist.
+func TestRunCodexTeamTurnSurfacesScanTooLongError(t *testing.T) {
+	tmp := t.TempDir()
+	// One unterminated line just over the 4MB scanner cap (4*1024*1024).
+	// The scanner drains roughly this many bytes before giving up, so the
+	// single producing pipeline (head|tr) finishes and the script exits
+	// normally — no second write is attempted afterward, so there's no risk
+	// of the child blocking on a pipe nobody's draining anymore.
+	script := "#!/bin/sh\nhead -c 4300000 /dev/zero | tr '\\0' 'a'\n"
+	path := filepath.Join(tmp, "fake-codex-oversized.sh")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := &Runner{CodexBinary: path}
+	// scanner.Err() fires almost immediately once ~4MB has been read (well
+	// under a second); the bound below is only a safety net in case the
+	// remaining unread tail leaves the child blocked on a pipe nobody's
+	// draining anymore (see the comment above) — it should never actually
+	// need to fire, but keeps the test from hanging if it does.
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	_, err := r.runCodexTeamTurn(ctx, tmp, filepath.Join(tmp, "last.txt"), t.TempDir(), "", "", "read-only", false, "hi", nil, nil)
+	if err == nil {
+		t.Fatal("expected an error for an oversized unterminated line, got nil")
+	}
+	if !strings.Contains(err.Error(), "reading output") {
+		t.Fatalf("expected the scan error surfaced (not silently ignored), got: %v", err)
 	}
 }

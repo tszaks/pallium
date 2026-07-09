@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -110,11 +111,12 @@ func buildTeamTurnPrompt(team Team, member TeamMember, messages []TeamMessage, t
 		}
 	}
 
-	b.WriteString("--- Open tasks on the board ---\n")
-	if len(tasks) == 0 {
+	visible := tasksForPrompt(tasks)
+	b.WriteString("--- Open tasks on the board (plus a few recent completions for context) ---\n")
+	if len(visible) == 0 {
 		b.WriteString("(none yet)\n")
 	} else {
-		raw, err := json.MarshalIndent(tasks, "", "  ")
+		raw, err := json.MarshalIndent(visible, "", "  ")
 		if err == nil {
 			b.Write(raw)
 			b.WriteString("\n")
@@ -122,6 +124,41 @@ func buildTeamTurnPrompt(team Team, member TeamMember, messages []TeamMessage, t
 	}
 	b.WriteString("\nTake whatever action fits this turn: read/inspect as needed, then decide.")
 	return b.String()
+}
+
+// teamPromptRecentCompletedTasks/teamPromptResultTruncateChars bound how
+// much completed-task history rides along in every turn's prompt.
+const (
+	teamPromptRecentCompletedTasks = 5
+	teamPromptResultTruncateChars  = 300
+)
+
+// tasksForPrompt trims the full board down to what a teammate's turn
+// actually needs: every OPEN task in full (pending/in_progress/blocked —
+// anything that isn't done), plus only the most recently completed few with
+// their result truncated. Without this, a long-running team's prompt grows
+// without bound — every turn re-embeds the FULL text of EVERY task ever
+// completed, most of which is stale context nobody's current decision
+// depends on.
+func tasksForPrompt(tasks []TeamTask) []TeamTask {
+	var open, completed []TeamTask
+	for _, t := range tasks {
+		if t.Status == "completed" {
+			completed = append(completed, t)
+		} else {
+			open = append(open, t)
+		}
+	}
+	sort.Slice(completed, func(i, j int) bool { return completed[i].CompletedAt > completed[j].CompletedAt })
+	if len(completed) > teamPromptRecentCompletedTasks {
+		completed = completed[:teamPromptRecentCompletedTasks]
+	}
+	for i := range completed {
+		if len(completed[i].Result) > teamPromptResultTruncateChars {
+			completed[i].Result = completed[i].Result[:teamPromptResultTruncateChars] + "... [truncated]"
+		}
+	}
+	return append(open, completed...)
 }
 
 // TeamTurnOptions configures RunTeamTurn / RunTeam.
@@ -493,6 +530,12 @@ func (r *Runner) runConfiguredProviderTeamTurn(ctx context.Context, teamID strin
 		"PALLIUM_WORKFLOW_SCHEMA_FILE="+schemaFile,
 		"PALLIUM_WORKFLOW_USAGE_FILE="+usageFile,
 		"PALLIUM_WORKFLOW_SESSION_FILE="+sessionFile,
+		// Always "0": unlike a regular worker (see resolveAgentNetwork,
+		// which honors agent(...).network AND run --allow-network), a team
+		// turn has no per-call network opt-in surface yet — every wrapper
+		// teammate runs network-locked-down regardless of what its provider
+		// could otherwise support. Revisit if/when team turns grow their own
+		// network-opt-in equivalent.
 		"PALLIUM_WORKFLOW_NETWORK=0",
 	)
 	var stdout, stderr bytes.Buffer
@@ -609,13 +652,17 @@ func (r *Runner) RunTeam(ctx context.Context, store *Store, teamID string, opts 
 
 		sem := make(chan struct{}, concurrency)
 		var wg sync.WaitGroup
-		for _, name := range eligible {
+		// Each goroutine writes only its own index, so this slice needs no
+		// lock/atomic despite the concurrent writers — race-detector-safe.
+		ranTurns := make([]bool, len(eligible))
+		for i, name := range eligible {
 			wg.Add(1)
 			sem <- struct{}{}
-			go func(name string) {
+			go func(i int, name string) {
 				defer wg.Done()
 				defer func() { <-sem }()
 				ranTurn, _ := r.RunTeamTurn(ctx, store, teamID, name, opts)
+				ranTurns[i] = ranTurn
 				// Only clear the nudge when a turn genuinely ran: if
 				// BeginMemberTurn lost the CAS (another turn was already in
 				// flight, ranTurn=false), this scheduling attempt never
@@ -624,10 +671,19 @@ func (r *Runner) RunTeam(ctx context.Context, store *Store, teamID string, opts 
 				if ranTurn {
 					_ = store.ClearNudge(teamID, name)
 				}
-			}(name)
+			}(i, name)
 		}
 		wg.Wait()
-		summary.TurnsTaken += len(eligible)
+		// Deliberately NOT len(eligible): a member scheduled this round but
+		// that lost BeginMemberTurn's CAS (another turn already in flight,
+		// ranTurn=false) never actually took a turn — counting it anyway
+		// inflated TurnsTaken above the number of provider calls actually
+		// made, misleading anyone using it as a cost/activity proxy.
+		for _, ran := range ranTurns {
+			if ran {
+				summary.TurnsTaken++
+			}
+		}
 
 		team, err = store.GetTeam(teamID)
 		if err != nil {

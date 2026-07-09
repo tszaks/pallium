@@ -135,6 +135,15 @@ func (r *Runner) runCodexTeamTurn(ctx context.Context, tmpDir, outFile, cwd, mod
 		}
 	}
 	waitErr := cmd.Wait()
+	// A scan error (a line over the 4MB cap, or the pipe itself erroring)
+	// stops the loop the same way a clean EOF does — Scan() just returns
+	// false either way — so without this check a truncated/corrupted
+	// stream with waitErr==nil would silently fall through to "success"
+	// on whatever partial last-message file happened to exist.
+	if scanErr := scanner.Err(); scanErr != nil {
+		baseErr := fmt.Errorf("team turn (codex) failed reading output: %w", scanErr)
+		return "", wrapProviderCommandError(baseErr, stdout.String()+stderr.String())
+	}
 	if waitErr != nil {
 		baseErr := fmt.Errorf("team turn (codex) failed: %w: %s", waitErr, strings.TrimSpace(stderr.String()))
 		return "", wrapProviderCommandError(baseErr, stdout.String()+stderr.String())

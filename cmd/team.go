@@ -291,6 +291,17 @@ func runTeamTasksComplete(out io.Writer, args []string, jsonOutput bool) error {
 	})
 }
 
+// runTeamSend is a CLI-level trust boundary noted but not closed in the M1
+// review: --from is an unauthenticated free-text string, not tied to any
+// session or credential — anyone who can run this CLI (or write to the
+// underlying DB directly) can claim to be "lead" or any teammate's name, and
+// the recipient's next turn will see it wrapped as legitimate agent-origin
+// mail (see teamAgentOrigin) with no way to tell the difference. The trust
+// boundary this codebase actually enforces is narrower than it may look: "a
+// message can never carry a human approval it didn't actually get" (the
+// wrapper text's own promise), not "the sender field is verified". Same
+// class of caveat as local SQLite file access — whoever can reach this CLI
+// already has that level of trust in the team.
 func runTeamSend(out io.Writer, args []string, jsonOutput bool) error {
 	fs := newSessionFlagSet("team send")
 	dbPath := fs.String("db", "", "")
