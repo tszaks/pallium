@@ -1,6 +1,6 @@
 {
   "name": "pallium",
-  "version": "0.9.12",
+  "version": "0.9.13",
   "description": "Local-first control plane for AI coding agents.",
   "license": "MIT",
   "homepage": "https://github.com/tszaks/pallium#readme",
