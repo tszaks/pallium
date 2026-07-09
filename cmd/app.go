@@ -38,6 +38,8 @@ func (a *App) Run(args []string) error {
 		return nil
 	case "start":
 		return runStart(a.stdout, filtered[1:], jsonOutput)
+	case "team":
+		return runTeam(a.stdout, filtered[1:], jsonOutput)
 	case "index":
 		return runIndex(a.stdout, filtered[1:], jsonOutput)
 	case "doctor":
@@ -85,6 +87,7 @@ func (a *App) printHelp() {
 
 Usage:
   pallium start <task> [--workflow name] [--style auto|review|test-fix|research] [--cwd repo-path] [--dry-run] [--json]
+  pallium team <start|spawn|tasks|send|inbox|nudge|status|run|approve|stop|attach> [--json]
   pallium index [repo-path] [--json]
   pallium doctor [repo-path] [--json]
   pallium version [--json]

@@ -26,6 +26,7 @@ Do NOT use Pallium for a one-shot edit, a quick question, or exploration you can
 3. **Verification** (`pallium verify fast|safe|full`, `verify.untilGreen(cmd)` inside workflows) — objective test-fix loops with stall detection.
 4. **Session memory** (`pallium sessions`, `pallium decisions`, `pallium handoff`) — what happened in previous agent runs, durable decision log, structured handoffs between agents.
 5. **Safe execution** — edit-mode workers run in isolated git worktrees; patches are secret-scanned before applying; `pallium workflow revert` undoes an applied run.
+6. **Teams** (`pallium team start|spawn|send|tasks|run|status|attach`) — a lead plus independent named peer agents that coordinate over a shared task board and mailbox, each with a real persistent session (`--resume`/`codex exec resume`) that survives across turns and even across the steering process being killed. Use a team when the work genuinely benefits from PEERS reasoning independently and messaging each other (parallel review from different angles, a research-then-synthesize pattern, adversarial debate) — a workflow's `parallel()`/`pipeline()` is still the right tool for fan-out work that doesn't need peer-to-peer coordination. `pallium team run <id>` is bounded like `workflow run`: it drives turns until the team converges (nobody has mail, a nudge, or claimable work left) and exits — no daemon. `pallium team attach <id>` reconnects to an existing team from any process, any agent, later.
 
 ## The recommended pattern
 

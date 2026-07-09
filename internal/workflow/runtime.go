@@ -37,8 +37,13 @@ type Runner struct {
 	PalliumBinary       string
 	AgentTimeoutSeconds int
 
-	mu             sync.Mutex
-	failuresMu     sync.Mutex
+	mu         sync.Mutex
+	failuresMu sync.Mutex
+	// teamApplyMu serializes `git apply` against a team's repo root across
+	// this Runner's concurrently scheduled member turns (see RunTeamTurn in
+	// team_runtime.go). Regular (non-team) workflow patch application is
+	// unaffected — it is already sequential by construction.
+	teamApplyMu    sync.Mutex
 	currentPhase   string
 	agentCount     int
 	budgetLimit    float64

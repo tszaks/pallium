@@ -289,6 +289,9 @@ WHERE id IN (SELECT id FROM ordered);
 	if _, err := s.db.Exec(`UPDATE workflow_runs SET agent_timeout_explicit=1 WHERE agent_timeout_seconds>0 AND COALESCE(agent_timeout_explicit,0)=0`); err != nil {
 		return err
 	}
+	if err := s.initTeams(); err != nil {
+		return err
+	}
 	return nil
 }
 
