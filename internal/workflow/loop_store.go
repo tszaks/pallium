@@ -193,6 +193,21 @@ func (s *Store) SetLoopStatus(name, status string) error {
 // has manually confirmed is fine to keep going (e.g. they fixed whatever was
 // actually blocking progress), without losing its tick count or needing to
 // `loop stop` + re-`loop start` and lose its identity/config.
+//
+// Known limitation (found by adversarial review, accepted not fixed): this
+// is NOT lease-aware. A reset issued while a tick is genuinely in flight can
+// be silently clobbered when that tick's FinishLoopTick lands — it writes
+// stagnation_count/last_signature computed from the loop state it read
+// BEFORE the reset happened, overwriting the just-applied reset with the
+// stale pre-reset values. The operator sees "reset" succeed but the next
+// `loop status` shows the same stagnation as before. Narrow (requires a
+// reset landing in the exact window while a tick is dispatched) and the
+// workaround is simple (reset again after confirming no tick is in flight
+// via `loop status`'s tick_started_at field), so this was accepted as a
+// documented gap rather than fixed in M1 — a real fix would need ResetLoop
+// to participate in the same lease CAS as BeginLoopTick/FinishLoopTick, or
+// FinishLoopTick to detect a reset happened during its own tick and skip
+// overwriting it, both bigger changes than this milestone's scope.
 func (s *Store) ResetLoop(name string) error {
 	res, err := s.db.Exec(`UPDATE workflow_loops SET stagnation_count=0, last_signature='', updated_at=? WHERE name=?`, nowString(), name)
 	if err != nil {
@@ -204,12 +219,12 @@ func (s *Store) ResetLoop(name string) error {
 	return nil
 }
 
-// errLoopTickInFlight means another `loop tick` invocation already holds
+// ErrLoopTickInFlight means another `loop tick` invocation already holds
 // this loop's lease (e.g. cron fired again while a slow previous tick is
 // still running). The CLI maps this to the already_running terminal
 // state/exit code WITHOUT calling FinishLoopTick — no lease was ever
 // acquired, so there is nothing to release and no state to mutate.
-var errLoopTickInFlight = fmt.Errorf("loop tick already in flight")
+var ErrLoopTickInFlight = fmt.Errorf("loop tick already in flight")
 
 // BeginLoopTick is the compare-and-swap that makes tick-taking safe under
 // concurrent `pallium loop tick <name>` invocations. Mirrors
@@ -242,7 +257,7 @@ func (s *Store) BeginLoopTick(name, staleAfter string) (lease string, err error)
 	if loop.Status != "active" {
 		return "", fmt.Errorf("loop %q is not active (status=%s)", name, loop.Status)
 	}
-	return "", errLoopTickInFlight
+	return "", ErrLoopTickInFlight
 }
 
 // FinishLoopTick closes out a tick: clears tick_started_at (so the loop is
@@ -269,4 +284,28 @@ func (s *Store) FinishLoopTick(name, lease, terminalState, signature string, sta
 		return fmt.Errorf("loop %q tick was not owned (lease %q no longer matches; lost to a stale takeover): not finishing it", name, lease)
 	}
 	return nil
+}
+
+// FinishLoopTickAsError is the minimal release used when something failed
+// so early after BeginLoopTick succeeded that the caller doesn't even have
+// the loop's other fields (last_signature/stagnation_count) to make a real
+// FinishLoopTick call with — e.g. GetLoop itself failing right after the
+// lease was acquired (found by adversarial review: that exact path used to
+// return the bare error with NO release at all, leaking the lease for up to
+// --stale-after-minutes over a single transient failure that had nothing
+// to do with the tick). Deliberately does NOT touch last_signature or
+// stagnation_count at all (they're simply absent from the SET clause, so
+// SQL leaves them exactly as they were) — consistent with error ticks never
+// advancing OR resetting stagnation (see AdvanceLoopStagnation).
+func (s *Store) FinishLoopTickAsError(name, lease string) error {
+	now := nowString()
+	// RowsAffected==0 is deliberately not treated as an error here: this is
+	// the safety-net path (see runLoopTick's defer), so "the lease was
+	// already released by the normal FinishLoopTick call" is the expected,
+	// harmless common case, not a bug worth surfacing.
+	_, err := s.db.Exec(
+		`UPDATE workflow_loops SET tick_started_at=NULL, cycle=cycle+1, last_terminal_state=?, updated_at=?
+		 WHERE name=? AND tick_started_at=?`,
+		LoopStateError, now, name, lease)
+	return err
 }

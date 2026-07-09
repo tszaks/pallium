@@ -340,3 +340,41 @@ func TestLoopResetClearsStagnationKeepsCycle(t *testing.T) {
 		t.Fatalf("expected reset to preserve cycle count, got %d", loop.Cycle)
 	}
 }
+
+// TestParseLoopTickResultReportsMalformedJSONAsError is the regression test
+// for a P2 found by adversarial review: parseLoopTickResult's err return was
+// dead code — every path returned nil, including malformed JSON in a
+// NON-empty result, silently degrading a corrupted/script-bug cycle into a
+// harmless-looking no_op instead of surfacing it as an error.
+func TestParseLoopTickResultReportsMalformedJSONAsError(t *testing.T) {
+	_, _, err := parseLoopTickResult("{not valid json")
+	if err == nil {
+		t.Fatal("expected malformed JSON in a non-empty result to report an error")
+	}
+	// An empty result is still NOT an error — a script legitimately
+	// returning nothing degrades to no_op, not error.
+	state, sig, err := parseLoopTickResult("")
+	if err != nil || state != "" || sig != "" {
+		t.Fatalf("expected an empty result to parse cleanly with no error, got state=%q sig=%q err=%v", state, sig, err)
+	}
+}
+
+// TestLoopTickDistinguishesNotFoundFromAlreadyRunning is the regression test
+// for a P2 found by adversarial review: every distinct error
+// BeginLoopTick can return — genuine in-flight contention, "loop not
+// active", "loop not found", a raw DB error — used to collapse into the
+// SAME already_running state/exit code, so a cron wrapper branching on exit
+// code alone couldn't distinguish "retry later" from "this loop doesn't
+// exist, page immediately".
+func TestLoopTickDistinguishesNotFoundFromAlreadyRunning(t *testing.T) {
+	_, dbPath := newLoopTestRepo(t)
+	var out bytes.Buffer
+	err := runLoop(&out, []string{"tick", "does-not-exist", "--db", dbPath}, true)
+	if err == nil {
+		t.Fatal("expected ticking a nonexistent loop to fail")
+	}
+	var exitErr *LoopTickExitError
+	if errors.As(err, &exitErr) {
+		t.Fatalf("expected a nonexistent loop's tick failure to be a PLAIN error, not an already_running LoopTickExitError (state=%q) — these are different failure classes a cron wrapper needs to tell apart", exitErr.State)
+	}
+}

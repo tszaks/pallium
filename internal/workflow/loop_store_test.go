@@ -134,11 +134,79 @@ func TestFinishLoopTickRejectsStaleLease(t *testing.T) {
 	}
 }
 
+// TestFinishLoopTickAsErrorReleasesLease is the regression test for a P1
+// found by adversarial review: runLoopTick used to leak the lease
+// (permanently, for up to --stale-after-minutes) if anything failed between
+// a successful BeginLoopTick and the next explicit FinishLoopTick call —
+// e.g. a transient GetLoop error that had nothing to do with the tick
+// itself. FinishLoopTickAsError is the minimal release the fix's defer-based
+// safety net calls on any such early return.
+func TestFinishLoopTickAsErrorReleasesLease(t *testing.T) {
+	store := newLoopTestStore(t)
+	if _, err := store.CreateLoop(Loop{Name: "l1", ScriptPath: "a.js"}); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.BeginLoopTick("l1", nowString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishLoopTickAsError("l1", lease); err != nil {
+		t.Fatal(err)
+	}
+	loop, err := store.GetLoop("l1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loop.TickStartedAt != "" {
+		t.Fatalf("expected the lease to be released (tick_started_at cleared), got %+v", loop)
+	}
+	if loop.Cycle != 1 || loop.LastTerminalState != LoopStateError {
+		t.Fatalf("expected cycle incremented and terminal state=error, got %+v", loop)
+	}
+	// Must be immediately tickable again — the whole point of releasing it —
+	// not stuck until --stale-after-minutes elapses.
+	if _, err := store.BeginLoopTick("l1", nowString()); err != nil {
+		t.Fatalf("expected the loop to be immediately tickable again after the error release, got: %v", err)
+	}
+}
+
+// TestFinishLoopTickAsErrorIsHarmlessNoOpWhenAlreadyReleased proves the
+// safety-net defer is safe to fire UNCONDITIONALLY on every return path,
+// including the normal happy path where a real FinishLoopTick already ran:
+// calling it again with the now-stale lease must not overwrite whatever the
+// real Finish already wrote.
+func TestFinishLoopTickAsErrorIsHarmlessNoOpWhenAlreadyReleased(t *testing.T) {
+	store := newLoopTestStore(t)
+	if _, err := store.CreateLoop(Loop{Name: "l1", ScriptPath: "a.js"}); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.BeginLoopTick("l1", nowString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishLoopTick("l1", lease, LoopStateSuccess, "sig-real", 0, 0.5); err != nil {
+		t.Fatal(err)
+	}
+	// Simulates the deferred safety net firing after a real Finish already
+	// happened — must be a silent no-op (see FinishLoopTickAsError's own
+	// doc comment: RowsAffected==0 here is the expected common case).
+	if err := store.FinishLoopTickAsError("l1", lease); err != nil {
+		t.Fatal(err)
+	}
+	loop, err := store.GetLoop("l1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loop.Cycle != 1 || loop.LastTerminalState != LoopStateSuccess || loop.LastSignature != "sig-real" {
+		t.Fatalf("expected the real Finish's values UNTOUCHED by the harmless no-op, got %+v", loop)
+	}
+}
+
 // TestConcurrentLoopTicksOnlyOneWins is one of the three regression tests
 // re-pinned explicitly for this PR: N racing `loop tick` invocations on the
 // SAME loop (the real scenario — cron firing again while a slow previous
 // tick is still running) must have exactly one winner; every loser gets
-// errLoopTickInFlight, not a corrupted or double-counted cycle.
+// ErrLoopTickInFlight, not a corrupted or double-counted cycle.
 func TestConcurrentLoopTicksOnlyOneWins(t *testing.T) {
 	store := newLoopTestStore(t)
 	if _, err := store.CreateLoop(Loop{Name: "l1", ScriptPath: "a.js"}); err != nil {
@@ -163,7 +231,7 @@ func TestConcurrentLoopTicksOnlyOneWins(t *testing.T) {
 		switch {
 		case errs[i] == nil:
 			wins++
-		case errs[i] == errLoopTickInFlight:
+		case errs[i] == ErrLoopTickInFlight:
 			contended++
 		default:
 			t.Fatalf("unexpected error from BeginLoopTick: %v", errs[i])
