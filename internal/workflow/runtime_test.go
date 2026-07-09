@@ -4918,3 +4918,62 @@ func TestConcurrentEditRunsOnSameRepoOneFailsFast(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestConcurrentStaleTakeoverOnlyOneWins races several independent Store
+// handles (separate *sql.DB, i.e. separate processes) to take over the SAME
+// stale lock. The compare-and-swap in acquireRepoLockOnce must let exactly one
+// win: without it, every racer that read the same stale row would UPDATE and
+// believe it holds the lock (bug #34 double-grant).
+func TestConcurrentStaleTakeoverOnlyOneWins(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "sessions.sqlite")
+	seed, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := seed.AcquireRepoLock("/repo", "run-old", time.Hour); err != nil || !ok {
+		t.Fatalf("seed acquire: ok=%v err=%v", ok, err)
+	}
+	// Backdate the seed so it is unambiguously stale under a 1h window, while a
+	// fresh takeover (updated_at=now) stays non-stale through the whole race —
+	// so the outcome tests the CAS, not staleness timing.
+	old := time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339Nano)
+	if _, err := seed.db.Exec(`UPDATE workflow_repo_locks SET updated_at=? WHERE repo_root=?`, old, "/repo"); err != nil {
+		t.Fatal(err)
+	}
+	seed.Close()
+
+	const n = 6
+	stores := make([]*Store, n)
+	for i := range stores {
+		s, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stores[i] = s
+		defer s.Close()
+	}
+	results := make([]bool, n)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, ok, _ := stores[i].AcquireRepoLock("/repo", fmt.Sprintf("run-%d", i), time.Hour)
+			results[i] = ok
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	wins := 0
+	for _, ok := range results {
+		if ok {
+			wins++
+		}
+	}
+	if wins != 1 {
+		t.Fatalf("expected exactly one stale-takeover winner, got %d", wins)
+	}
+}
