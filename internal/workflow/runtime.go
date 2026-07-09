@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/dop251/goja"
+	"github.com/tszaks/pallium/internal/gitlog"
 )
 
 var (
@@ -25,6 +26,13 @@ var (
 	ErrWorkflowPaused            = errors.New("workflow paused")
 	ErrWorkflowBudgetExhausted   = errors.New("workflow budget exhausted")
 	ErrWorkflowMaxAgentsExceeded = errors.New("workflow exceeded max agents")
+	// ErrWorkflowRepoLockContended means another run already holds the
+	// advisory edit lock on a repo this run needs to edit (see
+	// acquireRepoLock). Distinguished from an ordinary per-item provider
+	// failure so parallel()/pipeline() halt the run with one clear message
+	// instead of silently dropping every contended agent call to null, which
+	// would look like N unrelated failures rather than one root cause.
+	ErrWorkflowRepoLockContended = errors.New("workflow repo edit lock contended")
 )
 
 type Runner struct {
@@ -58,6 +66,21 @@ type Runner struct {
 	argsHash       string
 	failures       []RunFailure
 	fatalErr       error
+
+	// lockedRepos memoizes which canonical repo roots this run already holds
+	// the advisory edit lock for (see acquireRepoLock), so repeated
+	// edit-intent agents in the same run skip the DB round trip after the
+	// first.
+	lockMu      sync.Mutex
+	lockedRepos map[string]bool
+
+	// staging holds this run's lazily-created staging worktree per repo
+	// root (see mergeIntoStaging), keyed by the same repoRoot value
+	// runAgentCommand resolves (firstNonEmpty(agent.Repo, r.Run.CWD)) — not
+	// the canonical root acquireRepoLock uses, since staging is a pure
+	// in-process mirror with no cross-process identity to reconcile.
+	stagingMu sync.Mutex
+	staging   map[string]*stagingWorktree
 }
 
 type AgentOptions struct {
@@ -121,6 +144,14 @@ func (r *Runner) Execute(ctx context.Context, script string, args any) (string, 
 	if r.Run.ID == "" {
 		return "", fmt.Errorf("workflow run is required")
 	}
+	// Unconditional regardless of how Execute returns: a run-scoped staging
+	// worktree or a held repo lock must never outlive the Execute call that
+	// created them. removeStagingWorktrees runs first (defers are LIFO, and
+	// it is registered after releaseRepoLocks) so this run's own staging
+	// artifacts are fully torn down before the repo lock is released for a
+	// waiting run to take over.
+	defer r.releaseRepoLocks()
+	defer r.removeStagingWorktrees()
 	if r.MaxAgents <= 0 && r.Run.MaxAgents > 0 {
 		r.MaxAgents = r.Run.MaxAgents
 	}
@@ -766,6 +797,13 @@ func (r *Runner) runUntilGreen(ctx context.Context, command string, options map[
 		if worktree != "" {
 			return nil
 		}
+		// The fix rounds below have genuine edit intent (their combined patch
+		// is applied to the real repo at workflow success via
+		// registerUntilGreenPatch), so this loop needs the same advisory repo
+		// lock as any other edit-intent agent, acquired before touching disk.
+		if err := r.acquireRepoLock(repoRoot); err != nil {
+			return err
+		}
 		path, pathErr := r.worktreePath(loopID)
 		if pathErr != nil {
 			return pathErr
@@ -776,6 +814,14 @@ func (r *Runner) runUntilGreen(ctx context.Context, command string, options map[
 			return createErr
 		}
 		worktree = created
+		// Layer prior standalone edit agents' accumulated staging edits (if
+		// any) before restoring this loop's own resume patch below, so a fix
+		// round builds on top of edits made earlier in this run (mirrors
+		// gate()/check(), which already redirect through staging via
+		// runAgentCommand).
+		if err := r.seedFromStaging(repoRoot, worktree); err != nil {
+			return err
+		}
 		// Restore progress captured before an interrupt so cached fix agents
 		// replaying output-only do not silently lose their edits.
 		if raw, readErr := os.ReadFile(loopPatchPath); readErr == nil && strings.TrimSpace(string(raw)) != "" {
@@ -887,10 +933,17 @@ func (r *Runner) registerUntilGreenPatch(label, command, loopID, worktree, repoR
 	callIndex := r.nextAgentCallIndex()
 	patchLabel := label + "-patch"
 	prompt := "verify.untilGreen combined patch: " + command
-	if _, ok, err := r.Store.CompletedAgent(r.Run.ID, callIndex, phase, patchLabel, prompt, "internal", repoRoot, "edit", "worktree", "", "", argsHash, false); err != nil {
+	if cached, ok, err := r.Store.CompletedAgent(r.Run.ID, callIndex, phase, patchLabel, prompt, "internal", repoRoot, "edit", "worktree", "", "", argsHash, false); err != nil {
 		return err
 	} else if ok {
 		r.removeWorktree(repoRoot, worktree)
+		// On resume this run's staging worktree starts empty even though a
+		// prior process already captured the loop's combined patch: replay
+		// it into staging so later standalone check()/gate() calls and later
+		// edit agents see the fix, matching a fresh (non-cached) round.
+		if cached.PatchPath != "" {
+			return r.mergeIntoStaging(repoRoot, cached.PatchPath)
+		}
 		return nil
 	}
 	created, err := r.Store.CreateAgent(Agent{
@@ -916,6 +969,15 @@ func (r *Runner) registerUntilGreenPatch(label, command, loopID, worktree, repoR
 		return err
 	}
 	created.PatchPath = patchPath
+	// The loop's combined fix is genuine edit intent exactly like a
+	// standalone edit agent's patch: merge it into staging so a later
+	// standalone check()/gate() call or later edit agent in this run sees
+	// it, not just the loop's own already-persistent worktree.
+	if patchPath != "" {
+		if err := r.mergeIntoStaging(repoRoot, patchPath); err != nil {
+			return err
+		}
+	}
 	return r.Store.FinishAgent(created, stringifyResult(result), "")
 }
 
@@ -1500,6 +1562,26 @@ func (r *Runner) runAgentAtCallIndex(ctx context.Context, prompt string, opts Ag
 		if _, err := parseAgentOutputWithSchema(cached.Output, opts.Schema); err != nil {
 			return "", fmt.Errorf("cached agent %s failed schema validation: %w", cached.ID, err)
 		}
+		// A resumed run replays this call from cache instead of spawning a
+		// fresh agent, but a cached edit-intent agent's patch still gets
+		// applied to the real repo at workflow success (see ApplyPatches) —
+		// this resumed run needs the same advisory repo lock for its
+		// duration as a run that actually re-executed the agent. On resume
+		// this run's staging worktree starts empty even though a prior
+		// process already captured this edit agent's patch: replay it into
+		// staging so later standalone check()/gate() calls, verify.
+		// untilGreen, and later edit agents see the edit exactly as they
+		// would have mid-run before the interruption.
+		if isEditIntentAgent(mode, opts.Isolation) {
+			if err := r.acquireRepoLock(absRepo); err != nil {
+				return "", err
+			}
+			if cached.PatchPath != "" {
+				if err := r.mergeIntoStaging(absRepo, cached.PatchPath); err != nil {
+					return "", err
+				}
+			}
+		}
 		if phase != "" {
 			_ = r.Store.IncrementPhaseAgentCount(r.Run.ID, phase)
 		}
@@ -1703,7 +1785,8 @@ func isWorkflowFatalAgentError(err error) bool {
 	}
 	return isWorkflowInterruptedError(err) ||
 		errors.Is(err, ErrWorkflowBudgetExhausted) ||
-		errors.Is(err, ErrWorkflowMaxAgentsExceeded)
+		errors.Is(err, ErrWorkflowMaxAgentsExceeded) ||
+		errors.Is(err, ErrWorkflowRepoLockContended)
 }
 
 func isWorkflowStoppedError(err error) bool {
@@ -2350,11 +2433,41 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 		repoRoot := firstNonEmpty(agent.Repo, r.Run.CWD)
 		cwd := repoRoot
 		worktree := ""
-		if agent.Isolation != "none" && (agent.Mode == "edit" || agent.Isolation == "worktree") {
+		editIntent := isEditIntentAgent(agent.Mode, agent.Isolation)
+		// A prior edit-intent agent in this run may have already staged
+		// changes (see mergeIntoStaging): ANY agent — edit-intent or not —
+		// that needs to see them gets its OWN disposable worktree seeded from
+		// staging, never a cwd pointed directly at the shared staging
+		// directory (that would let a side-effecting "read-only" step
+		// pollute it, and race a concurrent step touching the same worktree).
+		stagingPath := r.stagingPathFor(repoRoot)
+		if editIntent || stagingPath != "" {
+			if editIntent {
+				if err := r.acquireRepoLock(repoRoot); err != nil {
+					return "", "", "", err
+				}
+			}
 			var err error
 			worktree, err = r.createWorktree(agent.ID, repoRoot)
 			if err != nil {
 				return "", "", "", err
+			}
+			// Registered immediately, before seedFromStaging (which can
+			// itself fail on a merge conflict), so every error exit below
+			// discards a staging-only worktree instead of leaking it —
+			// mirrors the real dispatch path's containmentWorktree defer.
+			// finalizeWorktreePatch (below) already discards it on the
+			// success path for the non-edit case, so this defer is a no-op
+			// there; it only fires on an early error return.
+			if !editIntent {
+				defer func() {
+					r.removeWorktree(repoRoot, worktree)
+				}()
+			}
+			if stagingPath != "" {
+				if err := r.seedFromStaging(repoRoot, worktree); err != nil {
+					return "", "", worktree, err
+				}
 			}
 			cwd = worktree
 		}
@@ -2368,9 +2481,18 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 				return "", "", worktree, err
 			}
 		}
+		// finalizeWorktreePatch discards a non-edit-intent worktree (the new
+		// staging-seeded containment case included) and only captures a
+		// patch for genuine edit intent, so no separate discard is needed
+		// here for the staging-only case.
 		patchPath, err := r.finalizeWorktreePatch(agent, worktree, repoRoot)
 		if err != nil {
 			return "", "", worktree, err
+		}
+		if editIntent && patchPath != "" {
+			if err := r.mergeIntoStaging(repoRoot, patchPath); err != nil {
+				return "", "", "", err
+			}
 		}
 		return strings.ReplaceAll(stub, "{{PROMPT}}", agent.Prompt), patchPath, worktree, nil
 	}
@@ -2379,11 +2501,25 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 	repoRoot := firstNonEmpty(agent.Repo, r.Run.CWD)
 	cwd := repoRoot
 	worktree := ""
+	// containmentWorktree is set (and its discard defer registered) as soon
+	// as a throwaway worktree is created below — before seedFromStaging,
+	// which can itself fail — and stood down (see "Reached a clean provider
+	// exit" below) once finalizeWorktreePatch takes over the worktree's
+	// disposition on a successful provider call.
+	containmentWorktree := false
 	// editIntent is true only when the agent is meant to produce file changes
 	// we keep: edit mode, or an explicit isolation:"worktree". Those are the
 	// ONLY worktrees whose writes get captured as a patch and applied back to
 	// the repo (see finalizeWorktreePatch).
-	editIntent := agent.Isolation != "none" && (agent.Mode == "edit" || agent.Isolation == "worktree")
+	editIntent := isEditIntentAgent(agent.Mode, agent.Isolation)
+	// A prior edit-intent agent in this run may have already staged changes
+	// (see mergeIntoStaging). A non-edit, non-networked agent that would
+	// otherwise run directly against the pristine repo instead gets its own
+	// disposable worktree seeded from staging below — never a cwd pointed
+	// directly at the shared staging directory, which would let a
+	// side-effecting "read-only" step pollute it and race a concurrent step
+	// touching the same worktree.
+	stagingPath := r.stagingPathFor(repoRoot)
 	// Granting network forces workspace-write (network egress requires it), so
 	// a networked read-only/test/check agent would otherwise run fs-write in
 	// the operator's LIVE checkout — writes to the real tree PLUS egress. When
@@ -2391,18 +2527,49 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 	// one (treat it like edit/worktree) so its forced workspace-write access is
 	// contained to a throwaway worktree, never the live repo. That containment
 	// worktree has no edit intent, so its writes are discarded, not applied.
-	if networkAllowed || editIntent {
+	if networkAllowed || editIntent || stagingPath != "" {
+		// The advisory repo lock is only for genuine edit intent: a
+		// containment worktree's writes are always discarded, so it can never
+		// clobber a concurrent run's edits. Acquired before createWorktree so
+		// a losing run fails fast without touching disk.
+		if editIntent {
+			if err := r.acquireRepoLock(repoRoot); err != nil {
+				return "", "", "", err
+			}
+		}
 		var err error
 		worktree, err = r.createWorktree(agent.ID, repoRoot)
 		if err != nil {
-			// A worktree forced purely to contain a networked worker (no edit
-			// intent) needs the run to sit inside a git repo. Turn the raw git
-			// "not a git repository" failure into actionable guidance instead
-			// of leaking an opaque `exit status 128`.
-			if networkAllowed && !editIntent && strings.Contains(err.Error(), "not a git repository") {
-				return "", "", "", fmt.Errorf("network access requires the run to execute inside a git repository so the worker can be isolated in a throwaway worktree (run directory %q is not a git repo); run from a git repository or drop network access: %w", repoRoot, err)
+			// A worktree forced purely to contain a networked worker or a
+			// staging-only read (no edit intent) needs the run to sit inside
+			// a git repo. Turn the raw git "not a git repository" failure
+			// into actionable guidance instead of leaking an opaque `exit
+			// status 128`.
+			if !editIntent && strings.Contains(err.Error(), "not a git repository") {
+				if networkAllowed {
+					return "", "", "", fmt.Errorf("network access requires the run to execute inside a git repository so the worker can be isolated in a throwaway worktree (run directory %q is not a git repo); run from a git repository or drop network access: %w", repoRoot, err)
+				}
+				return "", "", "", fmt.Errorf("seeing this run's staged edits requires the run to execute inside a git repository (run directory %q is not a git repo): %w", repoRoot, err)
 			}
 			return "", "", "", err
+		}
+		// A worktree that exists ONLY to contain a networked or staging-only
+		// non-edit worker holds throwaway writes. Registered immediately —
+		// before seedFromStaging, which can itself fail on a merge conflict —
+		// so EVERY error exit from here on (seed failure, command failure,
+		// timeout, unreadable output) discards it instead of leaking it on
+		// disk. Genuine edit/worktree agents are exempt: their tree is kept
+		// for its patch or for post-failure debugging.
+		containmentWorktree = !editIntent
+		defer func() {
+			if containmentWorktree {
+				r.removeWorktree(repoRoot, worktree)
+			}
+		}()
+		if stagingPath != "" {
+			if err := r.seedFromStaging(repoRoot, worktree); err != nil {
+				return "", "", worktree, err
+			}
 		}
 		// `git worktree add` always checks out the WHOLE repo, so `worktree`
 		// is the equivalent of the repo's top level, not of repoRoot itself.
@@ -2416,20 +2583,6 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 		// rather than failing the run over a containment nicety.
 		cwd = r.worktreeSubdirCWD(repoRoot, worktree)
 	}
-
-	// A worktree that exists ONLY to contain a networked non-edit worker holds
-	// throwaway writes. The success paths below discard it via
-	// finalizeWorktreePatch; on any error exit (setup failure, command failure,
-	// timeout, unreadable output) the early returns would otherwise leak that
-	// worktree on disk. Discard it on those error exits too. Genuine
-	// edit/worktree agents are exempt: their tree is kept for its patch or for
-	// post-failure debugging.
-	containmentWorktree := worktree != "" && !editIntent
-	defer func() {
-		if containmentWorktree {
-			r.removeWorktree(repoRoot, worktree)
-		}
-	}()
 
 	tmpDir, err := os.MkdirTemp("", "pallium-workflow-agent-*")
 	if err != nil {
@@ -2507,6 +2660,11 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 	patchPath, err := r.finalizeWorktreePatch(agent, worktree, repoRoot)
 	if err != nil {
 		return output, "", worktree, err
+	}
+	if editIntent && patchPath != "" {
+		if err := r.mergeIntoStaging(repoRoot, patchPath); err != nil {
+			return output, patchPath, worktree, err
+		}
 	}
 	return output, patchPath, worktree, nil
 }
@@ -2800,6 +2958,361 @@ func (r *Runner) removeWorktree(repoRoot, worktree string) {
 		prune := exec.Command("git", "worktree", "prune")
 		prune.Dir = repoRoot
 		_ = prune.Run()
+	}
+}
+
+// isEditIntentAgent reports whether an agent's writes are meant to be kept:
+// mode "edit", or an explicit isolation:"worktree". Those are the only
+// worktrees whose writes get captured as a patch and eventually applied back
+// to the real repo (see finalizeWorktreePatch), and the only agents that
+// need the advisory repo lock (see acquireRepoLock) — a containment worktree
+// created purely for a networked non-edit worker always discards its
+// writes, so it can never conflict with a concurrent run's edits.
+func isEditIntentAgent(mode, isolation string) bool {
+	return isolation != "none" && (mode == "edit" || isolation == "worktree")
+}
+
+// repoLockStaleAfter bounds how long an edit run's advisory repo lock (see
+// acquireRepoLock) survives without a refresh before another run may
+// reclaim it. Every edit-intent agent in the holding run refreshes it, so a
+// live run never goes stale; a crashed process leaves the row for this
+// window before the repo becomes available again.
+const repoLockStaleAfter = 30 * time.Minute
+
+// acquireRepoLock takes this run's advisory edit lock on repoRoot's
+// canonical git root, memoized in-process so repeated edit-intent agents in
+// the same run skip the DB round trip after the first. A second run with
+// edit-intent work already holding the lock fails fast here, before this
+// call creates a worktree or spends a provider call.
+func (r *Runner) acquireRepoLock(repoRoot string) error {
+	canonical, err := gitlog.CanonicalRepoRoot(repoRoot)
+	if err != nil {
+		// Fall back to the raw repoRoot rather than failing the lock outright
+		// — a repo Pallium can still operate on (e.g. a bare checkout without
+		// a resolvable canonical root) must not be blocked by this fallback.
+		// Logged because it silently diverges from the canonical key every
+		// OTHER caller (including this run's own later agents) will use for
+		// the SAME repo if a later call succeeds at canonicalizing it —
+		// worth knowing about if two supposedly-identical repo roots ever
+		// fail to share one lock.
+		fmt.Fprintf(os.Stderr, "[workflow:%s] repo lock: could not canonicalize %s, using raw path: %v\n", r.Run.ID, repoRoot, err)
+		canonical = repoRoot
+	}
+	r.lockMu.Lock()
+	alreadyHeld := r.lockedRepos != nil && r.lockedRepos[canonical]
+	r.lockMu.Unlock()
+	if alreadyHeld {
+		return nil
+	}
+	// The DB round trip (AcquireRepoLock retries on its own for up to ~200ms
+	// under SQLITE_BUSY/contention, see repolock.go) runs without r.lockMu
+	// held: a slow or contended acquire for one repo must never stall
+	// dispatch of unrelated agents against a DIFFERENT repo, or even a fast
+	// memoized re-entry for the SAME repo from a concurrent goroutine.
+	holder, ok, err := r.Store.AcquireRepoLock(canonical, r.Run.ID, repoLockStaleAfter)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("%w: another edit run holds %s (run %s)", ErrWorkflowRepoLockContended, canonical, holder)
+	}
+	r.lockMu.Lock()
+	if r.lockedRepos == nil {
+		r.lockedRepos = map[string]bool{}
+	}
+	r.lockedRepos[canonical] = true
+	r.lockMu.Unlock()
+	return nil
+}
+
+// releaseRepoLocks releases every repo lock this run acquired. Called
+// unconditionally when Execute returns so a normal completion frees the repo
+// immediately instead of waiting out the stale-lock timeout; a killed
+// process leaves its row for repoLockStaleAfter to reclaim.
+func (r *Runner) releaseRepoLocks() {
+	r.lockMu.Lock()
+	repos := make([]string, 0, len(r.lockedRepos))
+	for repo := range r.lockedRepos {
+		repos = append(repos, repo)
+	}
+	r.lockedRepos = nil
+	r.lockMu.Unlock()
+	for _, repo := range repos {
+		if err := r.Store.ReleaseRepoLock(repo, r.Run.ID); err != nil {
+			fmt.Fprintf(os.Stderr, "[workflow:%s] release repo lock %s: %v\n", r.Run.ID, repo, err)
+		}
+	}
+}
+
+// applyAndCommitDiff applies a previously captured diff into worktree via a
+// three-way merge and, on success, commits it into worktree's own detached
+// HEAD. Committing (rather than leaving the merge as an uncommitted
+// working-tree change, which an earlier version of this function did via
+// `git reset -q` to unstage what --3way auto-stages) is what lets a LATER
+// call apply a second, independent patch touching the SAME file: `git apply
+// --3way`'s fallback path requires the index to reflect a settled (matching)
+// state to attempt a real three-way merge, and refuses outright with "does
+// not match index" against a file with pre-existing UNSTAGED changes —
+// discovered by a same-file regression test that failed even for two
+// entirely non-overlapping edits, not just conflicting ones. A blank diff is
+// a no-op. Explicit -c identity: a fresh `git worktree add --detach` carries
+// no branch, so this commit floats free of any ref and is discarded along
+// with the worktree; a repo with no user.name/user.email configured must not
+// fail this commit only to break staging.
+func applyAndCommitDiff(worktree string, diff []byte) error {
+	if strings.TrimSpace(string(diff)) == "" {
+		return nil
+	}
+	apply := exec.Command("git", "apply", "--3way")
+	apply.Dir = worktree
+	apply.Stdin = bytes.NewReader(diff)
+	var applyStderr bytes.Buffer
+	apply.Stderr = &applyStderr
+	if err := apply.Run(); err != nil {
+		return fmt.Errorf("apply staged edits: %w: %s", err, strings.TrimSpace(applyStderr.String()))
+	}
+	add := exec.Command("git", "add", "-A")
+	add.Dir = worktree
+	var addStderr bytes.Buffer
+	add.Stderr = &addStderr
+	if err := add.Run(); err != nil {
+		return fmt.Errorf("stage applied edits: %w: %s", err, strings.TrimSpace(addStderr.String()))
+	}
+	commit := exec.Command("git", "-c", "user.email=pallium@localhost", "-c", "user.name=pallium",
+		"commit", "-q", "-m", "pallium: staged edit")
+	commit.Dir = worktree
+	var commitStderr bytes.Buffer
+	commit.Stderr = &commitStderr
+	if err := commit.Run(); err != nil {
+		return fmt.Errorf("commit applied edits: %w: %s", err, strings.TrimSpace(commitStderr.String()))
+	}
+	return nil
+}
+
+// resetWorktreeHard discards worktree's current uncommitted state — tracked
+// changes, untracked files, and any unmerged/conflicted index entries left
+// by a failed `git apply --3way` — back to its last commit. Used to recover
+// a shared, long-lived worktree (staging) after a failed merge attempt:
+// left in place, --3way's conflict markers and dirty index would be
+// silently treated as real file content by every subsequent
+// mergeIntoStaging/seedFromStaging call for the rest of the run. Since
+// applyAndCommitDiff only ever advances HEAD on a fully successful merge,
+// HEAD always names the exact state to recover to — no separate snapshot
+// needed.
+func resetWorktreeHard(worktree string) error {
+	reset := exec.Command("git", "reset", "--hard", "HEAD")
+	reset.Dir = worktree
+	var resetStderr bytes.Buffer
+	reset.Stderr = &resetStderr
+	if err := reset.Run(); err != nil {
+		return fmt.Errorf("reset to last known-good commit: %w: %s", err, strings.TrimSpace(resetStderr.String()))
+	}
+	clean := exec.Command("git", "clean", "-fd")
+	clean.Dir = worktree
+	var cleanStderr bytes.Buffer
+	clean.Stderr = &cleanStderr
+	if err := clean.Run(); err != nil {
+		return fmt.Errorf("clean untracked: %w: %s", err, strings.TrimSpace(cleanStderr.String()))
+	}
+	return nil
+}
+
+// diffAgainstBase returns worktree's cumulative diff from base (the commit
+// staging was originally created from) to its current HEAD. Every merge
+// into staging is committed (see applyAndCommitDiff), so this is a plain
+// two-commit diff — no working-tree/index trickery (`git add -N`, etc.)
+// needed, unlike an accumulator that stays uncommitted.
+func diffAgainstBase(worktree, base string) ([]byte, error) {
+	cmd := exec.Command("git", "diff", "--binary", base, "HEAD")
+	cmd.Dir = worktree
+	return cmd.Output()
+}
+
+// currentHEAD returns worktree's current commit SHA.
+func currentHEAD(worktree string) (string, error) {
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = worktree
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// stagingWorktree is the run-scoped mirror of one real repo root, holding
+// every edit-intent agent's accumulated changes (each committed in turn, see
+// applyAndCommitDiff) for the lifetime of a single Execute call. base is the
+// commit staging was originally created from — fixed for the run, since
+// diffAgainstBase needs a stable reference point regardless of how many
+// merges have since advanced HEAD. Its own mutex serializes creation and
+// merges for that repo, so a concurrent edit agent's mergeIntoStaging and a
+// concurrent non-edit step's seedFromStaging read never race against each
+// other on the SAME staging directory (see runAgentCommand: a non-edit step
+// never runs directly against this path — it always gets its own ephemeral
+// worktree seeded FROM this one, so only staging's own bookkeeping needs
+// this lock, never a live agent process).
+type stagingWorktree struct {
+	mu   sync.Mutex
+	path string
+	base string
+}
+
+// stagingEntry returns (creating if necessary) the bookkeeping slot for
+// repoRoot's staging worktree. Only the map lookup is guarded by stagingMu;
+// callers lock the returned entry's own mutex for the actual work.
+func (r *Runner) stagingEntry(repoRoot string) *stagingWorktree {
+	r.stagingMu.Lock()
+	defer r.stagingMu.Unlock()
+	if r.staging == nil {
+		r.staging = map[string]*stagingWorktree{}
+	}
+	entry, ok := r.staging[repoRoot]
+	if !ok {
+		entry = &stagingWorktree{}
+		r.staging[repoRoot] = entry
+	}
+	return entry
+}
+
+// stagingPathFor returns the run's staging worktree path for repoRoot, or ""
+// if no edit-intent agent has completed against repoRoot yet in this run.
+// Callers never run a live step's cwd against this path directly (that
+// would share one working directory across concurrent steps and let a
+// side-effecting "read-only" step pollute it — see runAgentCommand); it
+// exists only to seed a fresh, disposable worktree via seedFromStaging.
+func (r *Runner) stagingPathFor(repoRoot string) string {
+	entry := r.stagingEntry(repoRoot)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	return entry.path
+}
+
+// mergeIntoStaging lazily creates this run's staging worktree for repoRoot
+// (branched from repoRoot's HEAD, exactly like any other agent worktree) and
+// cumulatively applies patchPath into it, so later steps in THIS run that
+// consult stagingPathFor (via seedFromStaging into their own disposable
+// worktree) see the edit without waiting for the whole workflow to succeed.
+// A blank patchPath is a no-op beyond creating the staging worktree.
+func (r *Runner) mergeIntoStaging(repoRoot, patchPath string) error {
+	entry := r.stagingEntry(repoRoot)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.path == "" {
+		created, err := r.createWorktree(stagingWorktreeID(repoRoot), repoRoot)
+		if err != nil {
+			return err
+		}
+		base, err := currentHEAD(created)
+		if err != nil {
+			return err
+		}
+		entry.path = created
+		entry.base = base
+	}
+	if patchPath == "" {
+		return nil
+	}
+	raw, err := os.ReadFile(patchPath)
+	if err != nil {
+		return err
+	}
+	if err := applyAndCommitDiff(entry.path, raw); err != nil {
+		// A failed --3way apply (two edit-intent agents touching the same
+		// lines) leaves conflict markers and a dirty index behind — must not
+		// leave the shared, long-lived staging worktree corrupted for every
+		// later read this run. applyAndCommitDiff only advances HEAD on a
+		// fully successful merge, so resetting hard to HEAD always recovers
+		// exactly the last known-good state; the conflict then surfaces as a
+		// clean, actionable error instead of silent corruption.
+		if resetErr := resetWorktreeHard(entry.path); resetErr != nil {
+			return fmt.Errorf("%w (additionally failed to restore staging to its last known-good state: %v)", err, resetErr)
+		}
+		return err
+	}
+	return nil
+}
+
+// stagingWorktreeID deterministically names a repo root's staging worktree
+// under the run's artifact directory, so resume recreates the same path
+// without any clock- or randomness-derived identity.
+func stagingWorktreeID(repoRoot string) string {
+	return "staging-" + StableHash(repoRoot)[:16]
+}
+
+// seedFromStaging layers this run's current accumulated staging edits (if
+// any) onto a freshly created, disposable worktree — an edit agent's own
+// worktree, a non-edit step's throwaway containment worktree, or
+// verify.untilGreen's persistent fix-loop worktree — so it branches from
+// prior edits in this run instead of the pristine checkout. The seed is
+// committed into the target worktree's own detached HEAD (never touching any
+// branch, since every worktree here is created with `git worktree add
+// --detach`) rather than left as an unstaged working-tree diff. For an edit
+// agent specifically, that advances the baseline its OWN later patch capture
+// (`git diff` against its index/HEAD) diffs against, so that capture reports
+// only the agent's own incremental delta — not the seed it started from.
+// Without this, two edit agents' captured patches would both claim the same
+// seeded file change, and the second would fail to apply sequentially onto
+// the real repo at workflow success. A non-edit step's worktree is always
+// discarded afterward (see runAgentCommand's containmentWorktree cleanup),
+// so the commit there is just a convenient way to apply the seed — nothing
+// downstream ever reads it as a patch.
+func (r *Runner) seedFromStaging(repoRoot, worktree string) error {
+	entry := r.stagingEntry(repoRoot)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.path == "" {
+		return nil
+	}
+	diff, err := diffAgainstBase(entry.path, entry.base)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(diff)) == "" {
+		return nil
+	}
+	apply := exec.Command("git", "apply", "--3way")
+	apply.Dir = worktree
+	apply.Stdin = bytes.NewReader(diff)
+	var applyStderr bytes.Buffer
+	apply.Stderr = &applyStderr
+	if err := apply.Run(); err != nil {
+		return fmt.Errorf("seed worktree from staging: %w: %s", err, strings.TrimSpace(applyStderr.String()))
+	}
+	add := exec.Command("git", "add", "-A")
+	add.Dir = worktree
+	if err := add.Run(); err != nil {
+		return err
+	}
+	// Explicit -c identity: a fresh worktree add --detach carries no branch,
+	// so this commit floats free of any ref and is discarded along with the
+	// worktree; a repo with no user.name/user.email configured must not fail
+	// this commit only to break resume-independent seeding.
+	commit := exec.Command("git", "-c", "user.email=pallium@localhost", "-c", "user.name=pallium",
+		"commit", "-q", "-m", "pallium: seed from this run's staged edits")
+	commit.Dir = worktree
+	var commitStderr bytes.Buffer
+	commit.Stderr = &commitStderr
+	if err := commit.Run(); err != nil {
+		return fmt.Errorf("commit seeded worktree state: %w: %s", err, strings.TrimSpace(commitStderr.String()))
+	}
+	return nil
+}
+
+// removeStagingWorktrees deletes every staging worktree this run created.
+// Called unconditionally when Execute returns (success, failure, or
+// interrupt) so a run never leaves a run-scoped worktree registered once its
+// own per-agent worktrees are gone.
+func (r *Runner) removeStagingWorktrees() {
+	r.stagingMu.Lock()
+	entries := r.staging
+	r.staging = nil
+	r.stagingMu.Unlock()
+	for repoRoot, entry := range entries {
+		entry.mu.Lock()
+		if entry.path != "" {
+			r.removeWorktree(repoRoot, entry.path)
+		}
+		entry.mu.Unlock()
 	}
 }
 
