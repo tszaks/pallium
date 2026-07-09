@@ -1403,6 +1403,59 @@ return { results };`
 	}
 }
 
+// TestWorkflowRunExitsNonZeroWhenOnlyAgentFailsEntirely proves that a run
+// whose single agent fails entirely still exits non-zero, even though
+// parallel() drops the failure to null and the run's own status stays
+// "completed" by design. The report must still be written (--json output
+// decodes) despite the non-nil error.
+func TestWorkflowRunExitsNonZeroWhenOnlyAgentFailsEntirely(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_TEST_COMMAND", `echo "boom" >&2; exit 1`)
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	scriptPath := filepath.Join(tmp, "workflow.js")
+	script := `phase("solo");
+const results = await parallel(["only"], item => agent("worker " + item, { label: item, provider: "test" }));
+return { results };`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	err := runWorkflow(&out, []string{"run", "--id", "wf-total-failure", "--db", dbPath, "--cwd", tmp, "--script", scriptPath, "total failure"}, true)
+	if err == nil {
+		t.Fatal("expected a non-nil error when the run's only agent fails entirely")
+	}
+	var snapshot map[string]any
+	if jsonErr := json.Unmarshal(out.Bytes(), &snapshot); jsonErr != nil {
+		t.Fatalf("expected the report to still be written despite the error: %v\n%s", jsonErr, out.String())
+	}
+	run := snapshot["run"].(map[string]any)
+	if run["status"] != "completed" {
+		t.Fatalf("expected run status to remain %q (drop-to-null design), got %#v", "completed", run["status"])
+	}
+}
+
+// TestWorkflowRunExitsZeroWhenAgentSucceeds proves the exit-code gate only
+// trips on total failure: a run whose only agent succeeds keeps exiting 0.
+func TestWorkflowRunExitsZeroWhenAgentSucceeds(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"status":"ok"}`)
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	scriptPath := filepath.Join(tmp, "workflow.js")
+	script := `phase("solo");
+const results = await parallel(["only"], item => agent("worker " + item, { label: item }));
+return { results };`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{"run", "--id", "wf-total-success", "--db", dbPath, "--cwd", tmp, "--script", scriptPath, "total success"}, false); err != nil {
+		t.Fatalf("expected nil error when the run's only agent succeeds, got: %v", err)
+	}
+}
+
 func TestWorkflowGCRemovesOldTerminalRunArtifacts(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

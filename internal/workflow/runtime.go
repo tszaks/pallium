@@ -2252,7 +2252,13 @@ func (r *Runner) agentTimeout(opts AgentOptions) time.Duration {
 
 func agentCommandError(ctx context.Context, timeout time.Duration, err error) error {
 	if timeout > 0 && errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return fmt.Errorf("workflow agent timed out after %ds", int(timeout/time.Second))
+		// Keep err (which may already lead with a meaningful provider error
+		// line) instead of discarding it: a hung provider process is often
+		// hung BECAUSE of the real failure, e.g. it kept waiting on stdin
+		// after printing a quota error, so the underlying error is still the
+		// most useful diagnostic even though the proximate cause of exit was
+		// Pallium's own timeout killing it.
+		return fmt.Errorf("workflow agent timed out after %ds: %w", int(timeout/time.Second), err)
 	}
 	return err
 }
@@ -2507,7 +2513,8 @@ func (r *Runner) runConfiguredProviderCommand(ctx context.Context, command, tmpD
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return strings.TrimSpace(stdout.String()), fmt.Errorf("workflow provider %q failed: %w: %s", agent.Provider, err, strings.TrimSpace(stderr.String()))
+		baseErr := fmt.Errorf("workflow provider %q failed: %w: %s", agent.Provider, err, strings.TrimSpace(stderr.String()))
+		return strings.TrimSpace(stdout.String()), wrapProviderCommandError(baseErr, stdout.String()+stderr.String())
 	}
 	raw, readErr := os.ReadFile(outFile)
 	output := strings.TrimSpace(string(raw))
