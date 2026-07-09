@@ -104,3 +104,36 @@ other CLI — swap the binary and its flags for mode/network mapping.
 
 Keep wrappers dependency-light (shell + python3 is plenty) and never echo
 secrets: the wrapper's environment is the workflow's trust boundary.
+
+## Extra contract for teammates (`pallium team ...`)
+
+A `pallium team` teammate is a persistent identity whose life is a SERIES of
+one-shot CLI calls, not a single request/response — each turn must resume the
+same native conversation your CLI already tracks, so it remembers what it
+said and did in earlier turns. Your wrapper needs exactly one more file:
+
+- `PALLIUM_WORKFLOW_SESSION_FILE` — read it at the start of your turn. Empty
+  means this is the teammate's first turn ever; anything else is the resume
+  handle YOU wrote on a previous turn. Before you exit, OVERWRITE this file
+  with whatever session/thread id your CLI needs to resume this exact
+  conversation next time (your CLI's own concept — a session id, a thread id,
+  whatever it calls it). Pallium never inspects the value; it just shuttles it
+  between turns.
+
+```bash
+#!/bin/sh
+set -eu
+PROMPT=$(cat "$PALLIUM_WORKFLOW_PROMPT_FILE")
+SESSION=$(cat "$PALLIUM_WORKFLOW_SESSION_FILE" 2>/dev/null || true)
+if [ -n "$SESSION" ]; then
+  printf '%s' "$PROMPT" | your-model-cli --resume "$SESSION" --output-session-id > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+else
+  printf '%s' "$PROMPT" | your-model-cli --new-session --output-session-id > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+fi
+# Whatever your CLI printed as its session id, write it back for the next turn:
+your-model-cli last-session-id > "$PALLIUM_WORKFLOW_SESSION_FILE"
+```
+
+The rest of the contract (prompt/output/schema files, mode/network mapping,
+exit codes) is identical to a regular worker — a team-capable wrapper is a
+regular wrapper plus this one file.
