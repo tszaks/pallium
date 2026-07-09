@@ -29,8 +29,11 @@ jobs:
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
 
-      - name: Upgrade npm
-        run: npm install -g npm@latest
+      # Use the stable npm bundled with the Node 24 LTS toolchain. Do NOT
+      # `npm install -g npm@latest` here: a recent npm@latest broke
+      # `npm publish --provenance` with `Cannot find module 'sigstore'`
+      # (MODULE_NOT_FOUND), which failed the 0.9.9 publish. The bundled npm
+      # already supports provenance + OIDC trusted publishing.
 
       - name: Verify package version
         id: version
