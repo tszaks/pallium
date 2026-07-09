@@ -667,8 +667,30 @@ func (s *Store) CreateOwnedSession(sess OwnedSession) (OwnedSession, error) {
 	if err != nil {
 		return OwnedSession{}, err
 	}
+	// Upsert, not a plain insert: `workflow resume <id> --background` derives
+	// its owned-session id deterministically from the run id
+	// ("workflow-"+run.ID — see cmd/workflow.go), so resuming the SAME run in
+	// the background a second time reuses the SAME owned_sessions.id. A
+	// plain INSERT hit the primary key on that legitimate re-entry and
+	// crashed with a raw "UNIQUE constraint failed" instead of just starting
+	// the new background attempt. Reusing the id is the whole point (the
+	// caller wants `workflow status`/`console show` to keep resolving this
+	// run's background tracking under one stable id across resumes), so the
+	// upsert resets every field to the NEW launch's values — a fresh
+	// started_at/status, not a merge with the old (possibly long-exited) row.
 	_, err = s.db.Exec(`INSERT INTO owned_sessions(id,command_json,cwd,log_path,runner_pid,child_pid,status,started_at,updated_at,exited_at,exit_code)
-VALUES(?,?,?,?,?,?,?,?,?,?,?)`, sess.ID, commandJSON, sess.CWD, sess.LogPath, sess.RunnerPID, sess.ChildPID, sess.Status, sess.StartedAt, sess.UpdatedAt, sess.ExitedAt, sess.ExitCode)
+VALUES(?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(id) DO UPDATE SET
+  command_json=excluded.command_json,
+  cwd=excluded.cwd,
+  log_path=excluded.log_path,
+  runner_pid=excluded.runner_pid,
+  child_pid=excluded.child_pid,
+  status=excluded.status,
+  started_at=excluded.started_at,
+  updated_at=excluded.updated_at,
+  exited_at=excluded.exited_at,
+  exit_code=excluded.exit_code`, sess.ID, commandJSON, sess.CWD, sess.LogPath, sess.RunnerPID, sess.ChildPID, sess.Status, sess.StartedAt, sess.UpdatedAt, sess.ExitedAt, sess.ExitCode)
 	if err != nil {
 		return OwnedSession{}, err
 	}
