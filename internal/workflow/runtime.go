@@ -176,7 +176,7 @@ func (r *Runner) checkScriptChanged(script string) {
 	if err != nil {
 		return
 	}
-	currentHash := stableHash(script)
+	currentHash := StableHash(script)
 	if stored.ScriptHash == "" {
 		_ = r.Store.SetRunScriptState(r.Run.ID, currentHash, false)
 		return
@@ -192,8 +192,8 @@ func (r *Runner) executeScript(ctx context.Context, script string, args any, top
 	r.mu.Lock()
 	previousScriptHash := r.scriptHash
 	previousArgsHash := r.argsHash
-	r.scriptHash = stableHash(script)
-	r.argsHash = stableHash(args)
+	r.scriptHash = StableHash(script)
+	r.argsHash = StableHash(args)
 	r.mu.Unlock()
 	defer func() {
 		r.mu.Lock()
@@ -807,7 +807,7 @@ func (r *Runner) runUntilGreen(ctx context.Context, command string, options map[
 			green = true
 			break
 		}
-		signature := stableHash(checkResult)
+		signature := StableHash(checkResult)
 		if round > 0 && signature == lastSignature {
 			stalled = true
 			break
@@ -2005,10 +2005,18 @@ func agentSchemaHash(schema map[string]any) string {
 	if len(schema) == 0 {
 		return ""
 	}
-	return stableHash(normalizeSchema(schema))
+	return StableHash(normalizeSchema(schema))
 }
 
-func stableHash(value any) string {
+// StableHash is a deterministic content hash (sha256 of the JSON encoding,
+// or of a Go %#v dump when a value doesn't marshal) used anywhere two
+// observations need comparing for equality without storing the full
+// value: script/args cache-key hashing, untilGreen's stall-detection
+// signature, and loops' own stagnation signature comparison (see
+// loop_runtime.go's AdvanceLoopStagnation). Exported so cmd/loop.go can
+// compute a script's hash for its start-time staleness stamp without
+// duplicating a second hash implementation.
+func StableHash(value any) string {
 	raw, err := json.Marshal(value)
 	if err != nil {
 		raw = []byte(fmt.Sprintf("%#v", value))
@@ -2777,42 +2785,81 @@ func (r *Runner) removeWorktree(repoRoot, worktree string) {
 
 var metaPrefixRe = regexp.MustCompile(`export\s+const\s+meta\s*=\s*\{`)
 
-// stripMeta removes the export const meta = {...}; block by scanning brace
-// depth from the opening brace, so meta objects with nested objects strip
-// cleanly. An unbalanced meta block is left untouched and fails compilation.
+// findMetaBlock locates the FIRST `export const meta = {...}` declaration
+// in script by scanning brace depth from the opening brace (so a meta
+// object with nested objects, like loop config, matches its own closing
+// brace correctly rather than the first `}` encountered). literal is the
+// object expression text INCLUDING its braces (suitable for evaluating
+// directly, e.g. wrapped in parens); rest is the script with that exact
+// declaration (through a trailing `;` and whitespace) removed. found is
+// false when no declaration is present, or when one is present but
+// unbalanced (never terminates) — the caller is expected to fail
+// compilation on the latter the same way it always has, not to special-case
+// this function's inability to make sense of malformed input.
+func findMetaBlock(script string) (literal, rest string, found bool) {
+	loc := metaPrefixRe.FindStringIndex(script)
+	if loc == nil {
+		return "", script, false
+	}
+	depth := 1
+	end := -1
+	for i := loc[1]; i < len(script); i++ {
+		switch script[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				end = i + 1
+			}
+		}
+		if end >= 0 {
+			break
+		}
+	}
+	if end < 0 {
+		return "", script, false
+	}
+	// loc[1]-1 is the index of the opening '{' (metaPrefixRe's match itself
+	// ends just past it), so literal spans exactly the object expression.
+	literal = script[loc[1]-1 : end]
+	trimEnd := end
+	for trimEnd < len(script) && (script[trimEnd] == ' ' || script[trimEnd] == '\t' || script[trimEnd] == '\n' || script[trimEnd] == '\r') {
+		trimEnd++
+	}
+	if trimEnd < len(script) && script[trimEnd] == ';' {
+		trimEnd++
+	}
+	rest = script[:loc[0]] + script[trimEnd:]
+	return literal, rest, true
+}
+
+// stripMeta removes every export const meta = {...}; block (looping since
+// findMetaBlock only strips the first occurrence per call) so goja never
+// sees the ES module `export` syntax it doesn't support. An unbalanced meta
+// block is left untouched and fails compilation, same as before this was
+// refactored to share findMetaBlock with extractMetaLiteral.
 func stripMeta(script string) string {
 	for {
-		loc := metaPrefixRe.FindStringIndex(script)
-		if loc == nil {
+		_, rest, found := findMetaBlock(script)
+		if !found {
 			return script
 		}
-		depth := 1
-		end := -1
-		for i := loc[1]; i < len(script); i++ {
-			switch script[i] {
-			case '{':
-				depth++
-			case '}':
-				depth--
-				if depth == 0 {
-					end = i + 1
-				}
-			}
-			if end >= 0 {
-				break
-			}
-		}
-		if end < 0 {
-			return script
-		}
-		for end < len(script) && (script[end] == ' ' || script[end] == '\t' || script[end] == '\n' || script[end] == '\r') {
-			end++
-		}
-		if end < len(script) && script[end] == ';' {
-			end++
-		}
-		script = script[:loc[0]] + script[end:]
+		script = rest
 	}
+}
+
+// extractMetaLiteral returns the FIRST meta block's object-expression text
+// (see findMetaBlock), or ok=false if the script declares none. This is the
+// kernel-level half of meta handling — any service can use it to check
+// whether a script opts into that service's own kind (see loop_meta.go for
+// how loops interpret meta.kind=="loop"). It does not evaluate the literal;
+// evaluating arbitrary script-authored JS is the caller's decision to make
+// (and loop_meta.go's decision to do, via a throwaway goja VM), not this
+// general-purpose extraction step's.
+func extractMetaLiteral(script string) (literal string, ok bool) {
+	literal, _, found := findMetaBlock(script)
+	return literal, found
 }
 
 func stringifyResult(value any) string {

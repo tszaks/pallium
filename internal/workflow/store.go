@@ -46,9 +46,14 @@ type Run struct {
 	Failures      []RunFailure `json:"failures,omitempty"`
 	ScriptHash    string       `json:"script_hash,omitempty"`
 	ScriptChanged bool         `json:"script_changed,omitempty"`
-	CreatedAt     string       `json:"created_at"`
-	UpdatedAt     string       `json:"updated_at"`
-	CompletedAt   string       `json:"completed_at,omitempty"`
+	// LoopName is set only for a child run spawned by `loop tick` (see
+	// loop_store.go) — empty for every ordinary workflow run. A loop never
+	// reuses one run across ticks; this column is how `loop status`
+	// aggregates a loop's tick history without loops owning workflow_runs.
+	LoopName    string `json:"loop_name,omitempty"`
+	CreatedAt   string `json:"created_at"`
+	UpdatedAt   string `json:"updated_at"`
+	CompletedAt string `json:"completed_at,omitempty"`
 }
 
 // RunFailure records an item that was dropped to null inside parallel or
@@ -261,6 +266,14 @@ CREATE INDEX IF NOT EXISTS idx_workflow_gates_run ON workflow_gates(run_id, open
 		"ALTER TABLE workflow_runs ADD COLUMN script_hash TEXT",
 		"ALTER TABLE workflow_runs ADD COLUMN script_changed INTEGER DEFAULT 0",
 		"ALTER TABLE workflow_triggers ADD COLUMN last_fingerprint TEXT",
+		// loop_name links a child run spawned by `loop tick` back to its
+		// owning loop (see loop_store.go) — a loop never gets its own
+		// workflow_runs row reused across ticks (that would eventually hit
+		// Runner's default 1000-agent lifetime cap purely from ticking, and
+		// would force the resume cache to be salted per-cycle); each tick
+		// spawns a fresh child run through the SAME front door `workflow run`
+		// uses, and `loop status` aggregates by querying this column.
+		"ALTER TABLE workflow_runs ADD COLUMN loop_name TEXT",
 	} {
 		if _, alterErr := s.db.Exec(stmt); alterErr != nil && !strings.Contains(alterErr.Error(), "duplicate column name") {
 			return alterErr
@@ -292,6 +305,9 @@ WHERE id IN (SELECT id FROM ordered);
 	if err := s.initTeams(); err != nil {
 		return err
 	}
+	if err := s.initLoops(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -317,8 +333,8 @@ func (s *Store) CreateRun(run Run) (Run, error) {
 	if run.UpdatedAt == "" {
 		run.UpdatedAt = run.CreatedAt
 	}
-	_, err := s.db.Exec(`INSERT INTO workflow_runs(id,task,cwd,script_path,args_json,owned_session_id,max_agents,max_budget_usd,agent_timeout_seconds,agent_timeout_explicit,allow_network,status,result,error,created_at,updated_at,completed_at)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, run.ID, run.Task, run.CWD, run.ScriptPath, run.ArgsJSON, run.OwnedID, run.MaxAgents, run.MaxBudgetUSD, run.AgentTimeout, run.AgentTimeoutExplicit, run.AllowNetwork, run.Status, run.Result, run.Error, run.CreatedAt, run.UpdatedAt, run.CompletedAt)
+	_, err := s.db.Exec(`INSERT INTO workflow_runs(id,task,cwd,script_path,args_json,owned_session_id,max_agents,max_budget_usd,agent_timeout_seconds,agent_timeout_explicit,allow_network,status,result,error,loop_name,created_at,updated_at,completed_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, run.ID, run.Task, run.CWD, run.ScriptPath, run.ArgsJSON, run.OwnedID, run.MaxAgents, run.MaxBudgetUSD, run.AgentTimeout, run.AgentTimeoutExplicit, run.AllowNetwork, run.Status, run.Result, run.Error, run.LoopName, run.CreatedAt, run.UpdatedAt, run.CompletedAt)
 	return run, err
 }
 
@@ -391,7 +407,7 @@ func (s *Store) SetRunOwnedID(id, ownedID string) error {
 	return err
 }
 
-const runSelectColumns = `id,task,cwd,script_path,COALESCE(args_json,''),COALESCE(owned_session_id,''),COALESCE(max_agents,0),COALESCE(max_budget_usd,''),COALESCE(agent_timeout_seconds,0),COALESCE(agent_timeout_explicit,0),COALESCE(allow_network,0),status,COALESCE(result,''),COALESCE(error,''),COALESCE(failures,''),COALESCE(script_hash,''),COALESCE(script_changed,0),created_at,updated_at,COALESCE(completed_at,'')`
+const runSelectColumns = `id,task,cwd,script_path,COALESCE(args_json,''),COALESCE(owned_session_id,''),COALESCE(max_agents,0),COALESCE(max_budget_usd,''),COALESCE(agent_timeout_seconds,0),COALESCE(agent_timeout_explicit,0),COALESCE(allow_network,0),status,COALESCE(result,''),COALESCE(error,''),COALESCE(failures,''),COALESCE(script_hash,''),COALESCE(script_changed,0),COALESCE(loop_name,''),created_at,updated_at,COALESCE(completed_at,'')`
 
 func scanRun(row interface{ Scan(dest ...any) error }) (Run, error) {
 	var run Run
@@ -399,7 +415,7 @@ func scanRun(row interface{ Scan(dest ...any) error }) (Run, error) {
 	var scriptChanged int
 	var agentTimeoutExplicit int
 	var allowNetwork int
-	if err := row.Scan(&run.ID, &run.Task, &run.CWD, &run.ScriptPath, &run.ArgsJSON, &run.OwnedID, &run.MaxAgents, &run.MaxBudgetUSD, &run.AgentTimeout, &agentTimeoutExplicit, &allowNetwork, &run.Status, &run.Result, &run.Error, &failuresJSON, &run.ScriptHash, &scriptChanged, &run.CreatedAt, &run.UpdatedAt, &run.CompletedAt); err != nil {
+	if err := row.Scan(&run.ID, &run.Task, &run.CWD, &run.ScriptPath, &run.ArgsJSON, &run.OwnedID, &run.MaxAgents, &run.MaxBudgetUSD, &run.AgentTimeout, &agentTimeoutExplicit, &allowNetwork, &run.Status, &run.Result, &run.Error, &failuresJSON, &run.ScriptHash, &scriptChanged, &run.LoopName, &run.CreatedAt, &run.UpdatedAt, &run.CompletedAt); err != nil {
 		return Run{}, err
 	}
 	run.AgentTimeoutExplicit = agentTimeoutExplicit != 0
@@ -452,6 +468,31 @@ func (s *Store) ListRuns(limit int) ([]Run, error) {
 		limit = 50
 	}
 	rows, err := s.db.Query(`SELECT `+runSelectColumns+` FROM workflow_runs ORDER BY updated_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var runs []Run
+	for rows.Next() {
+		run, err := scanRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		runs = append(runs, run)
+	}
+	return runs, rows.Err()
+}
+
+// RunsByLoop lists the child runs a loop's ticks have spawned (see
+// Run.LoopName), most recent first — how `loop status` aggregates a loop's
+// tick history without the loops service owning or querying workflow_runs
+// itself (that stays store.go's job; loop_store.go never touches this
+// table, enforced by TestServiceStateOwnership).
+func (s *Store) RunsByLoop(loopName string, limit int) ([]Run, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.db.Query(`SELECT `+runSelectColumns+` FROM workflow_runs WHERE loop_name=? ORDER BY created_at DESC LIMIT ?`, loopName, limit)
 	if err != nil {
 		return nil, err
 	}
