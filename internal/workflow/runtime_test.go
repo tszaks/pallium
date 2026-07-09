@@ -386,6 +386,92 @@ return await agent("one metered call", { label: "one", provider: "metered" });`
 	}
 }
 
+// TestRunnerRunStatusCompletedWithFailuresWhenSomeAgentsSucceed proves a run
+// whose script rejects after some agents already completed gets an honest
+// "completed_with_failures" status instead of a flat "failed" that would
+// contradict a `workflow report` still built from those completed agents.
+func TestRunnerRunStatusCompletedWithFailuresWhenSomeAgentsSucceed(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_OKPROV_COMMAND", `printf '{"ok":true}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_FAILPROV_COMMAND", `exit 1`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `
+const okResults = await pipeline(["a", "b", "c"], item => agent("ok " + item, { label: item, provider: "okprov", mode: "read-only" }));
+await agent("boom", { label: "boom", provider: "failprov", mode: "read-only" });
+return { okResults };`
+	scriptPath, err := WriteRunScript("wf-partial-fail", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-partial-fail", Task: "partial failure", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err == nil {
+		t.Fatal("expected the run to return an error from the unwrapped failing agent call")
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed := 0
+	for _, a := range agents {
+		if a.Status == "completed" {
+			completed++
+		}
+	}
+	if completed != 3 {
+		t.Fatalf("expected 3 completed agents ahead of the failure, got %d (%+v)", completed, agents)
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Run.Status != "completed_with_failures" {
+		t.Fatalf("expected completed_with_failures status since 3 agents already succeeded, got %q (error=%q)", snapshot.Run.Status, snapshot.Run.Error)
+	}
+	if snapshot.Run.Error == "" {
+		t.Fatal("expected a non-empty run error even though the run partially succeeded")
+	}
+}
+
+// TestSetRunStatusNeverPersistsEmptyErrorForFailure proves the store-level
+// backstop: whatever upstream code called SetRunStatus with a failing status
+// and a blank errorText (e.g. an error whose own .Error() rendered empty),
+// the persisted run always ends up with a non-empty, actionable message.
+func TestSetRunStatusNeverPersistsEmptyErrorForFailure(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run, err := store.CreateRun(Run{ID: "wf-empty-error", Task: "empty error backstop", CWD: tmp, ScriptPath: "unused.js"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, status := range []string{"failed", "completed_with_failures"} {
+		if err := store.SetRunStatus(run.ID, status, "", ""); err != nil {
+			t.Fatal(err)
+		}
+		got, err := store.Run(run.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.TrimSpace(got.Error) == "" {
+			t.Fatalf("expected a non-empty error for status %q, got %+v", status, got)
+		}
+		if got.CompletedAt == "" {
+			t.Fatalf("expected %q to be treated as terminal (completed_at set), got %+v", status, got)
+		}
+	}
+}
+
 func TestRunnerComposesSavedWorkflow(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"prompt":"{{PROMPT}}"}`)
 	tmp := t.TempDir()
