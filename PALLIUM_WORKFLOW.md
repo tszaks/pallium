@@ -87,7 +87,7 @@ const finding = await agent("Review auth middleware", {
 | `isolation: "worktree"` | edit isolation | same |
 | `agentType` | named agent | use `provider` |
 | `provider` | - | which worker CLI to run; leave unset to adopt the steering agent (see precedence above) |
-| `schema` | StructuredOutput | Codex `--output-schema`; providers get schema file, Pallium validates returned JSON locally and, for read-only agents only, retries once with a corrective prompt before failing the agent. Edit/test/check agents fail schema validation immediately: the retry re-runs the full provider command in the same cwd, which could apply side effects twice |
+| `schema` | StructuredOutput | Codex `--output-schema`; providers get schema file, Pallium validates returned JSON locally and, for read-only agents only, retries once with a corrective prompt before failing the agent (the read-only structured output IS the deliverable). Edit/test/check agents do NOT retry (the retry re-runs the full provider command, which could apply side effects twice); instead, when an edit agent's structured output fails schema validation its completed patch is PRESERVED and applied and the schema failure is reported in the run's failures list — a malformed output never discards completed edit work |
 | `timeout_seconds` | - | per-call wall-clock cap; overrides `--agent-timeout` (`0` disables) |
 | `network` | - | opt into network egress (default `false`); honored only when the run was started with `--allow-network`. See [Network access](#network-access) |
 
