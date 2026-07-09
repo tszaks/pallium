@@ -45,7 +45,7 @@ func TestIndexerRunPreservesActiveTask(t *testing.T) {
 	task := db.ActiveTask{
 		Goal:       "Fix the indexer",
 		ScopePaths: []string{"internal/index"},
-		StartedAt:  time.Date(2026, 3, 13, 12, 30, 0, 0, time.UTC),
+		StartedAt:  time.Now().UTC().Add(-1 * time.Minute),
 	}
 	if err := store.SaveActiveTask(task); err != nil {
 		t.Fatalf("SaveActiveTask failed: %v", err)

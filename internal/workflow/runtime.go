@@ -312,7 +312,7 @@ func (r *Runner) executeScript(ctx context.Context, script string, args any, top
 			return "", ErrWorkflowPaused
 		}
 		if topLevel {
-			_ = r.Store.SetRunStatus(r.Run.ID, "failed", "", err.Error())
+			_ = r.Store.SetRunStatus(r.Run.ID, r.topLevelFailureStatus(), "", err.Error())
 		}
 		return "", err
 	}
@@ -332,7 +332,7 @@ func (r *Runner) executeScript(ctx context.Context, script string, args any, top
 			return "", ErrWorkflowPaused
 		}
 		if topLevel {
-			_ = r.Store.SetRunStatus(r.Run.ID, "failed", "", err.Error())
+			_ = r.Store.SetRunStatus(r.Run.ID, r.topLevelFailureStatus(), "", err.Error())
 		}
 		return "", err
 	}
@@ -348,7 +348,7 @@ func (r *Runner) executeScript(ctx context.Context, script string, args any, top
 				_ = r.Store.SetRunStatus(r.Run.ID, interruptedStatus(err), "", interruptedMessage(err))
 				return "", err
 			}
-			_ = r.Store.SetRunStatus(r.Run.ID, "failed", "", err.Error())
+			_ = r.Store.SetRunStatus(r.Run.ID, r.topLevelFailureStatus(), "", err.Error())
 			return "", err
 		}
 	}
@@ -367,6 +367,26 @@ func (r *Runner) executeScript(ctx context.Context, script string, args any, top
 		}
 	}
 	return resultText, nil
+}
+
+// topLevelFailureStatus decides the run-level status to persist when the
+// top-level script itself failed (an uncaught rejection, or patch
+// application after the script otherwise completed). A run with at least
+// one completed agent already produced usable, report-able work — "failed"
+// would contradict that. "completed_with_failures" names the honest middle
+// ground; a run that never got a single agent past "completed" is a
+// genuine flat failure.
+func (r *Runner) topLevelFailureStatus() string {
+	agents, err := r.Store.ListAgents(r.Run.ID)
+	if err != nil {
+		return "failed"
+	}
+	for _, agent := range agents {
+		if agent.Status == "completed" {
+			return "completed_with_failures"
+		}
+	}
+	return "failed"
 }
 
 // warnOnDropsAtCompletion emits a consolidated stderr warning when a run
@@ -2542,7 +2562,7 @@ func (r *Runner) runConfiguredProviderCommand(ctx context.Context, command, tmpD
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		baseErr := fmt.Errorf("workflow provider %q failed: %w: %s", agent.Provider, err, strings.TrimSpace(stderr.String()))
+		baseErr := formatProviderFailure(fmt.Sprintf("workflow provider %q", agent.Provider), err, stderr.String())
 		return strings.TrimSpace(stdout.String()), wrapProviderCommandError(baseErr, stdout.String()+stderr.String())
 	}
 	raw, readErr := os.ReadFile(outFile)

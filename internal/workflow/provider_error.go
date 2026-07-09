@@ -53,3 +53,18 @@ func wrapProviderCommandError(err error, combinedOutput string) error {
 	}
 	return err
 }
+
+// formatProviderFailure builds the base error for a failed provider command
+// invocation ahead of wrapProviderCommandError's meaningful-line search. A
+// process that exits nonzero without writing to stderr (a crash before any
+// output, or a signal kill) used to render as a dangling "failed: exit
+// status 1: " with nothing after the trailing colon — indistinguishable from
+// a real error message cut short. Naming the empty case explicitly keeps
+// every failure message non-empty and honest about what was captured.
+func formatProviderFailure(label string, err error, stderrSnippet string) error {
+	stderrSnippet = strings.TrimSpace(stderrSnippet)
+	if stderrSnippet == "" {
+		return fmt.Errorf("%s failed: %w (no stderr output captured)", label, err)
+	}
+	return fmt.Errorf("%s failed: %w: %s", label, err, stderrSnippet)
+}

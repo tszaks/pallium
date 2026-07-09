@@ -554,7 +554,7 @@ func (r *Runner) runConfiguredProviderTeamTurn(ctx context.Context, teamID strin
 	_, usage := readAndRemoveAgentUsage(usageFile)
 	cost, _ := usage["cost_usd"].(float64)
 	if runErr != nil {
-		baseErr := fmt.Errorf("team turn (%s wrapper) failed: %w: %s", member.Provider, runErr, strings.TrimSpace(stderr.String()))
+		baseErr := formatProviderFailure(fmt.Sprintf("team turn (%s wrapper)", member.Provider), runErr, stderr.String())
 		return "", newToken, cost, wrapProviderCommandError(baseErr, stdout.String()+stderr.String())
 	}
 	raw, readErr := os.ReadFile(outFile)

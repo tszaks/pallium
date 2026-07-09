@@ -393,8 +393,15 @@ func (s *Store) SetRunStatus(id, status, resultText, errorText string) error {
 	if strings.TrimSpace(id) == "" {
 		return fmt.Errorf("workflow run id is required")
 	}
+	if (status == "failed" || status == "completed_with_failures") && strings.TrimSpace(errorText) == "" {
+		// Every failure needs a message a user can act on. A blank errorText
+		// here means an upstream error's own message rendered empty (e.g. a
+		// provider exited nonzero with no captured stderr) — never persist
+		// that as a silently blank error column.
+		errorText = "run failed with no error message captured"
+	}
 	completedAt := ""
-	if status == "completed" || status == "failed" || status == "stopped" {
+	if status == "completed" || status == "completed_with_failures" || status == "failed" || status == "stopped" {
 		completedAt = nowString()
 	}
 	_, err := s.db.Exec(`UPDATE workflow_runs SET status=?,result=?,error=?,updated_at=?,completed_at=? WHERE id=?`,

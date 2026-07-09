@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/tszaks/pallium/internal/gitlog"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -213,7 +215,58 @@ WHERE last_touched_at = ''
 		return fmt.Errorf("backfill files.last_touched_at: %w", err)
 	}
 
+	if err := s.migrateActiveTasksBranchScoping(); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+// migrateActiveTasksBranchScoping upgrades active_tasks from its original
+// repo-only PRIMARY KEY to a (repo_id, branch) composite key. Two sessions
+// working the SAME checkout path on DIFFERENT branches used to share one
+// singleton row (repo_id alone was the only key) — whichever session called
+// `task start` most recently silently overwrote the other's task, and
+// `workflow preflight` would then present that stranger's task_scope as if
+// it were the calling session's own. SQLite can't ALTER a PRIMARY KEY in
+// place, so this recreates the table inside a transaction. Existing rows
+// migrate with branch='' (their true branch at task-start time is unknown
+// now) — safe, not a data loss: '' never matches any REAL current branch
+// going forward (see currentBranchForActiveTask, which returns "" only on a
+// git error, an edge case not worth chasing further), so a pre-migration
+// row simply stops being returned rather than continuing to leak.
+func (s *Store) migrateActiveTasksBranchScoping() error {
+	columns, err := s.tableColumns("active_tasks")
+	if err != nil {
+		return fmt.Errorf("read active_tasks columns: %w", err)
+	}
+	if _, ok := columns["branch"]; ok {
+		return nil
+	}
+	return s.WithTx(func(tx *Store) error {
+		if _, err := tx.q.Exec(`
+CREATE TABLE active_tasks_new (
+  repo_id INTEGER NOT NULL,
+  branch TEXT NOT NULL DEFAULT '',
+  goal TEXT NOT NULL,
+  scope_paths TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  PRIMARY KEY (repo_id, branch)
+)`); err != nil {
+			return fmt.Errorf("create active_tasks_new: %w", err)
+		}
+		if _, err := tx.q.Exec(`INSERT INTO active_tasks_new (repo_id, branch, goal, scope_paths, started_at)
+SELECT repo_id, '', goal, scope_paths, started_at FROM active_tasks`); err != nil {
+			return fmt.Errorf("copy active_tasks data: %w", err)
+		}
+		if _, err := tx.q.Exec(`DROP TABLE active_tasks`); err != nil {
+			return fmt.Errorf("drop old active_tasks: %w", err)
+		}
+		if _, err := tx.q.Exec(`ALTER TABLE active_tasks_new RENAME TO active_tasks`); err != nil {
+			return fmt.Errorf("rename active_tasks_new: %w", err)
+		}
+		return nil
+	})
 }
 
 func (s *Store) tableColumns(table string) (map[string]struct{}, error) {
@@ -378,11 +431,37 @@ VALUES (?, ?, ?, ?, ?, ?)
 	return nil
 }
 
+// activeTaskStaleAfter is how long an active task stays valid before
+// ActiveTask treats it as expired (returns sql.ErrNoRows) rather than
+// surfacing genuinely abandoned state left over from a past session on the
+// same branch. Chosen to comfortably cover one real working session (many
+// hours) while still aging out anything left over from a prior day's work.
+const activeTaskStaleAfter = 4 * time.Hour
+
+// currentBranchForActiveTask returns the CURRENT git branch (not the
+// possibly-stale repos.branch column, which only refreshes at index time)
+// so active_tasks can be scoped per-branch: two sessions working the SAME
+// checkout path on different branches must never see or overwrite each
+// other's task (see migrateActiveTasksBranchScoping's doc comment for the
+// exact bug this fixes). "" on a git error (e.g. a detached-HEAD edge case
+// gitlog.CurrentBranch can't resolve) is an acceptable degrade, not chased
+// further — it still isolates from any REAL named branch, just not from
+// another equally-detached session, which is the same residual gap the
+// pre-fix code had for its entire lifetime.
+func (s *Store) currentBranchForActiveTask() string {
+	branch, err := gitlog.CurrentBranch(s.RepoRoot)
+	if err != nil {
+		return ""
+	}
+	return branch
+}
+
 func (s *Store) SaveActiveTask(task ActiveTask) error {
 	repo, err := s.Repo()
 	if err != nil {
 		return err
 	}
+	branch := s.currentBranchForActiveTask()
 
 	scopeJSON, err := json.Marshal(task.ScopePaths)
 	if err != nil {
@@ -395,13 +474,13 @@ func (s *Store) SaveActiveTask(task ActiveTask) error {
 	}
 
 	_, err = s.q.Exec(`
-INSERT INTO active_tasks (repo_id, goal, scope_paths, started_at)
-VALUES (?, ?, ?, ?)
-ON CONFLICT(repo_id) DO UPDATE SET
+INSERT INTO active_tasks (repo_id, branch, goal, scope_paths, started_at)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(repo_id, branch) DO UPDATE SET
   goal = excluded.goal,
   scope_paths = excluded.scope_paths,
   started_at = excluded.started_at
-`, repo.ID, task.Goal, string(scopeJSON), startedAt.UTC().Format(time.RFC3339))
+`, repo.ID, branch, task.Goal, string(scopeJSON), startedAt.UTC().Format(time.RFC3339))
 	if err != nil {
 		return fmt.Errorf("save active task: %w", err)
 	}
@@ -413,8 +492,9 @@ func (s *Store) ActiveTask() (ActiveTask, error) {
 	if err != nil {
 		return ActiveTask{}, err
 	}
+	branch := s.currentBranchForActiveTask()
 
-	row := s.q.QueryRow(`SELECT goal, scope_paths, started_at FROM active_tasks WHERE repo_id = ?`, repo.ID)
+	row := s.q.QueryRow(`SELECT goal, scope_paths, started_at FROM active_tasks WHERE repo_id = ? AND branch = ?`, repo.ID, branch)
 	var task ActiveTask
 	var scopeJSON string
 	var startedAt string
@@ -429,6 +509,9 @@ func (s *Store) ActiveTask() (ActiveTask, error) {
 		return ActiveTask{}, fmt.Errorf("unmarshal task scope: %w", err)
 	}
 	task.StartedAt, _ = time.Parse(time.RFC3339, startedAt)
+	if !task.StartedAt.IsZero() && time.Since(task.StartedAt) > activeTaskStaleAfter {
+		return ActiveTask{}, sql.ErrNoRows
+	}
 	return task, nil
 }
 
@@ -437,7 +520,8 @@ func (s *Store) ClearActiveTask() error {
 	if err != nil {
 		return err
 	}
-	if _, err := s.q.Exec(`DELETE FROM active_tasks WHERE repo_id = ?`, repo.ID); err != nil {
+	branch := s.currentBranchForActiveTask()
+	if _, err := s.q.Exec(`DELETE FROM active_tasks WHERE repo_id = ? AND branch = ?`, repo.ID, branch); err != nil {
 		return fmt.Errorf("clear active task: %w", err)
 	}
 	return nil

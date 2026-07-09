@@ -220,6 +220,49 @@ func TestWorkflowGenerateSaveByName(t *testing.T) {
 	}
 }
 
+// TestWorkflowGenerateSaveRespectsCWDFlag proves `workflow generate --save`
+// scopes its `.pallium/workflows/` write to the repo named by --cwd instead
+// of silently writing relative to Pallium's own process working directory
+// (which requires the caller to cd into the target repo first).
+func TestWorkflowGenerateSaveRespectsCWDFlag(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	repo := t.TempDir()
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{
+		"generate",
+		"--cwd", repo,
+		"--style", "review",
+		"--save", "cwd-generated",
+		"review this branch",
+	}, false); err != nil {
+		t.Fatalf("workflow generate save failed: %v", err)
+	}
+	path := filepath.Join(repo, ".pallium", "workflows", "cwd-generated.js")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected saved generated workflow scoped to --cwd at %s: %v", path, err)
+	}
+}
+
+// TestWorkflowGenerateOutputRespectsCWDFlag proves a relative --output path
+// resolves against --cwd rather than Pallium's own process cwd.
+func TestWorkflowGenerateOutputRespectsCWDFlag(t *testing.T) {
+	repo := t.TempDir()
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{
+		"generate",
+		"--cwd", repo,
+		"--style", "review",
+		"--output", "relative-output.js",
+		"review this branch",
+	}, false); err != nil {
+		t.Fatalf("workflow generate failed: %v", err)
+	}
+	path := filepath.Join(repo, "relative-output.js")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected generated output scoped to --cwd at %s: %v", path, err)
+	}
+}
+
 func TestWorkflowGenerateLLMValidatesScript(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_GENERATE_STUB", "phase(\"llm\");\nreturn { ok: true };")
 	tmp := t.TempDir()
@@ -976,6 +1019,49 @@ return result;`), 0o644); err != nil {
 	nextSteps := report["next_steps"].([]any)
 	if findings[0] != "auth flow is covered" || risks[0] != "missing edge test" || nextSteps[0] != "add edge test" {
 		t.Fatalf("unexpected report extraction: %#v", report)
+	}
+}
+
+// TestWorkflowReportOmitsRelatedSessionsByDefault is the regression test for
+// #37: workflow report used to unconditionally call sessionmemory.Related,
+// which searches the GLOBAL cross-repo session store — RepoRoot is only a
+// ranking signal, not a hard filter, so unrelated Codex/Claude transcripts
+// from OTHER repos could bleed into a report that should be scoped to one
+// run. related_sessions must now be absent unless --related is passed.
+func TestWorkflowReportOmitsRelatedSessionsByDefault(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"x"}`)
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	scriptPath := filepath.Join(tmp, "workflow.js")
+	if err := os.WriteFile(scriptPath, []byte(`return { summary: "x" };`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{"run", "--id", "wf-related-test", "--db", dbPath, "--cwd", tmp, "--script", scriptPath, "task"}, false); err != nil {
+		t.Fatalf("workflow run failed: %v", err)
+	}
+
+	out.Reset()
+	if err := runWorkflow(&out, []string{"report", "wf-related-test", "--db", dbPath}, true); err != nil {
+		t.Fatalf("workflow report failed: %v", err)
+	}
+	var report map[string]any
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatalf("decode report json: %v\n%s", err, out.String())
+	}
+	if _, ok := report["related_sessions"]; ok {
+		t.Fatalf("expected related_sessions to be OMITTED by default, got %#v", report["related_sessions"])
+	}
+
+	// --related must still be accepted (the opt-in escape hatch) without
+	// breaking the command — sessionmemory.Related's own matching logic is
+	// pre-existing and untouched by this fix, so with an isolated empty HOME
+	// (no indexed sessions at all) the block legitimately stays empty too;
+	// this only proves the flag parses and doesn't error.
+	out.Reset()
+	if err := runWorkflow(&out, []string{"report", "wf-related-test", "--db", dbPath, "--related"}, true); err != nil {
+		t.Fatalf("workflow report --related should not error: %v", err)
 	}
 }
 

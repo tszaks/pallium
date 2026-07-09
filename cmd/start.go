@@ -76,7 +76,7 @@ func runStart(out io.Writer, args []string, jsonOutput bool) error {
 		// must always yield a runnable workflow, and the fallback is announced.
 		script = base
 		source = "template"
-		tailored, genErr := generateWorkflowWithLLM(task, *style, *testCommand, 3, *codexBinary, base)
+		tailored, genErr := generateWorkflowWithLLM(task, *style, *testCommand, 3, *codexBinary, absCWD, base)
 		switch {
 		case genErr != nil:
 			if !jsonOutput {

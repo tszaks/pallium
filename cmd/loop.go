@@ -272,7 +272,7 @@ func runLoopTick(out io.Writer, args []string, jsonOutput bool) error {
 	scriptState, signature, resultErr := parseLoopTickResult(childRun.Result)
 	state := scriptState
 	switch {
-	case runErr != nil || childRun.Status == "failed" || resultErr != nil:
+	case runErr != nil || childRun.Status == "failed" || childRun.Status == "completed_with_failures" || resultErr != nil:
 		state = workflow.LoopStateError
 	case state == "":
 		state = workflow.LoopStateNoOp
