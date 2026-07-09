@@ -107,6 +107,57 @@ func TestReadHistoryUnquotesPathsWithDoubleQuotes(t *testing.T) {
 	}
 }
 
+func TestCanonicalRepoRootMatchesRepoRootForNonWorktreeCheckout(t *testing.T) {
+	repo := initTempRepo(t)
+
+	canonical, err := CanonicalRepoRoot(repo)
+	if err != nil {
+		t.Fatalf("CanonicalRepoRoot failed: %v", err)
+	}
+	root, err := RepoRoot(repo)
+	if err != nil {
+		t.Fatalf("RepoRoot failed: %v", err)
+	}
+	if canonical != root {
+		t.Fatalf("expected canonical root %q to equal repo root %q for a non-worktree checkout", canonical, root)
+	}
+}
+
+func TestCanonicalRepoRootSharedAcrossLinkedWorktree(t *testing.T) {
+	repo := initTempRepo(t)
+
+	mainCanonical, err := CanonicalRepoRoot(repo)
+	if err != nil {
+		t.Fatalf("CanonicalRepoRoot(main) failed: %v", err)
+	}
+
+	worktree := filepath.Join(t.TempDir(), "wt")
+	run(t, repo, "git", "worktree", "add", "-b", "feature", worktree)
+
+	worktreeRoot, err := RepoRoot(worktree)
+	if err != nil {
+		t.Fatalf("RepoRoot(worktree) failed: %v", err)
+	}
+	if worktreeRoot == mainCanonical {
+		t.Fatalf("expected worktree's own toplevel %q to differ from the main repo root, otherwise this test doesn't exercise the worktree case", worktreeRoot)
+	}
+
+	worktreeCanonical, err := CanonicalRepoRoot(worktree)
+	if err != nil {
+		t.Fatalf("CanonicalRepoRoot(worktree) failed: %v", err)
+	}
+	if worktreeCanonical != mainCanonical {
+		t.Fatalf("expected worktree canonical root %q to equal main canonical root %q", worktreeCanonical, mainCanonical)
+	}
+}
+
+func TestCanonicalRepoRootErrorsOutsideGitRepo(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := CanonicalRepoRoot(dir); err == nil {
+		t.Fatal("expected error for a non-git directory")
+	}
+}
+
 func initTempRepo(t *testing.T) string {
 	t.Helper()
 
