@@ -1078,6 +1078,63 @@ func writeConflictingPatch(t *testing.T, dir, repoRoot, filename, newContent str
 	return patchPath
 }
 
+// TestMergeIntoStagingComposesTwoNonConflictingEditsToTheSameFile is the
+// regression test for a bug discovered while writing the conflict-restore
+// test below: the ORIGINAL applyWorktreeDiff ran `git reset -q` after each
+// successful --3way apply to unstage it (so a later git-diff-based capture
+// would still see it as an uncommitted change). That left the index clean
+// (matching HEAD) while the working tree carried the accumulated edit — and
+// `git apply --3way`'s fallback path refuses with "does not match index"
+// against ANY file with pre-existing unstaged changes, even when the new
+// patch's own target lines don't overlap with the first edit at all. That
+// made mergeIntoStaging fail outright for two agents editing the same file
+// in ANY way, not just a genuine conflict — a much more basic break than
+// the conflict-handling finding. The fix commits each merge instead of
+// leaving it uncommitted, so the index is always settled before the next
+// apply.
+func TestMergeIntoStagingComposesTwoNonConflictingEditsToTheSameFile(t *testing.T) {
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "shared.txt"), []byte("line1\nline2\nline3\nline4\nline5\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "shared.txt")
+	runGit(t, tmp, "commit", "-m", "initial")
+
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run, err := store.CreateRun(Run{ID: "wf-same-file-compose", Task: "same file compose", CWD: tmp, ScriptPath: "unused.js"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &Runner{Store: store, Run: run}
+
+	patchDir := t.TempDir()
+	patchA := writeConflictingPatch(t, patchDir, tmp, "shared.txt", "line1\nCHANGED-A\nline3\nline4\nline5\n")
+	if err := r.mergeIntoStaging(tmp, patchA); err != nil {
+		t.Fatalf("first merge should succeed: %v", err)
+	}
+	// Non-overlapping change: touches line4, not line2.
+	patchC := writeConflictingPatch(t, patchDir, tmp, "shared.txt", "line1\nline2\nline3\nCHANGED-C\nline5\n")
+	if err := r.mergeIntoStaging(tmp, patchC); err != nil {
+		t.Fatalf("expected a second, non-overlapping edit to the same file to compose cleanly, got: %v", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(r.stagingPathFor(tmp), "shared.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "line1\nCHANGED-A\nline3\nCHANGED-C\nline5\n"
+	if string(raw) != want {
+		t.Fatalf("expected both edits composed, got %q want %q", string(raw), want)
+	}
+}
+
 // TestMergeIntoStagingRestoresSnapshotOnConflict is the regression test for
 // the adversarial-review finding that a failed `git apply --3way` (a real
 // conflict between two edit-intent agents touching the same lines) left
@@ -1113,7 +1170,8 @@ func TestMergeIntoStagingRestoresSnapshotOnConflict(t *testing.T) {
 		t.Fatalf("first merge should succeed cleanly: %v", err)
 	}
 	stagingPath := r.stagingPathFor(tmp)
-	before, err := worktreeDiff(stagingPath)
+	stagingBase := r.stagingEntry(tmp).base
+	before, err := diffAgainstBase(stagingPath, stagingBase)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1123,7 +1181,7 @@ func TestMergeIntoStagingRestoresSnapshotOnConflict(t *testing.T) {
 		t.Fatal("expected the conflicting second merge to fail")
 	}
 
-	after, err := worktreeDiff(stagingPath)
+	after, err := diffAgainstBase(stagingPath, stagingBase)
 	if err != nil {
 		t.Fatal(err)
 	}

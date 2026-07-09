@@ -3044,62 +3044,68 @@ func (r *Runner) releaseRepoLocks() {
 	}
 }
 
-// worktreeDiff returns a worktree's current diff against HEAD, including
-// untracked files via `git add -N`, without writing it to a patch file.
-func worktreeDiff(worktree string) ([]byte, error) {
-	addIntent := exec.Command("git", "add", "-N", "--", ".")
-	addIntent.Dir = worktree
-	var stderr bytes.Buffer
-	addIntent.Stderr = &stderr
-	if err := addIntent.Run(); err != nil {
-		return nil, fmt.Errorf("prepare worktree diff: %w: %s", err, strings.TrimSpace(stderr.String()))
-	}
-	cmd := exec.Command("git", "diff", "--binary")
-	cmd.Dir = worktree
-	return cmd.Output()
-}
-
-// applyWorktreeDiff applies a previously captured diff into worktree via a
-// three-way merge, matching the restore technique verify.untilGreen already
-// uses for its own resume patch. A blank diff is a no-op.
-func applyWorktreeDiff(worktree string, diff []byte) error {
+// applyAndCommitDiff applies a previously captured diff into worktree via a
+// three-way merge and, on success, commits it into worktree's own detached
+// HEAD. Committing (rather than leaving the merge as an uncommitted
+// working-tree change, which an earlier version of this function did via
+// `git reset -q` to unstage what --3way auto-stages) is what lets a LATER
+// call apply a second, independent patch touching the SAME file: `git apply
+// --3way`'s fallback path requires the index to reflect a settled (matching)
+// state to attempt a real three-way merge, and refuses outright with "does
+// not match index" against a file with pre-existing UNSTAGED changes —
+// discovered by a same-file regression test that failed even for two
+// entirely non-overlapping edits, not just conflicting ones. A blank diff is
+// a no-op. Explicit -c identity: a fresh `git worktree add --detach` carries
+// no branch, so this commit floats free of any ref and is discarded along
+// with the worktree; a repo with no user.name/user.email configured must not
+// fail this commit only to break staging.
+func applyAndCommitDiff(worktree string, diff []byte) error {
 	if strings.TrimSpace(string(diff)) == "" {
 		return nil
 	}
 	apply := exec.Command("git", "apply", "--3way")
 	apply.Dir = worktree
 	apply.Stdin = bytes.NewReader(diff)
-	var stderr bytes.Buffer
-	apply.Stderr = &stderr
+	var applyStderr bytes.Buffer
+	apply.Stderr = &applyStderr
 	if err := apply.Run(); err != nil {
-		return fmt.Errorf("apply staged edits: %w: %s", err, strings.TrimSpace(stderr.String()))
+		return fmt.Errorf("apply staged edits: %w: %s", err, strings.TrimSpace(applyStderr.String()))
 	}
-	// git apply --3way stages the applied changes; unstage them so later
-	// `git diff`/`git add -N` captures of this worktree keep seeing them.
-	reset := exec.Command("git", "reset", "-q")
-	reset.Dir = worktree
-	_ = reset.Run()
+	add := exec.Command("git", "add", "-A")
+	add.Dir = worktree
+	var addStderr bytes.Buffer
+	add.Stderr = &addStderr
+	if err := add.Run(); err != nil {
+		return fmt.Errorf("stage applied edits: %w: %s", err, strings.TrimSpace(addStderr.String()))
+	}
+	commit := exec.Command("git", "-c", "user.email=pallium@localhost", "-c", "user.name=pallium",
+		"commit", "-q", "-m", "pallium: staged edit")
+	commit.Dir = worktree
+	var commitStderr bytes.Buffer
+	commit.Stderr = &commitStderr
+	if err := commit.Run(); err != nil {
+		return fmt.Errorf("commit applied edits: %w: %s", err, strings.TrimSpace(commitStderr.String()))
+	}
 	return nil
 }
 
-// resetWorktreeToDiff discards worktree's current uncommitted state (both
-// tracked and untracked changes, and any unmerged index entries) back to
-// HEAD, then reapplies diff. Used to recover a shared, long-lived worktree
-// (staging) to an exact prior snapshot after a failed merge attempt: `git
-// apply --3way` leaves conflict markers and a dirty index behind on failure
-// rather than cleaning up after itself, and staging is read by every later
-// step in the run — left in place, that corrupted state would be silently
-// treated as real file content by every subsequent mergeIntoStaging/
-// seedFromStaging call for the rest of the run. Reapplying diff (which, by
-// construction, already applied cleanly once against this same HEAD, which
-// staging never advances) deterministically reproduces the pre-failure state.
-func resetWorktreeToDiff(worktree string, diff []byte) error {
+// resetWorktreeHard discards worktree's current uncommitted state — tracked
+// changes, untracked files, and any unmerged/conflicted index entries left
+// by a failed `git apply --3way` — back to its last commit. Used to recover
+// a shared, long-lived worktree (staging) after a failed merge attempt:
+// left in place, --3way's conflict markers and dirty index would be
+// silently treated as real file content by every subsequent
+// mergeIntoStaging/seedFromStaging call for the rest of the run. Since
+// applyAndCommitDiff only ever advances HEAD on a fully successful merge,
+// HEAD always names the exact state to recover to — no separate snapshot
+// needed.
+func resetWorktreeHard(worktree string) error {
 	reset := exec.Command("git", "reset", "--hard", "HEAD")
 	reset.Dir = worktree
 	var resetStderr bytes.Buffer
 	reset.Stderr = &resetStderr
 	if err := reset.Run(); err != nil {
-		return fmt.Errorf("reset to clean HEAD: %w: %s", err, strings.TrimSpace(resetStderr.String()))
+		return fmt.Errorf("reset to last known-good commit: %w: %s", err, strings.TrimSpace(resetStderr.String()))
 	}
 	clean := exec.Command("git", "clean", "-fd")
 	clean.Dir = worktree
@@ -3108,24 +3114,47 @@ func resetWorktreeToDiff(worktree string, diff []byte) error {
 	if err := clean.Run(); err != nil {
 		return fmt.Errorf("clean untracked: %w: %s", err, strings.TrimSpace(cleanStderr.String()))
 	}
-	if err := applyWorktreeDiff(worktree, diff); err != nil {
-		return fmt.Errorf("reapply last known-good snapshot: %w", err)
-	}
 	return nil
 }
 
+// diffAgainstBase returns worktree's cumulative diff from base (the commit
+// staging was originally created from) to its current HEAD. Every merge
+// into staging is committed (see applyAndCommitDiff), so this is a plain
+// two-commit diff — no working-tree/index trickery (`git add -N`, etc.)
+// needed, unlike an accumulator that stays uncommitted.
+func diffAgainstBase(worktree, base string) ([]byte, error) {
+	cmd := exec.Command("git", "diff", "--binary", base, "HEAD")
+	cmd.Dir = worktree
+	return cmd.Output()
+}
+
+// currentHEAD returns worktree's current commit SHA.
+func currentHEAD(worktree string) (string, error) {
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = worktree
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 // stagingWorktree is the run-scoped mirror of one real repo root, holding
-// every edit-intent agent's accumulated changes for the lifetime of a single
-// Execute call. Its own mutex serializes creation and merges for that repo,
-// so a concurrent edit agent's mergeIntoStaging and a concurrent non-edit
-// step's seedFromStaging read never race against each other on the SAME
-// staging directory (see runAgentCommand: a non-edit step never runs
-// directly against this path — it always gets its own ephemeral worktree
-// seeded FROM this one, so only staging's own bookkeeping needs this lock,
-// never a live agent process).
+// every edit-intent agent's accumulated changes (each committed in turn, see
+// applyAndCommitDiff) for the lifetime of a single Execute call. base is the
+// commit staging was originally created from — fixed for the run, since
+// diffAgainstBase needs a stable reference point regardless of how many
+// merges have since advanced HEAD. Its own mutex serializes creation and
+// merges for that repo, so a concurrent edit agent's mergeIntoStaging and a
+// concurrent non-edit step's seedFromStaging read never race against each
+// other on the SAME staging directory (see runAgentCommand: a non-edit step
+// never runs directly against this path — it always gets its own ephemeral
+// worktree seeded FROM this one, so only staging's own bookkeeping needs
+// this lock, never a live agent process).
 type stagingWorktree struct {
 	mu   sync.Mutex
 	path string
+	base string
 }
 
 // stagingEntry returns (creating if necessary) the bookkeeping slot for
@@ -3173,7 +3202,12 @@ func (r *Runner) mergeIntoStaging(repoRoot, patchPath string) error {
 		if err != nil {
 			return err
 		}
+		base, err := currentHEAD(created)
+		if err != nil {
+			return err
+		}
 		entry.path = created
+		entry.base = base
 	}
 	if patchPath == "" {
 		return nil
@@ -3182,25 +3216,20 @@ func (r *Runner) mergeIntoStaging(repoRoot, patchPath string) error {
 	if err != nil {
 		return err
 	}
-	// Snapshot staging's current accumulated content before attempting this
-	// merge. A failed --3way apply (two edit-intent agents touching the same
-	// lines) must not leave the shared, long-lived staging worktree
-	// corrupted for every later read this run — restore it to exactly this
-	// snapshot so the conflict surfaces as a clean, actionable error instead.
-	before, snapshotErr := worktreeDiff(entry.path)
-	applyErr := applyWorktreeDiff(entry.path, raw)
-	if applyErr == nil {
-		return nil
+	if err := applyAndCommitDiff(entry.path, raw); err != nil {
+		// A failed --3way apply (two edit-intent agents touching the same
+		// lines) leaves conflict markers and a dirty index behind — must not
+		// leave the shared, long-lived staging worktree corrupted for every
+		// later read this run. applyAndCommitDiff only advances HEAD on a
+		// fully successful merge, so resetting hard to HEAD always recovers
+		// exactly the last known-good state; the conflict then surfaces as a
+		// clean, actionable error instead of silent corruption.
+		if resetErr := resetWorktreeHard(entry.path); resetErr != nil {
+			return fmt.Errorf("%w (additionally failed to restore staging to its last known-good state: %v)", err, resetErr)
+		}
+		return err
 	}
-	if snapshotErr != nil {
-		// No snapshot to restore to — surface both failures rather than
-		// leaving the operator to guess why staging looks wrong afterward.
-		return fmt.Errorf("%w (additionally could not snapshot staging before the attempt: %v)", applyErr, snapshotErr)
-	}
-	if resetErr := resetWorktreeToDiff(entry.path, before); resetErr != nil {
-		return fmt.Errorf("%w (additionally failed to restore staging to its last known-good state: %v)", applyErr, resetErr)
-	}
-	return applyErr
+	return nil
 }
 
 // stagingWorktreeID deterministically names a repo root's staging worktree
@@ -3234,7 +3263,7 @@ func (r *Runner) seedFromStaging(repoRoot, worktree string) error {
 	if entry.path == "" {
 		return nil
 	}
-	diff, err := worktreeDiff(entry.path)
+	diff, err := diffAgainstBase(entry.path, entry.base)
 	if err != nil {
 		return err
 	}
