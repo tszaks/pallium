@@ -1569,10 +1569,26 @@ func (r *Runner) runAgentAtCallIndex(ctx context.Context, prompt string, opts Ag
 		_ = r.Store.FinishAgentStatus(agent, interruptedStatus(err), output, interruptedMessage(err))
 		return "", err
 	}
-	if _, err := parseAgentOutputWithSchema(output, opts.Schema); err != nil {
+	if _, schemaErr := parseAgentOutputWithSchema(output, opts.Schema); schemaErr != nil {
+		if agent.PatchPath != "" {
+			// An edit agent's captured patch is completed WORK. A malformed
+			// structured OUTPUT must not discard it — that was a data-loss bug:
+			// the edit vanished silently while the run failed. Preserve the
+			// patch, finish the agent so its patch applies at workflow success
+			// (and is recoverable via `workflow apply`), and surface the schema
+			// failure in the run's failures list instead of throwing the edit
+			// away. Only the structured output fails, not the completed work.
+			r.recordDroppedItem(firstNonEmpty(opts.Label, agent.ID), fmt.Sprintf("structured output failed schema validation; edit patch preserved: %v", schemaErr))
+			if err := r.Store.FinishAgent(agent, output, ""); err != nil {
+				return "", err
+			}
+			return output, nil
+		}
+		// Read-only (no patch): the structured output IS the deliverable, so a
+		// schema failure (after the read-only retry) is a real failure.
 		agent.PatchPath = ""
-		_ = r.Store.FinishAgent(agent, output, err.Error())
-		return "", err
+		_ = r.Store.FinishAgent(agent, output, schemaErr.Error())
+		return "", schemaErr
 	}
 	if err := r.Store.FinishAgent(agent, output, ""); err != nil {
 		return "", err
