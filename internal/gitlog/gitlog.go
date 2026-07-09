@@ -50,6 +50,28 @@ func RepoRoot(path string) (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
+// CanonicalRepoRoot resolves the repo root shared by every worktree of the
+// same repository. A linked worktree has its own toplevel (RepoRoot), but
+// its git-common-dir always points back at the primary checkout's .git, so
+// all worktrees of a repo resolve to the same canonical root here. For a
+// normal checkout (or the primary worktree) this equals RepoRoot.
+func CanonicalRepoRoot(path string) (string, error) {
+	// Reuse RepoRoot's error handling so bare repos and non-git directories
+	// fail the same way they do today: --git-common-dir alone would succeed
+	// in a bare repo, where --show-toplevel does not.
+	if _, err := RepoRoot(path); err != nil {
+		return "", err
+	}
+
+	cmd := exec.Command("git", "-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", wrapGitError("failed to resolve canonical git repo root", err)
+	}
+
+	return filepath.Dir(strings.TrimSpace(string(output))), nil
+}
+
 func CurrentBranch(repoRoot string) (string, error) {
 	cmd := exec.Command("git", "-C", repoRoot, "rev-parse", "--abbrev-ref", "HEAD")
 	output, err := cmd.Output()
