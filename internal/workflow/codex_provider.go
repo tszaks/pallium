@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -45,6 +46,97 @@ func (r *Runner) runCodexCommand(ctx context.Context, tmpDir, outFile, cwd, prom
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		baseErr := fmt.Errorf("codex agent failed: %w: %s", err, strings.TrimSpace(stderr.String()))
+		return "", wrapProviderCommandError(baseErr, stdout.String()+stderr.String())
+	}
+	raw, err := os.ReadFile(outFile)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(raw)), nil
+}
+
+// codexThreadStartedEvent is the one `codex exec --json` event this file
+// cares about parsing: {"type":"thread.started","thread_id":"<uuid>"}, codex's
+// own session identifier, emitted once at the start of a fresh (non-resumed)
+// thread. Unlike claude, codex assigns this id itself — it cannot be minted
+// ahead of time — so it must be captured from the live event stream.
+type codexThreadStartedEvent struct {
+	Type     string `json:"type"`
+	ThreadID string `json:"thread_id"`
+}
+
+// runCodexTeamTurn runs one turn of a codex teammate's native conversation.
+// On the first turn (sessionToken empty), it runs a fresh `codex exec --json`
+// and captures the assigned thread_id from the `thread.started` event AS
+// SOON as that line streams in — via onSessionCaptured, called at most once
+// — rather than waiting for the whole turn to finish, so a process killed
+// moments later still leaves the session resumable. Later turns resume that
+// thread directly (`codex exec resume <thread_id>`); onSessionCaptured is not
+// called again since the id is already known. Output is still written to
+// outFile via --output-last-message, exactly like the regular worker path;
+// --json is layered on top purely to observe thread.started, not to parse
+// the final answer.
+func (r *Runner) runCodexTeamTurn(ctx context.Context, tmpDir, outFile, cwd, model, sessionToken string, mode string, networkAllowed bool, prompt string, schema map[string]any, onSessionCaptured func(threadID string)) (string, error) {
+	var cmdArgs []string
+	if sessionToken == "" {
+		cmdArgs = []string{"exec", "--cd", cwd, "--json", "--output-last-message", outFile}
+	} else {
+		cmdArgs = []string{"exec", "resume", sessionToken, "--cd", cwd, "--json", "--output-last-message", outFile}
+	}
+	cmdArgs = append(cmdArgs, codexSandboxArgs(mode, networkAllowed)...)
+	if model != "" {
+		cmdArgs = append(cmdArgs, "--model", model)
+	}
+	if len(schema) > 0 {
+		schemaPath := filepath.Join(tmpDir, "team-decision-schema.json")
+		raw, err := json.MarshalIndent(normalizeSchema(schema), "", "  ")
+		if err != nil {
+			return "", err
+		}
+		if err := os.WriteFile(schemaPath, raw, 0o644); err != nil {
+			return "", err
+		}
+		cmdArgs = append(cmdArgs, "--output-schema", schemaPath)
+	}
+	cmdArgs = append(cmdArgs, prompt)
+	cmd := exec.CommandContext(ctx, r.CodexBinary, cmdArgs...)
+	cmd.Dir = cwd
+	cmd.WaitDelay = 5 * time.Second
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", err
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return "", err
+	}
+
+	// The pipe MUST be fully drained before Wait — calling Wait while the
+	// pipe still has unread data races the pipe's own close (a documented
+	// os/exec pitfall). The scan loop below always runs to EOF (or the
+	// process's own exit closes the write end) before we call cmd.Wait().
+	var stdout bytes.Buffer
+	scanner := bufio.NewScanner(stdoutPipe)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	captured := false
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		stdout.Write(line)
+		stdout.WriteByte('\n')
+		if sessionToken == "" && !captured {
+			var event codexThreadStartedEvent
+			if json.Unmarshal(line, &event) == nil && event.Type == "thread.started" && event.ThreadID != "" {
+				captured = true
+				if onSessionCaptured != nil {
+					onSessionCaptured(event.ThreadID)
+				}
+			}
+		}
+	}
+	waitErr := cmd.Wait()
+	if waitErr != nil {
+		baseErr := fmt.Errorf("team turn (codex) failed: %w: %s", waitErr, strings.TrimSpace(stderr.String()))
 		return "", wrapProviderCommandError(baseErr, stdout.String()+stderr.String())
 	}
 	raw, err := os.ReadFile(outFile)

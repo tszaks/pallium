@@ -160,6 +160,61 @@ func (r *Runner) runBuiltinClaudeCommand(ctx context.Context, usageFile, cwd, pr
 	return text, nil
 }
 
+// buildClaudeTeamArgs builds argv for one team-turn invocation. isFirstTurn
+// picks --session-id (claude lets the caller MINT a session id, so team.go
+// generates one at spawn time and this is its very first use) vs --resume
+// (every later turn continues that same native conversation). The tool
+// allowlist is unchanged from the normal worker split: coordination
+// (messaging, task claim/complete) happens via a structured end-of-turn
+// decision Pallium parses and applies itself (see teamDecisionSchema in
+// team_runtime.go), not via mid-turn tool calls — deliberately, so a
+// teammate's coordination ability never depends on a provider's Bash
+// allowlist model (codex has no per-command allowlist, only a coarse
+// read-only/workspace-write sandbox toggle).
+func buildClaudeTeamArgs(mode, model, sessionToken string, isFirstTurn bool) []string {
+	args := buildClaudeArgs(mode, model)
+	if isFirstTurn {
+		args = append(args, "--session-id", sessionToken)
+	} else {
+		args = append(args, "--resume", sessionToken)
+	}
+	return args
+}
+
+// runClaudeTeamTurn runs one turn of a claude teammate's native conversation
+// and returns its raw text output — expected to be the structured decision
+// JSON described by schema (see teamDecisionSchema in team_runtime.go), built
+// into the prompt the same way runBuiltinClaudeCommand does for a regular
+// worker's schema option — plus usage (cost_usd/token counts, or nil if the
+// envelope carried none), which the caller feeds into team/member spend
+// tracking (see dispatchTeamTurn). cwd is the teammate's own worktree for
+// edit mode, or the team's repo root for read-only — resolved by the caller
+// exactly like a regular worker's cwd, so edit-mode teammates get the same
+// isolation.
+func (r *Runner) runClaudeTeamTurn(ctx context.Context, mode, model, sessionToken string, isFirstTurn bool, cwd, prompt string, schema map[string]any) (string, map[string]any, error) {
+	fullPrompt, err := buildClaudePrompt(prompt, schema)
+	if err != nil {
+		return "", nil, fmt.Errorf("team turn (claude): %w", err)
+	}
+	args := buildClaudeTeamArgs(mode, model, sessionToken, isFirstTurn)
+	cmd := exec.CommandContext(ctx, claudeCLIName, args...)
+	cmd.Dir = cwd
+	cmd.WaitDelay = 5 * time.Second
+	cmd.Stdin = strings.NewReader(fullPrompt)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		baseErr := fmt.Errorf("team turn (claude) failed: %w: %s", err, truncateForError(strings.TrimSpace(stderr.String())))
+		return "", nil, wrapProviderCommandError(baseErr, stdout.String()+stderr.String())
+	}
+	text, usage, err := extractClaudeOutput(stdout.String(), len(schema) > 0)
+	if err != nil {
+		return "", nil, fmt.Errorf("team turn (claude) produced no output: %w", err)
+	}
+	return text, usage, nil
+}
+
 // maxErrorOutputBytes caps CLI stdout/stderr embedded in a provider error so
 // a huge or malformed response can't bloat the stored error record.
 const maxErrorOutputBytes = 4096
