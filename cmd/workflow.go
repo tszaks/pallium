@@ -923,7 +923,14 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 	agentTimeout := fs.Int("agent-timeout", 600, "")
 	background := fs.Bool("background", false, "")
 	allowNetwork := fs.Bool("allow-network", false, "")
-	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "cwd": {}, "id": {}, "script": {}, "workflow": {}, "args": {}, "codex": {}, "max-agents": {}, "max-concurrent-agents": {}, "max-budget-usd": {}, "max-active-runs": {}, "agent-timeout": {}}, map[string]struct{}{"background": {}, "allow-network": {}}); err != nil {
+	// loopName is set only by `loop tick`'s composition through this exact
+	// front door (see cmd/loop.go) — not documented as a normal end-user
+	// flag, the same way trigger-run's --workflow/--script/--args composition
+	// flags aren't meant for interactive use either. It links this run back
+	// to its owning loop (Run.LoopName) so `loop status` can aggregate tick
+	// history without loops owning or querying workflow_runs directly.
+	loopName := fs.String("loop-name", "", "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "cwd": {}, "id": {}, "script": {}, "workflow": {}, "args": {}, "codex": {}, "max-agents": {}, "max-concurrent-agents": {}, "max-budget-usd": {}, "max-active-runs": {}, "agent-timeout": {}, "loop-name": {}}, map[string]struct{}{"background": {}, "allow-network": {}}); err != nil {
 		return err
 	}
 	maxAgentsSet := flagWasSet(fs, "max-agents")
@@ -1006,6 +1013,7 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 		ScriptPath: runScriptPath,
 		ArgsJSON:   *argsJSON,
 		Status:     "queued",
+		LoopName:   strings.TrimSpace(*loopName),
 	}
 	if maxAgentsSet {
 		runSpec.MaxAgents = *maxAgents
