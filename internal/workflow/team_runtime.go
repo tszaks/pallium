@@ -370,18 +370,25 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 // immediately inside that callback (see PersistMemberSession), not deferred
 // until this function returns, so a kill right after doesn't orphan it.
 //
-// costUSD reports what to add to team/member spend for this turn. Only
-// claude's built-in path reports a real cost — it round-trips a
-// total_cost_usd field in its own JSON envelope. codex's `codex exec`
-// reports no usage/cost at all (true of the regular, non-team worker path
-// too — this is a pre-existing platform asymmetry, not something team
-// turns introduce), and a configured wrapper's cost is whatever it chooses
-// to report via PALLIUM_WORKFLOW_USAGE_FILE (not yet read back for team
-// turns). Both cases return 0, so a codex- or wrapper-only team's `--budget-
-// usd` ceiling will not trigger — call this out plainly rather than pretend
-// enforcement exists where it doesn't.
+// costUSD reports what to add to team/member spend for this turn. claude's
+// built-in path reports a real cost (it round-trips a total_cost_usd field
+// in its own JSON envelope), and so does a configured wrapper that writes
+// PALLIUM_WORKFLOW_USAGE_FILE (runConfiguredProviderTeamTurn reads it back
+// via the same readAndRemoveAgentUsage helper the regular worker path
+// uses). codex's `codex exec` reports no usage/cost at all — true of the
+// regular, non-team worker path too, a pre-existing platform asymmetry, not
+// something team turns introduce — so it always returns 0. A codex-only
+// team's `--budget-usd` ceiling will therefore never trigger on its own;
+// `team status`/`team start` surface which providers are cost-tracked
+// rather than silently pretending enforcement exists where it doesn't.
 func (r *Runner) dispatchTeamTurn(ctx context.Context, store *Store, teamID, lease string, member *TeamMember, cwd, prompt string) (output, capturedToken string, costUSD float64, err error) {
-	isFirstTurn := member.TurnCount == 0
+	// Deliberately NOT member.TurnCount == 0: TurnCount counts attempts, not
+	// successes, and increments even when a turn errors out (see
+	// FinishMemberTurn). A failed first claude turn must retry with
+	// --session-id again, not switch to --resume against a session claude
+	// may never have actually created — see Store.FinishMemberTurn's doc
+	// comment for the full incident this fixes.
+	isFirstTurn := !member.SessionEstablished
 	switch {
 	case member.Provider == "codex":
 		tmpDir, terr := os.MkdirTemp("", "pallium-team-turn-*")
@@ -402,8 +409,8 @@ func (r *Runner) dispatchTeamTurn(ctx context.Context, store *Store, teamID, lea
 		})
 		return out, member.SessionToken, 0, cerr
 	case strings.TrimSpace(os.Getenv(providerCommandEnvName(member.Provider))) != "":
-		out, token, werr := r.runConfiguredProviderTeamTurn(ctx, teamID, member, cwd, prompt)
-		return out, token, 0, werr
+		out, token, cost, werr := r.runConfiguredProviderTeamTurn(ctx, teamID, member, cwd, prompt)
+		return out, token, cost, werr
 	case member.Provider == "claude":
 		out, usage, cerr := r.runClaudeTeamTurn(ctx, member.Mode, member.Model, member.SessionToken, isFirstTurn, cwd, prompt, teamDecisionSchema)
 		cost, _ := usage["cost_usd"].(float64)
@@ -430,35 +437,42 @@ func (r *Runner) notifyLeadOfMemberError(store *Store, teamID, name string, err 
 // agent" extension point (see providers/README.md): Pallium has zero
 // built-in knowledge of the CLI on the other end. It mirrors
 // runConfiguredProviderCommand's env contract exactly (prompt/output/schema
-// files, network flag) and extends it with ONE new file,
+// files, network flag, usage file) and extends it with ONE new file,
 // PALLIUM_WORKFLOW_SESSION_FILE: Pallium writes the member's current session
 // token there before invoking (empty file on the first turn) and reads back
 // whatever the wrapper writes to that same file afterward as the new/
 // continued token. What that token means, and how the wrapper's own
 // underlying CLI resumes a session with it, is entirely the wrapper's
 // business — Pallium only shuttles the value.
-func (r *Runner) runConfiguredProviderTeamTurn(ctx context.Context, teamID string, member *TeamMember, cwd, prompt string) (string, string, error) {
+//
+// The usage file WAS already part of the env contract handed to the wrapper
+// (see providers/README.md) but this function used to never read it back
+// for team turns, silently leaving any wrapper-provider team's spend
+// untracked — the regular (non-team) worker path already reads it via
+// readAndRemoveAgentUsage; this reuses the same helper so a wrapper only
+// has to implement the contract once for both paths.
+func (r *Runner) runConfiguredProviderTeamTurn(ctx context.Context, teamID string, member *TeamMember, cwd, prompt string) (string, string, float64, error) {
 	command := strings.TrimSpace(os.Getenv(providerCommandEnvName(member.Provider)))
-	tmpDir, err := os.MkdirTemp("", "pallium-team-turn-*")
-	if err != nil {
-		return "", "", err
+	tmpDir, terr := os.MkdirTemp("", "pallium-team-turn-*")
+	if terr != nil {
+		return "", "", 0, terr
 	}
 	defer os.RemoveAll(tmpDir)
 	promptFile := filepath.Join(tmpDir, "prompt.txt")
 	if err := os.WriteFile(promptFile, []byte(prompt), 0o600); err != nil {
-		return "", "", err
+		return "", "", 0, err
 	}
 	schemaFile := filepath.Join(tmpDir, "schema.json")
-	rawSchema, err := json.MarshalIndent(normalizeSchema(teamDecisionSchema), "", "  ")
-	if err != nil {
-		return "", "", err
+	rawSchema, merr := json.MarshalIndent(normalizeSchema(teamDecisionSchema), "", "  ")
+	if merr != nil {
+		return "", "", 0, merr
 	}
 	if err := os.WriteFile(schemaFile, rawSchema, 0o600); err != nil {
-		return "", "", err
+		return "", "", 0, err
 	}
 	sessionFile := filepath.Join(tmpDir, "session.txt")
 	if err := os.WriteFile(sessionFile, []byte(member.SessionToken), 0o600); err != nil {
-		return "", "", err
+		return "", "", 0, err
 	}
 	outFile := filepath.Join(tmpDir, "output.txt")
 	usageFile := filepath.Join(tmpDir, "usage.json")
@@ -491,9 +505,14 @@ func (r *Runner) runConfiguredProviderTeamTurn(ctx context.Context, teamID strin
 			newToken = t
 		}
 	}
+	// Read back regardless of runErr: a wrapper that fails partway through
+	// (e.g. after its own CLI call succeeded but before it wrote the output
+	// file) may still have reported real usage worth recording.
+	_, usage := readAndRemoveAgentUsage(usageFile)
+	cost, _ := usage["cost_usd"].(float64)
 	if runErr != nil {
 		baseErr := fmt.Errorf("team turn (%s wrapper) failed: %w: %s", member.Provider, runErr, strings.TrimSpace(stderr.String()))
-		return "", newToken, wrapProviderCommandError(baseErr, stdout.String()+stderr.String())
+		return "", newToken, cost, wrapProviderCommandError(baseErr, stdout.String()+stderr.String())
 	}
 	raw, readErr := os.ReadFile(outFile)
 	output := strings.TrimSpace(string(raw))
@@ -501,9 +520,9 @@ func (r *Runner) runConfiguredProviderTeamTurn(ctx context.Context, teamID strin
 		output = strings.TrimSpace(stdout.String())
 	}
 	if output == "" {
-		return "", newToken, fmt.Errorf("team turn (%s wrapper) produced no output", member.Provider)
+		return "", newToken, cost, fmt.Errorf("team turn (%s wrapper) produced no output", member.Provider)
 	}
-	return output, newToken, nil
+	return output, newToken, cost, nil
 }
 
 // TeamRunSummary reports what one `pallium team run` invocation did.
@@ -570,7 +589,16 @@ func (r *Runner) RunTeam(ctx context.Context, store *Store, teamID string, opts 
 			if err != nil {
 				return summary, err
 			}
-			if len(undelivered) > 0 || m.NudgedAt != "" || claimable {
+			// "claimable work exists" only earns this member ANOTHER turn if
+			// the board changed since its last one — otherwise a task every
+			// idle member has already looked at and declined to claim would
+			// re-summon the whole team every single round until maxRounds
+			// (a real cost runaway: found by an independent review, not a
+			// self-caught bug). A member with no turns yet (LastTurnAt=="")
+			// has by definition never seen the current board, so it stays
+			// eligible for its first look regardless of the watermark.
+			boardIsNewToMember := m.LastTurnAt == "" || team.TasksUpdatedAt > m.LastTurnAt
+			if len(undelivered) > 0 || m.NudgedAt != "" || (claimable && boardIsNewToMember) {
 				eligible = append(eligible, m.Name)
 			}
 		}

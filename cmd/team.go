@@ -92,7 +92,13 @@ func runTeamStart(out io.Writer, args []string, jsonOutput bool) error {
 		return err
 	}
 	return output.Write(out, team, jsonOutput, func() string {
-		return "Team started: " + team.ID + "\n  goal: " + team.Goal + "\n  cwd:  " + team.CWD
+		msg := "Team started: " + team.ID + "\n  goal: " + team.Goal + "\n  cwd:  " + team.CWD
+		if team.BudgetUSDLimit > 0 {
+			msg += fmt.Sprintf("\n  budget: $%.4f (only self-enforces for cost-tracked providers — claude,"+
+				" or a wrapper that reports PALLIUM_WORKFLOW_USAGE_FILE; codex reports no usage/cost at all"+
+				" and won't count toward this ceiling — see `team status` after spawning members)", team.BudgetUSDLimit)
+		}
+		return msg
 	})
 }
 
@@ -444,8 +450,32 @@ func runTeamStatus(out io.Writer, args []string, jsonOutput bool) error {
 			}
 		}
 		fmt.Fprintf(&b, "  tasks: %d pending, %d in progress, %d completed\n", pending, inProgress, completed)
+		if untracked := untrackedCostProviders(members); len(untracked) > 0 {
+			fmt.Fprintf(&b, "  cost not tracked for: %s (reports no usage/cost at all; the spend total above is incomplete for these members)\n", strings.Join(untracked, ", "))
+		}
 		return strings.TrimRight(b.String(), "\n")
 	})
+}
+
+// untrackedCostProviders reports which distinct providers among members
+// never contribute real spend, so `team status`/`team start --budget-usd`
+// can say plainly which providers a budget ceiling silently cannot see —
+// rather than a $0.0000 line looking indistinguishable from "genuinely free
+// so far". Only codex is unconditionally untracked (its exec has no usage
+// envelope at all); claude round-trips a real cost, and a configured
+// wrapper is tracked whenever it reports PALLIUM_WORKFLOW_USAGE_FILE (see
+// runConfiguredProviderTeamTurn) — Pallium can't tell from here whether a
+// given wrapper script actually does that, so wrappers are not flagged.
+func untrackedCostProviders(members []workflow.TeamMember) []string {
+	seen := map[string]bool{}
+	var untracked []string
+	for _, m := range members {
+		if m.Provider == "codex" && !seen[m.Provider] {
+			seen[m.Provider] = true
+			untracked = append(untracked, m.Provider)
+		}
+	}
+	return untracked
 }
 
 func runTeamRun(out io.Writer, args []string, jsonOutput bool) error {

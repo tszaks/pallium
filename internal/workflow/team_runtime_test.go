@@ -139,6 +139,95 @@ func TestRunTeamTurnProviderFailureNotifiesLeadWithError(t *testing.T) {
 	}
 }
 
+// TestDispatchTeamTurnRetriesSessionIDAfterFailedFirstTurn is the regression
+// test for a P1 found by independent review: a claude member's SessionToken
+// is pre-minted at spawn (see SpawnTeamMember), so if the FIRST turn's
+// provider call crashes before claude ever actually creates that native
+// session, TurnCount still increments (see FinishMemberTurn) — a naive
+// "isFirstTurn := TurnCount==0" would then use --resume on the next attempt
+// against a session claude never established, permanently bricking the
+// member. dispatchTeamTurn must key off SessionEstablished (sticky-true only
+// once a turn succeeds) instead, so a failed first turn retries with
+// --session-id again.
+func TestDispatchTeamTurnRetriesSessionIDAfterFailedFirstTurn(t *testing.T) {
+	store, _ := newTeamTestStore(t)
+	repo := newTeamTestRepo(t)
+	team, err := store.CreateTeam("goal", repo, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SpawnMember(team.ID, "worker-1", "claude", "", "", "read-only"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PersistMemberSession(team.ID, "worker-1", "seed-session-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	tmp := t.TempDir()
+	argLog := filepath.Join(tmp, "argv.log")
+	countFile := filepath.Join(tmp, "calls")
+	script := `#!/bin/sh
+cat >/dev/null
+echo "$@" >> "` + argLog + `"
+N=0
+if [ -f "` + countFile + `" ]; then N=$(cat "` + countFile + `"); fi
+N=$((N+1))
+echo "$N" > "` + countFile + `"
+if [ "$N" = "1" ]; then
+  echo 'boom: simulated crash before any session was ever established' >&2
+  exit 1
+fi
+printf '%s' '{"result":"{\"status\":\"idle\",\"summary\":\"ok\"}"}'
+`
+	path := filepath.Join(tmp, "fake-claude.sh")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	setClaudeCLI(t, path)
+
+	r := &Runner{Run: Run{ID: team.ID}}
+
+	if _, err := r.RunTeamTurn(context.Background(), store, team.ID, "worker-1", TeamTurnOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	member, err := store.GetMember(team.ID, "worker-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if member.Status != "error" || member.TurnCount != 1 {
+		t.Fatalf("expected turn 1 to record an error and still count as an attempt, got %+v", member)
+	}
+	if member.SessionEstablished {
+		t.Fatalf("expected session_established to stay false after a failed first turn, got true")
+	}
+
+	if _, err := r.RunTeamTurn(context.Background(), store, team.ID, "worker-1", TeamTurnOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	member, err = store.GetMember(team.ID, "worker-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if member.Status != "idle" || !member.SessionEstablished {
+		t.Fatalf("expected turn 2 to succeed and establish the session, got %+v", member)
+	}
+
+	rawLog, err := os.ReadFile(argLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(rawLog)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected exactly 2 claude invocations, got %d: %v", len(lines), lines)
+	}
+	if !strings.Contains(lines[0], "--session-id seed-session-1") {
+		t.Fatalf("expected turn 1 to use --session-id, got %q", lines[0])
+	}
+	if !strings.Contains(lines[1], "--session-id seed-session-1") || strings.Contains(lines[1], "--resume") {
+		t.Fatalf("expected turn 2 to RETRY with --session-id (turn 1 never established a session), not --resume — got %q", lines[1])
+	}
+}
+
 func TestRunTeamTurnMalformedDecisionPreservesEditPatch(t *testing.T) {
 	store, _ := newTeamTestStore(t)
 	repo := newTeamTestRepo(t)
@@ -250,6 +339,111 @@ esac
 	}
 	if r2.TurnCount != 1 || r2.Status != "idle" {
 		t.Fatalf("expected researcher-2 to have taken exactly one turn and gone idle, got %+v", r2)
+	}
+}
+
+// TestDispatchTeamTurnReadsBackWrapperProviderUsage is the regression test
+// for a P2 (wrapper-provider team spend silently untracked) found by
+// independent review: runConfiguredProviderTeamTurn already handed a
+// PALLIUM_WORKFLOW_USAGE_FILE to the wrapper (same env contract as the
+// regular, non-team worker path) but never read it back — every wrapper-
+// provider team turn reported costUSD=0 regardless of what the wrapper
+// actually spent, so `--budget-usd` could never trigger for such a team.
+func TestDispatchTeamTurnReadsBackWrapperProviderUsage(t *testing.T) {
+	clearProviderEnv(t)
+	script := `#!/bin/sh
+printf '%s' '{"status":"idle","summary":"done"}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+printf '%s' 'grok-session-1' > "$PALLIUM_WORKFLOW_SESSION_FILE"
+printf '%s' '{"cost_usd":0.42}' > "$PALLIUM_WORKFLOW_USAGE_FILE"
+`
+	path := filepath.Join(t.TempDir(), "fake-grok.sh")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_GROK_COMMAND", path)
+
+	store, _ := newTeamTestStore(t)
+	repo := newTeamTestRepo(t)
+	team, err := store.CreateTeam("goal", repo, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	member, err := store.SpawnMember(team.ID, "worker-1", "grok", "", "", "read-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r := &Runner{}
+	output, token, cost, err := r.dispatchTeamTurn(context.Background(), store, team.ID, "any-lease", &member, repo, "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output != `{"status":"idle","summary":"done"}` {
+		t.Fatalf("unexpected output: %q", output)
+	}
+	if token != "grok-session-1" {
+		t.Fatalf("expected session token read back, got %q", token)
+	}
+	if cost != 0.42 {
+		t.Fatalf("expected the wrapper's reported cost_usd read back (was silently dropped to 0 before this fix), got %v", cost)
+	}
+}
+
+// TestRunTeamIdleMembersDoNotReclaimUnchangedBoardEveryRound is the
+// regression test for a P2 (idle-spin cost runaway) found by independent
+// review: HasClaimableWork only reports whether ANY task is claimable, with
+// no notion of "already offered to this member and declined". The OLD
+// scheduler re-scheduled every non-busy member on every single round for as
+// long as one task stayed unclaimed — up to maxRounds (50) paid provider
+// calls per member for a board nobody has any intention of touching. The fix
+// (Team.TasksUpdatedAt, a board-wide watermark) means a member is only
+// re-offered claimable work if the board changed since ITS last turn.
+func TestRunTeamIdleMembersDoNotReclaimUnchangedBoardEveryRound(t *testing.T) {
+	store, _ := newTeamTestStore(t)
+	repo := newTeamTestRepo(t)
+	team, err := store.CreateTeam("goal", repo, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"worker-1", "worker-2"} {
+		if _, err := store.SpawnMember(team.ID, name, "claude", "", "", "read-only"); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.PersistMemberSession(team.ID, name, "sess-"+name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.CreateTeamTask(team.ID, "investigate something nobody wants", "", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Every member goes idle and never claims the one open task.
+	script := `#!/bin/sh
+cat >/dev/null
+printf '%s' '{"result":"{\"status\":\"idle\",\"summary\":\"nothing here for me\"}"}'
+`
+	path := filepath.Join(t.TempDir(), "fake-claude-idle.sh")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	setClaudeCLI(t, path)
+
+	r := &Runner{}
+	summary, err := r.RunTeam(context.Background(), store, team.ID, TeamTurnOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Rounds != 1 {
+		t.Fatalf("expected convergence in exactly 1 round once every member has seen the unchanged board once, got %d rounds (%+v)", summary.Rounds, summary)
+	}
+	for _, name := range []string{"worker-1", "worker-2"} {
+		m, err := store.GetMember(team.ID, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.TurnCount != 1 {
+			t.Fatalf("expected %s to take exactly one turn, got %d turns (a re-spin keeps re-showing the same unclaimed task)", name, m.TurnCount)
+		}
 	}
 }
 
