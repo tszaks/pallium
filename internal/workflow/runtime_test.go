@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/dop251/goja"
+	"github.com/tszaks/pallium/internal/gitlog"
 )
 
 func TestRunnerExecutesScriptAndRecordsAgents(t *testing.T) {
@@ -469,6 +470,234 @@ func TestSetRunStatusNeverPersistsEmptyErrorForFailure(t *testing.T) {
 		if got.CompletedAt == "" {
 			t.Fatalf("expected %q to be treated as terminal (completed_at set), got %+v", status, got)
 		}
+	}
+}
+
+// TestStoreAcquireRepoLockExclusiveAndIdempotent covers bug #34's core
+// contract at the Store level: a second run cannot acquire a repo lock
+// already held by a different run, the original holder can re-enter
+// idempotently (multiple edit-intent agents in the same run), and releasing
+// only removes the row when the caller is still the holder.
+func TestStoreAcquireRepoLockExclusiveAndIdempotent(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	holder, ok, err := store.AcquireRepoLock("/repo", "run-a", time.Hour)
+	if err != nil || !ok || holder != "run-a" {
+		t.Fatalf("expected run-a to acquire the fresh lock, got holder=%q ok=%v err=%v", holder, ok, err)
+	}
+	// Idempotent re-entry: the same run acquiring again succeeds.
+	holder, ok, err = store.AcquireRepoLock("/repo", "run-a", time.Hour)
+	if err != nil || !ok || holder != "run-a" {
+		t.Fatalf("expected run-a to re-enter its own lock, got holder=%q ok=%v err=%v", holder, ok, err)
+	}
+	// A different run is refused while the lock is fresh.
+	holder, ok, err = store.AcquireRepoLock("/repo", "run-b", time.Hour)
+	if err != nil || ok || holder != "run-a" {
+		t.Fatalf("expected run-b to be refused with holder=run-a, got holder=%q ok=%v err=%v", holder, ok, err)
+	}
+	// A release by the wrong run must not remove run-a's row.
+	if err := store.ReleaseRepoLock("/repo", "run-b"); err != nil {
+		t.Fatal(err)
+	}
+	holder, ok, err = store.AcquireRepoLock("/repo", "run-b", time.Hour)
+	if err != nil || ok || holder != "run-a" {
+		t.Fatalf("expected run-a's lock to survive a release attempt by a non-holder, got holder=%q ok=%v err=%v", holder, ok, err)
+	}
+	// The real holder releasing frees the repo for another run.
+	if err := store.ReleaseRepoLock("/repo", "run-a"); err != nil {
+		t.Fatal(err)
+	}
+	holder, ok, err = store.AcquireRepoLock("/repo", "run-b", time.Hour)
+	if err != nil || !ok || holder != "run-b" {
+		t.Fatalf("expected run-b to acquire the released lock, got holder=%q ok=%v err=%v", holder, ok, err)
+	}
+}
+
+// TestStoreRepoLockStaleTakeover covers the crash-safety half of bug #34: a
+// lock that hasn't been refreshed in longer than staleAfter is reclaimable
+// by another run, so a killed workflow process can never permanently block a
+// repo.
+func TestStoreRepoLockStaleTakeover(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if _, ok, err := store.AcquireRepoLock("/repo", "run-a", time.Hour); err != nil || !ok {
+		t.Fatalf("expected run-a to acquire the fresh lock, ok=%v err=%v", ok, err)
+	}
+	// A generous staleAfter refuses the second run: run-a's lock is not stale.
+	if holder, ok, err := store.AcquireRepoLock("/repo", "run-b", time.Hour); err != nil || ok || holder != "run-a" {
+		t.Fatalf("expected run-b refused while the lock is fresh, got holder=%q ok=%v err=%v", holder, ok, err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	// A tiny staleAfter (simulating a crashed run-a with no heartbeat since)
+	// lets run-b reclaim the lock.
+	holder, ok, err := store.AcquireRepoLock("/repo", "run-b", time.Millisecond)
+	if err != nil || !ok || holder != "run-b" {
+		t.Fatalf("expected run-b to reclaim the stale lock, got holder=%q ok=%v err=%v", holder, ok, err)
+	}
+	// run-a can no longer treat itself as the holder once reclaimed.
+	if holder, ok, err := store.AcquireRepoLock("/repo", "run-a", time.Hour); err != nil || ok || holder != "run-b" {
+		t.Fatalf("expected run-a to be refused after losing the lock, got holder=%q ok=%v err=%v", holder, ok, err)
+	}
+}
+
+// TestConcurrentStaleTakeoverOnlyOneWins races several independent Store
+// handles (separate *sql.DB, i.e. separate processes) to take over the SAME
+// stale lock. The compare-and-swap in acquireRepoLockOnce must let exactly one
+// win: without it, every racer that read the same stale row would UPDATE and
+// believe it holds the lock (bug #34 double-grant).
+func TestConcurrentStaleTakeoverOnlyOneWins(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "sessions.sqlite")
+	seed, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := seed.AcquireRepoLock("/repo", "run-old", time.Hour); err != nil || !ok {
+		t.Fatalf("seed acquire: ok=%v err=%v", ok, err)
+	}
+	// Backdate the seed so it is unambiguously stale under a 1h window, while a
+	// fresh takeover (updated_at=now) stays non-stale through the whole race —
+	// so the outcome tests the CAS, not staleness timing.
+	old := time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339Nano)
+	if _, err := seed.db.Exec(`UPDATE workflow_repo_locks SET updated_at=? WHERE repo_root=?`, old, "/repo"); err != nil {
+		t.Fatal(err)
+	}
+	seed.Close()
+
+	const n = 6
+	stores := make([]*Store, n)
+	for i := range stores {
+		s, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stores[i] = s
+		defer s.Close()
+	}
+	results := make([]bool, n)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, ok, _ := stores[i].AcquireRepoLock("/repo", fmt.Sprintf("run-%d", i), time.Hour)
+			results[i] = ok
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	wins := 0
+	for _, ok := range results {
+		if ok {
+			wins++
+		}
+	}
+	if wins != 1 {
+		t.Fatalf("expected exactly one stale-takeover winner, got %d", wins)
+	}
+}
+
+// TestConcurrentEditRunsOnSameRepoOneFailsFast is bug #34's non-negotiable
+// race test: two concurrent edit runs against the same repo, using two
+// separate Store handles onto the same sqlite file (mirroring two separate
+// `pallium workflow run` processes sharing one DB). Exactly one must proceed
+// and apply its edit; the other must fail fast with the lock error before
+// ever creating a worktree.
+func TestConcurrentEditRunsOnSameRepoOneFailsFast(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"edited"}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_WRITE_FILE", "note.txt")
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_WRITE_CONTENT", "changed\n")
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_DELAY_MS", "50")
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "note.txt"), []byte("original\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "note.txt")
+	runGit(t, tmp, "commit", "-m", "initial")
+
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	store1, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store1.Close()
+	store2, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store2.Close()
+
+	script := `agent("edit note", { label: "editor", mode: "edit", isolation: "worktree" }); return { ok: true };`
+	scriptPath, err := WriteRunScript("wf-lock-a", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runA, err := store1.CreateRun(Run{ID: "wf-lock-a", Task: "lock a", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runB, err := store1.CreateRun(Run{ID: "wf-lock-b", Task: "lock b", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, errs[0] = (&Runner{Store: store1, Run: runA, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	}()
+	go func() {
+		defer wg.Done()
+		_, errs[1] = (&Runner{Store: store2, Run: runB, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	}()
+	wg.Wait()
+
+	succeeded, lockFailed := 0, 0
+	for _, callErr := range errs {
+		switch {
+		case callErr == nil:
+			succeeded++
+		case strings.Contains(callErr.Error(), "another edit run holds"):
+			lockFailed++
+		default:
+			t.Fatalf("unexpected error: %v", callErr)
+		}
+	}
+	if succeeded != 1 || lockFailed != 1 {
+		t.Fatalf("expected exactly one success and one lock failure, got succeeded=%d lockFailed=%d errs=%v", succeeded, lockFailed, errs)
+	}
+	if raw, err := os.ReadFile(filepath.Join(tmp, "note.txt")); err != nil || string(raw) != "changed\n" {
+		t.Fatalf("expected the winning run's edit applied to the repo, got %q err=%v", string(raw), err)
+	}
+	// The repo lock must not outlive either Execute call. Look it up under
+	// the same canonical key acquireRepoLock uses, not the raw tmp path.
+	canonical, err := gitlog.CanonicalRepoRoot(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if holder, ok, err := store1.AcquireRepoLock(canonical, "run-c", time.Hour); err != nil || !ok || holder != "run-c" {
+		t.Fatalf("expected the repo lock released after both runs finished, got holder=%q ok=%v err=%v", holder, ok, err)
+	}
+	if err := store1.ReleaseRepoLock(canonical, "run-c"); err != nil {
+		t.Fatal(err)
 	}
 }
 

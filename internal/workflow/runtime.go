@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/dop251/goja"
+	"github.com/tszaks/pallium/internal/gitlog"
 )
 
 var (
@@ -58,6 +59,13 @@ type Runner struct {
 	argsHash       string
 	failures       []RunFailure
 	fatalErr       error
+
+	// lockedRepos memoizes which canonical repo roots this run already holds
+	// the advisory edit lock for (see acquireRepoLock), so repeated
+	// edit-intent agents in the same run skip the DB round trip after the
+	// first.
+	lockMu      sync.Mutex
+	lockedRepos map[string]bool
 }
 
 type AgentOptions struct {
@@ -121,6 +129,11 @@ func (r *Runner) Execute(ctx context.Context, script string, args any) (string, 
 	if r.Run.ID == "" {
 		return "", fmt.Errorf("workflow run is required")
 	}
+	// Unconditional regardless of how Execute returns: a held repo lock must
+	// never outlive the Execute call that acquired it, so a normal
+	// completion frees the repo immediately instead of waiting out the
+	// stale-lock timeout.
+	defer r.releaseRepoLocks()
 	if r.MaxAgents <= 0 && r.Run.MaxAgents > 0 {
 		r.MaxAgents = r.Run.MaxAgents
 	}
@@ -765,6 +778,13 @@ func (r *Runner) runUntilGreen(ctx context.Context, command string, options map[
 	ensureWorktree := func() error {
 		if worktree != "" {
 			return nil
+		}
+		// The fix rounds below have genuine edit intent (their combined patch
+		// is applied to the real repo at workflow success via
+		// registerUntilGreenPatch), so this loop needs the same advisory repo
+		// lock as any other edit-intent agent, acquired before touching disk.
+		if err := r.acquireRepoLock(repoRoot); err != nil {
+			return err
 		}
 		path, pathErr := r.worktreePath(loopID)
 		if pathErr != nil {
@@ -1499,6 +1519,16 @@ func (r *Runner) runAgentAtCallIndex(ctx context.Context, prompt string, opts Ag
 	} else if ok {
 		if _, err := parseAgentOutputWithSchema(cached.Output, opts.Schema); err != nil {
 			return "", fmt.Errorf("cached agent %s failed schema validation: %w", cached.ID, err)
+		}
+		// A resumed run replays this call from cache instead of spawning a
+		// fresh agent, but a cached edit-intent agent's patch still gets
+		// applied to the real repo at workflow success (see ApplyPatches) —
+		// this resumed run needs the same advisory repo lock for its
+		// duration as a run that actually re-executed the agent.
+		if isEditIntentAgent(mode, opts.Isolation) {
+			if err := r.acquireRepoLock(absRepo); err != nil {
+				return "", err
+			}
 		}
 		if phase != "" {
 			_ = r.Store.IncrementPhaseAgentCount(r.Run.ID, phase)
@@ -2350,7 +2380,10 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 		repoRoot := firstNonEmpty(agent.Repo, r.Run.CWD)
 		cwd := repoRoot
 		worktree := ""
-		if agent.Isolation != "none" && (agent.Mode == "edit" || agent.Isolation == "worktree") {
+		if isEditIntentAgent(agent.Mode, agent.Isolation) {
+			if err := r.acquireRepoLock(repoRoot); err != nil {
+				return "", "", "", err
+			}
 			var err error
 			worktree, err = r.createWorktree(agent.ID, repoRoot)
 			if err != nil {
@@ -2383,7 +2416,7 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 	// we keep: edit mode, or an explicit isolation:"worktree". Those are the
 	// ONLY worktrees whose writes get captured as a patch and applied back to
 	// the repo (see finalizeWorktreePatch).
-	editIntent := agent.Isolation != "none" && (agent.Mode == "edit" || agent.Isolation == "worktree")
+	editIntent := isEditIntentAgent(agent.Mode, agent.Isolation)
 	// Granting network forces workspace-write (network egress requires it), so
 	// a networked read-only/test/check agent would otherwise run fs-write in
 	// the operator's LIVE checkout — writes to the real tree PLUS egress. When
@@ -2392,6 +2425,15 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 	// contained to a throwaway worktree, never the live repo. That containment
 	// worktree has no edit intent, so its writes are discarded, not applied.
 	if networkAllowed || editIntent {
+		// The advisory repo lock is only for genuine edit intent: a
+		// containment worktree's writes are always discarded, so it can never
+		// clobber a concurrent run's edits. Acquired before createWorktree so
+		// a losing run fails fast without touching disk.
+		if editIntent {
+			if err := r.acquireRepoLock(repoRoot); err != nil {
+				return "", "", "", err
+			}
+		}
 		var err error
 		worktree, err = r.createWorktree(agent.ID, repoRoot)
 		if err != nil {
@@ -2800,6 +2842,81 @@ func (r *Runner) removeWorktree(repoRoot, worktree string) {
 		prune := exec.Command("git", "worktree", "prune")
 		prune.Dir = repoRoot
 		_ = prune.Run()
+	}
+}
+
+// isEditIntentAgent reports whether an agent's writes are meant to be kept:
+// mode "edit", or an explicit isolation:"worktree". Those are the only
+// worktrees whose writes get captured as a patch and eventually applied back
+// to the real repo (see finalizeWorktreePatch), and the only agents that
+// need the advisory repo lock (see acquireRepoLock) — a containment worktree
+// created purely for a networked non-edit worker always discards its
+// writes, so it can never conflict with a concurrent run's edits.
+func isEditIntentAgent(mode, isolation string) bool {
+	return isolation != "none" && (mode == "edit" || isolation == "worktree")
+}
+
+// repoLockStaleAfter bounds how long an edit run's advisory repo lock (see
+// acquireRepoLock) survives without a refresh before another run may
+// reclaim it. Every edit-intent agent in the holding run refreshes it, so a
+// live run never goes stale; a crashed process leaves the row for this
+// window before the repo becomes available again.
+const repoLockStaleAfter = 30 * time.Minute
+
+// acquireRepoLock takes this run's advisory edit lock on repoRoot's
+// canonical git root, memoized in-process so repeated edit-intent agents in
+// the same run skip the DB round trip after the first. A second run with
+// edit-intent work already holding the lock fails fast here, before this
+// call creates a worktree or spends a provider call.
+func (r *Runner) acquireRepoLock(repoRoot string) error {
+	canonical, err := gitlog.CanonicalRepoRoot(repoRoot)
+	if err != nil {
+		// Fall back to the raw repoRoot rather than failing the lock outright
+		// — a repo Pallium can still operate on (e.g. a bare checkout without
+		// a resolvable canonical root) must not be blocked by this fallback.
+		// Logged because it silently diverges from the canonical key every
+		// OTHER caller (including this run's own later agents) will use for
+		// the SAME repo if a later call succeeds at canonicalizing it —
+		// worth knowing about if two supposedly-identical repo roots ever
+		// fail to share one lock.
+		fmt.Fprintf(os.Stderr, "[workflow:%s] repo lock: could not canonicalize %s, using raw path: %v\n", r.Run.ID, repoRoot, err)
+		canonical = repoRoot
+	}
+	r.lockMu.Lock()
+	defer r.lockMu.Unlock()
+	if r.lockedRepos != nil && r.lockedRepos[canonical] {
+		return nil
+	}
+	holder, ok, err := r.Store.AcquireRepoLock(canonical, r.Run.ID, repoLockStaleAfter)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("another edit run holds %s (run %s)", canonical, holder)
+	}
+	if r.lockedRepos == nil {
+		r.lockedRepos = map[string]bool{}
+	}
+	r.lockedRepos[canonical] = true
+	return nil
+}
+
+// releaseRepoLocks releases every repo lock this run acquired. Called
+// unconditionally when Execute returns so a normal completion frees the repo
+// immediately instead of waiting out the stale-lock timeout; a killed
+// process leaves its row for repoLockStaleAfter to reclaim.
+func (r *Runner) releaseRepoLocks() {
+	r.lockMu.Lock()
+	repos := make([]string, 0, len(r.lockedRepos))
+	for repo := range r.lockedRepos {
+		repos = append(repos, repo)
+	}
+	r.lockedRepos = nil
+	r.lockMu.Unlock()
+	for _, repo := range repos {
+		if err := r.Store.ReleaseRepoLock(repo, r.Run.ID); err != nil {
+			fmt.Fprintf(os.Stderr, "[workflow:%s] release repo lock %s: %v\n", r.Run.ID, repo, err)
+		}
 	}
 }
 
