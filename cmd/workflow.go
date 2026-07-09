@@ -1117,17 +1117,49 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 		CodexBinary:         *codexBinary,
 		AgentTimeoutSeconds: effectiveAgentTimeout,
 	}
-	result, err := runner.Execute(context.Background(), script, inputArgs)
-	if err != nil {
-		return err
-	}
+	result, runErr := runner.Execute(context.Background(), script, inputArgs)
 	snapshot, err := store.Snapshot(run.ID)
 	if err != nil {
+		if runErr != nil {
+			return runErr
+		}
 		return err
 	}
-	return output.Write(out, snapshot, jsonOutput, func() string {
+	if err := output.Write(out, snapshot, jsonOutput, func() string {
 		return renderWorkflowResult(snapshot, result)
-	})
+	}); err != nil {
+		return err
+	}
+	if runErr != nil {
+		return runErr
+	}
+	if workflowRunFailedEntirely(snapshot) {
+		return fmt.Errorf("workflow run %s failed: every agent failed", run.ID)
+	}
+	return nil
+}
+
+// workflowRunFailedEntirely reports whether a run that otherwise reached the
+// end of Execute with no top-level error should still exit non-zero: the
+// run's own status ended up "failed", or it spawned at least one agent and
+// every single one failed. parallel()/pipeline() drop individual agent
+// failures to null and keep the run "completed" by design (see
+// warnOnDropsAtCompletion), so a totally failed run — every agent, not just
+// some — would otherwise report success. A partially-successful run (at
+// least one completed agent) still exits 0.
+func workflowRunFailedEntirely(snapshot workflow.Snapshot) bool {
+	if snapshot.Run.Status == "failed" {
+		return true
+	}
+	if len(snapshot.Agents) == 0 {
+		return false
+	}
+	for _, agent := range snapshot.Agents {
+		if agent.Status != "failed" {
+			return false
+		}
+	}
+	return true
 }
 
 func runWorkflowGenerate(out io.Writer, args []string, jsonOutput bool) error {

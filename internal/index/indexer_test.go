@@ -169,6 +169,47 @@ func TestIndexerRunKeepsCochangeEdgesWithColonPathsDistinct(t *testing.T) {
 	}
 }
 
+func TestOpenStoreSharesIndexAcrossLinkedWorktree(t *testing.T) {
+	repo := gitlogTestRepo(t)
+
+	store, err := OpenStore(repo)
+	if err != nil {
+		t.Fatalf("OpenStore(main) failed: %v", err)
+	}
+	if _, err := New(store).Run(); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	mainRepo, err := store.Repo()
+	if err != nil {
+		t.Fatalf("Repo() after indexing failed: %v", err)
+	}
+	mainDBPath := store.DBPath
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	worktree := filepath.Join(t.TempDir(), "wt")
+	run(t, repo, "git", "worktree", "add", "-b", "feature", worktree)
+
+	wtStore, err := OpenStore(worktree)
+	if err != nil {
+		t.Fatalf("OpenStore(worktree) failed: %v", err)
+	}
+	defer wtStore.Close()
+
+	if wtStore.DBPath != mainDBPath {
+		t.Fatalf("expected worktree db path %q to match main db path %q", wtStore.DBPath, mainDBPath)
+	}
+
+	wtRepo, err := wtStore.Repo()
+	if err != nil {
+		t.Fatalf("expected preflight lookup from the worktree to find the existing index, got: %v", err)
+	}
+	if wtRepo.ID != mainRepo.ID {
+		t.Fatalf("expected same repo_id across worktrees, got main=%d worktree=%d", mainRepo.ID, wtRepo.ID)
+	}
+}
+
 func gitlogTestRepo(t *testing.T) string {
 	t.Helper()
 	return gitlogTestRepoHelper(t)

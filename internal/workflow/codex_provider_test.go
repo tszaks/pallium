@@ -77,6 +77,27 @@ func TestRunCodexCommandFailurePropagatesStderr(t *testing.T) {
 	}
 }
 
+func TestRunCodexCommandSurfacesMeaningfulErrorLineFromStdout(t *testing.T) {
+	tmp := t.TempDir()
+	failing := filepath.Join(tmp, "fake-codex-quota.sh")
+	script := "#!/bin/sh\n" +
+		"echo \"ERROR: You've hit your usage limit, try again at Aug 7th, 2026\"\n" +
+		"echo \"signal: killed: Reading additional input from stdin...\" >&2\n" +
+		"exit 1\n"
+	if err := os.WriteFile(failing, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := &Runner{CodexBinary: failing}
+	agent := &Agent{Mode: "read-only", Prompt: "hi"}
+	_, err := r.runCodexCommand(context.Background(), tmp, filepath.Join(tmp, "last-message.txt"), t.TempDir(), agent.Prompt, agent, AgentOptions{}, false)
+	if err == nil || !strings.Contains(err.Error(), "usage limit") {
+		t.Fatalf("expected error to surface the usage-limit line from stdout, got %v", err)
+	}
+	if !strings.HasPrefix(err.Error(), "ERROR: You've hit your usage limit") {
+		t.Fatalf("expected the meaningful line to lead the error message, got: %v", err)
+	}
+}
+
 func TestRunnerDispatchesToRealCodexBinary(t *testing.T) {
 	clearProviderEnv(t)
 	tmp := t.TempDir()

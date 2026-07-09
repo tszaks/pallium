@@ -40,10 +40,12 @@ func (r *Runner) runCodexCommand(ctx context.Context, tmpDir, outFile, cwd, prom
 	cmd := exec.CommandContext(ctx, r.CodexBinary, cmdArgs...)
 	cmd.Dir = cwd
 	cmd.WaitDelay = 5 * time.Second
-	var stderr bytes.Buffer
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("codex agent failed: %w: %s", err, strings.TrimSpace(stderr.String()))
+		baseErr := fmt.Errorf("codex agent failed: %w: %s", err, strings.TrimSpace(stderr.String()))
+		return "", wrapProviderCommandError(baseErr, stdout.String()+stderr.String())
 	}
 	raw, err := os.ReadFile(outFile)
 	if err != nil {

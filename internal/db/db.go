@@ -21,10 +21,17 @@ type dbtx interface {
 }
 
 type Store struct {
-	conn     *sql.DB
-	q        dbtx
+	conn *sql.DB
+	q    dbtx
+	// RepoRoot is the actual filesystem repo root used for git and file
+	// operations, e.g. the linked worktree the caller ran from.
 	RepoRoot string
-	DBPath   string
+	// CanonicalRoot identifies the repo in the `repos` table and determines
+	// the sqlite file location. It is shared by every worktree of the same
+	// repo (see gitlog.CanonicalRepoRoot), so they read and write the same
+	// index. For a non-worktree checkout it equals RepoRoot.
+	CanonicalRoot string
+	DBPath        string
 }
 
 var ErrRepoNotIndexed = errors.New("repo has not been indexed yet")
@@ -89,12 +96,25 @@ type VerificationRun struct {
 }
 
 func Open(repoRoot string) (*Store, error) {
-	dbPath := DefaultDBPath(repoRoot)
+	return OpenCanonical(repoRoot, repoRoot)
+}
+
+// OpenCanonical opens the store for repoRoot (used for git/file operations)
+// while keying the index identity and sqlite file location on canonicalRoot
+// (shared across worktrees of the same repo). Passing the same value for
+// both is equivalent to Open.
+func OpenCanonical(repoRoot, canonicalRoot string) (*Store, error) {
+	dbPath := DefaultDBPath(canonicalRoot)
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		return nil, fmt.Errorf("create db directory: %w", err)
 	}
 
-	return OpenPath(repoRoot, dbPath)
+	store, err := OpenPath(repoRoot, dbPath)
+	if err != nil {
+		return nil, err
+	}
+	store.CanonicalRoot = canonicalRoot
+	return store, nil
 }
 
 func DefaultDBPath(repoRoot string) string {
@@ -117,7 +137,7 @@ func OpenPath(repoRoot, dbPath string) (*Store, error) {
 	conn.SetMaxOpenConns(1)
 	conn.SetMaxIdleConns(1)
 
-	store := &Store{conn: conn, q: conn, RepoRoot: repoRoot, DBPath: dbPath}
+	store := &Store{conn: conn, q: conn, RepoRoot: repoRoot, CanonicalRoot: repoRoot, DBPath: dbPath}
 	if err := store.Init(); err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -262,7 +282,7 @@ ON CONFLICT(root) DO UPDATE SET
   branch = excluded.branch,
   last_indexed_commit = excluded.last_indexed_commit,
   indexed_at = excluded.indexed_at
-`, s.RepoRoot, branch, lastIndexedCommit, indexedAt.UTC().Format(time.RFC3339)); err != nil {
+`, s.CanonicalRoot, branch, lastIndexedCommit, indexedAt.UTC().Format(time.RFC3339)); err != nil {
 		return RepoRecord{}, fmt.Errorf("upsert repo: %w", err)
 	}
 
@@ -270,7 +290,7 @@ ON CONFLICT(root) DO UPDATE SET
 }
 
 func (s *Store) Repo() (RepoRecord, error) {
-	row := s.q.QueryRow(`SELECT id, root, branch, COALESCE(last_indexed_commit, ''), indexed_at FROM repos WHERE root = ?`, s.RepoRoot)
+	row := s.q.QueryRow(`SELECT id, root, branch, COALESCE(last_indexed_commit, ''), indexed_at FROM repos WHERE root = ?`, s.CanonicalRoot)
 	var repo RepoRecord
 	var indexedAt string
 	if err := row.Scan(&repo.ID, &repo.Root, &repo.Branch, &repo.LastIndexedCommit, &indexedAt); err != nil {

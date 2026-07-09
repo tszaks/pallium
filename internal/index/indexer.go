@@ -201,5 +201,9 @@ func OpenStore(path string) (*db.Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve repo: %w", err)
 	}
-	return db.Open(repoRoot)
+	canonicalRoot, err := gitlog.CanonicalRepoRoot(path)
+	if err != nil {
+		return nil, fmt.Errorf("resolve repo: %w", err)
+	}
+	return db.OpenCanonical(repoRoot, canonicalRoot)
 }
