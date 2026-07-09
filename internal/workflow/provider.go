@@ -108,9 +108,13 @@ func (r *Runner) RunProviderText(ctx context.Context, prompt string) (string, er
 	if r.CodexBinary == "" {
 		r.CodexBinary = "codex"
 	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "", err
+	cwd := strings.TrimSpace(r.Run.CWD)
+	if cwd == "" {
+		var err error
+		cwd, err = os.Getwd()
+		if err != nil {
+			return "", err
+		}
 	}
 	tmpDir, err := os.MkdirTemp("", "pallium-workflow-text-*")
 	if err != nil {

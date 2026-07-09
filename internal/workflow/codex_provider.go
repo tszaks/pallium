@@ -45,7 +45,7 @@ func (r *Runner) runCodexCommand(ctx context.Context, tmpDir, outFile, cwd, prom
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		baseErr := fmt.Errorf("codex agent failed: %w: %s", err, strings.TrimSpace(stderr.String()))
+		baseErr := formatProviderFailure("codex agent", err, stderr.String())
 		return "", wrapProviderCommandError(baseErr, stdout.String()+stderr.String())
 	}
 	raw, err := os.ReadFile(outFile)
@@ -145,7 +145,7 @@ func (r *Runner) runCodexTeamTurn(ctx context.Context, tmpDir, outFile, cwd, mod
 		return "", wrapProviderCommandError(baseErr, stdout.String()+stderr.String())
 	}
 	if waitErr != nil {
-		baseErr := fmt.Errorf("team turn (codex) failed: %w: %s", waitErr, strings.TrimSpace(stderr.String()))
+		baseErr := formatProviderFailure("team turn (codex)", waitErr, stderr.String())
 		return "", wrapProviderCommandError(baseErr, stdout.String()+stderr.String())
 	}
 	raw, err := os.ReadFile(outFile)
