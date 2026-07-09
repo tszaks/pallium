@@ -54,3 +54,4 @@ Do NOT use Pallium for a one-shot edit, a quick question, or exploration you can
 - Validate scripts before running. Inspect actual worker output (`pallium workflow show <id> --json`) before assuming what cached results contain.
 - `parallel`/`pipeline` turn worker failures into `null` items — filter them and check the run's failure report rather than assuming every slot succeeded.
 - Set a budget for long runs (`--max-budget-usd`); agent and budget caps are lifetime limits that survive resume.
+- `pallium team ...` with no `--db` writes to the real, shared, global `~/.pallium/codex-sessions.sqlite` — the same store real long-lived teams use. For throwaway/test teams, either pass `--db <tmpfile>` every time, or set `PALLIUM_TEST_DB=<tmpfile>` once for the session (every `team ...` call that forgets `--db` then redirects there instead, with a loud stderr warning so the redirect is never silent).
