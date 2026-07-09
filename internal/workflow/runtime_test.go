@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/dop251/goja"
+	"github.com/tszaks/pallium/internal/gitlog"
 )
 
 func TestRunnerExecutesScriptAndRecordsAgents(t *testing.T) {
@@ -469,6 +470,984 @@ func TestSetRunStatusNeverPersistsEmptyErrorForFailure(t *testing.T) {
 		if got.CompletedAt == "" {
 			t.Fatalf("expected %q to be treated as terminal (completed_at set), got %+v", status, got)
 		}
+	}
+}
+
+// TestStoreAcquireRepoLockExclusiveAndIdempotent covers bug #34's core
+// contract at the Store level: a second run cannot acquire a repo lock
+// already held by a different run, the original holder can re-enter
+// idempotently (multiple edit-intent agents in the same run), and releasing
+// only removes the row when the caller is still the holder.
+// writeEditThenVerifyProvider writes a fake provider script that actually
+// inspects the filesystem it runs in: in "edit" mode it writes target.txt,
+// otherwise it reports success only if target.txt already reads "edited".
+// This is what proves bug #30's fix rather than a canned stub: a verifier
+// that runs against the pristine checkout (the bug) sees "original" and
+// reports failure, while one that runs against a worktree seeded from the
+// run's staging state (the fix) sees the edit.
+func writeEditThenVerifyProvider(t *testing.T, dir, successJSON, failureJSON string) string {
+	t.Helper()
+	path := filepath.Join(dir, "edit-then-verify-provider.sh")
+	script := `#!/bin/sh
+if [ "$PALLIUM_WORKFLOW_MODE" = "edit" ]; then
+  printf 'edited\n' > target.txt
+  printf '{"summary":"edited target"}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+elif [ -f target.txt ] && [ "$(cat target.txt)" = "edited" ]; then
+  printf '` + successJSON + `' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+else
+  printf '` + failureJSON + `' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+fi
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func initEditTargetRepo(t *testing.T, tmp string) {
+	t.Helper()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "target.txt"), []byte("original\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "target.txt")
+	runGit(t, tmp, "commit", "-m", "initial")
+}
+
+// TestCheckSeesPriorEditAgentChanges is the bug #30 acceptance test: a
+// standalone check() after an edit agent must see that agent's edit, not the
+// pristine repo. Before the fix, check() ran against the untouched
+// r.Run.CWD, so the fake verifier below would see "original" and report
+// ok=false; with the run-scoped staging worktree, it sees "edited".
+func TestCheckSeesPriorEditAgentChanges(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	initEditTargetRepo(t, tmp)
+	provider := writeEditThenVerifyProvider(t, t.TempDir(),
+		`{"ok":true,"command":"verify target","summary":"target edited","output_tail":"","failures":[]}`,
+		`{"ok":false,"command":"verify target","summary":"target not edited","output_tail":"missing edit","failures":[{"name":"target","message":"not edited"}]}`)
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_FAKE_COMMAND", provider)
+
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("edit");
+agent("edit target file", { label: "editor", mode: "edit", isolation: "worktree", provider: "fake" });
+phase("verify");
+const result = check("verify target file", { provider: "fake" });
+return result;`
+	scriptPath, err := WriteRunScript("wf-check-sees-edit", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-check-sees-edit", Task: "check sees edit", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"ok": true`) {
+		t.Fatalf("expected check() to see the edit agent's change, got %s", result)
+	}
+	if raw, err := os.ReadFile(filepath.Join(tmp, "target.txt")); err != nil || string(raw) != "edited\n" {
+		t.Fatalf("expected the edit applied to the real repo on completion, got %q err=%v", string(raw), err)
+	}
+	list := exec.Command("git", "worktree", "list", "--porcelain")
+	list.Dir = tmp
+	raw, err := list.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(raw), "worktree "); got != 1 {
+		t.Fatalf("expected only the main worktree registered after completion (staging worktree cleaned up), got %d:\n%s", got, string(raw))
+	}
+}
+
+// TestGateSeesPriorEditAgentChanges is bug #30's acceptance test for the
+// agent-based gate() verifier instead of check().
+func TestGateSeesPriorEditAgentChanges(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	initEditTargetRepo(t, tmp)
+	provider := writeEditThenVerifyProvider(t, t.TempDir(),
+		`{"approved":true,"reason":"target edited"}`,
+		`{"approved":false,"reason":"target not edited"}`)
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_FAKE_COMMAND", provider)
+
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("edit");
+agent("edit target file", { label: "editor", mode: "edit", isolation: "worktree", provider: "fake" });
+phase("verify");
+const result = gate("target-edited", "verify target file", { provider: "fake" });
+return result;`
+	scriptPath, err := WriteRunScript("wf-gate-sees-edit", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-gate-sees-edit", Task: "gate sees edit", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"approved": true`) {
+		t.Fatalf("expected gate() to see the edit agent's change, got %s", result)
+	}
+	if raw, err := os.ReadFile(filepath.Join(tmp, "target.txt")); err != nil || string(raw) != "edited\n" {
+		t.Fatalf("expected the edit applied to the real repo on completion, got %q err=%v", string(raw), err)
+	}
+}
+
+// TestMultipleEditAgentsComposeInStaging proves edits accumulate: a second
+// edit agent branches from the first agent's change (not the pristine
+// checkout), and a trailing check() sees both edits.
+func TestMultipleEditAgentsComposeInStaging(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	initEditTargetRepo(t, tmp)
+	if err := os.WriteFile(filepath.Join(tmp, "second.txt"), []byte("original\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "second.txt")
+	runGit(t, tmp, "commit", "-m", "second file")
+
+	providerDir := t.TempDir()
+	firstEdit := filepath.Join(providerDir, "first-edit.sh")
+	if err := os.WriteFile(firstEdit, []byte("#!/bin/sh\nprintf 'edited\\n' > target.txt\nprintf '{\"summary\":\"edited target\"}' > \"$PALLIUM_WORKFLOW_OUTPUT_FILE\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	secondEdit := filepath.Join(providerDir, "second-edit.sh")
+	if err := os.WriteFile(secondEdit, []byte("#!/bin/sh\nprintf 'edited\\n' > second.txt\nprintf '{\"summary\":\"edited second\"}' > \"$PALLIUM_WORKFLOW_OUTPUT_FILE\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	verify := filepath.Join(providerDir, "verify.sh")
+	if err := os.WriteFile(verify, []byte(`#!/bin/sh
+if [ "$(cat target.txt)" = "edited" ] && [ "$(cat second.txt)" = "edited" ]; then
+  printf '{"ok":true,"command":"verify both","summary":"both edited","output_tail":"","failures":[]}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+else
+  printf '{"ok":false,"command":"verify both","summary":"not both edited","output_tail":"","failures":[{"name":"both","message":"missing edit"}]}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+fi
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_FIRST_COMMAND", firstEdit)
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_SECOND_COMMAND", secondEdit)
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_VERIFY_COMMAND", verify)
+
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `agent("edit target", { label: "first", mode: "edit", isolation: "worktree", provider: "first" });
+agent("edit second", { label: "second", mode: "edit", isolation: "worktree", provider: "second" });
+const result = check("verify both files", { provider: "verify" });
+return result;`
+	scriptPath, err := WriteRunScript("wf-compose-staging", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-compose-staging", Task: "compose staging", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"ok": true`) {
+		t.Fatalf("expected check() to see both edit agents' changes, got %s", result)
+	}
+	for _, name := range []string{"target.txt", "second.txt"} {
+		if raw, err := os.ReadFile(filepath.Join(tmp, name)); err != nil || string(raw) != "edited\n" {
+			t.Fatalf("expected %s applied to the real repo on completion, got %q err=%v", name, string(raw), err)
+		}
+	}
+}
+
+// TestUntilGreenSeesPriorEditAgentChanges proves verify.untilGreen's own base
+// redirects to the run's staging worktree too: its very first check (before
+// it creates its own persistent loop worktree) must see an earlier standalone
+// edit agent's change instead of the pristine checkout.
+func TestUntilGreenSeesPriorEditAgentChanges(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	initEditTargetRepo(t, tmp)
+	provider := writeEditThenVerifyProvider(t, t.TempDir(),
+		`{"ok":true,"command":"verify target","summary":"target edited","output_tail":"","failures":[]}`,
+		`{"ok":false,"command":"verify target","summary":"target not edited","output_tail":"missing edit","failures":[{"name":"target","message":"not edited"}]}`)
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_FAKE_COMMAND", provider)
+
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `agent("edit target file", { label: "editor", mode: "edit", isolation: "worktree", provider: "fake" });
+const result = verify.untilGreen("verify target file", { label: "green", maxRounds: 1, provider: "fake" });
+return result;`
+	scriptPath, err := WriteRunScript("wf-untilgreen-sees-edit", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-untilgreen-sees-edit", Task: "untilgreen sees edit", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"ok": true`) || strings.Contains(result, `"fixed": true`) {
+		t.Fatalf("expected untilGreen to see the prior edit and converge WITHOUT needing its own fix round, got %s", result)
+	}
+}
+
+// TestCheckSeesEditAgentChangesAfterResume is bug #30's resume test: the
+// first execution runs the edit agent then hits a budget wall before check()
+// runs; the second execution (resume) replays the edit agent from cache and
+// must still rebuild the staging worktree from its durable patch so check()
+// sees the edit.
+func TestCheckSeesEditAgentChangesAfterResume(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	initEditTargetRepo(t, tmp)
+	provider := writeEditThenVerifyProvider(t, t.TempDir(),
+		`{"ok":true,"command":"verify target","summary":"target edited","output_tail":"","failures":[]}`,
+		`{"ok":false,"command":"verify target","summary":"target not edited","output_tail":"missing edit","failures":[{"name":"target","message":"not edited"}]}`)
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_FAKE_COMMAND", provider)
+
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("edit");
+agent("edit target file", { label: "editor", mode: "edit", isolation: "worktree", provider: "fake" });
+phase("verify");
+const result = check("verify target file", { provider: "fake" });
+return result;`
+	scriptPath, err := WriteRunScript("wf-resume-check-sees-edit", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-resume-check-sees-edit", Task: "resume check sees edit", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// First execution: the budget covers the edit agent only, so check() aborts
+	// the run mid-flight before it ever runs.
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10, MaxBudgetUSD: "0.01"}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), "budget exhausted") {
+		t.Fatalf("expected mid-run budget exhaustion before check(), got %v", err)
+	}
+	if raw, err := os.ReadFile(filepath.Join(tmp, "target.txt")); err != nil || string(raw) != "original\n" {
+		t.Fatalf("expected the failed run to leave the real repo untouched, got %q err=%v", string(raw), err)
+	}
+	// Second execution (resume): the edit agent replays from cache; check()
+	// must still see the edit via the freshly rebuilt staging worktree.
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"ok": true`) {
+		t.Fatalf("expected resumed check() to see the edit agent's change, got %s", result)
+	}
+	if raw, err := os.ReadFile(filepath.Join(tmp, "target.txt")); err != nil || string(raw) != "edited\n" {
+		t.Fatalf("expected the edit applied to the real repo on completion, got %q err=%v", string(raw), err)
+	}
+}
+
+// TestConcurrentNonEditReadsAgainstStagingGetOwnEphemeralWorktrees is the
+// regression test for the P0 and concurrency-race findings left open by the
+// prior attempt at bug #30: a naive fix pointed a non-edit step's cwd
+// directly at the shared staging worktree, so concurrent non-edit steps
+// raced raw git plumbing against the SAME directory, and a side-effecting
+// "read-only" step could leave stray files in the staging state that would
+// eventually leak into the real repo. Each concurrent step here performs
+// the exact git plumbing seedFromStaging/mergeIntoStaging themselves use
+// (`git add -N` + `git diff`) against its OWN cwd and writes a stray,
+// call-specific file — under the fix, that is always a throwaway worktree,
+// so all N calls succeed cleanly with no index.lock contention, and none of
+// the stray files ever reach the real repo.
+func TestConcurrentNonEditReadsAgainstStagingGetOwnEphemeralWorktrees(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	initEditTargetRepo(t, tmp)
+
+	editProvider := filepath.Join(t.TempDir(), "edit.sh")
+	if err := os.WriteFile(editProvider, []byte("#!/bin/sh\nprintf 'edited\\n' > target.txt\nprintf '{\"summary\":\"edited\"}' > \"$PALLIUM_WORKFLOW_OUTPUT_FILE\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Mirrors seedFromStaging/worktreeDiff's own git plumbing so a real race
+	// on a shared directory would surface as an index.lock failure here too.
+	readerProvider := filepath.Join(t.TempDir(), "reader.sh")
+	if err := os.WriteFile(readerProvider, []byte(`#!/bin/sh
+git add -N -- . || exit 1
+git diff --binary > /dev/null || exit 1
+echo "leftover from $PALLIUM_WORKFLOW_AGENT_ID" > "leftover-$PALLIUM_WORKFLOW_AGENT_ID.txt"
+printf '{"ok":true}' > "$PALLIUM_WORKFLOW_OUTPUT_FILE"
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_EDITOR_COMMAND", editProvider)
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_READER_COMMAND", readerProvider)
+
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	// parallel() drops a failed item to null and keeps the run "completed"
+	// rather than erroring Execute() itself, so the assertion below must
+	// count nulls explicitly — a bare results.length would stay 5 even if
+	// every single read failed and was dropped.
+	script := `agent("edit target", { label: "editor", mode: "edit", isolation: "worktree", provider: "editor" });
+const results = parallel(["a", "b", "c", "d", "e"], item => agent("read " + item, { label: "reader-" + item, mode: "test", provider: "reader" }));
+return { count: results.length, failed: results.filter(r => r === null).length };`
+	scriptPath, err := WriteRunScript("wf-concurrent-staging-reads", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-concurrent-staging-reads", Task: "concurrent staging reads", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10, MaxConcurrentAgents: 5}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatalf("expected all concurrent staging reads to succeed with no race, got: %v", err)
+	}
+	if !strings.Contains(result, `"failed": 0`) {
+		t.Fatalf("expected all 5 concurrent reads to succeed with none dropped to null, got %s", result)
+	}
+	if raw, err := os.ReadFile(filepath.Join(tmp, "target.txt")); err != nil || string(raw) != "edited\n" {
+		t.Fatalf("expected the edit applied to the real repo on completion, got %q err=%v", string(raw), err)
+	}
+	entries, err := os.ReadDir(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "leftover-") {
+			t.Fatalf("expected no leftover file from a discarded non-edit worktree to reach the real repo, found %s", entry.Name())
+		}
+	}
+}
+
+// TestNonEditAgentSeesStagingViaSubdirTranslation is the regression test for
+// the subdir-translation finding: `git worktree add` always checks out the
+// WHOLE repo, so a naive fix that pointed a non-edit step directly at the
+// staging path (or at an ephemeral worktree's ROOT) would silently relocate
+// a monorepo-subdir-scoped agent out of its intended subdirectory. The fix
+// must route the same worktreeSubdirCWD translation already used for
+// edit/networked worktrees.
+func TestNonEditAgentSeesStagingViaSubdirTranslation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	sub := filepath.Join(tmp, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "target.txt"), []byte("original\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "sub/target.txt")
+	runGit(t, tmp, "commit", "-m", "initial")
+
+	provider := writeEditThenVerifyProvider(t, t.TempDir(),
+		`{"ok":true,"command":"verify target","summary":"target edited","output_tail":"","failures":[]}`,
+		`{"ok":false,"command":"verify target","summary":"target not edited","output_tail":"missing edit","failures":[{"name":"target","message":"not edited"}]}`)
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_FAKE_COMMAND", provider)
+
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	// check()/gate() have no repo option of their own (CheckOptions/
+	// GateOptions carry no Repo field) — they always run against r.Run.CWD.
+	// Scoping the RUN itself to the subdirectory, matching how a real
+	// monorepo-subdir invocation is actually launched (e.g. `--cwd sub`),
+	// exercises the same worktreeSubdirCWD translation without depending on
+	// a per-call repo override neither builtin verifier supports.
+	script := `phase("edit");
+agent("edit target file", { label: "editor", mode: "edit", isolation: "worktree", provider: "fake" });
+phase("verify");
+const result = check("verify target file", { provider: "fake" });
+return result;`
+	scriptPath, err := WriteRunScript("wf-subdir-staging", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-subdir-staging", Task: "subdir staging", CWD: sub, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"ok": true`) {
+		t.Fatalf("expected check() to see the edit via subdir-translated staging, got %s", result)
+	}
+	if raw, err := os.ReadFile(filepath.Join(sub, "target.txt")); err != nil || string(raw) != "edited\n" {
+		t.Fatalf("expected the edit applied to sub/target.txt on completion, got %q err=%v", string(raw), err)
+	}
+}
+
+func TestStoreAcquireRepoLockExclusiveAndIdempotent(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	holder, ok, err := store.AcquireRepoLock("/repo", "run-a", time.Hour)
+	if err != nil || !ok || holder != "run-a" {
+		t.Fatalf("expected run-a to acquire the fresh lock, got holder=%q ok=%v err=%v", holder, ok, err)
+	}
+	// Idempotent re-entry: the same run acquiring again succeeds.
+	holder, ok, err = store.AcquireRepoLock("/repo", "run-a", time.Hour)
+	if err != nil || !ok || holder != "run-a" {
+		t.Fatalf("expected run-a to re-enter its own lock, got holder=%q ok=%v err=%v", holder, ok, err)
+	}
+	// A different run is refused while the lock is fresh.
+	holder, ok, err = store.AcquireRepoLock("/repo", "run-b", time.Hour)
+	if err != nil || ok || holder != "run-a" {
+		t.Fatalf("expected run-b to be refused with holder=run-a, got holder=%q ok=%v err=%v", holder, ok, err)
+	}
+	// A release by the wrong run must not remove run-a's row.
+	if err := store.ReleaseRepoLock("/repo", "run-b"); err != nil {
+		t.Fatal(err)
+	}
+	holder, ok, err = store.AcquireRepoLock("/repo", "run-b", time.Hour)
+	if err != nil || ok || holder != "run-a" {
+		t.Fatalf("expected run-a's lock to survive a release attempt by a non-holder, got holder=%q ok=%v err=%v", holder, ok, err)
+	}
+	// The real holder releasing frees the repo for another run.
+	if err := store.ReleaseRepoLock("/repo", "run-a"); err != nil {
+		t.Fatal(err)
+	}
+	holder, ok, err = store.AcquireRepoLock("/repo", "run-b", time.Hour)
+	if err != nil || !ok || holder != "run-b" {
+		t.Fatalf("expected run-b to acquire the released lock, got holder=%q ok=%v err=%v", holder, ok, err)
+	}
+}
+
+// TestStoreRepoLockStaleTakeover covers the crash-safety half of bug #34: a
+// lock that hasn't been refreshed in longer than staleAfter is reclaimable
+// by another run, so a killed workflow process can never permanently block a
+// repo.
+func TestStoreRepoLockStaleTakeover(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if _, ok, err := store.AcquireRepoLock("/repo", "run-a", time.Hour); err != nil || !ok {
+		t.Fatalf("expected run-a to acquire the fresh lock, ok=%v err=%v", ok, err)
+	}
+	// A generous staleAfter refuses the second run: run-a's lock is not stale.
+	if holder, ok, err := store.AcquireRepoLock("/repo", "run-b", time.Hour); err != nil || ok || holder != "run-a" {
+		t.Fatalf("expected run-b refused while the lock is fresh, got holder=%q ok=%v err=%v", holder, ok, err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	// A tiny staleAfter (simulating a crashed run-a with no heartbeat since)
+	// lets run-b reclaim the lock.
+	holder, ok, err := store.AcquireRepoLock("/repo", "run-b", time.Millisecond)
+	if err != nil || !ok || holder != "run-b" {
+		t.Fatalf("expected run-b to reclaim the stale lock, got holder=%q ok=%v err=%v", holder, ok, err)
+	}
+	// run-a can no longer treat itself as the holder once reclaimed.
+	if holder, ok, err := store.AcquireRepoLock("/repo", "run-a", time.Hour); err != nil || ok || holder != "run-b" {
+		t.Fatalf("expected run-a to be refused after losing the lock, got holder=%q ok=%v err=%v", holder, ok, err)
+	}
+}
+
+// TestConcurrentStaleTakeoverOnlyOneWins races several independent Store
+// handles (separate *sql.DB, i.e. separate processes) to take over the SAME
+// stale lock. The compare-and-swap in acquireRepoLockOnce must let exactly one
+// win: without it, every racer that read the same stale row would UPDATE and
+// believe it holds the lock (bug #34 double-grant).
+func TestConcurrentStaleTakeoverOnlyOneWins(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "sessions.sqlite")
+	seed, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := seed.AcquireRepoLock("/repo", "run-old", time.Hour); err != nil || !ok {
+		t.Fatalf("seed acquire: ok=%v err=%v", ok, err)
+	}
+	// Backdate the seed so it is unambiguously stale under a 1h window, while a
+	// fresh takeover (updated_at=now) stays non-stale through the whole race —
+	// so the outcome tests the CAS, not staleness timing.
+	old := time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339Nano)
+	if _, err := seed.db.Exec(`UPDATE workflow_repo_locks SET updated_at=? WHERE repo_root=?`, old, "/repo"); err != nil {
+		t.Fatal(err)
+	}
+	seed.Close()
+
+	const n = 6
+	stores := make([]*Store, n)
+	for i := range stores {
+		s, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stores[i] = s
+		defer s.Close()
+	}
+	results := make([]bool, n)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, ok, _ := stores[i].AcquireRepoLock("/repo", fmt.Sprintf("run-%d", i), time.Hour)
+			results[i] = ok
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	wins := 0
+	for _, ok := range results {
+		if ok {
+			wins++
+		}
+	}
+	if wins != 1 {
+		t.Fatalf("expected exactly one stale-takeover winner, got %d", wins)
+	}
+}
+
+// writeConflictingPatch creates a scratch worktree of repoRoot checked out
+// from HEAD, writes newContent to filename, and returns a patch file
+// capturing that change. Independent of any Runner/staging state so two
+// calls with different newContent for the same filename both generate their
+// diff against the SAME original HEAD — a genuine 3-way conflict when both
+// are applied in sequence onto one worktree, not just two edits that happen
+// to touch the same line via different intermediate states.
+func writeConflictingPatch(t *testing.T, dir, repoRoot, filename, newContent string) string {
+	t.Helper()
+	scratch := filepath.Join(dir, "scratch-"+strconv.Itoa(len(newContent))+"-"+filename)
+	runGit(t, repoRoot, "worktree", "add", "--detach", scratch, "HEAD")
+	defer func() {
+		rm := exec.Command("git", "worktree", "remove", "--force", scratch)
+		rm.Dir = repoRoot
+		_ = rm.Run()
+	}()
+	if err := os.WriteFile(filepath.Join(scratch, filename), []byte(newContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	add := exec.Command("git", "add", "-N", "--", ".")
+	add.Dir = scratch
+	if out, err := add.CombinedOutput(); err != nil {
+		t.Fatalf("git add -N: %v: %s", err, out)
+	}
+	diffCmd := exec.Command("git", "diff", "--binary")
+	diffCmd.Dir = scratch
+	raw, err := diffCmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	patchPath := filepath.Join(dir, filename+"-"+strconv.Itoa(len(newContent))+".patch")
+	if err := os.WriteFile(patchPath, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return patchPath
+}
+
+// TestMergeIntoStagingComposesTwoNonConflictingEditsToTheSameFile is the
+// regression test for a bug discovered while writing the conflict-restore
+// test below: the ORIGINAL applyWorktreeDiff ran `git reset -q` after each
+// successful --3way apply to unstage it (so a later git-diff-based capture
+// would still see it as an uncommitted change). That left the index clean
+// (matching HEAD) while the working tree carried the accumulated edit — and
+// `git apply --3way`'s fallback path refuses with "does not match index"
+// against ANY file with pre-existing unstaged changes, even when the new
+// patch's own target lines don't overlap with the first edit at all. That
+// made mergeIntoStaging fail outright for two agents editing the same file
+// in ANY way, not just a genuine conflict — a much more basic break than
+// the conflict-handling finding. The fix commits each merge instead of
+// leaving it uncommitted, so the index is always settled before the next
+// apply.
+func TestMergeIntoStagingComposesTwoNonConflictingEditsToTheSameFile(t *testing.T) {
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "shared.txt"), []byte("line1\nline2\nline3\nline4\nline5\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "shared.txt")
+	runGit(t, tmp, "commit", "-m", "initial")
+
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run, err := store.CreateRun(Run{ID: "wf-same-file-compose", Task: "same file compose", CWD: tmp, ScriptPath: "unused.js"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &Runner{Store: store, Run: run}
+
+	patchDir := t.TempDir()
+	patchA := writeConflictingPatch(t, patchDir, tmp, "shared.txt", "line1\nCHANGED-A\nline3\nline4\nline5\n")
+	if err := r.mergeIntoStaging(tmp, patchA); err != nil {
+		t.Fatalf("first merge should succeed: %v", err)
+	}
+	// Non-overlapping change: touches line4, not line2.
+	patchC := writeConflictingPatch(t, patchDir, tmp, "shared.txt", "line1\nline2\nline3\nCHANGED-C\nline5\n")
+	if err := r.mergeIntoStaging(tmp, patchC); err != nil {
+		t.Fatalf("expected a second, non-overlapping edit to the same file to compose cleanly, got: %v", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(r.stagingPathFor(tmp), "shared.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "line1\nCHANGED-A\nline3\nCHANGED-C\nline5\n"
+	if string(raw) != want {
+		t.Fatalf("expected both edits composed, got %q want %q", string(raw), want)
+	}
+}
+
+// TestMergeIntoStagingRestoresSnapshotOnConflict is the regression test for
+// the adversarial-review finding that a failed `git apply --3way` (a real
+// conflict between two edit-intent agents touching the same lines) left
+// staging's shared, long-lived worktree with literal conflict markers and a
+// dirty index — silently corrupting every later mergeIntoStaging/
+// seedFromStaging read for the rest of the run. The fix snapshots staging
+// before each merge attempt and restores it on failure.
+func TestMergeIntoStagingRestoresSnapshotOnConflict(t *testing.T) {
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "shared.txt"), []byte("line1\nline2\nline3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "shared.txt")
+	runGit(t, tmp, "commit", "-m", "initial")
+
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run, err := store.CreateRun(Run{ID: "wf-merge-conflict", Task: "merge conflict", CWD: tmp, ScriptPath: "unused.js"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &Runner{Store: store, Run: run}
+
+	patchDir := t.TempDir()
+	patchA := writeConflictingPatch(t, patchDir, tmp, "shared.txt", "line1\nCHANGED-A\nline3\n")
+	if err := r.mergeIntoStaging(tmp, patchA); err != nil {
+		t.Fatalf("first merge should succeed cleanly: %v", err)
+	}
+	stagingPath := r.stagingPathFor(tmp)
+	stagingBase := r.stagingEntry(tmp).base
+	before, err := diffAgainstBase(stagingPath, stagingBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	patchB := writeConflictingPatch(t, patchDir, tmp, "shared.txt", "line1\nCHANGED-B\nline3\n")
+	if err := r.mergeIntoStaging(tmp, patchB); err == nil {
+		t.Fatal("expected the conflicting second merge to fail")
+	}
+
+	after, err := diffAgainstBase(stagingPath, stagingBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("expected staging restored to its pre-conflict snapshot after the failed merge, got a different diff:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+	raw, err := os.ReadFile(filepath.Join(stagingPath, "shared.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "<<<<<<<") {
+		t.Fatalf("expected no conflict markers left in staging after the restore, got:\n%s", raw)
+	}
+}
+
+// TestNonEditWorktreeDiscardedWhenSeedFromStagingFails is the regression
+// test for the adversarial-review finding that the real dispatch path's
+// containment-worktree discard defer was registered AFTER the
+// seedFromStaging call, so a seed failure returned before the defer ever
+// existed and leaked the freshly created worktree on disk permanently.
+func TestNonEditWorktreeDiscardedWhenSeedFromStagingFails(t *testing.T) {
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "file.txt"), []byte("original\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "file.txt")
+	runGit(t, tmp, "commit", "-m", "initial")
+
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run, err := store.CreateRun(Run{ID: "wf-seed-fail-leak", Task: "seed fail leak", CWD: tmp, ScriptPath: "unused.js"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &Runner{Store: store, Run: run}
+	// A broken staging entry (pointing at a path that is not a valid git
+	// worktree at all) makes seedFromStaging fail deterministically without
+	// needing to construct a genuine merge conflict — the specific trigger
+	// doesn't matter for this test, only that ANY seedFromStaging failure
+	// must not leak the fresh containment worktree runAgentCommand created
+	// immediately before calling it.
+	r.staging = map[string]*stagingWorktree{
+		tmp: {path: filepath.Join(tmp, "not-a-real-worktree")},
+	}
+
+	agent := &Agent{ID: "check-agent-1", RunID: run.ID, Repo: tmp, Mode: "test"}
+	_, _, worktree, err := r.runAgentCommand(context.Background(), agent, AgentOptions{})
+	if err == nil {
+		t.Fatal("expected seedFromStaging's failure to propagate")
+	}
+	if worktree == "" {
+		t.Fatal("expected runAgentCommand to report the worktree path it had created before the seed failure")
+	}
+	if _, statErr := os.Stat(worktree); !os.IsNotExist(statErr) {
+		t.Fatalf("expected the containment worktree removed from disk after the seed failure, stat err=%v", statErr)
+	}
+	list := exec.Command("git", "worktree", "list", "--porcelain")
+	list.Dir = tmp
+	raw, err := list.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(raw), "worktree "); got != 1 {
+		t.Fatalf("expected only the main worktree registered after the leak fix, got %d:\n%s", got, string(raw))
+	}
+}
+
+// TestStubPathNonEditWorktreeDiscardedWhenSeedFromStagingFails is the same
+// regression as above for the PALLIUM_WORKFLOW_AGENT_STUB test-stub
+// dispatch path, which had no discard mechanism at all for this case.
+func TestStubPathNonEditWorktreeDiscardedWhenSeedFromStagingFails(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "file.txt"), []byte("original\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "file.txt")
+	runGit(t, tmp, "commit", "-m", "initial")
+
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run, err := store.CreateRun(Run{ID: "wf-seed-fail-leak-stub", Task: "seed fail leak stub", CWD: tmp, ScriptPath: "unused.js"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &Runner{Store: store, Run: run}
+	r.staging = map[string]*stagingWorktree{
+		tmp: {path: filepath.Join(tmp, "not-a-real-worktree")},
+	}
+
+	agent := &Agent{ID: "check-agent-2", RunID: run.ID, Repo: tmp, Mode: "test"}
+	_, _, worktree, err := r.runAgentCommand(context.Background(), agent, AgentOptions{})
+	if err == nil {
+		t.Fatal("expected seedFromStaging's failure to propagate")
+	}
+	if worktree == "" {
+		t.Fatal("expected runAgentCommand to report the worktree path it had created before the seed failure")
+	}
+	if _, statErr := os.Stat(worktree); !os.IsNotExist(statErr) {
+		t.Fatalf("expected the containment worktree removed from disk after the seed failure, stat err=%v", statErr)
+	}
+	list := exec.Command("git", "worktree", "list", "--porcelain")
+	list.Dir = tmp
+	raw, err := list.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(raw), "worktree "); got != 1 {
+		t.Fatalf("expected only the main worktree registered after the leak fix, got %d:\n%s", got, string(raw))
+	}
+}
+
+// TestRepoLockContentionInsideParallelHaltsRunInsteadOfBeingDropped is the
+// regression test for the adversarial-review finding that acquireRepoLock's
+// contention error had no distinguishable sentinel, so parallel()/pipeline()
+// silently dropped every contended edit-intent agent call to null via the
+// same path as an ordinary per-item provider failure — masking cross-run
+// lock contention as N unrelated failures instead of halting the run with
+// one clear cause.
+func TestRepoLockContentionInsideParallelHaltsRunInsteadOfBeingDropped(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"edited"}`)
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "note.txt"), []byte("original\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "note.txt")
+	runGit(t, tmp, "commit", "-m", "initial")
+
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `const results = parallel(["a", "b"], item => agent("edit " + item, { label: item, mode: "edit", isolation: "worktree" }));
+return { count: results.length };`
+	scriptPath, err := WriteRunScript("wf-lock-parallel", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-lock-parallel", Task: "lock contention in parallel", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	canonical, err := gitlog.CanonicalRepoRoot(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := store.AcquireRepoLock(canonical, "other-run", time.Hour); err != nil || !ok {
+		t.Fatalf("seed contending lock: ok=%v err=%v", ok, err)
+	}
+
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err == nil {
+		t.Fatal("expected the run to fail outright on lock contention, not silently drop both items to null")
+	}
+	if !strings.Contains(err.Error(), "workflow repo edit lock contended") {
+		t.Fatalf("expected the lock-contention sentinel to surface as the run's error, got: %v", err)
+	}
+}
+
+// TestConcurrentEditRunsOnSameRepoOneFailsFast is bug #34's non-negotiable
+// race test: two concurrent edit runs against the same repo, using two
+// separate Store handles onto the same sqlite file (mirroring two separate
+// `pallium workflow run` processes sharing one DB). Exactly one must proceed
+// and apply its edit; the other must fail fast with the lock error before
+// ever creating a worktree.
+func TestConcurrentEditRunsOnSameRepoOneFailsFast(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"summary":"edited"}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_WRITE_FILE", "note.txt")
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_WRITE_CONTENT", "changed\n")
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB_DELAY_MS", "50")
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "note.txt"), []byte("original\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, tmp, "add", "note.txt")
+	runGit(t, tmp, "commit", "-m", "initial")
+
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	store1, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store1.Close()
+	store2, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store2.Close()
+
+	script := `agent("edit note", { label: "editor", mode: "edit", isolation: "worktree" }); return { ok: true };`
+	scriptPath, err := WriteRunScript("wf-lock-a", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runA, err := store1.CreateRun(Run{ID: "wf-lock-a", Task: "lock a", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runB, err := store1.CreateRun(Run{ID: "wf-lock-b", Task: "lock b", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, errs[0] = (&Runner{Store: store1, Run: runA, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	}()
+	go func() {
+		defer wg.Done()
+		_, errs[1] = (&Runner{Store: store2, Run: runB, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	}()
+	wg.Wait()
+
+	succeeded, lockFailed := 0, 0
+	for _, callErr := range errs {
+		switch {
+		case callErr == nil:
+			succeeded++
+		case strings.Contains(callErr.Error(), "another edit run holds"):
+			lockFailed++
+		default:
+			t.Fatalf("unexpected error: %v", callErr)
+		}
+	}
+	if succeeded != 1 || lockFailed != 1 {
+		t.Fatalf("expected exactly one success and one lock failure, got succeeded=%d lockFailed=%d errs=%v", succeeded, lockFailed, errs)
+	}
+	if raw, err := os.ReadFile(filepath.Join(tmp, "note.txt")); err != nil || string(raw) != "changed\n" {
+		t.Fatalf("expected the winning run's edit applied to the repo, got %q err=%v", string(raw), err)
+	}
+	// The repo lock must not outlive either Execute call. Look it up under
+	// the same canonical key acquireRepoLock uses, not the raw tmp path.
+	canonical, err := gitlog.CanonicalRepoRoot(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if holder, ok, err := store1.AcquireRepoLock(canonical, "run-c", time.Hour); err != nil || !ok || holder != "run-c" {
+		t.Fatalf("expected the repo lock released after both runs finished, got holder=%q ok=%v err=%v", holder, ok, err)
+	}
+	if err := store1.ReleaseRepoLock(canonical, "run-c"); err != nil {
+		t.Fatal(err)
 	}
 }
 
