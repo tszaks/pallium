@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -185,6 +186,17 @@ func runLoopTick(out io.Writer, args []string, jsonOutput bool) error {
 	staleAfter := time.Now().Add(-time.Duration(*staleAfterMinutes) * time.Minute).UTC().Format(time.RFC3339Nano)
 	lease, err := store.BeginLoopTick(name, staleAfter)
 	if err != nil {
+		if !errors.Is(err, workflow.ErrLoopTickInFlight) {
+			// A DIFFERENT failure class — "loop not found", "loop not
+			// active", or a raw DB error — is NOT the same thing as a
+			// genuinely in-flight tick (found by adversarial review:
+			// these used to collapse into the same already_running state/
+			// exit code, so a cron wrapper branching on exit code alone
+			// couldn't tell "retry later" from "page immediately, this
+			// loop doesn't exist or was stopped"). No lease was acquired
+			// either way, so there's still nothing to release here.
+			return err
+		}
 		result := map[string]any{"loop": name, "state": workflow.LoopStateAlreadyRunning, "error": err.Error()}
 		// already_running is exit-code-only: zero state mutation. No
 		// FinishLoopTick call — no lease was ever acquired, so there is
@@ -194,6 +206,16 @@ func runLoopTick(out io.Writer, args []string, jsonOutput bool) error {
 		})
 		return &LoopTickExitError{Code: workflow.LoopExitCode(workflow.LoopStateAlreadyRunning), State: workflow.LoopStateAlreadyRunning}
 	}
+	// Safety net (found by adversarial review): if this function returns on
+	// ANY path below without having released the lease via a real
+	// FinishLoopTick call, this fires and releases it as an error tick
+	// instead of leaking it for up to --stale-after-minutes over what may
+	// have been a single transient failure unrelated to the tick itself.
+	// Harmless once the lease WAS already released normally below —
+	// FinishLoopTickAsError's own CAS (WHERE tick_started_at=?) simply
+	// matches zero rows once tick_started_at no longer holds this exact
+	// lease value, and a no-match is not treated as an error.
+	defer func() { _ = store.FinishLoopTickAsError(name, lease) }()
 
 	loop, err := store.GetLoop(name)
 	if err != nil {
@@ -288,10 +310,14 @@ func runLoopTick(out io.Writer, args []string, jsonOutput bool) error {
 // parseLoopTickResult reads a loop script's returned {state, signature}
 // contract out of the child run's stored Result (see Run.Result — already
 // populated by the regular workflow-run completion path, no new plumbing
-// needed). A script that returns nothing usable is not itself an error —
-// state comes back "" and runLoopTick treats that as no_op — but a run
-// that never completed at all (killed, crashed) reports resultErr so the
-// caller can distinguish "ran and said nothing" from "never finished".
+// needed). An EMPTY result is not itself an error — a script that legitimately
+// returns nothing gets state="" and runLoopTick treats that as no_op — but
+// malformed JSON in a NON-empty result IS reported via err: the child run
+// completed (childRun.Status isn't "failed") yet produced garbage instead of
+// the expected contract, which is a real corruption/script-bug signal, not a
+// harmless no-op. (Found by adversarial review: this branch used to swallow
+// jsonErr and return nil, silently recording a malformed cycle as no_op
+// instead of error.)
 func parseLoopTickResult(resultText string) (state, signature string, err error) {
 	resultText = strings.TrimSpace(resultText)
 	if resultText == "" {
@@ -299,7 +325,7 @@ func parseLoopTickResult(resultText string) (state, signature string, err error)
 	}
 	var parsed map[string]any
 	if jsonErr := json.Unmarshal([]byte(resultText), &parsed); jsonErr != nil {
-		return "", "", nil
+		return "", "", jsonErr
 	}
 	state, _ = parsed["state"].(string)
 	signature, _ = parsed["signature"].(string)
