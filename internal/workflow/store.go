@@ -237,12 +237,6 @@ CREATE TABLE IF NOT EXISTS workflow_gates (
   UNIQUE(run_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_workflow_gates_run ON workflow_gates(run_id, opened_at DESC);
-CREATE TABLE IF NOT EXISTS workflow_repo_locks (
-  repo_root TEXT PRIMARY KEY,
-  run_id TEXT NOT NULL,
-  acquired_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
 `)
 	if err != nil {
 		return err
