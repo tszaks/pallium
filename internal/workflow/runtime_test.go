@@ -2333,6 +2333,83 @@ return { results };`
 	}
 }
 
+// TestParallelThunksFormThrowDropsOnlyThatItem is the crash-isolation-parity
+// regression test for parallel(arrayOfThunks) — the no-mapper shape (each
+// item is itself a zero-arg function) that Ultracode-native agent reflexes
+// reach for by default. Before this fix, a thunk that threw (synchronously,
+// e.g. from touching an agent()'s return value directly instead of via the
+// deferred parallel()-capture/replace mechanism — a natural mistake for code
+// that doesn't know about that indirection) did a bare `panic(err)` and
+// killed the whole run, unlike the documented parallel(items, fn) mapper
+// form (see TestParallelMapperThrowDropsOnlyThatItem), which already
+// isolated an ordinary throw to a null result. The thunks form must match.
+func TestParallelThunksFormThrowDropsOnlyThatItem(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"prompt":"{{PROMPT}}"}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("parallel-thunks");
+const results = await parallel([
+  () => agent("inspect keep1", { label: "keep1" }),
+  () => { throw new Error("drop this item"); },
+  () => agent("inspect keep2", { label: "keep2" })
+]);
+return { results };`
+	scriptPath, err := WriteRunScript("wf-parallel-thunks-throw", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-parallel-thunks-throw", Task: "parallel thunks throw", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatalf("expected the run to complete with the failing thunk dropped to null, got: %v", err)
+	}
+	if !strings.Contains(result, "inspect keep1") || !strings.Contains(result, "null") || !strings.Contains(result, "inspect keep2") {
+		t.Fatalf("parallel thunks-form throw did not preserve item order with null drop: %s", result)
+	}
+}
+
+// TestParallelThunksFormFatalErrorAbortsRun mirrors
+// TestParallelMapperFatalErrorAbortsRun for the thunks form: a genuinely
+// fatal error (budget/max-agents/interrupt) synchronously raised inside a
+// thunk must still abort the whole run rather than being swallowed into a
+// null result — crash-isolation parity means matching the mapper form's
+// fatal-vs-transient classification exactly, not just "never fail".
+func TestParallelThunksFormFatalErrorAbortsRun(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("parallel-thunks-fatal");
+agent("warmup");
+const results = await parallel([
+  () => { throw new Error("drop this item"); },
+  () => verify.untilGreen("stub-check", { maxRounds: 0 })
+]);
+return { results };`
+	scriptPath, err := WriteRunScript("wf-parallel-thunks-fatal", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-parallel-thunks-fatal", Task: "parallel thunks fatal", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 1}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), "exceeded max agents") {
+		t.Fatalf("expected fatal thunk error to abort the run, got %v", err)
+	}
+}
+
 // TestParallelMapperInterruptPreservesPausedStatus covers pausing a run
 // while it's synchronously inside a parallel() mapper (e.g. via
 // verify.untilGreen()): the run must end up "paused", not "failed".
