@@ -59,7 +59,7 @@ func newWorkflowHTTPHandler(dbPath, token string) http.Handler {
 		writeJSON(w, map[string]any{"ok": true})
 	})
 	mux.HandleFunc("GET /workflows/fleet", func(w http.ResponseWriter, r *http.Request) {
-		store, err := workflow.Open(dbPath)
+		store, err := workflow.Open(resolvePalliumDBPath(dbPath))
 		if err != nil {
 			writeHTTPError(w, err)
 			return
@@ -82,7 +82,7 @@ func newWorkflowHTTPHandler(dbPath, token string) http.Handler {
 			}
 			limit = parsed
 		}
-		store, err := workflow.Open(dbPath)
+		store, err := workflow.Open(resolvePalliumDBPath(dbPath))
 		if err != nil {
 			writeHTTPError(w, err)
 			return
@@ -127,7 +127,7 @@ func newWorkflowHTTPHandler(dbPath, token string) http.Handler {
 		_, _ = w.Write(out.Bytes())
 	})
 	mux.HandleFunc("GET /workflows/runs/{id}", func(w http.ResponseWriter, r *http.Request) {
-		store, err := workflow.Open(dbPath)
+		store, err := workflow.Open(resolvePalliumDBPath(dbPath))
 		if err != nil {
 			writeHTTPError(w, err)
 			return

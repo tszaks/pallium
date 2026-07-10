@@ -1212,9 +1212,24 @@ func (r *Runner) jsParallel(ctx context.Context, vm *goja.Runtime) func(goja.Fun
 				}
 				rawResults = append(rawResults, value.Export())
 			} else if fn, ok := goja.AssertFunction(item); ok {
+				// parallel(arrayOfThunks) — no mapper, each item is itself a
+				// zero-arg function. This is the shape Ultracode-native agent
+				// reflexes reach for by default; it must degrade a failing
+				// thunk to null exactly like the mapper form above (same
+				// fatal-vs-transient classification via fatalCause, same
+				// rollback of any calls the thunk captured before throwing),
+				// not crash the whole run on one ordinary agent failure.
+				callStart := len(capture.Calls)
+				fatalBefore := r.fatalCause()
 				value, err := fn(goja.Undefined())
 				if err != nil {
-					panic(err)
+					if fatal := r.fatalCause(); fatal != nil && fatal != fatalBefore {
+						panic(vm.ToValue(r.throwable(fatal)))
+					}
+					capture.Calls = capture.Calls[:callStart]
+					r.recordDroppedItem(fmt.Sprintf("parallel item %d", i), describeStageDrop(err))
+					rawResults = append(rawResults, nil)
+					continue
 				}
 				rawResults = append(rawResults, value.Export())
 			} else {

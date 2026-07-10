@@ -62,7 +62,7 @@ func runConsoleRun(out io.Writer, args []string, jsonOutput bool) error {
 			return err
 		}
 	}
-	store, err := console.Open(*dbPath)
+	store, err := console.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -113,7 +113,7 @@ func runConsoleRunner(out io.Writer, args []string) error {
 	if err != nil {
 		return err
 	}
-	store, err := console.Open(*dbPath)
+	store, err := console.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -139,7 +139,7 @@ func runConsoleRead(out io.Writer, args []string, jsonOutput bool) error {
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: pallium console read <owned-session-id>")
 	}
-	store, err := console.Open(*dbPath)
+	store, err := console.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -166,7 +166,7 @@ func runConsoleInterrupt(out io.Writer, args []string, jsonOutput bool) error {
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: pallium console interrupt <owned-session-id>")
 	}
-	store, err := console.Open(*dbPath)
+	store, err := console.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -218,7 +218,7 @@ func runConsoleOwnedList(out io.Writer, args []string, jsonOutput bool) error {
 	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "limit": {}}, nil); err != nil {
 		return err
 	}
-	store, err := console.Open(*dbPath)
+	store, err := console.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -241,7 +241,7 @@ func runConsoleOwnedShow(out io.Writer, args []string, jsonOutput bool) error {
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: pallium console owned show <owned-session-id>")
 	}
-	store, err := console.Open(*dbPath)
+	store, err := console.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -343,14 +343,14 @@ func startOwnedBackground(out io.Writer, jsonOutput bool, dbPath string, session
 	cmd.Stdin = nil
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
-		if store, openErr := console.Open(dbPath); openErr == nil {
+		if store, openErr := console.Open(resolvePalliumDBPath(dbPath)); openErr == nil {
 			_ = store.FailOwnedSession(session.ID, 1)
 			_ = store.Close()
 		}
 		return err
 	}
 	if cmd.Process != nil {
-		if store, err := console.Open(dbPath); err == nil {
+		if store, err := console.Open(resolvePalliumDBPath(dbPath)); err == nil {
 			_ = store.UpdateOwnedSessionStarted(session.ID, cmd.Process.Pid, 0)
 			_ = store.Close()
 		}

@@ -131,6 +131,44 @@ func TestConsoleRunReadAndOwnedList(t *testing.T) {
 	}
 }
 
+// TestConsoleRunRespectsTestDB mirrors TestWorkflowRunRespectsTestDB for
+// `console run`: it called console.Open(*dbPath) directly instead of going
+// through resolvePalliumDBPath, so PALLIUM_TEST_DB silently did nothing for
+// it either — an owned session created this way with no --db landed in the
+// real global DB regardless of the env var. No --db below is deliberate.
+func TestConsoleRunRespectsTestDB(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "redirected.sqlite")
+	t.Setenv("PALLIUM_TEST_DB", dbPath)
+	logPath := filepath.Join(tmp, "owned.log")
+	var out bytes.Buffer
+	if err := runConsole(&out, []string{
+		"run",
+		"--id", "owned-testdb-redirect",
+		"--cwd", tmp,
+		"--log", logPath,
+		"--",
+		"/bin/sh", "-c", "printf 'hello-owned\n'",
+	}, false); err != nil {
+		t.Fatalf("console run (no --db, PALLIUM_TEST_DB set) failed: %v", err)
+	}
+	// Open dbPath directly, not through any resolvePalliumDBPath-aware
+	// helper: openExistingConsoleStore("") re-resolves PALLIUM_TEST_DB itself,
+	// so it can't distinguish "console run actually redirected" from "console
+	// run landed in the real default DB, and this lookup coincidentally
+	// redirected to the SAME place as this test's own dbPath" — it would
+	// pass either way. Opening the known path directly proves the record
+	// really is there.
+	store, err := consoleStore.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.OwnedSession("owned-testdb-redirect"); err != nil {
+		t.Fatalf("expected the owned session to be found in the PALLIUM_TEST_DB-redirected database, got: %v", err)
+	}
+}
+
 func TestReadOwnedLogTailIgnoresTrailingNewline(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "owned.log")
 	if err := os.WriteFile(logPath, []byte("alpha\nbeta\ngamma\n"), 0o644); err != nil {
