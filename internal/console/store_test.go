@@ -175,6 +175,72 @@ func TestOwnedSessionUpdateMissingRowFails(t *testing.T) {
 	}
 }
 
+// TestCreateOwnedSessionReenteringSameIDUpserts is the regression test for
+// the crash behind `workflow resume <id> --background`: cmd/workflow.go
+// derives an owned-session id deterministically from the workflow run's id
+// ("workflow-"+run.ID), so resuming the SAME run in the background a
+// second time — the whole point of resume — reuses the SAME
+// owned_sessions.id. A plain INSERT hit the primary key on that legitimate
+// re-entry and surfaced a raw "UNIQUE constraint failed" instead of
+// starting the new background attempt; foreground resume never went
+// through this path, so only --background crashed. CreateOwnedSession must
+// upsert: the second call succeeds and resets the row to the NEW launch's
+// values rather than erroring or silently keeping the stale one.
+func TestCreateOwnedSessionReenteringSameIDUpserts(t *testing.T) {
+	store := openTestStore(t)
+	defer store.Close()
+
+	first, err := store.CreateOwnedSession(OwnedSession{
+		ID:      "workflow-wf-resume-bg",
+		Command: []string{"pallium", "workflow", "run", "--id", "wf-resume-bg"},
+		CWD:     "/tmp/repo",
+		LogPath: "/tmp/repo/first.log",
+	})
+	if err != nil {
+		t.Fatalf("first CreateOwnedSession should succeed, got: %v", err)
+	}
+	if err := store.UpdateOwnedSessionStarted(first.ID, 111, 222); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishOwnedSession(first.ID, 0); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.OwnedSession(first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Status != "exited" {
+		t.Fatalf("expected the first launch to have exited before the resume re-entry, got %+v", before)
+	}
+
+	// Resume re-enters with the SAME id — this must not error, and must
+	// reset the row (fresh "starting" status, new log path) rather than
+	// leave the stale "exited" state from the first launch in place.
+	second, err := store.CreateOwnedSession(OwnedSession{
+		ID:      "workflow-wf-resume-bg",
+		Command: []string{"pallium", "workflow", "run", "--id", "wf-resume-bg"},
+		CWD:     "/tmp/repo",
+		LogPath: "/tmp/repo/second.log",
+	})
+	if err != nil {
+		t.Fatalf("expected background resume's re-entrant CreateOwnedSession to upsert, got: %v", err)
+	}
+	if second.Status != "starting" {
+		t.Fatalf("expected the resumed session to start fresh, got %+v", second)
+	}
+
+	after, err := store.OwnedSession("workflow-wf-resume-bg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != "starting" {
+		t.Fatalf("expected the row reset to the new launch's starting status, got %+v", after)
+	}
+	if after.LogPath != "/tmp/repo/second.log" {
+		t.Fatalf("expected the row updated to the new launch's log path, got %+v", after)
+	}
+}
+
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
 	store, err := Open(filepath.Join(t.TempDir(), "sessions.sqlite"))

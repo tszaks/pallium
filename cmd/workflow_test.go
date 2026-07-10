@@ -133,6 +133,49 @@ return result;`), 0o644); err != nil {
 	}
 }
 
+// TestWorkflowRunRespectsTestDB is the regression test for a real
+// production-DB pollution incident found live while dogfooding: every
+// `pallium workflow ...` subcommand called workflow.Open(*dbPath) directly
+// instead of going through the same openPalliumStore/resolvePalliumDBPath
+// chokepoint `team`/`loop` already use — so PALLIUM_TEST_DB (the safety net
+// that exists specifically to keep throwaway test/dogfood runs out of the
+// real ~/.pallium/codex-sessions.sqlite) silently did nothing for `workflow
+// run`, `workflow resume`, or any other workflow subcommand. Several
+// dogfood runs this way actually landed in and had to be manually cleaned
+// out of the real global DB before this fix. No --db on the call below is
+// deliberate — that is exactly what a real dogfood session does after
+// `export PALLIUM_TEST_DB=...` once, and the whole point of the safety net
+// is that it still works.
+func TestWorkflowRunRespectsTestDB(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "redirected.sqlite")
+	t.Setenv("PALLIUM_TEST_DB", dbPath)
+	scriptPath := filepath.Join(tmp, "workflow.js")
+	if err := os.WriteFile(scriptPath, []byte(`return agent("hello");`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{
+		"run",
+		"--id", "wf-testdb-redirect",
+		"--cwd", tmp,
+		"--script", scriptPath,
+		"testdb redirect",
+	}, false); err != nil {
+		t.Fatalf("workflow run (no --db, PALLIUM_TEST_DB set) failed: %v\n%s", err, out.String())
+	}
+	store, err := openPalliumStore("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.Run("wf-testdb-redirect"); err != nil {
+		t.Fatalf("expected the run to be found in the PALLIUM_TEST_DB-redirected database, got: %v", err)
+	}
+}
+
 func TestWorkflowGenerateStatusAndInspect(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true,"command":"go test ./...","summary":"passed","output_tail":"","failures":[]}`)
 	t.Setenv("PALLIUM_WORKFLOW_PALLIUM_STUB", `{"ok":true,"args":"{{ARGS}}"}`)
