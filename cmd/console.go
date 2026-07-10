@@ -189,7 +189,7 @@ func runConsoleManifestSet(out io.Writer, args []string, jsonOutput bool) error 
 	if *sourcePID == 0 && summary != nil {
 		*sourcePID = summary.PID
 	}
-	store, err := console.Open(*dbPath)
+	store, err := console.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -230,7 +230,7 @@ func runConsoleManifestShow(out io.Writer, args []string, jsonOutput bool) error
 	if err != nil {
 		return err
 	}
-	store, err := console.Open(*dbPath)
+	store, err := console.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -290,7 +290,7 @@ func runConsoleHandoffWrite(out io.Writer, args []string, jsonOutput bool) error
 			return err
 		}
 	}
-	store, err := console.Open(*dbPath)
+	store, err := console.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -321,7 +321,7 @@ func runConsoleHandoffList(out io.Writer, args []string, jsonOutput bool) error 
 	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "limit": {}}, nil); err != nil {
 		return err
 	}
-	store, err := console.Open(*dbPath)
+	store, err := console.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -344,7 +344,7 @@ func runConsoleHandoffAccept(out io.Writer, args []string, jsonOutput bool) erro
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: pallium console handoff accept <handoff-id>")
 	}
-	store, err := console.Open(*dbPath)
+	store, err := console.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -396,7 +396,7 @@ func runConsoleClaimAcquire(out io.Writer, args []string, jsonOutput bool) error
 	if err != nil {
 		return err
 	}
-	store, err := console.Open(*dbPath)
+	store, err := console.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -432,7 +432,7 @@ func runConsoleClaimRelease(out io.Writer, args []string, jsonOutput bool) error
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: pallium console claim release <claim-id>")
 	}
-	store, err := console.Open(*dbPath)
+	store, err := console.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -457,7 +457,7 @@ func runConsoleClaimList(out io.Writer, args []string, jsonOutput bool) error {
 	if strings.TrimSpace(*repo) != "" {
 		repoRoot, _ = resolveRepoRoot(*repo)
 	}
-	store, err := console.Open(*dbPath)
+	store, err := console.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -526,7 +526,7 @@ func requestConsoleAuthority(out io.Writer, args []string, jsonOutput bool, defa
 	if err != nil {
 		return err
 	}
-	store, err := console.Open(*dbPath)
+	store, err := console.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -575,7 +575,7 @@ func runConsoleAuthorityDecide(out io.Writer, args []string, jsonOutput bool) er
 	if status == "" {
 		return fmt.Errorf("choose --approve or --deny")
 	}
-	store, err := console.Open(*dbPath)
+	store, err := console.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -596,7 +596,7 @@ func runConsoleAuthorityList(out io.Writer, args []string, jsonOutput bool) erro
 	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "session": {}, "limit": {}}, nil); err != nil {
 		return err
 	}
-	store, err := console.Open(*dbPath)
+	store, err := console.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -636,7 +636,7 @@ func runConsoleGateOpen(out io.Writer, args []string, jsonOutput bool) error {
 	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "event": {}, "type": {}, "required": {}}, nil); err != nil {
 		return err
 	}
-	store, err := console.Open(*dbPath)
+	store, err := console.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -671,7 +671,7 @@ func runConsoleGateAttest(out io.Writer, args []string, jsonOutput bool) error {
 			return err
 		}
 	}
-	store, err := console.Open(*dbPath)
+	store, err := console.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -699,7 +699,7 @@ func runConsoleGateList(out io.Writer, args []string, jsonOutput bool) error {
 	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "limit": {}}, nil); err != nil {
 		return err
 	}
-	store, err := console.Open(*dbPath)
+	store, err := console.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -743,7 +743,7 @@ func runConsoleReviewCreate(out io.Writer, args []string, jsonOutput bool) error
 	if *sessionID != "" {
 		openedBy = *sessionID
 	}
-	store, err := console.Open(*dbPath)
+	store, err := console.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -766,7 +766,7 @@ func runConsoleReviewShow(out io.Writer, args []string, jsonOutput bool) error {
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: pallium console review show <review-id>")
 	}
-	store, err := console.Open(*dbPath)
+	store, err := console.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -790,7 +790,7 @@ func runConsoleReviewClose(out io.Writer, args []string, jsonOutput bool) error 
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: pallium console review close <review-id> --decision proceed|revise|decline")
 	}
-	store, err := console.Open(*dbPath)
+	store, err := console.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -840,7 +840,7 @@ func buildConsoleSnapshot(includeAll, details bool, dbPath string) (consoleSnaps
 }
 
 func openExistingConsoleStore(dbPath string) (*console.Store, error) {
-	path := dbPath
+	path := resolvePalliumDBPath(dbPath)
 	if path == "" {
 		path = sessionmemory.DefaultDBPath()
 	}
