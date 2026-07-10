@@ -391,7 +391,7 @@ func runWorkflowTriggerAdd(out io.Writer, args []string, jsonOutput bool) error 
 	if err != nil {
 		return err
 	}
-	store, err := workflow.Open(*dbPath)
+	store, err := workflow.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -420,7 +420,7 @@ func runWorkflowTriggerList(out io.Writer, args []string, jsonOutput bool) error
 	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}}, nil); err != nil {
 		return err
 	}
-	store, err := workflow.Open(*dbPath)
+	store, err := workflow.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -450,7 +450,7 @@ func runWorkflowTriggerShow(out io.Writer, args []string, jsonOutput bool) error
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: pallium workflow trigger show <name>")
 	}
-	store, err := workflow.Open(*dbPath)
+	store, err := workflow.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -476,7 +476,7 @@ func runWorkflowTriggerRun(out io.Writer, args []string, jsonOutput bool) error 
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: pallium workflow trigger run <name> [--background] [--allow-network]")
 	}
-	store, err := workflow.Open(*dbPath)
+	store, err := workflow.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -549,7 +549,7 @@ func runWorkflowTriggerRun(out io.Writer, args []string, jsonOutput bool) error 
 	if runErr := runWorkflowRun(out, runArgs[1:], jsonOutput); runErr != nil {
 		// Restore the previous trigger state only when the run never
 		// started (no run row exists), so the missed change fires again.
-		store, err := workflow.Open(*dbPath)
+		store, err := workflow.Open(resolvePalliumDBPath(*dbPath))
 		if err != nil {
 			return runErr
 		}
@@ -616,7 +616,7 @@ func runWorkflowTriggerWatch(out io.Writer, args []string, jsonOutput bool) erro
 }
 
 func runWorkflowTriggerWatchCycle(dbPath, kind string, background bool) (workflowTriggerWatchResult, error) {
-	store, err := workflow.Open(dbPath)
+	store, err := workflow.Open(resolvePalliumDBPath(dbPath))
 	if err != nil {
 		return workflowTriggerWatchResult{}, err
 	}
@@ -718,7 +718,7 @@ func runWorkflowFleetStatus(out io.Writer, args []string, jsonOutput bool) error
 	if fs.NArg() != 0 {
 		return fmt.Errorf("usage: pallium workflow fleet status [--limit n]")
 	}
-	store, err := workflow.Open(*dbPath)
+	store, err := workflow.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -759,7 +759,7 @@ func runWorkflowAnalytics(out io.Writer, args []string, jsonOutput bool) error {
 	if fs.NArg() != 0 {
 		return fmt.Errorf("usage: pallium workflow analytics [--limit n]")
 	}
-	store, err := workflow.Open(*dbPath)
+	store, err := workflow.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -886,7 +886,7 @@ func runWorkflowGateList(out io.Writer, args []string, jsonOutput bool) error {
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: pallium workflow gate list <run-id>")
 	}
-	store, err := workflow.Open(*dbPath)
+	store, err := workflow.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -994,7 +994,7 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 	if err != nil {
 		return err
 	}
-	store, err := workflow.Open(*dbPath)
+	store, err := workflow.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -1097,7 +1097,7 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 		if err := runConsoleRun(&buf, cmdArgs, true); err != nil {
 			return err
 		}
-		store, err := workflow.Open(*dbPath)
+		store, err := workflow.Open(resolvePalliumDBPath(*dbPath))
 		if err == nil {
 			_ = store.SetRunOwnedID(run.ID, ownedID)
 			_ = store.Close()
@@ -1111,7 +1111,7 @@ func runWorkflowRun(out io.Writer, args []string, jsonOutput bool) error {
 	if err != nil {
 		return err
 	}
-	store, err = workflow.Open(*dbPath)
+	store, err = workflow.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -1325,7 +1325,7 @@ func runWorkflowList(out io.Writer, args []string, jsonOutput bool) error {
 	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "limit": {}}, nil); err != nil {
 		return err
 	}
-	store, err := workflow.Open(*dbPath)
+	store, err := workflow.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -1355,7 +1355,7 @@ func runWorkflowStatus(out io.Writer, args []string, jsonOutput bool) error {
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: pallium workflow status <run-id>")
 	}
-	store, err := workflow.Open(*dbPath)
+	store, err := workflow.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -1379,7 +1379,7 @@ func runWorkflowInspect(out io.Writer, args []string, jsonOutput bool) error {
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: pallium workflow inspect <run-id>")
 	}
-	store, err := workflow.Open(*dbPath)
+	store, err := workflow.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -1403,7 +1403,7 @@ func runWorkflowShow(out io.Writer, args []string, jsonOutput bool) error {
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: pallium workflow show <run-id>")
 	}
-	store, err := workflow.Open(*dbPath)
+	store, err := workflow.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -1426,7 +1426,7 @@ func runWorkflowRead(out io.Writer, args []string, jsonOutput bool) error {
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: pallium workflow read <run-id>")
 	}
-	store, err := workflow.Open(*dbPath)
+	store, err := workflow.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -1472,7 +1472,7 @@ func runWorkflowReport(out io.Writer, args []string, jsonOutput bool) error {
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: pallium workflow report <run-id> [--related]")
 	}
-	store, err := workflow.Open(*dbPath)
+	store, err := workflow.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -1581,7 +1581,7 @@ func runWorkflowWatch(out io.Writer, args []string) error {
 		return fmt.Errorf("usage: pallium workflow watch <run-id>")
 	}
 	for {
-		store, err := workflow.Open(*dbPath)
+		store, err := workflow.Open(resolvePalliumDBPath(*dbPath))
 		if err != nil {
 			return err
 		}
@@ -1618,7 +1618,7 @@ func runWorkflowInterruptStatus(out io.Writer, args []string, jsonOutput bool, c
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: pallium workflow %s <run-id>", commandName)
 	}
-	store, err := workflow.Open(*dbPath)
+	store, err := workflow.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -1644,7 +1644,7 @@ func runWorkflowInterruptStatus(out io.Writer, args []string, jsonOutput bool, c
 	if err := runConsoleInterrupt(&buf, interruptArgs, true); err != nil {
 		return err
 	}
-	store, err = workflow.Open(*dbPath)
+	store, err = workflow.Open(resolvePalliumDBPath(*dbPath))
 	if err == nil {
 		_ = store.SetRunStatus(run.ID, status, run.Result, "interrupted")
 		_ = store.Close()
@@ -1655,7 +1655,7 @@ func runWorkflowInterruptStatus(out io.Writer, args []string, jsonOutput bool, c
 }
 
 func storeWorkflowStatus(dbPath, runID, status, result, errorText string) error {
-	store, err := workflow.Open(dbPath)
+	store, err := workflow.Open(resolvePalliumDBPath(dbPath))
 	if err != nil {
 		return err
 	}
@@ -1682,7 +1682,7 @@ func runWorkflowResume(out io.Writer, args []string, jsonOutput bool) error {
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: pallium workflow resume <run-id>")
 	}
-	store, err := workflow.Open(*dbPath)
+	store, err := workflow.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -1745,7 +1745,7 @@ func runWorkflowSave(out io.Writer, args []string, jsonOutput bool) error {
 	if strings.TrimSpace(*name) == "" {
 		return fmt.Errorf("workflow save requires --name")
 	}
-	store, err := workflow.Open(*dbPath)
+	store, err := workflow.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -1787,7 +1787,7 @@ func runWorkflowApply(out io.Writer, args []string, jsonOutput bool) error {
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: pallium workflow apply <run-id>")
 	}
-	store, err := workflow.Open(*dbPath)
+	store, err := workflow.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -1817,7 +1817,7 @@ func runWorkflowRevert(out io.Writer, args []string, jsonOutput bool) error {
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: pallium workflow revert <run-id>")
 	}
-	store, err := workflow.Open(*dbPath)
+	store, err := workflow.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
@@ -1875,7 +1875,7 @@ func runWorkflowGC(out io.Writer, args []string, jsonOutput bool) error {
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	store, err := workflow.Open(*dbPath)
+	store, err := workflow.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
