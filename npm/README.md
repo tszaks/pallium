@@ -12,7 +12,7 @@ The package installs the matching Pallium release binary from GitHub into
 platform, it falls back to:
 
 ```bash
-go install github.com/tszaks/pallium@v0.9.13
+go install github.com/tszaks/pallium@v0.9.14
 ```
 
 GitHub Packages mirror:
