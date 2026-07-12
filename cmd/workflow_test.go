@@ -1919,3 +1919,90 @@ func TestRenderWorkflowResultSurfacesDroppedItems(t *testing.T) {
 		t.Fatalf("expected dropped item label and reason in run output, got:\n%s", out)
 	}
 }
+
+// 0.9.15 stale run/agent auto-reconcile — see internal/workflow/run_liveness.go
+// for the Store-level tests; these cover the CLI wiring (gc --stale, and the
+// auto-reconcile-on-read behavior of list/status).
+
+func TestWorkflowGCStaleReconcilesDeadOwnerRun(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	store, err := workflow.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// owner_pid stays unclaimed (0) here — the CLI wiring test only needs to
+	// prove `gc --stale` actually invokes ReconcileStaleRuns end to end; the
+	// pid-liveness branch itself is covered directly (with a real killed
+	// process) by internal/workflow's TestReconcileStaleRunsKilledRunBecomesInterrupted,
+	// which has access to the unexported store internals this package does not.
+	old := time.Now().UTC().Add(-1 * time.Hour).Format(time.RFC3339Nano)
+	run, err := store.CreateRun(workflow.Run{Task: "gc stale test", CWD: tmp, ScriptPath: filepath.Join(tmp, "workflow.js"), Status: "running", CreatedAt: old, UpdatedAt: old})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateAgent(workflow.Agent{RunID: run.ID, Prompt: "p", Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{"gc", "--db", dbPath, "--stale", "--stale-after-minutes", "15"}, true); err != nil {
+		t.Fatalf("workflow gc --stale failed: %v", err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatalf("decode gc --stale json: %v\n%s", err, out.String())
+	}
+	reconciled, _ := result["reconciled"].([]any)
+	if len(reconciled) != 1 {
+		t.Fatalf("expected exactly one reconciled run, got %#v", result)
+	}
+
+	store2, err := workflow.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store2.Close()
+	got, err := store2.Run(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "interrupted" {
+		t.Fatalf("expected run reconciled to interrupted, got %q", got.Status)
+	}
+}
+
+func TestWorkflowStatusVerdictIsUnmistakableWhenNotFinished(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	store, err := workflow.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(workflow.Run{Task: "verdict test", CWD: tmp, ScriptPath: filepath.Join(tmp, "workflow.js"), Status: "running"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateAgent(workflow.Agent{RunID: run.ID, Prompt: "p", Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{"status", run.ID, "--db", dbPath}, false); err != nil {
+		t.Fatalf("workflow status failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "VERDICT: NOT FINISHED") {
+		t.Fatalf("expected an unmissable NOT FINISHED verdict line, got:\n%s", out.String())
+	}
+	if !strings.HasPrefix(out.String(), "VERDICT:") {
+		t.Fatalf("expected verdict as the first line so a skim can't miss it, got:\n%s", out.String())
+	}
+}

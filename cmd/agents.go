@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -9,6 +11,7 @@ import (
 
 	"github.com/tszaks/pallium/internal/agentdocs"
 	"github.com/tszaks/pallium/internal/output"
+	"golang.org/x/term"
 )
 
 const (
@@ -103,6 +106,72 @@ func runAgentsInstall(out io.Writer, args []string, jsonOutput bool) error {
 		}
 		return strings.Join(lines, "\n")
 	})
+}
+
+// hasAgentsBlock reports whether dir's AGENTS.md or CLAUDE.md already carries
+// the adoption block — the shared check both maybeOfferAdoptionInstall and
+// the `version` hint use to decide whether there's anything to offer.
+func hasAgentsBlock(dir string) bool {
+	for _, name := range []string{"AGENTS.md", "CLAUDE.md"} {
+		raw, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			continue
+		}
+		if strings.Contains(string(raw), agentsBlockBegin) {
+			return true
+		}
+	}
+	return false
+}
+
+// adoptionHintSuppressed is the one suppression knob both the `start` y/n
+// offer and the `version` one-line hint honor, so a CI runner or a user who
+// has already made a deliberate choice sets it once instead of each surface
+// inventing its own flag.
+func adoptionHintSuppressed() bool {
+	return strings.TrimSpace(os.Getenv("PALLIUM_SKIP_ADOPTION_HINT")) != ""
+}
+
+// shouldPromptAdoptionOffer is maybeOfferAdoptionInstall's decision logic,
+// split out as a pure function so offer/decline/suppress behavior is unit
+// testable without needing a real pty to fake a terminal.
+func shouldPromptAdoptionOffer(jsonOutput, suppressed, hasBlock, isTerminal bool) bool {
+	return !jsonOutput && !suppressed && !hasBlock && isTerminal
+}
+
+// isAffirmativeResponse reports whether a y/n prompt's raw stdin line counts
+// as "yes". Anything other than an explicit y/yes (case-insensitive) — an
+// empty line, "n", garbage — is a decline, matching the prompt's [y/N]
+// default-no framing and the "never silently write" rule: an ambiguous
+// answer must not be read as consent.
+func isAffirmativeResponse(line string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(line)), "y")
+}
+
+// maybeOfferAdoptionInstall runs at the top of `pallium start`. Fix for the
+// exact gap found 2026-07-12: `pallium agents install` existed since PR #14
+// but sat unused on a real machine for 4 days because nothing ever prompted
+// for it — a mechanism nobody runs is the same failure as a mechanism that
+// doesn't exist. Never writes silently: skipped entirely (no prompt, no
+// write) whenever a human isn't actually available to answer — --json mode
+// (a machine caller), non-interactive stdin (script/CI), or the explicit
+// suppression env var — and even when asked, only installs on an explicit
+// "y" (see isAffirmativeResponse).
+func maybeOfferAdoptionInstall(cwd string, jsonOutput bool) {
+	if !shouldPromptAdoptionOffer(jsonOutput, adoptionHintSuppressed(), hasAgentsBlock(cwd), term.IsTerminal(int(os.Stdin.Fd()))) {
+		return
+	}
+	fmt.Fprint(os.Stderr, "Pallium found no adoption block in this repo's AGENTS.md/CLAUDE.md. Add one so future agents here reach for `pallium start`/workflows automatically? [y/N] ")
+	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	if !isAffirmativeResponse(line) {
+		return
+	}
+	var installOut bytes.Buffer
+	if err := runAgentsInstall(&installOut, []string{"--dir", cwd}, false); err != nil {
+		fmt.Fprintf(os.Stderr, "pallium: adoption install failed: %v\n", err)
+		return
+	}
+	fmt.Fprintln(os.Stderr, "Installed:\n"+strings.TrimSpace(installOut.String()))
 }
 
 func installAgentsBlock(path string) (string, error) {

@@ -655,7 +655,15 @@ func TestRelatedRanksRepoAndFileMatches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	now := "2026-06-10T12:00:00Z"
+	// Relative to time.Now(), not a fixed calendar date: recencyScore's own
+	// 30-day cutoff (search.go) means a hardcoded absolute timestamp here
+	// decays past that cutoff as real time passes, dropping "other"'s score
+	// to exactly 0 (it has no repo/file/query match, only recency) and
+	// filtering it out of the results entirely — degenerating this test's
+	// two-result comparison into comparing "target" against itself. Found
+	// 2026-07-12: a fixed 2026-06-10 date was 32 real days old and already
+	// past the cutoff.
+	now := time.Now().UTC().Add(-1 * time.Hour).Format(time.RFC3339)
 	insertSessionForRelatedTest(t, store, "target", "/repo", "Fix auth file", []string{"src/auth.go"}, []string{"go test ./..."}, now)
 	insertSessionForRelatedTest(t, store, "other", "/other", "Unrelated work", []string{"README.md"}, []string{"npm test"}, now)
 	if err := store.Close(); err != nil {

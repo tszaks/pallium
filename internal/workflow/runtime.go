@@ -195,6 +195,9 @@ func (r *Runner) Execute(ctx context.Context, script string, args any) (string, 
 	if err := r.Store.SetRunStatus(r.Run.ID, "running", "", ""); err != nil {
 		return "", err
 	}
+	if err := r.Store.ClaimRunOwnership(r.Run.ID); err != nil {
+		return "", err
+	}
 	return r.executeScript(ctx, script, args, true)
 }
 

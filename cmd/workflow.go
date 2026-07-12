@@ -696,16 +696,17 @@ func runWorkflowFleet(out io.Writer, args []string, jsonOutput bool) error {
 }
 
 type workflowFleetStatus struct {
-	RunsTotal       int              `json:"runs_total"`
-	RunsByStatus    map[string]int   `json:"runs_by_status"`
-	ActiveRuns      []workflow.Run   `json:"active_runs,omitempty"`
-	TriggersTotal   int              `json:"triggers_total"`
-	EnabledTriggers int              `json:"enabled_triggers"`
-	RunningAgents   int              `json:"running_agents"`
-	PausedAgents    int              `json:"paused_agents"`
-	FailedAgents    int              `json:"failed_agents"`
-	UpdatedAt       string           `json:"updated_at"`
-	RecentRuns      []workflowStatus `json:"recent_runs,omitempty"`
+	RunsTotal       int                      `json:"runs_total"`
+	RunsByStatus    map[string]int           `json:"runs_by_status"`
+	ActiveRuns      []workflow.Run           `json:"active_runs,omitempty"`
+	TriggersTotal   int                      `json:"triggers_total"`
+	EnabledTriggers int                      `json:"enabled_triggers"`
+	RunningAgents   int                      `json:"running_agents"`
+	PausedAgents    int                      `json:"paused_agents"`
+	FailedAgents    int                      `json:"failed_agents"`
+	UpdatedAt       string                   `json:"updated_at"`
+	RecentRuns      []workflowStatus         `json:"recent_runs,omitempty"`
+	Reconciled      []workflow.ReconciledRun `json:"reconciled,omitempty"`
 }
 
 func runWorkflowFleetStatus(out io.Writer, args []string, jsonOutput bool) error {
@@ -723,30 +724,33 @@ func runWorkflowFleetStatus(out io.Writer, args []string, jsonOutput bool) error
 		return err
 	}
 	defer store.Close()
+	reconciled := autoReconcileStale(store)
 	status, err := buildWorkflowFleetStatus(store, *limit)
 	if err != nil {
 		return err
 	}
+	status.Reconciled = reconciled
 	return output.Write(out, status, jsonOutput, func() string {
 		return renderWorkflowFleetStatus(status)
 	})
 }
 
 type workflowAnalytics struct {
-	RunsTotal           int            `json:"runs_total"`
-	CompletionRate      float64        `json:"completion_rate"`
-	RunsByStatus        map[string]int `json:"runs_by_status"`
-	AgentsTotal         int            `json:"agents_total"`
-	AgentsByStatus      map[string]int `json:"agents_by_status"`
-	AgentsByProvider    map[string]int `json:"agents_by_provider"`
-	AgentsByMode        map[string]int `json:"agents_by_mode"`
-	PatchesProduced     int            `json:"patches_produced"`
-	EstimatedCostUSD    float64        `json:"estimated_cost_usd"`
-	AverageAgentsPerRun float64        `json:"average_agents_per_run"`
-	TriggersTotal       int            `json:"triggers_total"`
-	EnabledTriggers     int            `json:"enabled_triggers"`
-	MostRecentRunID     string         `json:"most_recent_run_id,omitempty"`
-	UpdatedAt           string         `json:"updated_at"`
+	RunsTotal           int                      `json:"runs_total"`
+	CompletionRate      float64                  `json:"completion_rate"`
+	RunsByStatus        map[string]int           `json:"runs_by_status"`
+	AgentsTotal         int                      `json:"agents_total"`
+	AgentsByStatus      map[string]int           `json:"agents_by_status"`
+	AgentsByProvider    map[string]int           `json:"agents_by_provider"`
+	AgentsByMode        map[string]int           `json:"agents_by_mode"`
+	PatchesProduced     int                      `json:"patches_produced"`
+	EstimatedCostUSD    float64                  `json:"estimated_cost_usd"`
+	AverageAgentsPerRun float64                  `json:"average_agents_per_run"`
+	TriggersTotal       int                      `json:"triggers_total"`
+	EnabledTriggers     int                      `json:"enabled_triggers"`
+	MostRecentRunID     string                   `json:"most_recent_run_id,omitempty"`
+	UpdatedAt           string                   `json:"updated_at"`
+	Reconciled          []workflow.ReconciledRun `json:"reconciled,omitempty"`
 }
 
 func runWorkflowAnalytics(out io.Writer, args []string, jsonOutput bool) error {
@@ -764,10 +768,12 @@ func runWorkflowAnalytics(out io.Writer, args []string, jsonOutput bool) error {
 		return err
 	}
 	defer store.Close()
+	reconciled := autoReconcileStale(store)
 	analytics, err := buildWorkflowAnalytics(store, *limit)
 	if err != nil {
 		return err
 	}
+	analytics.Reconciled = reconciled
 	return output.Write(out, analytics, jsonOutput, func() string {
 		return renderWorkflowAnalytics(analytics)
 	})
@@ -1204,8 +1210,12 @@ func runWorkflowGenerate(out io.Writer, args []string, jsonOutput bool) error {
 			return err
 		}
 	}
-	if validation := workflow.ValidateScript(script); !validation.Valid {
+	validation := workflow.ValidateScript(script)
+	if !validation.Valid {
 		return fmt.Errorf("generated workflow is invalid: %s", validation.Error)
+	}
+	for _, warning := range validation.Warnings {
+		fmt.Fprintln(os.Stderr, "workflow generate warning:", warning)
 	}
 	dest := strings.TrimSpace(*outputPath)
 	if dest != "" && !filepath.IsAbs(dest) {
@@ -1311,11 +1321,29 @@ func runWorkflowValidate(out io.Writer, args []string, jsonOutput bool) error {
 		return fmt.Errorf("workflow script is invalid: %s", result.Error)
 	}
 	return output.Write(out, result, jsonOutput, func() string {
-		if result.Valid {
-			return "Workflow script valid: " + *scriptPath
+		if !result.Valid {
+			return "Workflow script invalid: " + result.Error
 		}
-		return "Workflow script invalid: " + result.Error
+		lines := []string{"Workflow script valid: " + *scriptPath}
+		for _, warning := range result.Warnings {
+			lines = append(lines, "Warning: "+warning)
+		}
+		return strings.Join(lines, "\n")
 	})
+}
+
+// autoReconcileStale flips any dead-owner "running" run/agent to "interrupted"
+// before the caller reads state to display it — safe and cheap to call on
+// every list/status/inspect/fleet/analytics invocation (see
+// run_liveness.go). Best-effort: a reconcile failure is logged, not fatal —
+// a stale-registry bug must never take down `workflow list` itself.
+func autoReconcileStale(store *workflow.Store) []workflow.ReconciledRun {
+	reconciled, err := store.ReconcileStaleRuns(workflow.StaleAfterString(0))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "workflow: stale-run reconcile failed: %v\n", err)
+		return nil
+	}
+	return reconciled
 }
 
 func runWorkflowList(out io.Writer, args []string, jsonOutput bool) error {
@@ -1330,15 +1358,21 @@ func runWorkflowList(out io.Writer, args []string, jsonOutput bool) error {
 		return err
 	}
 	defer store.Close()
+	reconciled := autoReconcileStale(store)
 	runs, err := store.ListRuns(*limit)
 	if err != nil {
 		return err
 	}
 	return output.Write(out, runs, jsonOutput, func() string {
-		if len(runs) == 0 {
-			return "No workflow runs found."
+		var lines []string
+		if len(reconciled) > 0 {
+			lines = append(lines, fmt.Sprintf("Reconciled %d stale run(s) to interrupted just now.", len(reconciled)))
 		}
-		lines := []string{"Workflow runs:"}
+		if len(runs) == 0 {
+			lines = append(lines, "No workflow runs found.")
+			return strings.Join(lines, "\n")
+		}
+		lines = append(lines, "Workflow runs:")
 		for _, run := range runs {
 			lines = append(lines, fmt.Sprintf("- %s %s %s", run.ID, run.Status, run.Task))
 		}
@@ -1360,6 +1394,7 @@ func runWorkflowStatus(out io.Writer, args []string, jsonOutput bool) error {
 		return err
 	}
 	defer store.Close()
+	autoReconcileStale(store)
 	snapshot, err := store.Snapshot(fs.Arg(0))
 	if err != nil {
 		return err
@@ -1384,6 +1419,7 @@ func runWorkflowInspect(out io.Writer, args []string, jsonOutput bool) error {
 		return err
 	}
 	defer store.Close()
+	autoReconcileStale(store)
 	snapshot, err := store.Snapshot(fs.Arg(0))
 	if err != nil {
 		return err
@@ -1845,10 +1881,11 @@ type workflowGCRun struct {
 }
 
 type workflowGCResult struct {
-	Removed    []workflowGCRun `json:"removed"`
-	Count      int             `json:"count"`
-	BytesFreed int64           `json:"bytes_freed"`
-	DryRun     bool            `json:"dry_run,omitempty"`
+	Removed    []workflowGCRun          `json:"removed"`
+	Count      int                      `json:"count"`
+	BytesFreed int64                    `json:"bytes_freed"`
+	DryRun     bool                     `json:"dry_run,omitempty"`
+	Reconciled []workflow.ReconciledRun `json:"reconciled,omitempty"`
 }
 
 // runWorkflowGC removes artifact directories (~/.pallium/workflow-runs/<id>)
@@ -1861,11 +1898,13 @@ func runWorkflowGC(out io.Writer, args []string, jsonOutput bool) error {
 	olderThan := fs.Int("older-than", 7, "")
 	includeFailed := fs.Bool("include-failed", false, "")
 	dryRun := fs.Bool("dry-run", false, "")
-	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "older-than": {}}, map[string]struct{}{"dry-run": {}, "include-failed": {}}); err != nil {
+	stale := fs.Bool("stale", false, "")
+	staleAfterMinutes := fs.Int("stale-after-minutes", workflow.DefaultStaleRunAfterMinutes, "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "older-than": {}, "stale-after-minutes": {}}, map[string]struct{}{"dry-run": {}, "include-failed": {}, "stale": {}}); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 || *olderThan < 0 {
-		return fmt.Errorf("usage: pallium workflow gc [--older-than days] [--include-failed] [--dry-run] [--json]")
+		return fmt.Errorf("usage: pallium workflow gc [--older-than days] [--include-failed] [--dry-run] [--stale] [--stale-after-minutes n] [--json]")
 	}
 	root, err := workflow.RunsRootDir()
 	if err != nil {
@@ -1880,8 +1919,18 @@ func runWorkflowGC(out io.Writer, args []string, jsonOutput bool) error {
 		return err
 	}
 	defer store.Close()
-	cutoff := time.Now().UTC().Add(-time.Duration(*olderThan) * 24 * time.Hour)
 	result := workflowGCResult{Removed: []workflowGCRun{}, DryRun: *dryRun}
+	// Reconcile runs regardless of --dry-run: flipping a dead run's status to
+	// "interrupted" is a metadata correction, not a destructive removal — the
+	// --dry-run contract is about directory deletion below, not this.
+	if *stale {
+		reconciled, err := store.ReconcileStaleRuns(workflow.StaleAfterString(*staleAfterMinutes))
+		if err != nil {
+			return err
+		}
+		result.Reconciled = reconciled
+	}
+	cutoff := time.Now().UTC().Add(-time.Duration(*olderThan) * 24 * time.Hour)
 	repos := map[string]struct{}{}
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -1954,14 +2003,26 @@ func workflowRunDirSize(path string) int64 {
 }
 
 func renderWorkflowGC(result workflowGCResult) string {
+	var lines []string
+	if len(result.Reconciled) > 0 {
+		totalAgents := 0
+		for _, r := range result.Reconciled {
+			totalAgents += r.AgentsReconciled
+		}
+		lines = append(lines, fmt.Sprintf("Reconciled %d stale run(s), %d agent(s):", len(result.Reconciled), totalAgents))
+		for _, r := range result.Reconciled {
+			lines = append(lines, fmt.Sprintf("- %s -> interrupted (%d agents)", r.RunID, r.AgentsReconciled))
+		}
+	}
 	verb := "removed"
 	if result.DryRun {
 		verb = "would remove"
 	}
 	if result.Count == 0 {
-		return fmt.Sprintf("Workflow gc %s no run directories.", verb)
+		lines = append(lines, fmt.Sprintf("Workflow gc %s no run directories.", verb))
+		return strings.Join(lines, "\n")
 	}
-	lines := []string{fmt.Sprintf("Workflow gc %s %d run directories (%d bytes freed):", verb, result.Count, result.BytesFreed)}
+	lines = append(lines, fmt.Sprintf("Workflow gc %s %d run directories (%d bytes freed):", verb, result.Count, result.BytesFreed))
 	for _, run := range result.Removed {
 		lines = append(lines, fmt.Sprintf("- %s (%d bytes) %s", run.ID, run.Bytes, run.Path))
 	}
@@ -1989,21 +2050,25 @@ func isWorkflowTerminalOrPaused(status string) bool {
 }
 
 type workflowStatus struct {
-	ID              string `json:"id"`
-	Task            string `json:"task"`
-	Status          string `json:"status"`
-	PhasesTotal     int    `json:"phases_total"`
-	PhasesCompleted int    `json:"phases_completed"`
-	AgentsTotal     int    `json:"agents_total"`
-	AgentsRunning   int    `json:"agents_running"`
-	AgentsCompleted int    `json:"agents_completed"`
-	AgentsFailed    int    `json:"agents_failed"`
-	AgentsStopped   int    `json:"agents_stopped"`
-	AgentsPaused    int    `json:"agents_paused"`
-	ScriptChanged   bool   `json:"script_changed,omitempty"`
-	UpdatedAt       string `json:"updated_at"`
-	CompletedAt     string `json:"completed_at,omitempty"`
-	Error           string `json:"error,omitempty"`
+	ID     string `json:"id"`
+	Task   string `json:"task"`
+	Status string `json:"status"`
+	// Verdict is the same blunt not-done-vs-done line as workflow.Report.Verdict
+	// (see report.go) — status/inspect need it just as much as report does.
+	Verdict           string `json:"verdict"`
+	PhasesTotal       int    `json:"phases_total"`
+	PhasesCompleted   int    `json:"phases_completed"`
+	AgentsTotal       int    `json:"agents_total"`
+	AgentsRunning     int    `json:"agents_running"`
+	AgentsCompleted   int    `json:"agents_completed"`
+	AgentsFailed      int    `json:"agents_failed"`
+	AgentsStopped     int    `json:"agents_stopped"`
+	AgentsPaused      int    `json:"agents_paused"`
+	AgentsInterrupted int    `json:"agents_interrupted"`
+	ScriptChanged     bool   `json:"script_changed,omitempty"`
+	UpdatedAt         string `json:"updated_at"`
+	CompletedAt       string `json:"completed_at,omitempty"`
+	Error             string `json:"error,omitempty"`
 }
 
 type workflowInspectionReport struct {
@@ -2019,11 +2084,12 @@ type workflowInspectionReport struct {
 }
 
 type phaseStats struct {
-	AgentsCompleted int `json:"agents_completed"`
-	AgentsRunning   int `json:"agents_running"`
-	AgentsFailed    int `json:"agents_failed"`
-	AgentsStopped   int `json:"agents_stopped"`
-	AgentsPaused    int `json:"agents_paused"`
+	AgentsCompleted   int `json:"agents_completed"`
+	AgentsRunning     int `json:"agents_running"`
+	AgentsFailed      int `json:"agents_failed"`
+	AgentsStopped     int `json:"agents_stopped"`
+	AgentsPaused      int `json:"agents_paused"`
+	AgentsInterrupted int `json:"agents_interrupted"`
 }
 
 func workflowStatusSummary(snapshot workflow.Snapshot) workflowStatus {
@@ -2055,8 +2121,11 @@ func workflowStatusSummary(snapshot workflow.Snapshot) workflowStatus {
 			status.AgentsStopped++
 		case "paused":
 			status.AgentsPaused++
+		case "interrupted":
+			status.AgentsInterrupted++
 		}
 	}
+	status.Verdict = workflow.Verdict(status.Status, status.AgentsCompleted, status.AgentsTotal)
 	return status
 }
 
@@ -2089,6 +2158,8 @@ func workflowInspection(snapshot workflow.Snapshot) workflowInspectionReport {
 			stats.AgentsStopped++
 		case "paused":
 			stats.AgentsPaused++
+		case "interrupted":
+			stats.AgentsInterrupted++
 		}
 		report.ByPhase[agent.Phase] = stats
 	}
@@ -2097,10 +2168,11 @@ func workflowInspection(snapshot workflow.Snapshot) workflowInspectionReport {
 
 func renderWorkflowStatus(status workflowStatus) string {
 	lines := []string{
+		status.Verdict,
 		fmt.Sprintf("Workflow %s: %s", status.ID, status.Status),
 		"Task: " + status.Task,
 		fmt.Sprintf("Phases: %d/%d completed", status.PhasesCompleted, status.PhasesTotal),
-		fmt.Sprintf("Agents: %d completed, %d running, %d failed, %d paused, %d stopped, %d total", status.AgentsCompleted, status.AgentsRunning, status.AgentsFailed, status.AgentsPaused, status.AgentsStopped, status.AgentsTotal),
+		fmt.Sprintf("Agents: %d completed, %d running, %d failed, %d paused, %d stopped, %d interrupted, %d total", status.AgentsCompleted, status.AgentsRunning, status.AgentsFailed, status.AgentsPaused, status.AgentsStopped, status.AgentsInterrupted, status.AgentsTotal),
 		"Updated: " + status.UpdatedAt,
 	}
 	if status.ScriptChanged {
@@ -2124,7 +2196,7 @@ func renderWorkflowInspection(report workflowInspectionReport) string {
 		lines = append(lines, "Phase stats:")
 		for _, phase := range report.Phases {
 			stats := report.ByPhase[phase.Name]
-			lines = append(lines, fmt.Sprintf("- %s: %d completed, %d running, %d failed, %d paused, %d stopped", phase.Name, stats.AgentsCompleted, stats.AgentsRunning, stats.AgentsFailed, stats.AgentsPaused, stats.AgentsStopped))
+			lines = append(lines, fmt.Sprintf("- %s: %d completed, %d running, %d failed, %d paused, %d stopped, %d interrupted", phase.Name, stats.AgentsCompleted, stats.AgentsRunning, stats.AgentsFailed, stats.AgentsPaused, stats.AgentsStopped, stats.AgentsInterrupted))
 		}
 	}
 	if len(report.Patches) > 0 {
@@ -2267,16 +2339,32 @@ func renderWorkflowTriggerWatchResult(result workflowTriggerWatchResult) string 
 	return strings.Join(lines, "\n")
 }
 
+func renderReconciled(reconciled []workflow.ReconciledRun) []string {
+	if len(reconciled) == 0 {
+		return nil
+	}
+	totalAgents := 0
+	for _, r := range reconciled {
+		totalAgents += r.AgentsReconciled
+	}
+	lines := []string{fmt.Sprintf("Reconciled %d stale run(s), %d agent(s) to interrupted just now:", len(reconciled), totalAgents)}
+	for _, r := range reconciled {
+		lines = append(lines, fmt.Sprintf("- %s (%d agents)", r.RunID, r.AgentsReconciled))
+	}
+	return lines
+}
+
 func renderWorkflowFleetStatus(status workflowFleetStatus) string {
-	lines := []string{
+	lines := renderReconciled(status.Reconciled)
+	lines = append(lines,
 		"Workflow fleet status",
 		fmt.Sprintf("Runs: %d", status.RunsTotal),
 		fmt.Sprintf("Triggers: %d enabled / %d total", status.EnabledTriggers, status.TriggersTotal),
 		fmt.Sprintf("Agents: %d running, %d paused, %d failed", status.RunningAgents, status.PausedAgents, status.FailedAgents),
-	}
+	)
 	if len(status.RunsByStatus) > 0 {
 		lines = append(lines, "Runs by status:")
-		for _, key := range []string{"queued", "running", "paused", "completed", "completed_with_failures", "failed", "stopped"} {
+		for _, key := range []string{"queued", "running", "paused", "completed", "completed_with_failures", "failed", "stopped", "interrupted"} {
 			if count := status.RunsByStatus[key]; count > 0 {
 				lines = append(lines, fmt.Sprintf("- %s: %d", key, count))
 			}
@@ -2292,15 +2380,16 @@ func renderWorkflowFleetStatus(status workflowFleetStatus) string {
 }
 
 func renderWorkflowAnalytics(analytics workflowAnalytics) string {
-	lines := []string{
+	lines := renderReconciled(analytics.Reconciled)
+	lines = append(lines,
 		"Workflow analytics",
 		fmt.Sprintf("Runs: %d completion=%.1f%%", analytics.RunsTotal, analytics.CompletionRate*100),
 		fmt.Sprintf("Agents: %d avg/run=%.2f patches=%d estimated_cost=$%.4f", analytics.AgentsTotal, analytics.AverageAgentsPerRun, analytics.PatchesProduced, analytics.EstimatedCostUSD),
 		fmt.Sprintf("Triggers: %d enabled / %d total", analytics.EnabledTriggers, analytics.TriggersTotal),
-	}
+	)
 	if len(analytics.RunsByStatus) > 0 {
 		lines = append(lines, "Runs by status:")
-		for _, key := range []string{"queued", "running", "paused", "completed", "completed_with_failures", "failed", "stopped"} {
+		for _, key := range []string{"queued", "running", "paused", "completed", "completed_with_failures", "failed", "stopped", "interrupted"} {
 			if count := analytics.RunsByStatus[key]; count > 0 {
 				lines = append(lines, fmt.Sprintf("- %s: %d", key, count))
 			}
@@ -2338,6 +2427,7 @@ func renderWorkflowPack(pack workflow.PackInfo) string {
 
 func renderWorkflowReport(report workflow.Report) string {
 	lines := []string{
+		report.Verdict,
 		fmt.Sprintf("Workflow report %s: %s", report.ID, report.Status),
 		"Task: " + report.Task,
 		"Summary: " + report.Summary,
@@ -2527,7 +2617,7 @@ Usage:
   pallium workflow save <run-id> --name name [--user] [--json]
   pallium workflow apply <run-id> [--json]
   pallium workflow revert <run-id> [--json]
-  pallium workflow gc [--older-than days] [--include-failed] [--dry-run] [--json]`)
+  pallium workflow gc [--older-than days] [--include-failed] [--dry-run] [--stale] [--stale-after-minutes n] [--json]`)
 }
 
 func latestWorkflowRun(store *workflow.Store) (workflow.Run, error) {
