@@ -50,7 +50,19 @@ type Run struct {
 	// loop_store.go) — empty for every ordinary workflow run. A loop never
 	// reuses one run across ticks; this column is how `loop status`
 	// aggregates a loop's tick history without loops owning workflow_runs.
-	LoopName    string `json:"loop_name,omitempty"`
+	LoopName string `json:"loop_name,omitempty"`
+	// OwnerPID is the OS pid of the `pallium workflow run` process currently
+	// executing this run, recorded once at start via ClaimRunOwnership. Zero
+	// means unclaimed (a pre-0.9.15 row, or a run that never got past
+	// CreateRun) — see run_liveness.go for how reconcile treats that case.
+	OwnerPID int `json:"owner_pid,omitempty"`
+	// HeartbeatAt is refreshed alongside ClaimRunOwnership and on every agent
+	// completion (see FinishAgentStatus). It is the fallback staleness signal
+	// for an unclaimed row (OwnerPID==0); a claimed row's liveness is decided
+	// by whether OwnerPID is still an actual live process, not by how old
+	// this timestamp is (a single long-running agent call can legitimately
+	// leave it stale while the owning process is very much alive).
+	HeartbeatAt string `json:"heartbeat_at,omitempty"`
 	CreatedAt   string `json:"created_at"`
 	UpdatedAt   string `json:"updated_at"`
 	CompletedAt string `json:"completed_at,omitempty"`
@@ -280,6 +292,13 @@ CREATE TABLE IF NOT EXISTS workflow_repo_locks (
 		// spawns a fresh child run through the SAME front door `workflow run`
 		// uses, and `loop status` aggregates by querying this column.
 		"ALTER TABLE workflow_runs ADD COLUMN loop_name TEXT",
+		// owner_pid/heartbeat_at back the stale run/agent auto-reconcile
+		// (run_liveness.go): a running row with no live process behind it
+		// (owner_pid recorded but not alive) or no recent heartbeat (never
+		// claimed at all) gets flipped to "interrupted" on the next
+		// list/status/inspect/fleet/gc call instead of looking busy forever.
+		"ALTER TABLE workflow_runs ADD COLUMN owner_pid INTEGER DEFAULT 0",
+		"ALTER TABLE workflow_runs ADD COLUMN heartbeat_at TEXT",
 	} {
 		if _, alterErr := s.db.Exec(stmt); alterErr != nil && !strings.Contains(alterErr.Error(), "duplicate column name") {
 			return alterErr
@@ -420,7 +439,7 @@ func (s *Store) SetRunOwnedID(id, ownedID string) error {
 	return err
 }
 
-const runSelectColumns = `id,task,cwd,script_path,COALESCE(args_json,''),COALESCE(owned_session_id,''),COALESCE(max_agents,0),COALESCE(max_budget_usd,''),COALESCE(agent_timeout_seconds,0),COALESCE(agent_timeout_explicit,0),COALESCE(allow_network,0),status,COALESCE(result,''),COALESCE(error,''),COALESCE(failures,''),COALESCE(script_hash,''),COALESCE(script_changed,0),COALESCE(loop_name,''),created_at,updated_at,COALESCE(completed_at,'')`
+const runSelectColumns = `id,task,cwd,script_path,COALESCE(args_json,''),COALESCE(owned_session_id,''),COALESCE(max_agents,0),COALESCE(max_budget_usd,''),COALESCE(agent_timeout_seconds,0),COALESCE(agent_timeout_explicit,0),COALESCE(allow_network,0),status,COALESCE(result,''),COALESCE(error,''),COALESCE(failures,''),COALESCE(script_hash,''),COALESCE(script_changed,0),COALESCE(loop_name,''),COALESCE(owner_pid,0),COALESCE(heartbeat_at,''),created_at,updated_at,COALESCE(completed_at,'')`
 
 func scanRun(row interface{ Scan(dest ...any) error }) (Run, error) {
 	var run Run
@@ -428,7 +447,7 @@ func scanRun(row interface{ Scan(dest ...any) error }) (Run, error) {
 	var scriptChanged int
 	var agentTimeoutExplicit int
 	var allowNetwork int
-	if err := row.Scan(&run.ID, &run.Task, &run.CWD, &run.ScriptPath, &run.ArgsJSON, &run.OwnedID, &run.MaxAgents, &run.MaxBudgetUSD, &run.AgentTimeout, &agentTimeoutExplicit, &allowNetwork, &run.Status, &run.Result, &run.Error, &failuresJSON, &run.ScriptHash, &scriptChanged, &run.LoopName, &run.CreatedAt, &run.UpdatedAt, &run.CompletedAt); err != nil {
+	if err := row.Scan(&run.ID, &run.Task, &run.CWD, &run.ScriptPath, &run.ArgsJSON, &run.OwnedID, &run.MaxAgents, &run.MaxBudgetUSD, &run.AgentTimeout, &agentTimeoutExplicit, &allowNetwork, &run.Status, &run.Result, &run.Error, &failuresJSON, &run.ScriptHash, &scriptChanged, &run.LoopName, &run.OwnerPID, &run.HeartbeatAt, &run.CreatedAt, &run.UpdatedAt, &run.CompletedAt); err != nil {
 		return Run{}, err
 	}
 	run.AgentTimeoutExplicit = agentTimeoutExplicit != 0
@@ -624,9 +643,18 @@ func (s *Store) FinishAgent(agent Agent, outputText, errorText string) error {
 }
 
 func (s *Store) FinishAgentStatus(agent Agent, status, outputText, errorText string) error {
+	now := nowString()
 	_, err := s.db.Exec(`UPDATE workflow_agents SET status=?,output=?,error=?,patch_path=?,worktree=?,estimated_cost_usd=?,usage_json=?,updated_at=?,completed_at=? WHERE id=?`,
-		status, outputText, errorText, agent.PatchPath, agent.Worktree, agent.EstimatedCostUSD, agent.UsageJSON, nowString(), nowString(), agent.ID)
-	return err
+		status, outputText, errorText, agent.PatchPath, agent.Worktree, agent.EstimatedCostUSD, agent.UsageJSON, now, now, agent.ID)
+	if err != nil {
+		return err
+	}
+	// Best-effort heartbeat refresh: every agent completion is proof the
+	// owning run is still making real progress, not just technically alive.
+	// Advisory only (see run_liveness.go) — a failure here never fails the
+	// agent's own completion.
+	_, _ = s.db.Exec(`UPDATE workflow_runs SET heartbeat_at=? WHERE id=? AND status='running'`, now, agent.RunID)
+	return nil
 }
 
 func (s *Store) CompletedAgent(runID string, callIndex int, phase, label, prompt, provider, repo, mode, isolation, model, schemaHash, argsHash string, networked bool) (Agent, bool, error) {
