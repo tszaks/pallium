@@ -126,3 +126,131 @@ func TestAgentsInstallIsIdempotent(t *testing.T) {
 		t.Fatalf("install is not idempotent:\nfirst:  %q\nsecond: %q", string(first), string(second))
 	}
 }
+
+// 0.9.15: the adoption trigger installs itself — see agents.go's
+// maybeOfferAdoptionInstall / version.go's adoptionHintLine. shouldPromptAdoptionOffer
+// and isAffirmativeResponse are pulled out of the actual I/O so offer/decline/
+// suppress logic is testable without faking a real pty.
+
+func TestShouldPromptAdoptionOfferOnlyWhenAllConditionsAllow(t *testing.T) {
+	cases := []struct {
+		name                                               string
+		jsonOutput, suppressed, hasBlock, isTerminal, want bool
+	}{
+		{"offers when interactive and missing", false, false, false, true, true},
+		{"suppressed by json mode (machine caller)", true, false, false, true, false},
+		{"suppressed by env var", false, true, false, true, false},
+		{"suppressed because block already exists", false, false, true, true, false},
+		{"suppressed by non-interactive stdin (CI/script)", false, false, false, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := shouldPromptAdoptionOffer(tc.jsonOutput, tc.suppressed, tc.hasBlock, tc.isTerminal)
+			if got != tc.want {
+				t.Fatalf("shouldPromptAdoptionOffer(%v,%v,%v,%v) = %v, want %v", tc.jsonOutput, tc.suppressed, tc.hasBlock, tc.isTerminal, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsAffirmativeResponse(t *testing.T) {
+	yes := []string{"y\n", "Y\n", "yes\n", "  y  \n", "Yes please\n"}
+	for _, line := range yes {
+		if !isAffirmativeResponse(line) {
+			t.Fatalf("expected %q to be affirmative", line)
+		}
+	}
+	no := []string{"n\n", "no\n", "\n", "", "   \n", "nah\n"}
+	for _, line := range no {
+		if isAffirmativeResponse(line) {
+			t.Fatalf("expected %q to be a decline, not affirmative — an ambiguous or empty answer must never read as consent", line)
+		}
+	}
+}
+
+func TestHasAgentsBlockDetectsEitherFile(t *testing.T) {
+	dir := t.TempDir()
+	if hasAgentsBlock(dir) {
+		t.Fatal("expected no block detected in an empty dir")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "CLAUDE.md"), []byte(agentsBlock+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !hasAgentsBlock(dir) {
+		t.Fatal("expected block detected once CLAUDE.md carries it")
+	}
+}
+
+func TestAdoptionHintSuppressedHonorsEnvVar(t *testing.T) {
+	if adoptionHintSuppressed() {
+		t.Fatal("expected not suppressed with env var unset")
+	}
+	t.Setenv("PALLIUM_SKIP_ADOPTION_HINT", "1")
+	if !adoptionHintSuppressed() {
+		t.Fatal("expected suppressed once PALLIUM_SKIP_ADOPTION_HINT is set")
+	}
+}
+
+func TestVersionPrintsAdoptionHintWhenBlockMissing(t *testing.T) {
+	dir := t.TempDir()
+	orig, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(orig) })
+
+	var out bytes.Buffer
+	if err := runVersion(&out, false); err != nil {
+		t.Fatalf("version failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "pallium agents install") {
+		t.Fatalf("expected adoption hint in version output, got %q", out.String())
+	}
+}
+
+func TestVersionSuppressesAdoptionHintWhenEnvSet(t *testing.T) {
+	dir := t.TempDir()
+	orig, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(orig) })
+	t.Setenv("PALLIUM_SKIP_ADOPTION_HINT", "1")
+
+	var out bytes.Buffer
+	if err := runVersion(&out, false); err != nil {
+		t.Fatalf("version failed: %v", err)
+	}
+	if strings.Contains(out.String(), "pallium agents install") {
+		t.Fatalf("expected adoption hint suppressed, got %q", out.String())
+	}
+}
+
+func TestVersionOmitsAdoptionHintWhenBlockAlreadyPresent(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte(agentsBlock+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	orig, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(orig) })
+
+	var out bytes.Buffer
+	if err := runVersion(&out, false); err != nil {
+		t.Fatalf("version failed: %v", err)
+	}
+	if strings.Contains(out.String(), "pallium agents install") {
+		t.Fatalf("expected no adoption hint once the block already exists, got %q", out.String())
+	}
+}

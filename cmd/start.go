@@ -50,6 +50,7 @@ func runStart(out io.Writer, args []string, jsonOutput bool) error {
 	if err != nil {
 		return err
 	}
+	maybeOfferAdoptionInstall(absCWD, jsonOutput)
 
 	script := ""
 	source := ""

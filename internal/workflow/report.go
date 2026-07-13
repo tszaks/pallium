@@ -7,9 +7,16 @@ import (
 )
 
 type Report struct {
-	ID        string        `json:"id"`
-	Task      string        `json:"task"`
-	Status    string        `json:"status"`
+	ID     string `json:"id"`
+	Task   string `json:"task"`
+	Status string `json:"status"`
+	// Verdict is a blunt, unmissable one-liner ("VERDICT: NOT FINISHED — ...")
+	// stating whether the run actually finished and how many agents actually
+	// completed. Exists because a skimming reader (human or model) can
+	// mistake a mid-run status poll for a done run if all it reads is
+	// "0 agents completed" scrolling by without a plain verdict up top — see
+	// Verdict's doc comment for the incident that motivated this.
+	Verdict   string        `json:"verdict"`
 	OwnedID   string        `json:"owned_session_id,omitempty"`
 	Summary   string        `json:"summary"`
 	Findings  []string      `json:"findings,omitempty"`
@@ -19,6 +26,32 @@ type Report struct {
 	Agents    []AgentReport `json:"agents"`
 	Failures  []RunFailure  `json:"failures,omitempty"`
 	Error     string        `json:"error,omitempty"`
+}
+
+// finishedRunStatuses are terminal states where the run is genuinely done
+// executing, successfully or not — as opposed to running/queued/paused/
+// interrupted, where more work either is happening or was cut short.
+var finishedRunStatuses = map[string]bool{
+	"completed":               true,
+	"completed_with_failures": true,
+	"failed":                  true,
+	"stopped":                 true,
+}
+
+// Verdict renders the blunt one-line summary described on Report.Verdict.
+// Motivating incident (2026-07-12): an outside audit of Pallium polled a
+// run's status, saw "no agents completed yet" repeatedly, then declared its
+// verification "clean" anyway — nothing in the output forced a skim-resistant
+// "this is NOT done" read. This line is that forcing function.
+func Verdict(status string, agentsCompleted, agentsTotal int) string {
+	if finishedRunStatuses[status] {
+		word := "FINISHED"
+		if status != "completed" {
+			word = "FINISHED (" + status + ")"
+		}
+		return fmt.Sprintf("VERDICT: %s — %d/%d agents complete", word, agentsCompleted, agentsTotal)
+	}
+	return fmt.Sprintf("VERDICT: NOT FINISHED (%s) — %d/%d agents complete", status, agentsCompleted, agentsTotal)
 }
 
 type AgentReport struct {
@@ -44,6 +77,13 @@ func BuildReport(snapshot Snapshot) Report {
 		Error:    snapshot.Run.Error,
 		Summary:  defaultReportSummary(snapshot),
 	}
+	agentsCompleted := 0
+	for _, agent := range snapshot.Agents {
+		if agent.Status == "completed" {
+			agentsCompleted++
+		}
+	}
+	report.Verdict = Verdict(snapshot.Run.Status, agentsCompleted, len(snapshot.Agents))
 	for _, agent := range snapshot.Agents {
 		if agent.PatchPath != "" {
 			report.Patches = appendUnique(report.Patches, agent.PatchPath)
