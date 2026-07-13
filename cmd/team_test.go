@@ -280,3 +280,70 @@ func TestTeamMemberSteerDeliversDirective(t *testing.T) {
 		t.Fatalf("expected a distinctly-framed steering message delivered to worker-1, got %+v", msg)
 	}
 }
+
+// TestTeamStartWithTemplateSpawnsAllMembers is the round-trip test for M3's
+// team templates: `team start --template` must actually spawn every
+// templated member as a real, listable team member, not just describe them.
+func TestTeamStartWithTemplateSpawnsAllMembers(t *testing.T) {
+	dbPath := newTeamCmdTestDB(t)
+	var out bytes.Buffer
+	if err := runTeam(&out, []string{"start", "review the diff", "--template", "parallel-review", "--db", dbPath, "--cwd", t.TempDir()}, true); err != nil {
+		t.Fatal(err)
+	}
+	var started struct {
+		workflow.Team
+		TemplateMembers []workflow.TeamMember `json:"template_members"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &started); err != nil {
+		t.Fatal(err)
+	}
+	tmpl, ok := workflow.TeamTemplate("parallel-review")
+	if !ok {
+		t.Fatal("expected the parallel-review template to exist")
+	}
+	if len(started.TemplateMembers) != len(tmpl.Members) {
+		t.Fatalf("expected %d template members spawned, got %d: %+v", len(tmpl.Members), len(started.TemplateMembers), started.TemplateMembers)
+	}
+	for i, want := range tmpl.Members {
+		got := started.TemplateMembers[i]
+		if got.Name != want.Name || got.Mode != want.Mode {
+			t.Fatalf("template member %d: expected name=%s mode=%s, got %+v", i, want.Name, want.Mode, got)
+		}
+	}
+
+	out.Reset()
+	if err := runTeam(&out, []string{"status", started.ID, "--db", dbPath}, true); err != nil {
+		t.Fatal(err)
+	}
+	var status struct {
+		Members []workflow.TeamMember `json:"members"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Members) != len(tmpl.Members) {
+		t.Fatalf("expected the template's members to be real, listable team members; got %d via team status", len(status.Members))
+	}
+}
+
+func TestTeamStartWithUnknownTemplateErrors(t *testing.T) {
+	dbPath := newTeamCmdTestDB(t)
+	var out bytes.Buffer
+	err := runTeam(&out, []string{"start", "goal", "--template", "does-not-exist", "--db", dbPath, "--cwd", t.TempDir()}, false)
+	if err == nil {
+		t.Fatal("expected an unknown template name to be rejected")
+	}
+	if !strings.Contains(err.Error(), "does-not-exist") {
+		t.Fatalf("expected the error to name the bad template, got %v", err)
+	}
+}
+
+func TestTeamTemplateShowRendersMembers(t *testing.T) {
+	var out bytes.Buffer
+	if err := runTeam(&out, []string{"template", "show", "adversarial-debate"}, false); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "advocate") || !strings.Contains(out.String(), "skeptic") {
+		t.Fatalf("expected the rendered template to name its members, got %q", out.String())
+	}
+}
