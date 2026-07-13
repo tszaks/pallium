@@ -830,7 +830,15 @@ func (r *Runner) jsTeam(ctx context.Context, vm *goja.Runtime) map[string]any {
 				if len(rawOpts) > 0 {
 					decodeOpts(rawOpts[0], &opts)
 				}
-				task, err := teamRunner().CreateTeamTaskWithGate(ctx, r.Store, teamID, title, opts.Description, opts.DependsOn)
+				// contextWithStoredStop, same as team.wait above and for
+				// the identical reason: without it, `pallium workflow
+				// stop`/`pause` updated the run's status in the store but
+				// an in-flight task_created gate verifier call from this
+				// primitive kept running (and spending) regardless. Found
+				// by review.
+				gateCtx, stopWatching := r.contextWithStoredStop(ctx)
+				defer stopWatching()
+				task, err := teamRunner().CreateTeamTaskWithGate(gateCtx, r.Store, teamID, title, opts.Description, opts.DependsOn)
 				if err != nil {
 					panic(vm.ToValue(err.Error()))
 				}
@@ -851,7 +859,11 @@ func (r *Runner) jsTeam(ctx context.Context, vm *goja.Runtime) map[string]any {
 				return vm.ToValue(task)
 			},
 			"complete": func(teamID, taskID, as string, result ...string) goja.Value {
-				task, approved, err := teamRunner().CompleteTaskWithGate(ctx, r.Store, teamID, taskID, as, strings.Join(result, ""))
+				// contextWithStoredStop — see team.tasks.create above for
+				// why. Found by review.
+				gateCtx, stopWatching := r.contextWithStoredStop(ctx)
+				defer stopWatching()
+				task, approved, err := teamRunner().CompleteTaskWithGate(gateCtx, r.Store, teamID, taskID, as, strings.Join(result, ""))
 				if err != nil {
 					panic(vm.ToValue(err.Error()))
 				}

@@ -495,4 +495,16 @@ func TestSetTeamGateRoundTripAndRejectsUnknownHook(t *testing.T) {
 	if err := store.SetTeamGate(team.ID, "prompt", []string{"not-a-real-hook"}); err == nil {
 		t.Fatal("expected an unknown hook name to be rejected")
 	}
+	// Regression test for the review finding: an empty prompt with non-empty
+	// hooks used to persist silently — teamGateHasHook always treats an
+	// empty GatePrompt as "no gating" regardless of GateHooks, so this
+	// combination would report configured hooks that never actually fire.
+	if err := store.SetTeamGate(team.ID, "", []string{"task_completed"}); err == nil {
+		t.Fatal("expected an empty prompt with non-empty hooks to be rejected")
+	}
+	// The one legitimate use of an empty prompt — disabling gating
+	// entirely via an empty hooks list — must still work.
+	if err := store.SetTeamGate(team.ID, "", nil); err != nil {
+		t.Fatalf("expected an empty prompt with an empty hooks list (disabling gating) to be allowed, got %v", err)
+	}
 }

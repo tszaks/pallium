@@ -263,6 +263,17 @@ func (s *Store) SetTeamGate(teamID, prompt string, hooks []string) error {
 			return fmt.Errorf("unknown team gate hook %q (valid: task_created, task_completed, teammate_idle)", h)
 		}
 	}
+	// A non-empty hooks list with an empty prompt is a silently-inert
+	// config: teamGateHasHook always treats an empty GatePrompt as "no
+	// gating" regardless of GateHooks, so this combination would persist
+	// (and team.status would report) hooks that never actually fire. The
+	// CLI already rejects this at its own layer; guarded here too so every
+	// caller of the shared store method — including the team.gate()
+	// workflow primitive, which has no such guard of its own — gets the
+	// same protection. Found by review.
+	if strings.TrimSpace(prompt) == "" && len(hooks) > 0 {
+		return fmt.Errorf("team gate hooks %v require a non-empty prompt; pass an empty hooks list to disable gating instead", hooks)
+	}
 	_, err := s.db.Exec(`UPDATE teams SET gate_prompt=?, gate_hooks=?, updated_at=? WHERE id=?`, prompt, strings.Join(hooks, ","), nowString(), teamID)
 	return err
 }

@@ -832,6 +832,133 @@ func TestRunTeamTurnCompletionGateRunsBeforeFinishMemberTurn(t *testing.T) {
 	}
 }
 
+// TestRunTeamTurnSameTurnClaimAndCompleteSucceedsUnderGate is the regression
+// test for the review finding that a decision claiming AND completing the
+// SAME task in one turn used to fail eligibility under a task_completed
+// gate: the completion gate resolves before FinishMemberTurn, but the
+// actual ClaimTask call happens after — so the task still looked
+// pending/unowned at eligibility-check time even though the claim was
+// requested in the very same decision. The ungated path already supports
+// this; the gated path must too.
+func TestRunTeamTurnSameTurnClaimAndCompleteSucceedsUnderGate(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER", "claude") // see TestCreateTeamTaskWithGateBlocksRejectedTask's comment
+	store, _ := newTeamTestStore(t)
+	repo := newTeamTestRepo(t)
+	team, err := store.CreateTeam("goal", repo, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetTeamGate(team.ID, "verify the result", []string{"task_completed"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SpawnMember(team.ID, "worker-1", "claude", "", "", "read-only"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PersistMemberSession(team.ID, "worker-1", "sess-1"); err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.CreateTeamTask(team.ID, "fix the bug", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately left unclaimed — the decision below claims AND
+	// completes it in the same turn.
+
+	decision := fmt.Sprintf(`{"result":"{\"status\":\"idle\",\"summary\":\"done\",\"claim_task_id\":\"%s\",\"complete_task_id\":\"%s\",\"complete_result\":\"fixed it\"}"}`, task.ID, task.ID)
+	gate := `{"result":"{\"approved\":true,\"reason\":\"looks good\"}"}`
+	setClaudeCLI(t, fakeClaudeBinaryBranching(t, decision, gate))
+
+	r := &Runner{Run: Run{ID: team.ID}}
+	if _, err := r.RunTeamTurn(context.Background(), store, team.ID, "worker-1", TeamTurnOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := store.GetTeamTask(team.ID, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "completed" || got.Owner != "worker-1" {
+		t.Fatalf("expected the same-turn claim-and-complete to succeed under a task_completed gate, got %+v", got)
+	}
+}
+
+// TestRunTeamTurnCompletionGateMalfunctionRequeuesOwner is the regression
+// test for the review finding that a task_completed gate malfunction (the
+// verifier erroring, not a clean rejection) let the member's own decided
+// status (often "idle", since it just proposed the completion) apply
+// unchanged — stranding the owner idle with a task stuck in_progress that
+// RunTeam's scheduler would never re-offer (HasClaimableWork ignores
+// in_progress tasks), with no feedback telling it why.
+func TestRunTeamTurnCompletionGateMalfunctionRequeuesOwner(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER", "claude") // see TestCreateTeamTaskWithGateBlocksRejectedTask's comment
+	store, _ := newTeamTestStore(t)
+	repo := newTeamTestRepo(t)
+	team, err := store.CreateTeam("goal", repo, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetTeamGate(team.ID, "verify the result", []string{"task_completed"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SpawnMember(team.ID, "worker-1", "claude", "", "", "read-only"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PersistMemberSession(team.ID, "worker-1", "sess-1"); err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.CreateTeamTask(team.ID, "fix the bug", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimTask(team.ID, task.ID, "worker-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	decision := fmt.Sprintf(`{"result":"{\"status\":\"idle\",\"summary\":\"done\",\"complete_task_id\":\"%s\",\"complete_result\":\"fixed it\"}"}`, task.ID)
+	gate := `{"is_error":true,"result":"verifier crashed"}`
+	setClaudeCLI(t, fakeClaudeBinaryBranching(t, decision, gate))
+
+	r := &Runner{Run: Run{ID: team.ID}}
+	if _, err := r.RunTeamTurn(context.Background(), store, team.ID, "worker-1", TeamTurnOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	member, err := store.GetMember(team.ID, "worker-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if member.Status != "active" {
+		t.Fatalf("expected a completion gate malfunction to force status back to active rather than let the member's own requested idle apply, got %+v", member)
+	}
+	gotTask, err := store.GetTeamTask(team.ID, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotTask.Status != "in_progress" {
+		t.Fatalf("expected the task to remain in_progress (never approved), got %+v", gotTask)
+	}
+	feedback, err := store.UndeliveredMessages(team.ID, "worker-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, m := range feedback {
+		if strings.Contains(m.Body, "could not be verified") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected the owner to receive feedback about the gate malfunction, got %+v", feedback)
+	}
+	gotTeam, err := store.GetTeam(team.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !(gotTeam.TasksUpdatedAt > member.LastTurnAt) {
+		t.Fatalf("expected the watermark bumped so the scheduler re-offers this member a turn, got team.TasksUpdatedAt=%q member.LastTurnAt=%q", gotTeam.TasksUpdatedAt, member.LastTurnAt)
+	}
+}
+
 func TestRunTeamTurnProviderFailureNotifiesLeadWithError(t *testing.T) {
 	store, _ := newTeamTestStore(t)
 	repo := newTeamTestRepo(t)

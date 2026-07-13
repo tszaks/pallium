@@ -444,16 +444,45 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 	var completionVerdict taskCompletionVerdict
 	completionReady := false
 	if id := strings.TrimSpace(decision.CompleteTaskID); id != "" && !planPending {
-		_, verdict, gateCostUSD, cerr := r.resolveTaskCompletionGate(turnCtx, store, teamID, id, name, decision.CompleteResult)
+		// claimedThisTurn: the decision can legitimately claim_task_id and
+		// complete_task_id the SAME task in one turn (the ungated path
+		// already supports this) — the actual ClaimTask call hasn't run
+		// yet at this point (post-finish, same ordering as this
+		// completion), so resolveTaskCompletionGate needs to know a claim
+		// for this exact task is coming in this same turn rather than
+		// judging eligibility off the still-pending row. Found by review.
+		claimedThisTurn := strings.TrimSpace(decision.ClaimTaskID) == id
+		_, verdict, gateCostUSD, cerr := r.resolveTaskCompletionGate(turnCtx, store, teamID, id, name, decision.CompleteResult, claimedThisTurn)
 		if gateCostUSD > 0 {
 			costUSD += gateCostUSD
 			if serr := recordTeamSpend(store, teamID, gateCostUSD); serr != nil {
 				r.notifyLeadOfMemberError(store, teamID, name, fmt.Errorf("recording task_completed gate spend: %w", serr))
 			}
 		}
-		if cerr != nil {
+		switch {
+		case cerr != nil && errors.Is(cerr, errTaskCompletionNotEligible):
+			// The member's own request was invalid (wrong owner, already
+			// completed) — nothing to rescue here, its own next decision
+			// should just not repeat the mistake.
 			r.notifyLeadOfMemberError(store, teamID, name, fmt.Errorf("completing task %s: %w", id, cerr))
-		} else {
+		case cerr != nil:
+			// A genuine gate malfunction (the verifier errored or timed
+			// out), not a rejection. Found by review: this used to only
+			// notify lead and let the member's own decided status (often
+			// "idle" — it just proposed a completion) apply unchanged,
+			// stranding the owner idle with a task that stays in_progress
+			// forever: HasClaimableWork ignores in_progress tasks, so
+			// RunTeam's scheduler would never re-offer this member a turn
+			// without a manual nudge, and the owner never even learns why.
+			// Fail closed the same way the teammate_idle gate malfunction
+			// does: force active + reschedule, and tell the owner
+			// directly (not just lead) so it knows to retry.
+			r.notifyLeadOfMemberError(store, teamID, name, fmt.Errorf("completing task %s: %w", id, cerr))
+			_, _ = store.SendTeamMessage(teamID, "quality-gate", name, fmt.Sprintf("Your completion of task %s could not be verified (%v) — please try completing it again.", id, cerr))
+			status = "active"
+			statusNote = fmt.Sprintf("%s [task_completed gate failed to run: %v — staying active]", statusNote, cerr)
+			rescheduleAfterIdleRejection = true
+		default:
 			completionVerdict = verdict
 			completionReady = true
 		}
@@ -546,7 +575,7 @@ type taskCompletionVerdict struct {
 // CompleteTaskWithGate (the CLI/script front door, with no lease/turn to
 // protect) just calls this immediately followed by applyTaskCompletionVerdict,
 // getting the identical checks in one call as before this split.
-func (r *Runner) resolveTaskCompletionGate(ctx context.Context, store *Store, teamID, taskID, owner, result string) (task TeamTask, verdict taskCompletionVerdict, costUSD float64, err error) {
+func (r *Runner) resolveTaskCompletionGate(ctx context.Context, store *Store, teamID, taskID, owner, result string, claimedThisTurn bool) (task TeamTask, verdict taskCompletionVerdict, costUSD float64, err error) {
 	team, err := store.GetTeam(teamID)
 	if err != nil {
 		return TeamTask{}, taskCompletionVerdict{}, 0, err
@@ -568,7 +597,29 @@ func (r *Runner) resolveTaskCompletionGate(ctx context.Context, store *Store, te
 	// through to the same error CompleteTask already produces, which is
 	// fine: this is a cost-avoidance shortcut for the common case, not a
 	// second source of truth.
-	if task.Status != "in_progress" || task.Owner != owner {
+	eligible := task.Status == "in_progress" && task.Owner == owner
+	if !eligible && claimedThisTurn && task.Status == "pending" {
+		// Same-turn claim-and-complete: RunTeamTurn's caller sets
+		// claimedThisTurn when the decision's claim_task_id and
+		// complete_task_id are the SAME task. The actual ClaimTask call
+		// hasn't run yet at this point (it happens post-finish, same as
+		// this completion — ticket #32's zombie-safety ordering), so the
+		// task still looks pending/unowned here even though the claim is
+		// about to land in this same turn. Mirror ClaimTask's own
+		// eligibility (dependencies satisfied) rather than the literal
+		// current row, matching what the ungated path already allows.
+		// Found by review: this used to reject the completion outright,
+		// silently dropping it even though the claim would have succeeded.
+		eligible = true
+		for _, dep := range task.DependsOn {
+			depTask, derr := store.GetTeamTask(teamID, dep)
+			if derr != nil || depTask.Status != "completed" {
+				eligible = false
+				break
+			}
+		}
+	}
+	if !eligible {
 		return task, taskCompletionVerdict{}, 0, fmt.Errorf("%w: team task %q is not owned by %q (or already completed); cannot complete it", errTaskCompletionNotEligible, taskID, owner)
 	}
 	situation := fmt.Sprintf("Task %q (%s), owned by %s, is proposed complete. Description:\n%s\nResult:\n%s", task.Title, task.ID, owner, task.Description, result)
@@ -604,7 +655,7 @@ func (r *Runner) applyTaskCompletionVerdict(store *Store, teamID, owner, result 
 // there is nothing to literally revert; staying "in_progress" is the same
 // observable outcome as a revert.
 func (r *Runner) CompleteTaskWithGate(ctx context.Context, store *Store, teamID, taskID, owner, result string) (TeamTask, bool, error) {
-	task, verdict, gateCostUSD, err := r.resolveTaskCompletionGate(ctx, store, teamID, taskID, owner, result)
+	task, verdict, gateCostUSD, err := r.resolveTaskCompletionGate(ctx, store, teamID, taskID, owner, result, false)
 	if gateCostUSD > 0 {
 		if serr := recordTeamSpend(store, teamID, gateCostUSD); serr != nil {
 			_, _ = store.SendTeamMessage(teamID, "quality-gate", "lead", fmt.Sprintf("recording task_completed gate spend for %s: %v", taskID, serr))
@@ -844,13 +895,25 @@ func (r *Runner) runTeamGate(ctx context.Context, team Team, situation string) (
 	// Same default RunProviderText applies (provider.go) — needed here for
 	// the identical reason: when ResolveProvider resolves to "codex" (no
 	// detected steering agent, e.g. CI with no CLAUDECODE env var), an empty
-	// r.CodexBinary means exec.Command("", ...) fails with a bare "no
-	// command" error. Found by this exact gap failing on GitHub Actions
-	// while passing locally (steering-agent detection resolves to "claude"
-	// there, so the missing codex default never got exercised).
-	if r.CodexBinary == "" {
-		r.CodexBinary = "codex"
+	// CodexBinary means exec.Command("", ...) fails with a bare "no command"
+	// error. Found by this exact gap failing on GitHub Actions while
+	// passing locally (steering-agent detection resolves to "claude" there,
+	// so the missing codex default never got exercised).
+	//
+	// Dispatched on a throwaway gateRunner, never r itself: RunTeam
+	// schedules several member turns concurrently on ONE shared *Runner
+	// (see the doc comment on RunTeamTurn's own r.Run.ID precondition), so
+	// mutating r.CodexBinary here — as this used to — raced with every
+	// other concurrent gate/turn call sharing the same instance. Found by
+	// review. gateRunner still carries Run.ID over (not just CodexBinary/
+	// PalliumBinary) so a configured wrapper provider gets the same
+	// PALLIUM_WORKFLOW_RUN_ID metadata a gate call already gets elsewhere
+	// (see cmd/team.go's own Run.ID fix for the CLI's one-off gate calls).
+	codexBinary := r.CodexBinary
+	if codexBinary == "" {
+		codexBinary = "codex"
 	}
+	gateRunner := &Runner{CodexBinary: codexBinary, PalliumBinary: r.PalliumBinary, Run: Run{ID: r.Run.ID}}
 	cwd := strings.TrimSpace(team.CWD)
 	if cwd == "" {
 		cwd, err = os.Getwd()
@@ -868,7 +931,7 @@ func (r *Runner) runTeamGate(ctx context.Context, team Team, situation string) (
 	provider := ResolveProvider("", "")
 	prompt := buildGatePrompt("team-quality-gate", situation, team.GatePrompt)
 	agent := &Agent{Mode: "read-only", Prompt: prompt, Provider: provider}
-	output, derr := r.runProviderCommand(ctx, provider, tmpDir, outFile, usageFile, cwd, prompt, agent, AgentOptions{Schema: defaultGateSchema()}, false)
+	output, derr := gateRunner.runProviderCommand(ctx, provider, tmpDir, outFile, usageFile, cwd, prompt, agent, AgentOptions{Schema: defaultGateSchema()}, false)
 	if _, usage := readAndRemoveAgentUsage(usageFile); usage != nil {
 		if cost, ok := usage["cost_usd"].(float64); ok && cost > 0 {
 			costUSD = cost

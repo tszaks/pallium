@@ -234,3 +234,77 @@ func TestTeamWaitPrimitiveHonorsWorkflowStop(t *testing.T) {
 		t.Fatal("team.wait did not return at all within 8s of the run being marked stopped")
 	}
 }
+
+// TestTeamTasksCreatePrimitiveHonorsWorkflowStop is the regression test for
+// the review finding that team.tasks.create()'s (and, by the identical
+// fix, team.tasks.complete()'s) task_created gate call used the raw script
+// context instead of contextWithStoredStop — the same gap team.wait had
+// (see the test above). A paused/stopped workflow used to leave an
+// in-flight gate verifier call running to its own timeout regardless.
+func TestTeamTasksCreatePrimitiveHonorsWorkflowStop(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER", "claude") // see other gate tests' comment for why
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	team, err := store.CreateTeam("goal", tmp, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetTeamGate(team.ID, "reject anything vague", []string{"task_created"}); err != nil {
+		t.Fatal(err)
+	}
+
+	startedMarker := filepath.Join(tmp, "gate-started")
+	finishedMarker := filepath.Join(tmp, "gate-finished")
+	path := filepath.Join(tmp, "fake-claude-slow-gate.sh")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\ncat >/dev/null\ntouch '"+startedMarker+"'\nsleep 5\ntouch '"+finishedMarker+"'\nprintf '%s' '{\"result\":\"{\\\"approved\\\":true,\\\"reason\\\":\\\"ok\\\"}\"}'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	setClaudeCLI(t, path)
+
+	script := `team.tasks.create("` + team.ID + `", "do the thing"); return "done";`
+	scriptPath, err := WriteRunScript("wf-tasks-create-stop", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-tasks-create-stop", Task: "tasks create stop", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, execErr := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+		done <- execErr
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	if err := store.SetRunStatus(run.ID, "stopped", "", "test-triggered-stop"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Same reasoning as TestTeamWaitPrimitiveHonorsWorkflowStop above: check
+	// the marker file AFTER the fake gate's own 5s sleep would have
+	// naturally elapsed, not before — checking earlier can't distinguish
+	// "killed early" from "just hasn't gotten there yet" either way.
+	time.Sleep(6 * time.Second)
+	if _, err := os.Stat(startedMarker); err != nil {
+		t.Fatalf("expected the fake gate verifier to have started before the stop landed: %v", err)
+	}
+	if _, err := os.Stat(finishedMarker); err == nil {
+		t.Fatal("expected the fake gate verifier's process to have been killed mid-sleep once the run was marked stopped, but it ran to natural completion — contextWithStoredStop's cancellation did not take effect")
+	}
+
+	select {
+	case execErr := <-done:
+		if execErr == nil {
+			t.Fatal("expected an error once the stopped run canceled the in-flight gate call, got none")
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("team.tasks.create did not return at all within 8s of the run being marked stopped")
+	}
+}
