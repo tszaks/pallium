@@ -1288,6 +1288,60 @@ func TestRunTeamTurnMalformedDecisionNotifiesLeadAndStaysEligible(t *testing.T) 
 	}
 }
 
+// TestRunTeamPreservesMidTurnNudgeAcrossSchedulerCleanup is the regression
+// test for a real bug an adversarial review found in #52's own fix: the
+// test above proves RunTeamTurn sets a fresh nudge on a malformed decision,
+// but that test calls RunTeamTurn directly and never exercises RunTeam's
+// OWN post-turn cleanup. Going through the real scheduler (RunTeam, not
+// RunTeamTurn) surfaces the actual bug: RunTeam unconditionally cleared
+// ANY nudge after a turn that ran (ranTurn==true), including one the turn
+// itself had JUST set moments earlier — silently undoing the "stays
+// eligible next round" fix in the very same round it took effect. Needs a
+// message in the mailbox first so the member is eligible for a FIRST turn
+// at all (with nothing else pending, RunTeam schedules zero rounds).
+func TestRunTeamPreservesMidTurnNudgeAcrossSchedulerCleanup(t *testing.T) {
+	store, _ := newTeamTestStore(t)
+	repo := newTeamTestRepo(t)
+	team, err := store.CreateTeam("goal", repo, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SpawnMember(team.ID, "researcher-1", "claude", "", "", "read-only"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PersistMemberSession(team.ID, "researcher-1", "seed-session-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SendTeamMessage(team.ID, "lead", "researcher-1", "go"); err != nil {
+		t.Fatal(err)
+	}
+	setClaudeCLI(t, fakeClaudeBinary(t, `{"result":"sure, done, no JSON here"}`))
+
+	r := &Runner{Run: Run{ID: team.ID}}
+	summary, err := r.RunTeam(context.Background(), store, team.ID, TeamTurnOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fake claude ALWAYS returns a malformed decision, so a member whose
+	// mid-turn nudge survives correctly stays eligible every round and runs
+	// until the round cap (50) — the discriminating signal for the bug this
+	// guards: with the old unconditional ClearNudge, round 1's fresh nudge
+	// was wiped the instant it was set, the board never changed (a
+	// malformed decision applies nothing), and the member went permanently
+	// ineligible after exactly ONE turn.
+	if summary.TurnsTaken < 2 {
+		t.Fatalf("expected the surviving nudge to keep the member eligible past its first turn, got %+v", summary)
+	}
+
+	member, err := store.GetMember(team.ID, "researcher-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if member.NudgedAt == "" {
+		t.Fatalf("expected the malformed-decision nudge to SURVIVE RunTeam's own post-turn cleanup, got %+v", member)
+	}
+}
+
 // TestRunTeamConvergesAcrossRoundsWithMultipleMembers drives a real
 // multi-member, multi-round exchange through the actual scheduler
 // (RunTeam), not just a single RunTeamTurn call: the lead messages

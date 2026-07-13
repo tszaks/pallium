@@ -3399,6 +3399,48 @@ func TestRunnerValidatesNullableObjectSchemasRecursively(t *testing.T) {
 	}
 }
 
+// TestValidateSchemaValueEnforcesEnum is the regression test for a real
+// gap an adversarial review found in #52: teamDecisionSchema's own status
+// field has always declared enum:["active","idle","blocked"], but nothing
+// in validateSchemaValue ever read the "enum" keyword at all — an out-of-
+// enum value like "done" passed validation and would have persisted a
+// status the rest of the codebase never branches on. Covers exactly what
+// was asked: the real teamDecisionSchema shape, all three legal values,
+// and an enum on an unrelated field to prove it's a general schema
+// capability, not a status-only special case.
+func TestValidateSchemaValueEnforcesEnum(t *testing.T) {
+	statusSchema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"status": map[string]any{"type": "string", "enum": []any{"active", "idle", "blocked"}},
+		},
+		"required": []any{"status"},
+	}
+	if _, err := parseAgentOutputWithSchema(`{"status":"done"}`, statusSchema); err == nil {
+		t.Fatal("expected an out-of-enum status value to be rejected")
+	} else if !strings.Contains(err.Error(), "must be one of") {
+		t.Fatalf("expected an enum violation message, got %v", err)
+	}
+	for _, legal := range []string{"active", "idle", "blocked"} {
+		if _, err := parseAgentOutputWithSchema(`{"status":"`+legal+`"}`, statusSchema); err != nil {
+			t.Fatalf("expected legal enum value %q to pass, got %v", legal, err)
+		}
+	}
+
+	genericSchema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"priority": map[string]any{"type": "string", "enum": []any{"low", "medium", "high"}},
+		},
+	}
+	if _, err := parseAgentOutputWithSchema(`{"priority":"urgent"}`, genericSchema); err == nil {
+		t.Fatal("expected enum enforcement on a non-status field, not just status")
+	}
+	if _, err := parseAgentOutputWithSchema(`{"priority":"high"}`, genericSchema); err != nil {
+		t.Fatalf("expected a legal value on a non-status field to pass, got %v", err)
+	}
+}
+
 func TestPipelineCallIndexesAreDeterministicByItemAndStage(t *testing.T) {
 	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"source":"first","prompt":"{{PROMPT}}"}`)
 	tmp := t.TempDir()

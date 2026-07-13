@@ -1234,6 +1234,10 @@ func (r *Runner) RunTeam(ctx context.Context, store *Store, teamID string, opts 
 			return summary, err
 		}
 		var eligible []string
+		// preTurnNudgedAt snapshots each eligible member's NudgedAt as it
+		// stood BEFORE this round's turns run — see ClearNudgeIfUnchanged's
+		// own doc comment for why an unconditional clear is wrong.
+		preTurnNudgedAt := make(map[string]string, len(members))
 		for _, m := range members {
 			// StopRequested (M2 individual supervision), not Status ==
 			// "stopped": StopRequested is the durable source of truth (see
@@ -1267,6 +1271,7 @@ func (r *Runner) RunTeam(ctx context.Context, store *Store, teamID string, opts 
 			boardIsNewToMember := m.LastTurnAt == "" || team.TasksUpdatedAt > m.LastTurnAt
 			if len(undelivered) > 0 || m.NudgedAt != "" || (claimable && boardIsNewToMember) {
 				eligible = append(eligible, m.Name)
+				preTurnNudgedAt[m.Name] = m.NudgedAt
 			}
 		}
 		if len(eligible) == 0 {
@@ -1292,8 +1297,16 @@ func (r *Runner) RunTeam(ctx context.Context, store *Store, teamID string, opts 
 				// flight, ranTurn=false), this scheduling attempt never
 				// showed the member anything — clearing the nudge here would
 				// silently discard it before any turn ever saw it.
+				//
+				// ClearNudgeIfUnchanged, not the unconditional ClearNudge:
+				// the turn just run can set its OWN fresh nudge mid-turn
+				// (the malformed-decision path does exactly this so the
+				// member survives the "unchanged board" eligibility
+				// watermark) — clearing unconditionally here erased that
+				// brand-new nudge in the very same round it was set. Found
+				// by adversarial review.
 				if ranTurn {
-					_ = store.ClearNudge(teamID, name)
+					_ = store.ClearNudgeIfUnchanged(teamID, name, preTurnNudgedAt[name])
 				}
 			}(i, name)
 		}
