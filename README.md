@@ -54,7 +54,7 @@ force objective checks, gate on verification. Runs persist with stable IDs, full
 history, and resumable state.
 
 ```bash
-pallium workflow preflight "audit the auth module" --json
+pallium workflow preflight "audit the auth module" --scope internal/auth --json
 pallium workflow run "audit the auth module"
 pallium workflow report <run-id> --json
 ```
@@ -67,7 +67,7 @@ detects when it stops making progress instead of spinning forever. No daemon; an
 external scheduler or agent drives the ticks.
 
 ```bash
-pallium loop start review-until-clean "<task>"
+pallium loop start review-until-clean --script review.loop.js "<task>"
 pallium loop tick review-until-clean
 pallium loop status review-until-clean --json
 ```
@@ -93,6 +93,7 @@ with it, what is risky to touch, what changed in the working tree, and how to
 hand work off.
 
 ```bash
+pallium index   # one-time per repo, before the queries below
 pallium explain cmd/workflow.go --json
 pallium risk internal/workflow/runtime.go --json
 pallium neighbors cmd/app.go --json
@@ -107,23 +108,29 @@ work so the reasoning outlives any one context.
 
 ```bash
 pallium sessions live --json
-pallium decisions --json
+pallium decisions "why did we choose worktrees" --json
 ```
 
 ## A worked example
 
-Review a pull request across independent dimensions, then verify each finding
-before trusting it. A workflow that fans out, then confirms:
+A review workflow that fans out across dimensions, then verifies each finding
+before trusting it. You author the plan as a script and run it:
 
 ```bash
-pallium workflow run "review the changed files for correctness and security \
-  bugs; verify each finding adversarially before reporting" --json
+pallium workflow generate "review the changed files for correctness and \
+  security bugs, then verify each finding adversarially" \
+  --style review --output review.workflow.js
+pallium workflow validate review.workflow.js
+pallium workflow run --script review.workflow.js "review the diff" --json
 ```
 
-Pallium scopes the diff, runs a reviewer per dimension in parallel, spawns a
-skeptic to try to refute each finding, drops the ones that do not survive, and
-returns a ranked, verified list. The run is saved: inspect it, resume it, or read
-its report later.
+The script runs a reviewer per dimension in parallel, spawns a skeptic to try to
+refute each finding, keeps the ones that survive, and returns a ranked list. The
+run is saved: inspect it, resume it, or read its report later.
+
+(A bare `pallium workflow run "<task>"` with no script uses a built-in
+plan-and-verify default. Supply a script, or `pallium start`, when you want a
+specific shape like the review above.)
 
 ## Mental model
 
