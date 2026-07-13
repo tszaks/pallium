@@ -574,6 +574,16 @@ func teamGateHasHook(team Team, hook string) bool {
 // (a different task, a different idle declaration) is its own fresh
 // question anyway.
 func (r *Runner) runTeamGate(ctx context.Context, team Team, situation string) (approved bool, reason string, err error) {
+	// Same default RunProviderText applies (provider.go) — needed here for
+	// the identical reason: when ResolveProvider resolves to "codex" (no
+	// detected steering agent, e.g. CI with no CLAUDECODE env var), an empty
+	// r.CodexBinary means exec.Command("", ...) fails with a bare "no
+	// command" error. Found by this exact gap failing on GitHub Actions
+	// while passing locally (steering-agent detection resolves to "claude"
+	// there, so the missing codex default never got exercised).
+	if r.CodexBinary == "" {
+		r.CodexBinary = "codex"
+	}
 	cwd := strings.TrimSpace(team.CWD)
 	if cwd == "" {
 		cwd, err = os.Getwd()

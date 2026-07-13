@@ -329,6 +329,12 @@ func TestRunTeamTurnPlanPendingMemberCannotClaimOrComplete(t *testing.T) {
 // synchronously when a task is added, from the CLI or a workflow primitive,
 // never from inside a teammate's own decision).
 func TestCreateTeamTaskWithGateBlocksRejectedTask(t *testing.T) {
+	// runTeamGate's own ResolveProvider call is independent of any member's
+	// provider — pin it explicitly so this test's expectations don't depend
+	// on the ambient environment (a dev running this from inside Claude Code
+	// has CLAUDECODE set for real; CI has neither, so it falls through to
+	// codex instead of the "claude" this test's fake binary stands in for).
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER", "claude")
 	store, _ := newTeamTestStore(t)
 	repo := newTeamTestRepo(t)
 	team, err := store.CreateTeam("goal", repo, 0)
@@ -353,6 +359,7 @@ func TestCreateTeamTaskWithGateBlocksRejectedTask(t *testing.T) {
 // TestCreateTeamTaskWithGateAllowsApprovedTask is the positive-path sibling:
 // an approved task must land exactly as CreateTeamTask alone would leave it.
 func TestCreateTeamTaskWithGateAllowsApprovedTask(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER", "claude") // see the sibling test's comment for why
 	store, _ := newTeamTestStore(t)
 	repo := newTeamTestRepo(t)
 	team, err := store.CreateTeam("goal", repo, 0)
@@ -384,6 +391,7 @@ func TestCreateTeamTaskWithGateAllowsApprovedTask(t *testing.T) {
 // slow fake claude binary standing in for the gate's verifier call, and
 // asserts a concurrent claim attempt fails throughout.
 func TestCreateTeamTaskWithGateNeverClaimableWhileGateInFlight(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER", "claude") // see TestCreateTeamTaskWithGateBlocksRejectedTask's comment
 	store, _ := newTeamTestStore(t)
 	repo := newTeamTestRepo(t)
 	team, err := store.CreateTeam("goal", repo, 0)
@@ -465,6 +473,7 @@ func fakeClaudeBinaryBranching(t *testing.T, decisionEnvelope, gateEnvelope stri
 // in_progress (never actually transitioned, so nothing to "revert") with the
 // gate's output delivered to the owner as feedback.
 func TestRunTeamTurnTaskCompletedGateRejectsAndDeliversFeedback(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER", "claude") // see TestCreateTeamTaskWithGateBlocksRejectedTask's comment
 	store, _ := newTeamTestStore(t)
 	repo := newTeamTestRepo(t)
 	team, err := store.CreateTeam("goal", repo, 0)
@@ -525,6 +534,7 @@ func TestRunTeamTurnTaskCompletedGateRejectsAndDeliversFeedback(t *testing.T) {
 // to "active" with the gate's reason as the note instead of the member's
 // own claimed idle status.
 func TestRunTeamTurnTeammateIdleGateForcesActiveOnRejection(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER", "claude") // see TestCreateTeamTaskWithGateBlocksRejectedTask's comment
 	store, _ := newTeamTestStore(t)
 	repo := newTeamTestRepo(t)
 	team, err := store.CreateTeam("goal", repo, 0)
