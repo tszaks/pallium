@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/dop251/goja"
+	"github.com/google/uuid"
 	"github.com/tszaks/pallium/internal/gitlog"
 )
 
@@ -60,12 +61,18 @@ type Runner struct {
 	workflowDepth  int
 	stubIndex      int
 	agentCallIndex int
-	pipelineIndex  int
-	capture        *parallelCapture
-	scriptHash     string
-	argsHash       string
-	failures       []RunFailure
-	fatalErr       error
+	// teamCreateCallIndex mirrors agentCallIndex's own pattern (reset to 0
+	// at the start of Execute, incremented once per team.create() call)
+	// but keyed separately: a script's Nth team.create() call needs a
+	// counter scoped to team.create() calls specifically, not conflated
+	// with however many agent()/gate() calls happened to run before it.
+	teamCreateCallIndex int
+	pipelineIndex       int
+	capture             *parallelCapture
+	scriptHash          string
+	argsHash            string
+	failures            []RunFailure
+	fatalErr            error
 
 	// lockedRepos memoizes which canonical repo roots this run already holds
 	// the advisory edit lock for (see acquireRepoLock), so repeated
@@ -184,6 +191,7 @@ func (r *Runner) Execute(ctx context.Context, script string, args any) (string, 
 	r.agentCount = usedAgents
 	r.budgetSpent = usedBudget
 	r.agentCallIndex = 0
+	r.teamCreateCallIndex = 0
 	r.pipelineIndex = 0
 	r.failures = nil
 	r.fatalErr = nil
@@ -320,6 +328,9 @@ func (r *Runner) executeScript(ctx context.Context, script string, args any, top
 		return "", err
 	}
 	if err := vm.Set("gate", r.jsGate(ctx, vm)); err != nil {
+		return "", err
+	}
+	if err := vm.Set("team", r.jsTeam(ctx, vm)); err != nil {
 		return "", err
 	}
 
@@ -588,6 +599,302 @@ func (r *Runner) runAgentGate(ctx context.Context, name, message string, opts Ga
 		return result, fmt.Errorf("workflow gate %q rejected by agent: %s", name, reason)
 	}
 	return result, nil
+}
+
+// jsTeam exposes team.* to workflow/loop scripts (M2 item 1): a loop tick or
+// a workflow can now convene and drive an Agent Team programmatically. Every
+// call below goes through the exact same Store methods (or the exact same
+// RunTeam/CreateTeamTaskWithGate/CompleteTaskWithGate runtime helpers)
+// `pallium team ...` uses — front-door composition per the kernel/services
+// architecture ruling, nothing here reaches into team internals a CLI caller
+// couldn't also reach.
+//
+// teamRunner constructs a FRESH *Runner for any call that dispatches real
+// provider turns (wait) or a gate check (tasks.create/tasks.complete) —
+// never r itself. r.Run.ID is THIS workflow run's id, already load-bearing
+// for every agent()/check() call elsewhere in this same script; RunTeam sets
+// r.Run.ID = teamID on whatever Runner it's given (see its own doc comment),
+// which would silently corrupt this run's own agent-call bookkeeping if it
+// ran on r directly.
+// resolveWaitAgentTimeoutSeconds turns team.wait's optional pointer field
+// into the actual seconds to use. Extracted so the omitted-vs-explicit-zero
+// distinction is directly unit-testable without going through goja/JSON
+// decoding. nil (omitted) defaults to 600, matching `pallium team run`'s
+// own --agent-timeout CLI default; an explicit value, even 0, is honored
+// as-is (0 means "no deadline", same as RunTeamTurn and the CLI already
+// treat it). Found by review: a plain int field couldn't tell "omitted"
+// from "explicitly 0" apart (Go's JSON decoder leaves both as the zero
+// value), so an explicit {agentTimeoutSeconds: 0} — matching the CLI's own
+// --agent-timeout 0 no-deadline behavior — used to get silently overridden
+// to 600 instead of honored.
+func resolveWaitAgentTimeoutSeconds(explicit *int) int {
+	if explicit == nil {
+		return 600
+	}
+	return *explicit
+}
+
+func (r *Runner) jsTeam(ctx context.Context, vm *goja.Runtime) map[string]any {
+	// teamRunner takes teamID explicitly (rather than leaving Run.ID empty
+	// and relying on RunTeam to set it) because two of its three callers —
+	// team.tasks.create/complete — call CreateTeamTaskWithGate/
+	// CompleteTaskWithGate directly, never through RunTeam at all, so
+	// nothing else would ever set it for them. Found by review: a
+	// configured wrapper provider still saw an empty PALLIUM_WORKFLOW_RUN_ID
+	// from these two primitives' gate calls even after the CLI's own
+	// one-off gate calls got the identical fix.
+	teamRunner := func(teamID string) *Runner {
+		return &Runner{CodexBinary: r.CodexBinary, PalliumBinary: r.PalliumBinary, Run: Run{ID: teamID}}
+	}
+	decodeOpts := func(raw any, out any) {
+		if raw == nil {
+			return
+		}
+		encoded, err := json.Marshal(raw)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		if err := json.Unmarshal(encoded, out); err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+	}
+	mintClaudeSessionIfNeeded := func(teamID, name, provider string) TeamMember {
+		if provider == "claude" {
+			if err := r.Store.PersistMemberSession(teamID, name, uuid.NewString()); err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+		}
+		member, err := r.Store.GetMember(teamID, name)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		return member
+	}
+
+	return map[string]any{
+		"create": func(goal string, rawOpts ...any) goja.Value {
+			opts := struct {
+				CWD       string  `json:"cwd"`
+				BudgetUSD float64 `json:"budgetUsd"`
+			}{}
+			if len(rawOpts) > 0 {
+				decodeOpts(rawOpts[0], &opts)
+			}
+			cwd := strings.TrimSpace(opts.CWD)
+			switch {
+			case cwd == "":
+				cwd = r.Run.CWD
+			case !filepath.IsAbs(cwd):
+				// Resolve against the WORKFLOW's own cwd, not
+				// filepath.Abs's implicit base (the Pallium process's own
+				// OS working directory, which can easily differ from
+				// r.Run.CWD and would silently resolve to the wrong repo).
+				cwd = filepath.Join(r.Run.CWD, cwd)
+			}
+			// Final normalize/clean — a no-op once cwd is already absolute
+			// (the common case), matching `pallium team start`'s own
+			// filepath.Abs(--cwd) call. Found by review: this team
+			// durably persists cwd for every future `pallium team
+			// run/attach`; an unresolved relative path stored as-is
+			// breaks or silently targets the wrong repo once resumed from
+			// anywhere else.
+			if absCWD, aerr := filepath.Abs(cwd); aerr == nil {
+				cwd = absCWD
+			}
+			// Deterministic id (run id + this run's Nth team.create() call),
+			// not CreateTeam's own freshly-minted one — GetOrCreateTeam
+			// returns the EXISTING team on a match instead of inserting a
+			// duplicate. Found by review: unlike agent()/gate(), this
+			// primitive had no replay key at all, so a paused/resumed
+			// workflow re-executing the same script created a second
+			// active team every time, orphaning the first one's state and
+			// spend.
+			teamID := fmt.Sprintf("team-%s-%d", r.Run.ID, r.nextTeamCreateCallIndex())
+			team, err := r.Store.GetOrCreateTeam(teamID, goal, cwd, opts.BudgetUSD)
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			return vm.ToValue(team)
+		},
+		"spawn": func(teamID, name string, rawOpts ...any) goja.Value {
+			opts := struct {
+				Provider     string `json:"provider"`
+				Model        string `json:"model"`
+				Role         string `json:"role"`
+				Mode         string `json:"mode"`
+				PlanRequired bool   `json:"planRequired"`
+			}{Mode: "read-only"}
+			if len(rawOpts) > 0 {
+				decodeOpts(rawOpts[0], &opts)
+			}
+			provider := ResolveProvider("", opts.Provider)
+			var err error
+			if opts.PlanRequired {
+				_, err = r.Store.SpawnPlanRequiredMember(teamID, name, provider, opts.Model, opts.Role)
+			} else {
+				_, err = r.Store.SpawnMember(teamID, name, provider, opts.Model, opts.Role, opts.Mode)
+			}
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			return vm.ToValue(mintClaudeSessionIfNeeded(teamID, name, provider))
+		},
+		"send": func(teamID, to, body string, from ...string) goja.Value {
+			sender := firstNonEmpty(strings.Join(from, ""), "lead")
+			msg, err := r.Store.SendTeamMessage(teamID, sender, to, body)
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			return vm.ToValue(msg)
+		},
+		"approve": func(teamID, name string) goja.Value {
+			existing, err := r.Store.GetMember(teamID, name)
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			var member TeamMember
+			if existing.PlanRequired {
+				member, err = r.Store.ApproveMemberPlan(teamID, name)
+			} else {
+				if err = r.Store.SetMemberMode(teamID, name, "edit"); err == nil {
+					member, err = r.Store.GetMember(teamID, name)
+				}
+			}
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			return vm.ToValue(member)
+		},
+		"reject": func(teamID, name, feedback string) goja.Value {
+			member, err := r.Store.RejectMemberPlan(teamID, name, feedback)
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			return vm.ToValue(member)
+		},
+		"gate": func(teamID, prompt string, hooks []string) goja.Value {
+			if err := r.Store.SetTeamGate(teamID, prompt, hooks); err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			team, err := r.Store.GetTeam(teamID)
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			return vm.ToValue(team)
+		},
+		"status": func(teamID string) goja.Value {
+			team, err := r.Store.GetTeam(teamID)
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			members, err := r.Store.ListMembers(teamID)
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			tasks, err := r.Store.ListTeamTasks(teamID)
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			return vm.ToValue(map[string]any{"team": team, "members": members, "tasks": tasks, "untracked_cost_providers": UntrackedCostProviders(members)})
+		},
+		// wait drives the team — the acceptance shape for "a loop tick
+		// convening a team": create/spawn/tasks.create set the board up,
+		// wait actually runs rounds of real teammate turns (same bounded
+		// scheduler `pallium team run` uses: rounds until convergence,
+		// budget, or the round cap, then returns — no daemon), then
+		// status/tasks.list read back what happened.
+		"wait": func(teamID string, rawOpts ...any) goja.Value {
+			opts := struct {
+				// *int, not int: a plain int can't distinguish "the script
+				// didn't specify one" from "the script explicitly asked for
+				// 0" (Go's JSON decoder leaves both as the zero value), so
+				// an explicit {agentTimeoutSeconds: 0} — matching the CLI's
+				// own --agent-timeout 0 no-deadline behavior — used to get
+				// silently overridden to 600 instead of honored. A nil
+				// pointer means genuinely omitted. Found by review.
+				AgentTimeoutSeconds *int `json:"agentTimeoutSeconds"`
+				StaleAfterMinutes   int  `json:"staleAfterMinutes"`
+				MaxConcurrent       int  `json:"maxConcurrent"`
+			}{}
+			if len(rawOpts) > 0 {
+				decodeOpts(rawOpts[0], &opts)
+			}
+			turnOpts := TeamTurnOptions{
+				AgentTimeout:   time.Duration(resolveWaitAgentTimeoutSeconds(opts.AgentTimeoutSeconds)) * time.Second,
+				StaleTurnAfter: time.Duration(opts.StaleAfterMinutes) * time.Minute,
+				MaxConcurrent:  opts.MaxConcurrent,
+			}
+			// contextWithStoredStop, not the raw script ctx — the same
+			// stop/pause-aware wrapper every agent() call already gets (see
+			// its call site above). Without it, `pallium workflow stop`/
+			// `pause` updated the run's status in the store but a long
+			// teammate turn already in flight through this primitive kept
+			// running and spending regardless, unlike every other provider
+			// call in a workflow run. Found by review.
+			waitCtx, stopWatching := r.contextWithStoredStop(ctx)
+			defer stopWatching()
+			summary, err := teamRunner(teamID).RunTeam(waitCtx, r.Store, teamID, turnOpts)
+			if err != nil {
+				panic(vm.ToValue(r.throwable(err)))
+			}
+			return vm.ToValue(summary)
+		},
+		"stop": func(teamID string) goja.Value {
+			if err := r.Store.SetTeamStatus(teamID, "stopped"); err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			return vm.ToValue(map[string]any{"team_id": teamID, "status": "stopped"})
+		},
+		"tasks": map[string]any{
+			"create": func(teamID, title string, rawOpts ...any) goja.Value {
+				opts := struct {
+					Description string   `json:"description"`
+					DependsOn   []string `json:"dependsOn"`
+				}{}
+				if len(rawOpts) > 0 {
+					decodeOpts(rawOpts[0], &opts)
+				}
+				// contextWithStoredStop, same as team.wait above and for
+				// the identical reason: without it, `pallium workflow
+				// stop`/`pause` updated the run's status in the store but
+				// an in-flight task_created gate verifier call from this
+				// primitive kept running (and spending) regardless. Found
+				// by review.
+				gateCtx, stopWatching := r.contextWithStoredStop(ctx)
+				defer stopWatching()
+				task, err := teamRunner(teamID).CreateTeamTaskWithGate(gateCtx, r.Store, teamID, title, opts.Description, opts.DependsOn)
+				if err != nil {
+					panic(vm.ToValue(err.Error()))
+				}
+				return vm.ToValue(task)
+			},
+			"list": func(teamID string) goja.Value {
+				tasks, err := r.Store.ListTeamTasks(teamID)
+				if err != nil {
+					panic(vm.ToValue(err.Error()))
+				}
+				return vm.ToValue(tasks)
+			},
+			"claim": func(teamID, taskID, as string) goja.Value {
+				task, err := r.Store.ClaimTask(teamID, taskID, as)
+				if err != nil {
+					panic(vm.ToValue(err.Error()))
+				}
+				return vm.ToValue(task)
+			},
+			"complete": func(teamID, taskID, as string, result ...string) goja.Value {
+				// contextWithStoredStop — see team.tasks.create above for
+				// why. Found by review.
+				gateCtx, stopWatching := r.contextWithStoredStop(ctx)
+				defer stopWatching()
+				task, approved, err := teamRunner(teamID).CompleteTaskWithGate(gateCtx, r.Store, teamID, taskID, as, strings.Join(result, ""))
+				if err != nil {
+					panic(vm.ToValue(err.Error()))
+				}
+				return vm.ToValue(map[string]any{"task": task, "approved": approved})
+			},
+		},
+	}
 }
 
 func (r *Runner) jsPhase(vm *goja.Runtime) func(goja.FunctionCall) goja.Value {
@@ -1415,6 +1722,13 @@ func (r *Runner) nextAgentCallIndex() int {
 	defer r.mu.Unlock()
 	r.agentCallIndex++
 	return r.agentCallIndex
+}
+
+func (r *Runner) nextTeamCreateCallIndex() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.teamCreateCallIndex++
+	return r.teamCreateCallIndex
 }
 
 func (r *Runner) activeCapture() *parallelCapture {
@@ -2874,10 +3188,43 @@ func (r *Runner) worktreeSubdirCWD(repoRoot, worktree string) string {
 	return filepath.Join(worktree, rel)
 }
 
+// createWorktree's target path is deterministic per agentID (worktreePath),
+// which is exactly right for a fresh call — but a team member reuses the
+// SAME agentID (member.ID) on every turn, stable across retries. Found live
+// via this batch's own kill/resume acceptance proof: killing the steering
+// process mid-turn leaves that turn's worktree directory on disk (its own
+// cleanup never got to run), and the member's NEXT turn's createWorktree
+// call then fails outright — `git worktree add` refuses to target an
+// existing directory — permanently blocking that member's edit mode until
+// someone manually removes it. Pre-existing M1-era gap, not introduced by
+// M2; fixed here because M2's own live proof is what surfaced it.
 func (r *Runner) createWorktree(agentID, repoRoot string) (string, error) {
 	path, err := r.worktreePath(agentID)
 	if err != nil {
 		return "", err
+	}
+	if _, statErr := os.Stat(path); statErr == nil {
+		// Accepted, documented risk (found by review, not fully solved
+		// here): a team member's stale-takeover window presumes the OLD
+		// turn is dead, same as every other stale-reconciliation in this
+		// system (ReconcileInterruptedMembers reassigning a session token
+		// or task ownership makes the identical presumption) — but unlike
+		// those, this cleanup can be WRONG in a way that actively harms the
+		// old turn if it merely exceeded --stale-after-minutes while
+		// genuinely still running: it deletes that live process's worktree
+		// out from under it mid-operation, instead of leaving it to fail
+		// (or succeed and be discarded by FinishMemberTurn's own lease
+		// check) on its own. Before this fix, the failure mode here was
+		// clean (`git worktree add` refuses, THIS turn errors, the old one
+		// is undisturbed); the tradeoff made here accepts a messier failure
+		// for the old turn in exchange for actually fixing the far more
+		// common case — the old turn's OWNING PROCESS was truly killed, not
+		// just slow — which otherwise permanently blocks this member's edit
+		// mode. A real fix needs per-turn liveness tracking for team
+		// members (the 0.9.15 owner_pid/heartbeat pattern exists for
+		// workflow runs, not team member turns) — bigger than this fix,
+		// tracked as a backlog item rather than attempted here.
+		r.removeWorktree(repoRoot, path)
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return "", err
