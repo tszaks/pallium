@@ -1244,6 +1244,14 @@ func (r *Runner) RunTeam(ctx context.Context, store *Store, teamID string, opts 
 			if m.Status == "stopped" || m.StopRequested || m.TurnStartedAt != "" {
 				continue
 			}
+			// M3 external-session attach: an "external" member has no
+			// provider to dispatch a turn through at all — it drives itself
+			// via the ordinary CLI (see JoinExternalMember/
+			// TouchMemberActivity in team_store.go). Never eligible here,
+			// never counted toward Rounds/TurnsTaken.
+			if m.Provider == "external" {
+				continue
+			}
 			undelivered, err := store.UndeliveredMessages(teamID, m.Name)
 			if err != nil {
 				return summary, err
