@@ -17,7 +17,7 @@ import (
 
 func runTeam(out io.Writer, args []string, jsonOutput bool) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: pallium team <start|spawn|tasks|send|inbox|nudge|status|run|approve|stop|attach> [--json]")
+		return fmt.Errorf("usage: pallium team <start|spawn|tasks|send|inbox|nudge|status|run|approve|reject|gate|stop|attach> [--json]")
 	}
 	switch args[0] {
 	case "start":
@@ -38,6 +38,10 @@ func runTeam(out io.Writer, args []string, jsonOutput bool) error {
 		return runTeamRun(out, args[1:], jsonOutput)
 	case "approve":
 		return runTeamApprove(out, args[1:], jsonOutput)
+	case "reject":
+		return runTeamReject(out, args[1:], jsonOutput)
+	case "gate":
+		return runTeamGateCmd(out, args[1:], jsonOutput)
 	case "stop":
 		return runTeamStop(out, args[1:], jsonOutput)
 	case "attach":
@@ -122,12 +126,13 @@ func runTeamSpawn(out io.Writer, args []string, jsonOutput bool) error {
 	model := fs.String("model", "", "")
 	role := fs.String("role", "", "")
 	mode := fs.String("mode", "read-only", "")
-	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "provider": {}, "model": {}, "role": {}, "mode": {}}, nil); err != nil {
+	planRequired := fs.Bool("plan-required", false, "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "provider": {}, "model": {}, "role": {}, "mode": {}}, map[string]struct{}{"plan-required": {}}); err != nil {
 		return err
 	}
 	positionals := fs.Args()
 	if len(positionals) < 2 {
-		return fmt.Errorf("usage: pallium team spawn <team-id> <name> [--provider p] [--model m] [--role r] [--mode read-only|edit] [--json]")
+		return fmt.Errorf("usage: pallium team spawn <team-id> <name> [--provider p] [--model m] [--role r] [--mode read-only|edit] [--plan-required] [--json]")
 	}
 	teamID, name := positionals[0], positionals[1]
 	resolvedProvider := workflow.ResolveProvider("", *provider)
@@ -136,7 +141,15 @@ func runTeamSpawn(out io.Writer, args []string, jsonOutput bool) error {
 		return err
 	}
 	defer store.Close()
-	member, err := store.SpawnMember(teamID, name, resolvedProvider, *model, *role, *mode)
+	var member workflow.TeamMember
+	if *planRequired {
+		// A plan-required member is always spawned read-only regardless of
+		// --mode: it cannot edit anything until `team approve` flips it, so
+		// mode is enforced here, not merely defaulted.
+		member, err = store.SpawnPlanRequiredMember(teamID, name, resolvedProvider, *model, *role)
+	} else {
+		member, err = store.SpawnMember(teamID, name, resolvedProvider, *model, *role, *mode)
+	}
 	if err != nil {
 		return err
 	}
@@ -199,11 +212,26 @@ func runTeamTasksAdd(out io.Writer, args []string, jsonOutput bool) error {
 		return err
 	}
 	defer store.Close()
-	task, err := store.CreateTeamTask(teamID, title, *description, deps)
+	// CreateTeamTaskWithGate (not the bare Store method) so the M2
+	// task_created quality-gate hook fires from the CLI exactly the same way
+	// it does from the team.tasks.create workflow primitive — one front
+	// door, per the architecture ruling.
+	//
+	// Run.ID is set to teamID before the call — a one-off CLI invocation is
+	// a single goroutine, so this has none of the concurrency risk RunTeam's
+	// own r.Run.ID assignment documents (see RunTeamTurn); it just gives a
+	// configured wrapper provider the same PALLIUM_WORKFLOW_RUN_ID metadata
+	// during a gate call that it already gets during a real team turn.
+	// Found by review: this bare Runner used to leave Run.ID empty.
+	runner := &workflow.Runner{Run: workflow.Run{ID: teamID}}
+	task, err := runner.CreateTeamTaskWithGate(context.Background(), store, teamID, title, *description, deps)
 	if err != nil {
 		return err
 	}
 	return output.Write(out, task, jsonOutput, func() string {
+		if task.Status == "blocked" {
+			return "Task added then BLOCKED by quality gate: " + task.ID + " — " + task.Title + " (" + task.Result + ")"
+		}
 		return "Task added: " + task.ID + " — " + task.Title
 	})
 }
@@ -278,11 +306,33 @@ func runTeamTasksComplete(out io.Writer, args []string, jsonOutput bool) error {
 		return err
 	}
 	defer store.Close()
-	task, err := store.CompleteTask(positionals[0], positionals[1], *as, *result)
+	// CompleteTaskWithGate, not the bare Store method — same front door as
+	// team.tasks.complete and RunTeamTurn's own decision-application, so a
+	// CLI-driven completion gets the identical task_completed quality bar.
+	//
+	// Run.ID is set to teamID before the call for the same reason as `team
+	// tasks add` above — a configured wrapper provider gets the same
+	// PALLIUM_WORKFLOW_RUN_ID metadata during this gate call that it would
+	// during a real team turn. Found by review.
+	runner := &workflow.Runner{Run: workflow.Run{ID: positionals[0]}}
+	task, approved, err := runner.CompleteTaskWithGate(context.Background(), store, positionals[0], positionals[1], *as, *result)
 	if err != nil {
 		return err
 	}
-	return output.Write(out, task, jsonOutput, func() string {
+	// approved is folded into the JSON payload (not just the text renderer)
+	// via anonymous embedding, which flattens TeamTask's own fields into the
+	// same object rather than nesting under a "task" key — found by review:
+	// --json on a rejected completion used to serialize only the unchanged
+	// task, so automation had no reliable way to distinguish a rejection
+	// from a successful no-op completion.
+	payload := struct {
+		workflow.TeamTask
+		Approved bool `json:"approved"`
+	}{TeamTask: task, Approved: approved}
+	return output.Write(out, payload, jsonOutput, func() string {
+		if !approved {
+			return "Task " + task.ID + " completion REJECTED by quality gate; feedback sent to " + *as
+		}
 		return "Task " + task.ID + " completed"
 	})
 }
@@ -421,7 +471,14 @@ func runTeamStatus(out io.Writer, args []string, jsonOutput bool) error {
 	if err != nil {
 		return err
 	}
-	payload := map[string]any{"team": team, "members": members, "tasks": tasks}
+	// untracked_cost_providers surfaces the SAME honesty signal the text
+	// renderer below already prints, as a structured field too — M1 landed
+	// the usage read-back and the human-readable note, but a JSON consumer
+	// (a dashboard, a script polling `team status --json`) had no way to
+	// see it without parsing prose. Included unconditionally (not gated on
+	// whether a budget is set) since it's equally true either way; a caller
+	// checking budget honesty naturally reads it alongside BudgetUSDLimit.
+	payload := map[string]any{"team": team, "members": members, "tasks": tasks, "untracked_cost_providers": workflow.UntrackedCostProviders(members)}
 	return output.Write(out, payload, jsonOutput, func() string {
 		var b strings.Builder
 		fmt.Fprintf(&b, "Team %s [%s] — %s (spend $%.4f", team.ID, team.Status, team.Goal, team.SpendUSD)
@@ -457,32 +514,11 @@ func runTeamStatus(out io.Writer, args []string, jsonOutput bool) error {
 			}
 		}
 		fmt.Fprintf(&b, "  tasks: %d pending, %d in progress, %d completed\n", pending, inProgress, completed)
-		if untracked := untrackedCostProviders(members); len(untracked) > 0 {
+		if untracked := workflow.UntrackedCostProviders(members); len(untracked) > 0 {
 			fmt.Fprintf(&b, "  cost not tracked for: %s (reports no usage/cost at all; the spend total above is incomplete for these members)\n", strings.Join(untracked, ", "))
 		}
 		return strings.TrimRight(b.String(), "\n")
 	})
-}
-
-// untrackedCostProviders reports which distinct providers among members
-// never contribute real spend, so `team status`/`team start --budget-usd`
-// can say plainly which providers a budget ceiling silently cannot see —
-// rather than a $0.0000 line looking indistinguishable from "genuinely free
-// so far". Only codex is unconditionally untracked (its exec has no usage
-// envelope at all); claude round-trips a real cost, and a configured
-// wrapper is tracked whenever it reports PALLIUM_WORKFLOW_USAGE_FILE (see
-// runConfiguredProviderTeamTurn) — Pallium can't tell from here whether a
-// given wrapper script actually does that, so wrappers are not flagged.
-func untrackedCostProviders(members []workflow.TeamMember) []string {
-	seen := map[string]bool{}
-	var untracked []string
-	for _, m := range members {
-		if m.Provider == "codex" && !seen[m.Provider] {
-			seen[m.Provider] = true
-			untracked = append(untracked, m.Provider)
-		}
-	}
-	return untracked
 }
 
 func runTeamRun(out io.Writer, args []string, jsonOutput bool) error {
@@ -520,6 +556,12 @@ func runTeamRun(out io.Writer, args []string, jsonOutput bool) error {
 	})
 }
 
+// runTeamApprove is the full M2 plan-approval flow when the member is
+// plan-required (ApproveMemberPlan: validates a plan is actually pending,
+// flips to edit, journals the approval as a message), and falls back to the
+// M1 primitive mode-flip for a plain read-only member with no plan flow at
+// all — approve on a non-plan-required member has always just meant "let it
+// edit now," and that keeps working unchanged.
 func runTeamApprove(out io.Writer, args []string, jsonOutput bool) error {
 	fs := newSessionFlagSet("team approve")
 	dbPath := fs.String("db", "", "")
@@ -530,23 +572,115 @@ func runTeamApprove(out io.Writer, args []string, jsonOutput bool) error {
 	if len(positionals) < 2 {
 		return fmt.Errorf("usage: pallium team approve <team-id> <member-name> [--json]")
 	}
-	// M1 scope: approve is the primitive mode-flip only (read-only -> edit).
-	// The full plan-review artifact + reject-with-feedback loop from the
-	// settled design is M2 (workflow-script primitives, quality gates).
+	teamID, name := positionals[0], positionals[1]
 	store, err := openPalliumStore(*dbPath)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
-	if err := store.SetMemberMode(positionals[0], positionals[1], "edit"); err != nil {
+	existing, err := store.GetMember(teamID, name)
+	if err != nil {
 		return err
 	}
-	member, err := store.GetMember(positionals[0], positionals[1])
+	var member workflow.TeamMember
+	if existing.PlanRequired {
+		member, err = store.ApproveMemberPlan(teamID, name)
+	} else {
+		if err := store.SetMemberMode(teamID, name, "edit"); err != nil {
+			return err
+		}
+		member, err = store.GetMember(teamID, name)
+	}
 	if err != nil {
 		return err
 	}
 	return output.Write(out, member, jsonOutput, func() string {
 		return member.Name + " approved for edit mode"
+	})
+}
+
+// runTeamReject delivers plan-review feedback (M2) and keeps the member
+// read-only — see Store.RejectMemberPlan for why this isn't terminal.
+func runTeamReject(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("team reject")
+	dbPath := fs.String("db", "", "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}}, nil); err != nil {
+		return err
+	}
+	positionals := fs.Args()
+	if len(positionals) < 3 {
+		return fmt.Errorf("usage: pallium team reject <team-id> <member-name> \"<feedback>\" [--json]")
+	}
+	teamID, name := positionals[0], positionals[1]
+	feedback := strings.Join(positionals[2:], " ")
+	store, err := openPalliumStore(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	member, err := store.RejectMemberPlan(teamID, name, feedback)
+	if err != nil {
+		return err
+	}
+	return output.Write(out, member, jsonOutput, func() string {
+		return member.Name + "'s plan rejected; feedback delivered"
+	})
+}
+
+// runTeamGateCmd configures the M2 quality-gate hooks. Called "gate set"
+// (not just "gate") to leave room for a future "gate show" without an
+// awkward positional-vs-subcommand ambiguity.
+func runTeamGateCmd(out io.Writer, args []string, jsonOutput bool) error {
+	if len(args) == 0 || args[0] != "set" {
+		return fmt.Errorf("usage: pallium team gate set <team-id> --hooks task_created,task_completed,teammate_idle \"<prompt>\" [--json]")
+	}
+	fs := newSessionFlagSet("team gate set")
+	dbPath := fs.String("db", "", "")
+	hooksFlag := fs.String("hooks", "", "")
+	if err := parseSessionFlags(fs, args[1:], map[string]struct{}{"db": {}, "hooks": {}}, nil); err != nil {
+		return err
+	}
+	positionals := fs.Args()
+	// SetTeamGate already treats an empty hooks list as "disable gating"
+	// (team_store.go), but this CLI used to reject an empty --hooks before
+	// that path was ever reachable, leaving no supported way to turn a
+	// configured gate back off. --hooks "" (explicitly passed, checked via
+	// flagWasSet rather than just an empty string, which is also what an
+	// omitted flag defaults to) now clears it, and a prompt is no longer
+	// required in that case — there is nothing left for a prompt to
+	// describe. Found by review.
+	clearingHooks := flagWasSet(fs, "hooks") && strings.TrimSpace(*hooksFlag) == ""
+	if len(positionals) < 1 || (!clearingHooks && (len(positionals) < 2 || strings.TrimSpace(*hooksFlag) == "")) {
+		return fmt.Errorf("usage: pallium team gate set <team-id> --hooks task_created,task_completed,teammate_idle \"<prompt>\" [--json]\n   or: pallium team gate set <team-id> --hooks \"\" (clears a configured gate)")
+	}
+	teamID := positionals[0]
+	prompt := ""
+	if len(positionals) > 1 {
+		prompt = strings.Join(positionals[1:], " ")
+	}
+	var hooks []string
+	for _, h := range strings.Split(*hooksFlag, ",") {
+		if h = strings.TrimSpace(h); h != "" {
+			hooks = append(hooks, h)
+		}
+	}
+	store, err := openPalliumStore(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if err := store.SetTeamGate(teamID, prompt, hooks); err != nil {
+		return err
+	}
+	team, err := store.GetTeam(teamID)
+	if err != nil {
+		return err
+	}
+	return output.Write(out, team, jsonOutput, func() string {
+		if len(hooks) == 0 {
+			return "Quality gate cleared for " + teamID
+		}
+		return fmt.Sprintf("Quality gate configured for %s: hooks=%s", teamID, strings.Join(hooks, ","))
 	})
 }
 
