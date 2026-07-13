@@ -875,6 +875,15 @@ func (r *Runner) jsTeam(ctx context.Context, vm *goja.Runtime) map[string]any {
 				return vm.ToValue(member)
 			},
 			"steer": func(teamID, name, directive string) goja.Value {
+				// Validate the member exists first, mirroring the CLI path
+				// (cmd/team.go) — found by review: SendTeamMessage alone
+				// doesn't check the recipient is a real row, so a
+				// misspelled name used to return success while the
+				// directive sat addressed to nobody RunTeam would ever
+				// schedule, silently never delivered.
+				if _, err := r.Store.GetMember(teamID, name); err != nil {
+					panic(vm.ToValue(err.Error()))
+				}
 				msg, err := r.Store.SendTeamMessage(teamID, "lead", name, SteerDirectivePrefix+directive)
 				if err != nil {
 					panic(vm.ToValue(err.Error()))

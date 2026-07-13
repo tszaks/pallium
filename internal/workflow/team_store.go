@@ -515,7 +515,27 @@ func (s *Store) RestartMember(teamID, name, staleAfter string) (TeamMember, erro
 	if n, _ := res.RowsAffected(); n == 0 {
 		return TeamMember{}, fmt.Errorf("team member %q not found on team %s", name, teamID)
 	}
-	if _, err := s.ReconcileInterruptedMembers(teamID, staleAfter); err != nil {
+	// ReconcileInterruptedMember (scoped to THIS member), not the team-wide
+	// ReconcileInterruptedMembers sweep — found by review: the sweep
+	// reconciles EVERY stale-looking member on the team, so an operator
+	// force-restarting one hung teammate with a short
+	// --stale-after-minutes cutoff could also clear (and revert the
+	// in-progress tasks of) other teammates whose turns were legitimately
+	// still in flight, letting a second turn double-run them.
+	if _, err := s.ReconcileInterruptedMember(teamID, name, staleAfter); err != nil {
+		return TeamMember{}, err
+	}
+	// NudgeMember: clearing stop_requested and reconciling a stale lease
+	// do NOT by themselves make RunTeam schedule this member again — the
+	// scheduler only offers a turn for undelivered mail, a nudge, or
+	// claimable work whose watermark is newer than the member's own last
+	// turn. Found by review: without an explicit signal, a member
+	// restarted after it already saw the current (unchanged) board would
+	// sit un-scheduled through the next `team run` despite restart
+	// reporting success. Nudge is the existing, purpose-built "give this
+	// member a turn regardless of board state" primitive — RunTeam clears
+	// it itself once a turn actually runs.
+	if err := s.NudgeMember(teamID, name); err != nil {
 		return TeamMember{}, err
 	}
 	return s.GetMember(teamID, name)
@@ -608,9 +628,18 @@ var errMemberTurnInFlight = fmt.Errorf("team member turn already in flight")
 // an idempotent same-holder refresh) rather than re-deriving it.
 func (s *Store) BeginMemberTurn(teamID, name string, staleAfter string) (lease string, err error) {
 	now := nowString()
+	// stop_requested=0 is part of the ACTUAL acquisition CAS, not just
+	// RunTeam's earlier eligibility snapshot (ListMembers, read before any
+	// goroutine calls this) — found by review: a stop landing in the gap
+	// between that snapshot and this UPDATE used to dispatch one more real
+	// provider call regardless, since nothing here re-checked it. This is
+	// the same class of guarantee turn_started_at's own CAS already gives
+	// against a second concurrent scheduler; stop_requested needed the
+	// identical treatment; a stale snapshot can never win a race the
+	// acquisition step itself re-validates.
 	res, err := s.db.Exec(
 		`UPDATE team_members SET turn_started_at=?, status='active', updated_at=?
-		 WHERE team_id=? AND name=? AND (turn_started_at IS NULL OR turn_started_at < ?)`,
+		 WHERE team_id=? AND name=? AND (turn_started_at IS NULL OR turn_started_at < ?) AND COALESCE(stop_requested,0)=0`,
 		now, now, teamID, name, staleAfter)
 	if err != nil {
 		return "", err
@@ -780,63 +809,92 @@ func (s *Store) ReconcileInterruptedMembers(teamID, staleAfter string) ([]string
 	now := nowString()
 	var reconciled []string
 	for _, name := range names {
-		// Both statements below run in ONE transaction: a live dogfooded
-		// review caught that they were previously two separate, individually
-		// autocommitted Exec calls — a crash between them (or a process kill
-		// mid-reconcile) could mark the member interrupted while leaving its
-		// task permanently stuck "in_progress" with no live owner, forever
-		// unclaimable (not pending) and never resumed (owner's turn already
-		// closed out).
-		if err := func() error {
-			tx, err := s.db.Begin()
-			if err != nil {
-				return err
-			}
-			defer tx.Rollback()
-			// CAS, matching BeginMemberTurn: re-check the exact staleness
-			// condition at UPDATE time, not just at the earlier SELECT.
-			// Found by the same review: without the re-check, a member
-			// whose turn legitimately restarted via stale-takeover — or
-			// finished cleanly — between the SELECT above and this UPDATE
-			// would get clobbered back to "interrupted" with
-			// turn_started_at wiped, letting a second BeginMemberTurn
-			// succeed and double-run the same member. Concurrent `team
-			// run`/`team attach` on one team is an explicitly supported
-			// scenario, so this window is real, not theoretical.
-			res, err := tx.Exec(`UPDATE team_members SET turn_started_at=NULL, status='interrupted', updated_at=?
-				WHERE team_id=? AND name=? AND turn_started_at IS NOT NULL AND turn_started_at < ?`, now, teamID, name, staleAfter)
-			if err != nil {
-				return err
-			}
-			if n, _ := res.RowsAffected(); n == 0 {
-				// Lost the race: this member's turn is no longer the stale
-				// one we observed (it restarted or finished already) —
-				// leave it alone.
-				return nil
-			}
-			reconciled = append(reconciled, name)
-			if sessions[name] != "" {
-				return tx.Commit()
-			}
-			revertRes, err := tx.Exec(`UPDATE team_tasks SET status='pending', owner=NULL, updated_at=? WHERE team_id=? AND owner=? AND status='in_progress'`, now, teamID, name)
-			if err != nil {
-				return err
-			}
-			if n, _ := revertRes.RowsAffected(); n > 0 {
-				// A task just became claimable again (owner cleared) — bump
-				// the board watermark so the scheduler doesn't treat this as
-				// the same unchanged board every other idle member already
-				// declined (see RunTeam / Team.TasksUpdatedAt).
-				if err := bumpTeamTasksUpdated(tx, teamID, now); err != nil {
-					return err
-				}
-			}
-			return tx.Commit()
-		}(); err != nil {
+		ok, err := s.reconcileOneStaleMember(teamID, name, sessions[name], staleAfter, now)
+		if err != nil {
 			return nil, err
+		}
+		if ok {
+			reconciled = append(reconciled, name)
 		}
 	}
 	return reconciled, nil
+}
+
+// ReconcileInterruptedMember is ReconcileInterruptedMembers scoped to ONE
+// named member, for `team member restart`: found by review, restart used
+// to call the team-wide sweep, which reconciles EVERY stale-looking member
+// on the team, not just the one requested. An operator force-restarting a
+// single hung teammate with a short --stale-after-minutes cutoff could
+// therefore also clear (and revert the in-progress tasks of) other
+// teammates whose turns were legitimately still in flight, letting a
+// second turn double-run them. This SELECTs only the named member's own
+// row before delegating to the identical CAS-protected reconciliation
+// logic ReconcileInterruptedMembers itself uses.
+func (s *Store) ReconcileInterruptedMember(teamID, name, staleAfter string) (bool, error) {
+	var sess sql.NullString
+	err := s.db.QueryRow(`SELECT session_token FROM team_members WHERE team_id=? AND name=? AND turn_started_at IS NOT NULL AND turn_started_at < ?`, teamID, name, staleAfter).Scan(&sess)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return s.reconcileOneStaleMember(teamID, name, sess.String, staleAfter, nowString())
+}
+
+// reconcileOneStaleMember is the CAS-protected reconciliation both
+// ReconcileInterruptedMembers (team-wide sweep) and ReconcileInterruptedMember
+// (single-member restart) delegate to — one implementation, two entry
+// points at different scopes.
+func (s *Store) reconcileOneStaleMember(teamID, name, sessionToken, staleAfter, now string) (bool, error) {
+	// Both statements below run in ONE transaction: a live dogfooded
+	// review caught that they were previously two separate, individually
+	// autocommitted Exec calls — a crash between them (or a process kill
+	// mid-reconcile) could mark the member interrupted while leaving its
+	// task permanently stuck "in_progress" with no live owner, forever
+	// unclaimable (not pending) and never resumed (owner's turn already
+	// closed out).
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	// CAS, matching BeginMemberTurn: re-check the exact staleness
+	// condition at UPDATE time, not just at the earlier SELECT. Found by
+	// review: without the re-check, a member whose turn legitimately
+	// restarted via stale-takeover — or finished cleanly — between the
+	// SELECT and this UPDATE would get clobbered back to "interrupted"
+	// with turn_started_at wiped, letting a second BeginMemberTurn succeed
+	// and double-run the same member. Concurrent `team run`/`team attach`
+	// on one team is an explicitly supported scenario, so this window is
+	// real, not theoretical.
+	res, err := tx.Exec(`UPDATE team_members SET turn_started_at=NULL, status='interrupted', updated_at=?
+		WHERE team_id=? AND name=? AND turn_started_at IS NOT NULL AND turn_started_at < ?`, now, teamID, name, staleAfter)
+	if err != nil {
+		return false, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		// Lost the race: this member's turn is no longer the stale one we
+		// observed (it restarted or finished already) — leave it alone.
+		return false, nil
+	}
+	if sessionToken != "" {
+		return true, tx.Commit()
+	}
+	revertRes, err := tx.Exec(`UPDATE team_tasks SET status='pending', owner=NULL, updated_at=? WHERE team_id=? AND owner=? AND status='in_progress'`, now, teamID, name)
+	if err != nil {
+		return false, err
+	}
+	if n, _ := revertRes.RowsAffected(); n > 0 {
+		// A task just became claimable again (owner cleared) — bump the
+		// board watermark so the scheduler doesn't treat this as the same
+		// unchanged board every other idle member already declined (see
+		// RunTeam / Team.TasksUpdatedAt).
+		if err := bumpTeamTasksUpdated(tx, teamID, now); err != nil {
+			return false, err
+		}
+	}
+	return true, tx.Commit()
 }
 
 // CreateTeamTask adds a task to the board. dependsOn task ids need not exist

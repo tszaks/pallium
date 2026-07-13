@@ -179,6 +179,38 @@ return {teamId: teamId, stopped, restarted, steered};
 	}
 }
 
+// TestTeamMemberSteerRejectsUnknownMember is the regression test for the
+// review finding that team.member.steer() wrote directly to the mailbox
+// with no existence check, unlike the CLI path (cmd/team.go) which looks
+// the member up first — a misspelled name used to return success while the
+// directive sat addressed to nobody RunTeam would ever schedule, silently
+// never delivered.
+func TestTeamMemberSteerRejectsUnknownMember(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	script := `
+const newTeam = team.create("ship the feature", {cwd: "` + strings.ReplaceAll(tmp, `\`, `\\`) + `"});
+team.member.steer(newTeam.id, "worker-typo", "focus on the auth bug");
+return "unreachable";
+`
+	scriptPath, err := WriteRunScript("wf-team-steer-typo", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-team-steer-typo", Task: "team steer typo", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil); err == nil {
+		t.Fatal("expected team.member.steer to reject a nonexistent member instead of silently succeeding")
+	}
+}
+
 // TestTeamWaitPrimitiveHonorsWorkflowStop is the regression test for the
 // review finding that team.wait passed the raw script context into RunTeam
 // instead of contextWithStoredStop's wrapper — the same stop/pause-aware
