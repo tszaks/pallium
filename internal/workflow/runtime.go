@@ -753,7 +753,7 @@ func (r *Runner) jsTeam(ctx context.Context, vm *goja.Runtime) map[string]any {
 			if err != nil {
 				panic(vm.ToValue(err.Error()))
 			}
-			return vm.ToValue(map[string]any{"team": team, "members": members, "tasks": tasks})
+			return vm.ToValue(map[string]any{"team": team, "members": members, "tasks": tasks, "untracked_cost_providers": UntrackedCostProviders(members)})
 		},
 		// wait drives the team — the acceptance shape for "a loop tick
 		// convening a team": create/spawn/tasks.create set the board up,

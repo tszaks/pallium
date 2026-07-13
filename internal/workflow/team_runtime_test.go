@@ -585,6 +585,89 @@ func TestRunTeamTurnTeammateIdleGateForcesActiveOnRejection(t *testing.T) {
 	}
 }
 
+// TestDescribeClaimableWork covers the teammate_idle gate's task-board
+// summary (found by review: the gate used to see only the teammate's own
+// summary, with no factual board state to check an idle claim against).
+func TestDescribeClaimableWork(t *testing.T) {
+	if got := describeClaimableWork(nil); got != "The task board is empty." {
+		t.Fatalf("expected the empty-board message, got %q", got)
+	}
+	blocked := []TeamTask{
+		{ID: "t1", Title: "needs a dependency", Status: "pending", DependsOn: []string{"t0"}},
+		{ID: "t0", Title: "the dependency", Status: "in_progress"},
+	}
+	if got := describeClaimableWork(blocked); !strings.Contains(got, "No pending task is currently claimable") {
+		t.Fatalf("expected the all-blocked message when every pending task has an unmet dependency, got %q", got)
+	}
+	claimable := []TeamTask{
+		{ID: "t0", Title: "the dependency", Status: "completed"},
+		{ID: "t1", Title: "unblocked now", Status: "pending", DependsOn: []string{"t0"}},
+		{ID: "t2", Title: "already done", Status: "completed"},
+	}
+	got := describeClaimableWork(claimable)
+	if !strings.Contains(got, "unblocked now") || strings.Contains(got, "already done") {
+		t.Fatalf("expected only the claimable pending task named, got %q", got)
+	}
+}
+
+// TestCompleteTaskWithGateSkipsGateForIneligibleTask is the regression test
+// for the review finding that CompleteTaskWithGate ran a real (costly)
+// verifier call even for a completion request that could never succeed —
+// wrong owner, not actually in_progress. The fake claude binary here writes
+// a marker file on invocation; asserting that file never appears is the
+// only way to prove the gate itself was never called, not just that its
+// answer was later ignored.
+func TestCompleteTaskWithGateSkipsGateForIneligibleTask(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER", "claude") // see TestCreateTeamTaskWithGateBlocksRejectedTask's comment
+	store, _ := newTeamTestStore(t)
+	repo := newTeamTestRepo(t)
+	team, err := store.CreateTeam("goal", repo, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetTeamGate(team.ID, "verify the result", []string{"task_completed"}); err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.CreateTeamTask(team.ID, "do the thing", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately left "pending", never claimed — no owner can legitimately
+	// complete it yet.
+	marker := filepath.Join(t.TempDir(), "gate-was-called")
+	script := "#!/bin/sh\ncat >/dev/null\ntouch '" + marker + "'\nprintf '%s' '{\"result\":\"{\\\"approved\\\":true,\\\"reason\\\":\\\"ok\\\"}\"}'\n"
+	fakeBin := filepath.Join(t.TempDir(), "fake-claude-marker.sh")
+	if err := os.WriteFile(fakeBin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	setClaudeCLI(t, fakeBin)
+
+	r := &Runner{Run: Run{ID: team.ID}}
+	_, approved, err := r.CompleteTaskWithGate(context.Background(), store, team.ID, task.ID, "worker-1", "done")
+	if approved {
+		t.Fatalf("expected an ineligible completion to never be approved")
+	}
+	if err == nil || !strings.Contains(err.Error(), "not owned by") {
+		t.Fatalf("expected the same not-owned error CompleteTask itself produces, got %v", err)
+	}
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Fatalf("expected the gate verifier NEVER invoked for an ineligible completion, but the marker file exists")
+	}
+
+	// Positive control: the exact same fake binary DOES get called once the
+	// task is actually eligible, proving the marker technique itself works
+	// and this isn't just a fake binary that silently never runs.
+	if _, err := store.ClaimTask(team.ID, task.ID, "worker-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, approved, err := r.CompleteTaskWithGate(context.Background(), store, team.ID, task.ID, "worker-1", "done"); err != nil || !approved {
+		t.Fatalf("expected the now-eligible completion to be approved, got approved=%v err=%v", approved, err)
+	}
+	if _, statErr := os.Stat(marker); statErr != nil {
+		t.Fatalf("expected the gate verifier invoked once the task became eligible: %v", statErr)
+	}
+}
+
 func TestRunTeamTurnProviderFailureNotifiesLeadWithError(t *testing.T) {
 	store, _ := newTeamTestStore(t)
 	repo := newTeamTestRepo(t)

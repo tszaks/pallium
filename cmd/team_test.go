@@ -128,6 +128,60 @@ func TestTeamGateSetRejectsUnknownHookAndRoundTrips(t *testing.T) {
 	}
 }
 
+// TestTeamGateSetCanBeCleared is the regression test for the review finding
+// that there was no supported way to turn a configured gate back off:
+// --hooks "" used to be rejected as "no --hooks given" before it ever
+// reached SetTeamGate's own empty-disables semantics.
+func TestTeamGateSetCanBeCleared(t *testing.T) {
+	dbPath := newTeamCmdTestDB(t)
+	var out bytes.Buffer
+	if err := runTeam(&out, []string{"start", "goal", "--db", dbPath, "--cwd", t.TempDir()}, true); err != nil {
+		t.Fatal(err)
+	}
+	var team workflow.Team
+	if err := json.Unmarshal(out.Bytes(), &team); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	if err := runTeam(&out, []string{"gate", "set", team.ID, "--hooks", "task_created", "no vague tasks", "--db", dbPath}, true); err != nil {
+		t.Fatal(err)
+	}
+	var configured workflow.Team
+	if err := json.Unmarshal(out.Bytes(), &configured); err != nil {
+		t.Fatal(err)
+	}
+	if len(configured.GateHooks) == 0 {
+		t.Fatalf("expected the gate hooks stored after configuring, got %+v", configured)
+	}
+
+	out.Reset()
+	if err := runTeam(&out, []string{"gate", "set", team.ID, "--hooks", "", "--db", dbPath}, false); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "cleared") {
+		t.Fatalf("expected a clear confirmation, got %q", out.String())
+	}
+
+	// Once cleared, a new task must land plain-pending with NO provider call
+	// at all (teamGateHasHook is false, so CreateTeamTaskWithGate takes the
+	// bare Store.CreateTeamTask branch) — this is what actually proves the
+	// clear took effect, without this test needing to mock a real gate
+	// verifier call itself (that's already covered by the workflow-package
+	// gate tests).
+	out.Reset()
+	if err := runTeam(&out, []string{"tasks", "add", team.ID, "do the thing", "--db", dbPath}, true); err != nil {
+		t.Fatal(err)
+	}
+	var task workflow.TeamTask
+	if err := json.Unmarshal(out.Bytes(), &task); err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != "pending" {
+		t.Fatalf("expected no gate to fire after clearing, got %+v", task)
+	}
+}
+
 func TestTeamTasksAddRoutesThroughGate(t *testing.T) {
 	dbPath := newTeamCmdTestDB(t)
 	var out bytes.Buffer

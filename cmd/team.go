@@ -216,7 +216,14 @@ func runTeamTasksAdd(out io.Writer, args []string, jsonOutput bool) error {
 	// task_created quality-gate hook fires from the CLI exactly the same way
 	// it does from the team.tasks.create workflow primitive — one front
 	// door, per the architecture ruling.
-	runner := &workflow.Runner{}
+	//
+	// Run.ID is set to teamID before the call — a one-off CLI invocation is
+	// a single goroutine, so this has none of the concurrency risk RunTeam's
+	// own r.Run.ID assignment documents (see RunTeamTurn); it just gives a
+	// configured wrapper provider the same PALLIUM_WORKFLOW_RUN_ID metadata
+	// during a gate call that it already gets during a real team turn.
+	// Found by review: this bare Runner used to leave Run.ID empty.
+	runner := &workflow.Runner{Run: workflow.Run{ID: teamID}}
 	task, err := runner.CreateTeamTaskWithGate(context.Background(), store, teamID, title, *description, deps)
 	if err != nil {
 		return err
@@ -302,12 +309,27 @@ func runTeamTasksComplete(out io.Writer, args []string, jsonOutput bool) error {
 	// CompleteTaskWithGate, not the bare Store method — same front door as
 	// team.tasks.complete and RunTeamTurn's own decision-application, so a
 	// CLI-driven completion gets the identical task_completed quality bar.
-	runner := &workflow.Runner{}
+	//
+	// Run.ID is set to teamID before the call for the same reason as `team
+	// tasks add` above — a configured wrapper provider gets the same
+	// PALLIUM_WORKFLOW_RUN_ID metadata during this gate call that it would
+	// during a real team turn. Found by review.
+	runner := &workflow.Runner{Run: workflow.Run{ID: positionals[0]}}
 	task, approved, err := runner.CompleteTaskWithGate(context.Background(), store, positionals[0], positionals[1], *as, *result)
 	if err != nil {
 		return err
 	}
-	return output.Write(out, task, jsonOutput, func() string {
+	// approved is folded into the JSON payload (not just the text renderer)
+	// via anonymous embedding, which flattens TeamTask's own fields into the
+	// same object rather than nesting under a "task" key — found by review:
+	// --json on a rejected completion used to serialize only the unchanged
+	// task, so automation had no reliable way to distinguish a rejection
+	// from a successful no-op completion.
+	payload := struct {
+		workflow.TeamTask
+		Approved bool `json:"approved"`
+	}{TeamTask: task, Approved: approved}
+	return output.Write(out, payload, jsonOutput, func() string {
 		if !approved {
 			return "Task " + task.ID + " completion REJECTED by quality gate; feedback sent to " + *as
 		}
@@ -456,7 +478,7 @@ func runTeamStatus(out io.Writer, args []string, jsonOutput bool) error {
 	// see it without parsing prose. Included unconditionally (not gated on
 	// whether a budget is set) since it's equally true either way; a caller
 	// checking budget honesty naturally reads it alongside BudgetUSDLimit.
-	payload := map[string]any{"team": team, "members": members, "tasks": tasks, "untracked_cost_providers": untrackedCostProviders(members)}
+	payload := map[string]any{"team": team, "members": members, "tasks": tasks, "untracked_cost_providers": workflow.UntrackedCostProviders(members)}
 	return output.Write(out, payload, jsonOutput, func() string {
 		var b strings.Builder
 		fmt.Fprintf(&b, "Team %s [%s] — %s (spend $%.4f", team.ID, team.Status, team.Goal, team.SpendUSD)
@@ -492,32 +514,11 @@ func runTeamStatus(out io.Writer, args []string, jsonOutput bool) error {
 			}
 		}
 		fmt.Fprintf(&b, "  tasks: %d pending, %d in progress, %d completed\n", pending, inProgress, completed)
-		if untracked := untrackedCostProviders(members); len(untracked) > 0 {
+		if untracked := workflow.UntrackedCostProviders(members); len(untracked) > 0 {
 			fmt.Fprintf(&b, "  cost not tracked for: %s (reports no usage/cost at all; the spend total above is incomplete for these members)\n", strings.Join(untracked, ", "))
 		}
 		return strings.TrimRight(b.String(), "\n")
 	})
-}
-
-// untrackedCostProviders reports which distinct providers among members
-// never contribute real spend, so `team status`/`team start --budget-usd`
-// can say plainly which providers a budget ceiling silently cannot see —
-// rather than a $0.0000 line looking indistinguishable from "genuinely free
-// so far". Only codex is unconditionally untracked (its exec has no usage
-// envelope at all); claude round-trips a real cost, and a configured
-// wrapper is tracked whenever it reports PALLIUM_WORKFLOW_USAGE_FILE (see
-// runConfiguredProviderTeamTurn) — Pallium can't tell from here whether a
-// given wrapper script actually does that, so wrappers are not flagged.
-func untrackedCostProviders(members []workflow.TeamMember) []string {
-	seen := map[string]bool{}
-	var untracked []string
-	for _, m := range members {
-		if m.Provider == "codex" && !seen[m.Provider] {
-			seen[m.Provider] = true
-			untracked = append(untracked, m.Provider)
-		}
-	}
-	return untracked
 }
 
 func runTeamRun(out io.Writer, args []string, jsonOutput bool) error {
@@ -640,11 +641,23 @@ func runTeamGateCmd(out io.Writer, args []string, jsonOutput bool) error {
 		return err
 	}
 	positionals := fs.Args()
-	if len(positionals) < 2 || strings.TrimSpace(*hooksFlag) == "" {
-		return fmt.Errorf("usage: pallium team gate set <team-id> --hooks task_created,task_completed,teammate_idle \"<prompt>\" [--json]")
+	// SetTeamGate already treats an empty hooks list as "disable gating"
+	// (team_store.go), but this CLI used to reject an empty --hooks before
+	// that path was ever reachable, leaving no supported way to turn a
+	// configured gate back off. --hooks "" (explicitly passed, checked via
+	// flagWasSet rather than just an empty string, which is also what an
+	// omitted flag defaults to) now clears it, and a prompt is no longer
+	// required in that case — there is nothing left for a prompt to
+	// describe. Found by review.
+	clearingHooks := flagWasSet(fs, "hooks") && strings.TrimSpace(*hooksFlag) == ""
+	if len(positionals) < 1 || (!clearingHooks && (len(positionals) < 2 || strings.TrimSpace(*hooksFlag) == "")) {
+		return fmt.Errorf("usage: pallium team gate set <team-id> --hooks task_created,task_completed,teammate_idle \"<prompt>\" [--json]\n   or: pallium team gate set <team-id> --hooks \"\" (clears a configured gate)")
 	}
 	teamID := positionals[0]
-	prompt := strings.Join(positionals[1:], " ")
+	prompt := ""
+	if len(positionals) > 1 {
+		prompt = strings.Join(positionals[1:], " ")
+	}
 	var hooks []string
 	for _, h := range strings.Split(*hooksFlag, ",") {
 		if h = strings.TrimSpace(h); h != "" {
@@ -664,6 +677,9 @@ func runTeamGateCmd(out io.Writer, args []string, jsonOutput bool) error {
 		return err
 	}
 	return output.Write(out, team, jsonOutput, func() string {
+		if len(hooks) == 0 {
+			return "Quality gate cleared for " + teamID
+		}
 		return fmt.Sprintf("Quality gate configured for %s: hooks=%s", teamID, strings.Join(hooks, ","))
 	})
 }

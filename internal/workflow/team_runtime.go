@@ -382,7 +382,8 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 	// lease) stuck past the requested timeout instead of failing within it.
 	rescheduleAfterIdleRejection := false
 	if status == "idle" && teamGateHasHook(team, "teammate_idle") {
-		approved, reason, gateCostUSD, gerr := r.runTeamGate(turnCtx, team, fmt.Sprintf("Teammate %q wants to go idle. Its own summary: %s", name, decision.Summary))
+		situation := fmt.Sprintf("Teammate %q wants to go idle. Its own summary: %s\n%s", name, decision.Summary, describeClaimableWork(tasks))
+		approved, reason, gateCostUSD, gerr := r.runTeamGate(turnCtx, team, situation)
 		if gateCostUSD > 0 {
 			// costUSD's turn-level cost was already added to team spend
 			// above (right after dispatchTeamTurn) — that call already
@@ -463,7 +464,13 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 			}
 		}
 		if id := strings.TrimSpace(decision.CompleteTaskID); id != "" {
-			if _, _, err := r.CompleteTaskWithGate(ctx, store, teamID, id, name, decision.CompleteResult); err != nil {
+			// turnCtx, not the unbounded outer ctx — same fix as the
+			// teammate_idle gate above (line ~385) and for the identical
+			// reason: a hung task_completed verifier here used to be
+			// unbounded by --agent-timeout, leaving the goroutine (and the
+			// already-finished turn's lease) stuck past the requested
+			// timeout instead of failing within it. Found by review.
+			if _, _, err := r.CompleteTaskWithGate(turnCtx, store, teamID, id, name, decision.CompleteResult); err != nil {
 				r.notifyLeadOfMemberError(store, teamID, name, fmt.Errorf("completing task %s: %w", id, err))
 			}
 		}
@@ -491,9 +498,23 @@ func (r *Runner) CompleteTaskWithGate(ctx context.Context, store *Store, teamID,
 		if err != nil {
 			return TeamTask{}, false, err
 		}
+		// Check eligibility BEFORE spending a real gate call: CompleteTask's
+		// own CAS (owner=? AND status='in_progress') is the actual authority
+		// and still runs below regardless, but a request that can't
+		// possibly succeed (wrong owner, already completed, reclaimed away
+		// from a stale owner) shouldn't cost a provider round-trip to find
+		// that out. Found by review. Non-atomic — a task reassigned between
+		// this check and CompleteTask's CAS just falls through to the same
+		// error CompleteTask already produces, which is fine: this is a
+		// cost-avoidance shortcut for the common case, not a second source
+		// of truth.
+		if task.Status != "in_progress" || task.Owner != owner {
+			return task, false, fmt.Errorf("team task %q is not owned by %q (or already completed); cannot complete it", taskID, owner)
+		}
 		var reason string
 		var gateCostUSD float64
-		approved, reason, gateCostUSD, err = r.runTeamGate(ctx, team, fmt.Sprintf("Task %q (%s), owned by %s, is proposed complete. Result:\n%s", task.Title, task.ID, owner, result))
+		situation := fmt.Sprintf("Task %q (%s), owned by %s, is proposed complete. Description:\n%s\nResult:\n%s", task.Title, task.ID, owner, task.Description, result)
+		approved, reason, gateCostUSD, err = r.runTeamGate(ctx, team, situation)
 		if gateCostUSD > 0 {
 			if _, serr := store.AddTeamSpend(teamID, gateCostUSD); serr != nil {
 				_, _ = store.SendTeamMessage(teamID, "quality-gate", "lead", fmt.Sprintf("recording task_completed gate spend for %s: %v", taskID, serr))
@@ -600,6 +621,64 @@ func teamGateHasHook(team Team, hook string) bool {
 		}
 	}
 	return false
+}
+
+// UntrackedCostProviders reports which distinct providers among members are
+// known to under-report cost. Currently just "codex": its CLI has no
+// machine-readable usage/cost output the way claude and configured wrappers
+// (via PALLIUM_WORKFLOW_USAGE_FILE) do, so a codex-backed member's turns are
+// real spend that team status can never see. Shared by the CLI's `team
+// status` JSON and the team.status() workflow primitive — found by review:
+// the primitive used to omit this caveat entirely, so a script managing a
+// codex-backed team saw spend_usd as if it were complete.
+func UntrackedCostProviders(members []TeamMember) []string {
+	seen := map[string]bool{}
+	var untracked []string
+	for _, m := range members {
+		if m.Provider == "codex" && !seen[m.Provider] {
+			seen[m.Provider] = true
+			untracked = append(untracked, m.Provider)
+		}
+	}
+	return untracked
+}
+
+// describeClaimableWork summarizes the task board for the teammate_idle
+// gate's situation string. Without this, a real verifier had no factual
+// basis to reject "going idle while work remains" — it only ever saw the
+// teammate's own summary, not whether the board backs that up. Found by
+// review. Deliberately terse (title + status only, no descriptions): this
+// is a factual check for the gate to weigh, not the gate's whole prompt.
+func describeClaimableWork(tasks []TeamTask) string {
+	if len(tasks) == 0 {
+		return "The task board is empty."
+	}
+	completed := map[string]bool{}
+	for _, t := range tasks {
+		if t.Status == "completed" {
+			completed[t.ID] = true
+		}
+	}
+	var lines []string
+	for _, t := range tasks {
+		if t.Status != "pending" {
+			continue
+		}
+		claimable := true
+		for _, dep := range t.DependsOn {
+			if !completed[dep] {
+				claimable = false
+				break
+			}
+		}
+		if claimable {
+			lines = append(lines, fmt.Sprintf("- %q (%s) is pending and claimable now", t.Title, t.ID))
+		}
+	}
+	if len(lines) == 0 {
+		return "No pending task is currently claimable (all remaining tasks are blocked, in progress, or completed)."
+	}
+	return "Claimable pending tasks:\n" + strings.Join(lines, "\n")
 }
 
 // runTeamGate is the M2 quality-gate check: an autonomous read-only verifier
@@ -720,7 +799,14 @@ func (r *Runner) CreateTeamTaskWithGate(ctx context.Context, store *Store, teamI
 	if err := store.SetTaskStatus(teamID, task.ID, "blocked", "quality gate check in progress"); err != nil {
 		return task, err
 	}
-	approved, reason, gateCostUSD, gerr := r.runTeamGate(ctx, team, fmt.Sprintf("A new task was proposed: %q. Description: %s", title, description))
+	situation := fmt.Sprintf("A new task was proposed: %q. Description: %s", title, description)
+	if len(dependsOn) > 0 {
+		// Found by review: a gate meant to catch bad task definitions
+		// couldn't see dependsOn at all, so incorrect/unclaimable
+		// prerequisite IDs sailed through approval unreviewed.
+		situation += fmt.Sprintf(" Depends on: %s.", strings.Join(dependsOn, ", "))
+	}
+	approved, reason, gateCostUSD, gerr := r.runTeamGate(ctx, team, situation)
 	if gateCostUSD > 0 {
 		if _, serr := store.AddTeamSpend(teamID, gateCostUSD); serr != nil {
 			_, _ = store.SendTeamMessage(teamID, "quality-gate", "lead", fmt.Sprintf("recording task_created gate spend for %s: %v", task.ID, serr))
