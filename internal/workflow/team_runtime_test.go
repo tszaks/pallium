@@ -1195,6 +1195,99 @@ func TestRunTeamTurnMalformedDecisionPreservesEditPatch(t *testing.T) {
 	}
 }
 
+// TestRunTeamTurnToleratesMissingSummary is the regression test for M3's
+// decision-contract hardening: live M2 dogfooding found real claude/codex
+// teammates omitting the optional "summary" field on effectively every
+// turn (6 of 6 real decisions in one session), which used to fail schema
+// validation and discard the ENTIRE decision — including a real message to
+// lead — over one missing prose field the model itself treated as
+// optional. summary is no longer required; a decision that omits it but
+// still carries real content must still apply that content.
+func TestRunTeamTurnToleratesMissingSummary(t *testing.T) {
+	store, _ := newTeamTestStore(t)
+	repo := newTeamTestRepo(t)
+	team, err := store.CreateTeam("review the diff", repo, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SpawnMember(team.ID, "researcher-1", "claude", "", "researcher", "read-only"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PersistMemberSession(team.ID, "researcher-1", "seed-session-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	setClaudeCLI(t, fakeClaudeBinary(t, `{"result":"{\"status\":\"idle\",\"messages\":[{\"to\":\"lead\",\"body\":\"module A looks fine\"}]}"}`))
+
+	r := &Runner{Run: Run{ID: team.ID}}
+	if _, err := r.RunTeamTurn(context.Background(), store, team.ID, "researcher-1", TeamTurnOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	member, err := store.GetMember(team.ID, "researcher-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if member.Status != "idle" || member.LastTurnError != "" {
+		t.Fatalf("expected a clean idle turn despite the missing summary, got %+v", member)
+	}
+	leadInbox, err := store.UndeliveredMessages(team.ID, "lead")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leadInbox) != 1 || leadInbox[0].Body != "module A looks fine" {
+		t.Fatalf("expected the summary-less decision's message still delivered to lead, got %+v", leadInbox)
+	}
+}
+
+// TestRunTeamTurnMalformedDecisionNotifiesLeadAndStaysEligible is the
+// regression test for M3's other decision-contract fix: a decision that
+// genuinely fails schema (not just a missing optional field, e.g. plain
+// prose with no JSON at all) must never be a SILENT no-op. Before this fix,
+// a parse failure recorded a note only in the member's own status field
+// (invisible unless someone runs `team status`) and advanced LastTurnAt
+// with nothing applied to the board — the scheduler's own "don't re-offer
+// an unchanged board" optimization (boardIsNewToMember in RunTeam) then
+// permanently stranded the member until a human ran `team nudge` by hand.
+// Found live: this exact stall was observed directly during M2 dogfooding
+// (round 2: 0 rounds, 0 turns).
+func TestRunTeamTurnMalformedDecisionNotifiesLeadAndStaysEligible(t *testing.T) {
+	store, _ := newTeamTestStore(t)
+	repo := newTeamTestRepo(t)
+	team, err := store.CreateTeam("goal", repo, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SpawnMember(team.ID, "researcher-1", "claude", "", "", "read-only"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PersistMemberSession(team.ID, "researcher-1", "seed-session-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	setClaudeCLI(t, fakeClaudeBinary(t, `{"result":"sure, done, no JSON here"}`))
+
+	r := &Runner{Run: Run{ID: team.ID}}
+	if _, err := r.RunTeamTurn(context.Background(), store, team.ID, "researcher-1", TeamTurnOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	member, err := store.GetMember(team.ID, "researcher-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if member.NudgedAt == "" {
+		t.Fatalf("expected the member nudged so it stays eligible next round despite the unchanged board, got %+v", member)
+	}
+	leadInbox, err := store.UndeliveredMessages(team.ID, "lead")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leadInbox) != 1 || !strings.Contains(leadInbox[0].Body, "decision did not match schema") {
+		t.Fatalf("expected the lead notified in its inbox of the schema failure, got %+v", leadInbox)
+	}
+}
+
 // TestRunTeamConvergesAcrossRoundsWithMultipleMembers drives a real
 // multi-member, multi-round exchange through the actual scheduler
 // (RunTeam), not just a single RunTeamTurn call: the lead messages
