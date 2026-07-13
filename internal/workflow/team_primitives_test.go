@@ -3,9 +3,11 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestWorkflowScriptCanConveneAndDriveATeamBoard exercises the M2 item-1
@@ -117,5 +119,118 @@ return {teamId: teamId, planner, worker, sent, task, claimed, listed, rejected, 
 	}
 	if final.Status != "stopped" {
 		t.Fatalf("expected team.stop to have actually persisted, got %+v", final)
+	}
+}
+
+// TestTeamWaitPrimitiveHonorsWorkflowStop is the regression test for the
+// review finding that team.wait passed the raw script context into RunTeam
+// instead of contextWithStoredStop's wrapper — the same stop/pause-aware
+// context every agent() call already gets. A teammate turn dispatched
+// through team.wait used to keep running (and spending) after `pallium
+// workflow stop`/`pause` marked the run's status in the store, unlike every
+// other provider call in a workflow run. Proven with a deliberately slow
+// fake teammate provider: if this test takes anywhere near the full sleep
+// duration, the stop was not honored.
+func TestTeamWaitPrimitiveHonorsWorkflowStop(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER", "claude") // see other gate tests' comment for why
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	team, err := store.CreateTeam("goal", tmp, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SpawnMember(team.ID, "worker-1", "claude", "", "", "read-only"); err != nil {
+		t.Fatal(err)
+	}
+	// A claimable task, or RunTeam's scheduler finds zero eligible members
+	// and returns immediately regardless of stop/pause — a fresh member
+	// with no task board and no mail is NOT eligible for a first look
+	// (HasClaimableWork is false with nothing on the board at all), which
+	// would make this test pass for the wrong reason (nothing scheduled at
+	// all, not the stop actually canceling an in-flight turn).
+	if _, err := store.CreateTeamTask(team.ID, "do something", "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PersistMemberSession(team.ID, "worker-1", "sess-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sleeps far longer than this test should ever actually wait — if
+	// contextWithStoredStop doesn't cancel the in-flight exec, the test
+	// itself would need to wait out the whole sleep.
+	path := filepath.Join(tmp, "fake-claude-slow.sh")
+	startedMarker := filepath.Join(tmp, "started")
+	finishedMarker := filepath.Join(tmp, "finished")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\ncat >/dev/null\ntouch '"+startedMarker+"'\nsleep 5\ntouch '"+finishedMarker+"'\nprintf '%s' '{\"result\":\"{\\\"status\\\":\\\"idle\\\",\\\"summary\\\":\\\"done\\\"}\"}'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	setClaudeCLI(t, path)
+
+	script := `team.wait("` + team.ID + `"); return "done";`
+	scriptPath, err := WriteRunScript("wf-team-wait-stop", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-team-wait-stop", Task: "team wait stop", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type outcome struct {
+		err     error
+		elapsed time.Duration
+	}
+	done := make(chan outcome, 1)
+	start := time.Now()
+	go func() {
+		_, execErr := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+		done <- outcome{execErr, time.Since(start)}
+	}()
+
+	// Long enough for Execute to reach team.wait and start the (sleeping)
+	// teammate turn, short enough to land well before the 5s fake sleep or
+	// the very first 250ms contextWithStoredStop poll tick would resolve it
+	// on its own without this explicit stop.
+	time.Sleep(100 * time.Millisecond)
+	if err := store.SetRunStatus(run.ID, "stopped", "", "test-triggered-stop"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The REAL signal is whether the fake provider's process was actually
+	// killed mid-sleep, checked directly via the marker file rather than
+	// timing Execute's own return: exec.Cmd's WaitDelay (set on every real
+	// team-turn provider call, e.g. claude_provider.go, to bound how long
+	// Wait() drains a killed process's I/O) means cmd.Run() can legitimately
+	// take several more seconds to actually RETURN even once the process
+	// itself has already been killed — that grace period is orthogonal to
+	// whether contextWithStoredStop's cancellation fired correctly.
+	//
+	// Checked AFTER the fake process's own 5s sleep would have naturally
+	// elapsed (not before): checking any earlier is meaningless — "finished"
+	// wouldn't exist yet either way, whether cancellation worked or not,
+	// since 5 real seconds haven't passed regardless. Only checking past
+	// that point actually distinguishes "killed early" from "still running
+	// toward its own natural completion" (a mistake this test's own first
+	// draft made, caught by the revert-proof below).
+	time.Sleep(6 * time.Second)
+	if _, err := os.Stat(startedMarker); err != nil {
+		t.Fatalf("expected the fake provider to have started before the stop landed: %v", err)
+	}
+	if _, err := os.Stat(finishedMarker); err == nil {
+		t.Fatal("expected the fake provider's process to have been killed mid-sleep once the run was marked stopped, but it ran to natural completion — contextWithStoredStop's cancellation did not take effect")
+	}
+
+	select {
+	case got := <-done:
+		if got.err == nil {
+			t.Fatalf("expected an error once the stopped run canceled the in-flight teammate turn, got none (elapsed %v)", got.elapsed)
+		}
+	case <-time.After(8 * time.Second): // comfortably longer than WaitDelay's own grace period
+		t.Fatal("team.wait did not return at all within 8s of the run being marked stopped")
 	}
 }

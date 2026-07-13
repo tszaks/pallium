@@ -821,8 +821,25 @@ func describeClaimableWork(tasks []TeamTask) string {
 // by SOME timeout.
 const defaultTeamGateTimeout = 600 * time.Second
 
+// gateCallContext returns ctx unchanged (with a no-op cancel) when it
+// already carries its own deadline, otherwise wraps it with
+// defaultTeamGateTimeout. Extracted so the deadline-preservation decision is
+// directly unit-testable without a live provider call. Found by review:
+// unconditionally wrapping with context.WithTimeout means the SHORTER of
+// the two deadlines always wins (Go context composition), so an operator
+// who intentionally allowed a longer turn (--agent-timeout 1800, or 0 for
+// no deadline at all) still had every gate call capped at 600s regardless,
+// silently failing/rejecting work well within the caller's own explicit
+// timeout budget.
+func gateCallContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, hasDeadline := ctx.Deadline(); hasDeadline {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, defaultTeamGateTimeout)
+}
+
 func (r *Runner) runTeamGate(ctx context.Context, team Team, situation string) (approved bool, reason string, costUSD float64, err error) {
-	ctx, cancel := context.WithTimeout(ctx, defaultTeamGateTimeout)
+	ctx, cancel := gateCallContext(ctx)
 	defer cancel()
 	// Same default RunProviderText applies (provider.go) — needed here for
 	// the identical reason: when ResolveProvider resolves to "codex" (no

@@ -1544,6 +1544,52 @@ func TestRunTeamTurnRecordsRealClaudeSpend(t *testing.T) {
 	}
 }
 
+// TestGateCallContextPreservesALongerCallerDeadline is the regression test
+// for the review finding that unconditionally wrapping with
+// context.WithTimeout(ctx, 600s) let the SHORTER deadline always win: an
+// operator who intentionally allowed a longer turn (--agent-timeout 1800)
+// still had every gate call capped at 600s. A context with no deadline at
+// all must still get the 600s default (a hung verifier must never be
+// literally unbounded).
+func TestGateCallContextPreservesALongerCallerDeadline(t *testing.T) {
+	longDeadline := time.Now().Add(2 * time.Hour)
+	withLongDeadline, cancel := context.WithDeadline(context.Background(), longDeadline)
+	defer cancel()
+
+	gotCtx, gotCancel := gateCallContext(withLongDeadline)
+	defer gotCancel()
+	gotDeadline, ok := gotCtx.Deadline()
+	if !ok || !gotDeadline.Equal(longDeadline) {
+		t.Fatalf("expected the caller's own 2-hour deadline preserved unchanged, got ok=%v deadline=%v (wanted %v)", ok, gotDeadline, longDeadline)
+	}
+
+	noDeadlineCtx, cancel2 := gateCallContext(context.Background())
+	defer cancel2()
+	_, hasDeadline := noDeadlineCtx.Deadline()
+	if !hasDeadline {
+		t.Fatalf("expected the 600s default applied when the caller's context has no deadline at all")
+	}
+}
+
+// TestResolveWaitAgentTimeoutSecondsHonorsExplicitZero is the regression
+// test for the finding that team.wait couldn't distinguish "the script
+// omitted agentTimeoutSeconds" from "the script explicitly asked for 0"
+// (unlimited, matching the CLI's --agent-timeout 0) — both used to decode
+// to Go's int zero value and get silently overridden to the 600s default.
+func TestResolveWaitAgentTimeoutSecondsHonorsExplicitZero(t *testing.T) {
+	if got := resolveWaitAgentTimeoutSeconds(nil); got != 600 {
+		t.Fatalf("expected omitted to default to 600, got %d", got)
+	}
+	zero := 0
+	if got := resolveWaitAgentTimeoutSeconds(&zero); got != 0 {
+		t.Fatalf("expected an explicit 0 honored as unlimited, got %d", got)
+	}
+	custom := 120
+	if got := resolveWaitAgentTimeoutSeconds(&custom); got != 120 {
+		t.Fatalf("expected an explicit non-zero value honored as-is, got %d", got)
+	}
+}
+
 // TestCreateWorktreeRecoversFromStaleDirectoryFromAKilledTurn is the
 // regression test for a real M1-era bug this batch's own live kill/resume
 // acceptance proof surfaced: killing the steering process mid-turn leaves

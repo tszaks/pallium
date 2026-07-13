@@ -609,6 +609,24 @@ func (r *Runner) runAgentGate(ctx context.Context, name, message string, opts Ga
 // r.Run.ID = teamID on whatever Runner it's given (see its own doc comment),
 // which would silently corrupt this run's own agent-call bookkeeping if it
 // ran on r directly.
+// resolveWaitAgentTimeoutSeconds turns team.wait's optional pointer field
+// into the actual seconds to use. Extracted so the omitted-vs-explicit-zero
+// distinction is directly unit-testable without going through goja/JSON
+// decoding. nil (omitted) defaults to 600, matching `pallium team run`'s
+// own --agent-timeout CLI default; an explicit value, even 0, is honored
+// as-is (0 means "no deadline", same as RunTeamTurn and the CLI already
+// treat it). Found by review: a plain int field couldn't tell "omitted"
+// from "explicitly 0" apart (Go's JSON decoder leaves both as the zero
+// value), so an explicit {agentTimeoutSeconds: 0} — matching the CLI's own
+// --agent-timeout 0 no-deadline behavior — used to get silently overridden
+// to 600 instead of honored.
+func resolveWaitAgentTimeoutSeconds(explicit *int) int {
+	if explicit == nil {
+		return 600
+	}
+	return *explicit
+}
+
 func (r *Runner) jsTeam(ctx context.Context, vm *goja.Runtime) map[string]any {
 	teamRunner := func() *Runner {
 		return &Runner{CodexBinary: r.CodexBinary, PalliumBinary: r.PalliumBinary}
@@ -763,29 +781,35 @@ func (r *Runner) jsTeam(ctx context.Context, vm *goja.Runtime) map[string]any {
 		// status/tasks.list read back what happened.
 		"wait": func(teamID string, rawOpts ...any) goja.Value {
 			opts := struct {
-				AgentTimeoutSeconds int `json:"agentTimeoutSeconds"`
-				StaleAfterMinutes   int `json:"staleAfterMinutes"`
-				MaxConcurrent       int `json:"maxConcurrent"`
+				// *int, not int: a plain int can't distinguish "the script
+				// didn't specify one" from "the script explicitly asked for
+				// 0" (Go's JSON decoder leaves both as the zero value), so
+				// an explicit {agentTimeoutSeconds: 0} — matching the CLI's
+				// own --agent-timeout 0 no-deadline behavior — used to get
+				// silently overridden to 600 instead of honored. A nil
+				// pointer means genuinely omitted. Found by review.
+				AgentTimeoutSeconds *int `json:"agentTimeoutSeconds"`
+				StaleAfterMinutes   int  `json:"staleAfterMinutes"`
+				MaxConcurrent       int  `json:"maxConcurrent"`
 			}{}
 			if len(rawOpts) > 0 {
 				decodeOpts(rawOpts[0], &opts)
 			}
-			if opts.AgentTimeoutSeconds <= 0 {
-				// RunTeamTurn treats AgentTimeout<=0 as "no deadline at all"
-				// (unlike StaleAfterMinutes, which already has its own
-				// internal default via staleAfterString) — `pallium team
-				// run`'s own --agent-timeout CLI flag defaults to 600s, so
-				// team.wait needs the identical default when the script
-				// didn't specify one, or a stuck teammate can hang the
-				// whole workflow indefinitely. Found by review.
-				opts.AgentTimeoutSeconds = 600
-			}
 			turnOpts := TeamTurnOptions{
-				AgentTimeout:   time.Duration(opts.AgentTimeoutSeconds) * time.Second,
+				AgentTimeout:   time.Duration(resolveWaitAgentTimeoutSeconds(opts.AgentTimeoutSeconds)) * time.Second,
 				StaleTurnAfter: time.Duration(opts.StaleAfterMinutes) * time.Minute,
 				MaxConcurrent:  opts.MaxConcurrent,
 			}
-			summary, err := teamRunner().RunTeam(ctx, r.Store, teamID, turnOpts)
+			// contextWithStoredStop, not the raw script ctx — the same
+			// stop/pause-aware wrapper every agent() call already gets (see
+			// its call site above). Without it, `pallium workflow stop`/
+			// `pause` updated the run's status in the store but a long
+			// teammate turn already in flight through this primitive kept
+			// running and spending regardless, unlike every other provider
+			// call in a workflow run. Found by review.
+			waitCtx, stopWatching := r.contextWithStoredStop(ctx)
+			defer stopWatching()
+			summary, err := teamRunner().RunTeam(waitCtx, r.Store, teamID, turnOpts)
 			if err != nil {
 				panic(vm.ToValue(r.throwable(err)))
 			}
