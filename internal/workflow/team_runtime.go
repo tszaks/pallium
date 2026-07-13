@@ -125,6 +125,7 @@ func buildTeamTurnPrompt(team Team, member TeamMember, messages []TeamMessage, t
 
 	visible := tasksForPrompt(tasks)
 	b.WriteString("--- Open tasks on the board (plus a few recent completions for context) ---\n")
+	hasOpenTask := false
 	if len(visible) == 0 {
 		b.WriteString("(none yet)\n")
 	} else {
@@ -133,6 +134,22 @@ func buildTeamTurnPrompt(team Team, member TeamMember, messages []TeamMessage, t
 			b.Write(raw)
 			b.WriteString("\n")
 		}
+		for _, t := range visible {
+			if t.Status != "completed" {
+				hasOpenTask = true
+				break
+			}
+		}
+	}
+	// Found live: a real teammate did the exact work an open task described
+	// (a genuine code change, verified) but never set claim_task_id/
+	// complete_task_id — the board still showed the task pending despite
+	// the work landing on disk. The schema always allowed those fields;
+	// nothing ever told the model that doing the work IS NOT ENOUGH, the
+	// board itself has to say so. Only shown when an open task actually
+	// exists — no point insisting on this when there's nothing to claim.
+	if hasOpenTask {
+		b.WriteString("\nIf the work you do this turn addresses one of the open tasks above, you MUST reflect that in your decision (claim_task_id and/or complete_task_id) — describing the work in a message is not enough, the task board itself has to change.\n")
 	}
 	b.WriteString("\nTake whatever action fits this turn: read/inspect as needed, then decide.")
 	return b.String()
