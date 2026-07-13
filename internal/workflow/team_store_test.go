@@ -320,6 +320,42 @@ func TestRunTeamSkipsStopRequestedMember(t *testing.T) {
 	}
 }
 
+// TestRunTeamSkipsExternalMembers is the M3 external-attach counterpart to
+// the stop-requested test above: an external member has no provider to
+// dispatch a turn through at all, so RunTeam's scheduler must never offer
+// it one, no matter how much claimable work sits on the board.
+func TestRunTeamSkipsExternalMembers(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	team, _ := store.CreateTeam("goal", tmp, 0)
+	if _, err := store.JoinExternalMember(team.ID, "advisor"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateTeamTask(team.ID, "do something", "", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &Runner{Run: Run{ID: team.ID}}
+	summary, err := r.RunTeam(context.Background(), store, team.ID, TeamTurnOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.TurnsTaken != 0 || summary.Rounds != 0 {
+		t.Fatalf("expected an external member to never be scheduled despite a real claimable task, got %+v", summary)
+	}
+	member, err := store.GetMember(team.ID, "advisor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if member.TurnCount != 0 {
+		t.Fatalf("expected the external member's turn count untouched, got %+v", member)
+	}
+}
+
 // TestRestartMemberClearsStopAndReconcilesStaleTurn covers restart's two
 // jobs together: clearing the stop, and immediately unsticking a turn that
 // was ALSO left stale (rather than requiring a separate manual `team
@@ -793,5 +829,166 @@ func TestSetTeamGateRoundTripAndRejectsUnknownHook(t *testing.T) {
 	// entirely via an empty hooks list — must still work.
 	if err := store.SetTeamGate(team.ID, "", nil); err != nil {
 		t.Fatalf("expected an empty prompt with an empty hooks list (disabling gating) to be allowed, got %v", err)
+	}
+}
+
+// TestJoinExternalMemberCreatesAndReattaches is the core M3 external-attach
+// round trip: a first join creates a real, listable member with no
+// provider dispatch; a second join for the SAME name is a re-attach (fresh
+// liveness, not an error), matching how a restarted or just-quiet external
+// session re-announces itself.
+func TestJoinExternalMemberCreatesAndReattaches(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	team, err := store.CreateTeam("goal", tmp, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := store.JoinExternalMember(team.ID, "advisor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Provider != "external" || first.LastActiveAt == "" {
+		t.Fatalf("expected a fresh external member with liveness set, got %+v", first)
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	second, err := store.JoinExternalMember(team.ID, "advisor")
+	if err != nil {
+		t.Fatalf("expected re-joining the same name to succeed, got %v", err)
+	}
+	if second.ID != first.ID {
+		t.Fatalf("expected re-join to reuse the SAME member row, not create a second one: %+v vs %+v", first, second)
+	}
+	if second.LastActiveAt <= first.LastActiveAt {
+		t.Fatalf("expected re-join to refresh liveness (first=%q second=%q)", first.LastActiveAt, second.LastActiveAt)
+	}
+
+	members, err := store.ListMembers(team.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(members) != 1 {
+		t.Fatalf("expected exactly one member after create+reattach, got %d: %+v", len(members), members)
+	}
+}
+
+// TestJoinExternalMemberRejectsNonExternalNameCollision guards the real
+// hazard JoinExternalMember's own doc comment names: joining under a name
+// already held by a real provider-driven teammate would let an external
+// session start acting as a name RunTeam still schedules turns for.
+func TestJoinExternalMemberRejectsNonExternalNameCollision(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	team, err := store.CreateTeam("goal", tmp, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SpawnMember(team.ID, "worker-1", "claude", "", "", "read-only"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.JoinExternalMember(team.ID, "worker-1"); err == nil {
+		t.Fatal("expected joining under a real provider-driven member's name to be rejected")
+	}
+}
+
+// TestJoinExternalMemberConcurrentJoinsOfBrandNewNameNeverDuplicate is the
+// regression test for the real TOCTOU an adversarial review found in the
+// original check-then-act (GetMember, then branch to SpawnMember)
+// implementation: two concurrent `team join` calls for the SAME brand-new
+// name could both observe "not found" and both attempt SpawnMember,
+// producing either two member rows (if nothing enforced uniqueness) or an
+// ugly constraint error surfaced to the loser (if something did) — either
+// way breaking the documented "re-joining is NOT an error" contract under
+// a genuine race, not just a sequential re-join. The fix makes SpawnMember
+// itself (a single atomic INSERT guarded by team_members' own
+// UNIQUE(team_id,name)) the primary path, with the loser gracefully
+// falling back to the existing row.
+func TestJoinExternalMemberConcurrentJoinsOfBrandNewNameNeverDuplicate(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	team, err := store.CreateTeam("goal", tmp, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const concurrency = 8
+	var wg sync.WaitGroup
+	errs := make([]error, concurrency)
+	var ready sync.WaitGroup
+	ready.Add(concurrency)
+	release := make(chan struct{})
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ready.Done()
+			<-release
+			_, errs[i] = store.JoinExternalMember(team.ID, "advisor")
+		}(i)
+	}
+	ready.Wait()
+	close(release)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d: expected every concurrent join of a brand-new name to succeed, got %v", i, err)
+		}
+	}
+	members, err := store.ListMembers(team.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(members) != 1 {
+		t.Fatalf("expected exactly ONE member despite %d concurrent joins racing to create it, got %d: %+v", concurrency, len(members), members)
+	}
+}
+
+// TestTouchMemberActivityIsNoOpForNonExternal locks in the safety property
+// TouchMemberActivity's own doc comment claims: callers (team send, team
+// tasks claim/complete) touch activity unconditionally without checking
+// who they're touching first, so it must be a true no-op — no error, no
+// LastActiveAt written — for a provider-driven member or a name that
+// doesn't exist at all.
+func TestTouchMemberActivityIsNoOpForNonExternal(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	team, err := store.CreateTeam("goal", tmp, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SpawnMember(team.ID, "worker-1", "claude", "", "", "read-only"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.TouchMemberActivity(team.ID, "worker-1"); err != nil {
+		t.Fatalf("expected a no-op, got error: %v", err)
+	}
+	if err := store.TouchMemberActivity(team.ID, "does-not-exist"); err != nil {
+		t.Fatalf("expected a no-op for an unknown name, got error: %v", err)
+	}
+	member, err := store.GetMember(team.ID, "worker-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if member.LastActiveAt != "" {
+		t.Fatalf("expected LastActiveAt to stay empty for a non-external member, got %q", member.LastActiveAt)
 	}
 }

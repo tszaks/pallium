@@ -17,13 +17,15 @@ import (
 
 func runTeam(out io.Writer, args []string, jsonOutput bool) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: pallium team <start|spawn|member|tasks|send|inbox|nudge|status|run|approve|reject|gate|stop|attach|template> [--json]")
+		return fmt.Errorf("usage: pallium team <start|spawn|join|member|tasks|send|inbox|nudge|status|run|approve|reject|gate|stop|attach|template> [--json]")
 	}
 	switch args[0] {
 	case "start":
 		return runTeamStart(out, args[1:], jsonOutput)
 	case "template":
 		return runTeamTemplate(out, args[1:], jsonOutput)
+	case "join":
+		return runTeamJoin(out, args[1:], jsonOutput)
 	case "spawn":
 		return runTeamSpawn(out, args[1:], jsonOutput)
 	case "member":
@@ -127,6 +129,55 @@ func runTeamStart(out io.Writer, args []string, jsonOutput bool) error {
 			msg += fmt.Sprintf("\n  spawned %s (provider=%s mode=%s): %s", m.Name, m.Provider, m.Mode, m.Role)
 		}
 		return msg
+	})
+}
+
+// externalMemberStaleAfter matches the same 15-minute default convention
+// `team member restart`'s --stale-after-minutes already uses elsewhere in
+// this file — one honest, consistent staleness window across the teams
+// surface rather than a second magic number.
+const externalMemberStaleAfter = 15 * time.Minute
+
+// parseTeamTimestamp returns the zero time on a parse failure rather than
+// erroring — used only for staleness display, where a zero time reads as
+// "long past any threshold" and correctly renders as stale rather than
+// panicking or hiding the (already unusual) malformed value.
+func parseTeamTimestamp(s string) time.Time {
+	t, _ := time.Parse(time.RFC3339Nano, s)
+	return t
+}
+
+// runTeamJoin is M3's external-session attach: an already-running agent
+// session (a Claude Code tab, a Codex session, a human at a terminal)
+// registers itself as a self-driving teammate with no provider dispatch —
+// see JoinExternalMember's doc comment for the full reasoning. Re-running
+// `team join` for a name that already joined is how that same session
+// re-announces liveness with no other CLI activity in between.
+func runTeamJoin(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("team join")
+	dbPath := fs.String("db", "", "")
+	as := fs.String("as", "", "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "as": {}}, nil); err != nil {
+		return err
+	}
+	teamID, err := requireArg(fs.Args(), "team-id")
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(*as) == "" {
+		return fmt.Errorf("usage: pallium team join <team-id> --as <name> [--db path] [--json]")
+	}
+	store, err := openPalliumStore(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	member, err := store.JoinExternalMember(teamID, *as)
+	if err != nil {
+		return err
+	}
+	return output.Write(out, member, jsonOutput, func() string {
+		return fmt.Sprintf("Joined team %s as %q (external, drives itself via inbox/send/tasks claim/complete)", teamID, member.Name)
 	})
 }
 
@@ -398,6 +449,11 @@ func runTeamTasksClaim(out io.Writer, args []string, jsonOutput bool) error {
 	if err != nil {
 		return err
 	}
+	// Best-effort (see TouchMemberActivity's own doc comment): the claim
+	// already succeeded and is already committed — a heartbeat-refresh
+	// failure here must never surface as a claim failure to a caller
+	// (a real external session) that already holds the task.
+	_ = store.TouchMemberActivity(positionals[0], *as)
 	return output.Write(out, task, jsonOutput, func() string {
 		return fmt.Sprintf("Task %s claimed by %s", task.ID, task.Owner)
 	})
@@ -433,6 +489,9 @@ func runTeamTasksComplete(out io.Writer, args []string, jsonOutput bool) error {
 	if err != nil {
 		return err
 	}
+	// Best-effort, same reasoning as runTeamTasksClaim above: the
+	// completion (and any gate verdict) already committed.
+	_ = store.TouchMemberActivity(positionals[0], *as)
 	// approved is folded into the JSON payload (not just the text renderer)
 	// via anonymous embedding, which flattens TeamTask's own fields into the
 	// same object rather than nesting under a "task" key — found by review:
@@ -488,6 +547,11 @@ func runTeamSend(out io.Writer, args []string, jsonOutput bool) error {
 	if err != nil {
 		return err
 	}
+	// Best-effort liveness ping (see TouchMemberActivity's own doc comment):
+	// the send already succeeded, so a heartbeat-refresh failure must never
+	// surface as a send failure. Also always a safe no-op for a
+	// non-external sender like the default "lead".
+	_ = store.TouchMemberActivity(teamID, *from)
 	return output.Write(out, msg, jsonOutput, func() string {
 		return fmt.Sprintf("Sent %s -> %s: %s", msg.From, msg.To, msg.Body)
 	})
@@ -521,6 +585,38 @@ func runTeamInbox(out io.Writer, args []string, jsonOutput bool) error {
 	}
 	if err != nil {
 		return err
+	}
+	// M3 external-session attach: an external member has no provider-driven
+	// turn to mark its own mail delivered the way RunTeamTurn does, so
+	// reading its inbox IS the delivery event — the CLI's own delivery
+	// receipt. Scoped to provider=="external" (checked here, not just in the
+	// store's own defensive WHERE clause) so a lead peeking at a real
+	// provider-driven member's queued mail via `--for` never marks it
+	// delivered out from under that member's own next turn. `--all` is
+	// exempt for the same reason: it's a whole-team read, not one member
+	// reading its own mail.
+	if !*all && strings.TrimSpace(*forName) != "" {
+		if member, merr := store.GetMember(teamID, *forName); merr == nil && member.Provider == "external" {
+			ids := make([]string, len(msgs))
+			for i, m := range msgs {
+				ids[i] = m.ID
+			}
+			if err := store.MarkMessagesDelivered(ids, 0); err != nil {
+				return err
+			}
+			// Best-effort (see TouchMemberActivity's own doc comment): the
+			// mail above is ALREADY marked delivered in the DB at this
+			// point — found by adversarial review, a touch failure here
+			// used to fail the whole command and return an error, but the
+			// caller's own undelivered-mail query would never surface
+			// these messages again on retry. Losing a heartbeat refresh is
+			// a shrug; losing mail content is not.
+			_ = store.TouchMemberActivity(teamID, *forName)
+			now := time.Now().UTC().Format(time.RFC3339Nano)
+			for i := range msgs {
+				msgs[i].DeliveredAt = now
+			}
+		}
 	}
 	return output.Write(out, msgs, jsonOutput, func() string {
 		var b strings.Builder
@@ -619,6 +715,19 @@ func runTeamStatus(out io.Writer, args []string, jsonOutput bool) error {
 			// is still making unrestricted progress.
 			if m.StopRequested && m.Status != "stopped" {
 				b.WriteString(" (stop requested — will not be scheduled again once this turn finishes)")
+			}
+			// M3 external-session attach: this member has no provider turn
+			// to prove it's alive, so say plainly what its OWN CLI activity
+			// last showed rather than implying it's being watched somehow.
+			if m.Provider == "external" {
+				switch {
+				case m.LastActiveAt == "":
+					b.WriteString(" (external, no activity since joining)")
+				case time.Since(parseTeamTimestamp(m.LastActiveAt)) > externalMemberStaleAfter:
+					fmt.Fprintf(&b, " (external, STALE — last active %s)", m.LastActiveAt)
+				default:
+					fmt.Fprintf(&b, " (external, last active %s)", m.LastActiveAt)
+				}
 			}
 			if m.LastTurnError != "" {
 				fmt.Fprintf(&b, " last_error=%q", m.LastTurnError)

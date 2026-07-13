@@ -347,3 +347,117 @@ func TestTeamTemplateShowRendersMembers(t *testing.T) {
 		t.Fatalf("expected the rendered template to name its members, got %q", out.String())
 	}
 }
+
+// TestTeamJoinCreatesExternalMemberAndReattaches covers the CLI routing for
+// M3's external-session attach: `team join --as` must create a real,
+// listable external member on first call and succeed again (not error) on
+// a second call for the same name.
+func TestTeamJoinCreatesExternalMemberAndReattaches(t *testing.T) {
+	dbPath := newTeamCmdTestDB(t)
+	var out bytes.Buffer
+	if err := runTeam(&out, []string{"start", "goal", "--db", dbPath, "--cwd", t.TempDir()}, true); err != nil {
+		t.Fatal(err)
+	}
+	var team workflow.Team
+	if err := json.Unmarshal(out.Bytes(), &team); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	if err := runTeam(&out, []string{"join", team.ID, "--as", "advisor", "--db", dbPath}, true); err != nil {
+		t.Fatal(err)
+	}
+	var joined workflow.TeamMember
+	if err := json.Unmarshal(out.Bytes(), &joined); err != nil {
+		t.Fatal(err)
+	}
+	if joined.Provider != "external" || joined.LastActiveAt == "" {
+		t.Fatalf("expected a real external member with liveness set, got %+v", joined)
+	}
+
+	out.Reset()
+	if err := runTeam(&out, []string{"join", team.ID, "--as", "advisor", "--db", dbPath}, false); err != nil {
+		t.Fatalf("expected re-joining the same name to succeed, got %v", err)
+	}
+}
+
+// TestTeamJoinRejectsNonExternalNameCollision covers the CLI's exposure of
+// JoinExternalMember's own real-name-collision guard.
+func TestTeamJoinRejectsNonExternalNameCollision(t *testing.T) {
+	dbPath := newTeamCmdTestDB(t)
+	var out bytes.Buffer
+	if err := runTeam(&out, []string{"start", "goal", "--db", dbPath, "--cwd", t.TempDir()}, true); err != nil {
+		t.Fatal(err)
+	}
+	var team workflow.Team
+	if err := json.Unmarshal(out.Bytes(), &team); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := runTeam(&out, []string{"spawn", team.ID, "worker-1", "--provider", "claude", "--db", dbPath}, true); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := runTeam(&out, []string{"join", team.ID, "--as", "worker-1", "--db", dbPath}, false); err == nil {
+		t.Fatal("expected joining under a real provider-driven member's name to be rejected")
+	}
+}
+
+// TestTeamInboxForExternalMemberMarksDeliveredAndTouchesActivity is the
+// combined regression test for M3's delivery receipts AND heartbeat: an
+// external member reading its own inbox is the ONLY delivery event it will
+// ever get (no provider turn will ever mark it), and that same read must
+// bump its liveness. A provider-driven member's inbox peek must NOT be
+// touched this way — its own turn is still the only thing allowed to mark
+// its mail delivered.
+func TestTeamInboxForExternalMemberMarksDeliveredAndTouchesActivity(t *testing.T) {
+	dbPath := newTeamCmdTestDB(t)
+	var out bytes.Buffer
+	if err := runTeam(&out, []string{"start", "goal", "--db", dbPath, "--cwd", t.TempDir()}, true); err != nil {
+		t.Fatal(err)
+	}
+	var team workflow.Team
+	if err := json.Unmarshal(out.Bytes(), &team); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := runTeam(&out, []string{"join", team.ID, "--as", "advisor", "--db", dbPath}, true); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := runTeam(&out, []string{"spawn", team.ID, "worker-1", "--provider", "claude", "--db", dbPath}, true); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := runTeam(&out, []string{"send", team.ID, "--to", "advisor", "--from", "lead", "--db", dbPath, "hello advisor"}, true); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := runTeam(&out, []string{"send", team.ID, "--to", "worker-1", "--from", "lead", "--db", dbPath, "hello worker"}, true); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	if err := runTeam(&out, []string{"inbox", team.ID, "--for", "advisor", "--db", dbPath}, true); err != nil {
+		t.Fatal(err)
+	}
+	var advisorMsgs []workflow.TeamMessage
+	if err := json.Unmarshal(out.Bytes(), &advisorMsgs); err != nil {
+		t.Fatal(err)
+	}
+	if len(advisorMsgs) != 1 || advisorMsgs[0].DeliveredAt == "" {
+		t.Fatalf("expected the external member's own inbox read to mark its mail delivered, got %+v", advisorMsgs)
+	}
+
+	out.Reset()
+	if err := runTeam(&out, []string{"inbox", team.ID, "--for", "worker-1", "--db", dbPath}, true); err != nil {
+		t.Fatal(err)
+	}
+	var workerMsgs []workflow.TeamMessage
+	if err := json.Unmarshal(out.Bytes(), &workerMsgs); err != nil {
+		t.Fatal(err)
+	}
+	if len(workerMsgs) != 1 || workerMsgs[0].DeliveredAt != "" {
+		t.Fatalf("expected a provider-driven member's inbox peek to stay read-only (delivery is its own turn's job), got %+v", workerMsgs)
+	}
+}

@@ -270,6 +270,23 @@ gets the identical shape by calling `team.create` then `team.spawn` once per
 member with the same names/roles/modes (see `internal/workflow/catalog.go`
 for the exact member list each template spawns).
 
+### External-session attach
+
+`pallium team join <team-id> --as <name>` is CLI-only, not a `team.*` script
+primitive — it registers an already-running agent session (another Claude
+Code tab, a Codex session, a human at a terminal) as a self-driving
+"external" member. An external member has no provider dispatch at all:
+`RunTeam`'s scheduler skips it unconditionally, and it never appears in
+`Rounds`/`TurnsTaken`. It drives itself entirely through the ordinary
+`inbox`/`send`/`tasks claim|complete` CLI, which is what keeps its liveness
+current — every one of those calls (plus a bare re-`join`) refreshes a
+`last_active_at` heartbeat, and `team status` flags it plainly once that
+goes stale (past 15 minutes with no activity). Reading its own inbox
+(`team inbox <team-id> --for <name>`) IS its delivery receipt: no turn will
+ever mark its mail delivered otherwise, so the read itself does — a real
+provider-driven member's own inbox peek is unaffected, delivery there still
+happens only when its own turn actually runs.
+
 ## Limits
 
 | Limit | Value |

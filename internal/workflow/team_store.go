@@ -83,7 +83,16 @@ type TeamMember struct {
 	// completion first. See the migration comment on this column for why
 	// it's independent of Status rather than reusing the existing
 	// (currently dead) "stopped" enum value.
-	StopRequested  bool    `json:"stop_requested,omitempty"`
+	StopRequested bool `json:"stop_requested,omitempty"`
+	// LastActiveAt backs M3 external-session attach: an "external" provider
+	// member (see JoinExternalMember) has no provider dispatch and never
+	// takes a scheduled turn, so it has no TurnStartedAt/LastTurnAt to prove
+	// it's actually alive the way a provider-driven member does.
+	// LastActiveAt is bumped by TouchMemberActivity every time that session
+	// calls the CLI it drives itself with (`team inbox`, `team send`, `team
+	// tasks claim/complete`) or re-runs `team join`, so `team status` can
+	// show real staleness instead of guessing.
+	LastActiveAt   string  `json:"last_active_at,omitempty"`
 	Worktree       string  `json:"worktree,omitempty"`
 	TurnCount      int     `json:"turn_count"`
 	TurnStartedAt  string  `json:"turn_started_at,omitempty"`
@@ -224,6 +233,8 @@ func (s *Store) initTeams() error {
 		// back (see the CASE there) to make the stop visible once the
 		// in-flight turn actually finishes.
 		"ALTER TABLE team_members ADD COLUMN stop_requested INTEGER DEFAULT 0",
+		// M3: external-session attach (see TeamMember.LastActiveAt).
+		"ALTER TABLE team_members ADD COLUMN last_active_at TEXT",
 	} {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return err
@@ -423,6 +434,72 @@ func (s *Store) SpawnPlanRequiredMember(teamID, name, provider, model, role stri
 	return s.GetMember(teamID, name)
 }
 
+// JoinExternalMember registers (or re-announces) an already-running agent
+// session as a self-driving teammate — M3's external-session attach. An
+// external member has no provider dispatch and RunTeam's scheduler never
+// offers it a turn (see the Provider=="external" skip there); it drives
+// itself entirely through the ordinary team CLI (inbox/send/tasks claim/
+// complete), which is what TouchMemberActivity's call sites keep alive.
+//
+// Re-joining an existing external member is NOT an error — a session that
+// restarted (or is just re-announcing presence with no other CLI activity
+// in a while) should be able to run `team join` again and pick back up,
+// same spirit as `team attach` for the whole team. Joining under a name
+// already held by a NON-external member (a real provider-driven teammate)
+// IS an error: that would silently let an external session start acting as
+// a name RunTeam still schedules turns for, corrupting whichever side
+// "wins" a given claim/complete race.
+func (s *Store) JoinExternalMember(teamID, name string) (TeamMember, error) {
+	// Attempt-insert-first, not check-then-act: SpawnMember's INSERT is a
+	// single atomic statement guarded by team_members' own UNIQUE(team_id,
+	// name) constraint, so two concurrent `team join` calls for the SAME
+	// brand-new name can never both "win" — exactly one INSERT succeeds,
+	// the other fails with the UNIQUE error SpawnMember already translates
+	// to "already exists". Found by adversarial review: the original
+	// GetMember-then-branch version had a real TOCTOU window (both calls
+	// see "not found" and both call SpawnMember) that a check-then-act
+	// rewrite closes for free by using the constraint SQLite already
+	// enforces, instead of a second check in application code.
+	if _, err := s.SpawnMember(teamID, name, "external", "", "", "read-only"); err != nil {
+		if !strings.Contains(err.Error(), "already exists") {
+			return TeamMember{}, err
+		}
+		// Lost the race (or this is a genuine re-join, not a race at all)
+		// — either way, "already exists" is exactly the case this
+		// function's own contract says is NOT an error.
+		existing, gerr := s.GetMember(teamID, name)
+		if gerr != nil {
+			return TeamMember{}, gerr
+		}
+		if existing.Provider != "external" {
+			return TeamMember{}, fmt.Errorf("team member %q already exists on team %s as provider %q, not external", name, teamID, existing.Provider)
+		}
+	}
+	// Best-effort, matching every other TouchMemberActivity call site: a
+	// failure to refresh the liveness timestamp is not a reason to fail
+	// the join itself — the member exists (or now does) either way. Found
+	// by adversarial review, same finding as the CLI call sites below.
+	_ = s.TouchMemberActivity(teamID, name)
+	return s.GetMember(teamID, name)
+}
+
+// TouchMemberActivity is the M3 external-attach heartbeat: a best-effort
+// liveness ping scoped to provider='external' in the UPDATE itself, so
+// calling it with a provider-driven member's name (or one that doesn't
+// exist at all) is always a harmless no-op — callers never need to check
+// "is this member actually external" first before touching it. Every call
+// site treats its error as non-fatal (see cmd/team.go) — found by
+// adversarial review: an earlier version let a touch failure fail the
+// WHOLE command even after the real work (a task claim, a message send, a
+// mailbox read that had already marked mail delivered) had already
+// succeeded, which could lose mail or strand an external session that
+// legitimately holds a claim it was never told about.
+func (s *Store) TouchMemberActivity(teamID, name string) error {
+	now := nowString()
+	_, err := s.db.Exec(`UPDATE team_members SET last_active_at=?, updated_at=? WHERE team_id=? AND name=? AND provider='external'`, now, now, teamID, name)
+	return err
+}
+
 // ApproveMemberPlan flips a plan-required member into edit mode once its
 // plan is approved, and journals the approval as an ordinary team message
 // (the durable record every other coordination event already uses — no
@@ -543,22 +620,23 @@ func (s *Store) RestartMember(teamID, name, staleAfter string) (TeamMember, erro
 
 func scanMember(row *sql.Row) (TeamMember, error) {
 	var m TeamMember
-	var model, role, session, worktree, turnStarted, lastAt, lastStatus, lastErr, nudged, planStatus sql.NullString
+	var model, role, session, worktree, turnStarted, lastAt, lastStatus, lastErr, nudged, planStatus, lastActive sql.NullString
 	var planRequired, stopRequested int
 	err := row.Scan(&m.ID, &m.TeamID, &m.Name, &m.Provider, &model, &role, &m.Mode, &m.Status, &session, &m.SessionEstablished, &planRequired, &planStatus, &stopRequested, &worktree,
-		&m.TurnCount, &turnStarted, &lastAt, &lastStatus, &lastErr, &nudged, &m.SpendUSD, &m.CreatedAt, &m.UpdatedAt)
+		&m.TurnCount, &turnStarted, &lastAt, &lastStatus, &lastErr, &nudged, &lastActive, &m.SpendUSD, &m.CreatedAt, &m.UpdatedAt)
 	if err != nil {
 		return TeamMember{}, err
 	}
 	m.Model, m.Role, m.SessionToken, m.Worktree = model.String, role.String, session.String, worktree.String
 	m.TurnStartedAt, m.LastTurnAt, m.LastTurnStatus, m.LastTurnError, m.NudgedAt = turnStarted.String, lastAt.String, lastStatus.String, lastErr.String, nudged.String
+	m.LastActiveAt = lastActive.String
 	m.PlanRequired = planRequired != 0
 	m.PlanStatus = planStatus.String
 	m.StopRequested = stopRequested != 0
 	return m, nil
 }
 
-const memberSelectCols = `id,team_id,name,provider,model,role,mode,status,session_token,session_established,COALESCE(plan_required,0),COALESCE(plan_status,''),COALESCE(stop_requested,0),worktree,turn_count,turn_started_at,last_turn_at,last_turn_status,last_turn_error,nudged_at,spend_usd,created_at,updated_at`
+const memberSelectCols = `id,team_id,name,provider,model,role,mode,status,session_token,session_established,COALESCE(plan_required,0),COALESCE(plan_status,''),COALESCE(stop_requested,0),worktree,turn_count,turn_started_at,last_turn_at,last_turn_status,last_turn_error,nudged_at,COALESCE(last_active_at,''),spend_usd,created_at,updated_at`
 
 func (s *Store) GetMember(teamID, name string) (TeamMember, error) {
 	m, err := scanMember(s.db.QueryRow(`SELECT `+memberSelectCols+` FROM team_members WHERE team_id=? AND name=?`, teamID, name))
@@ -577,14 +655,15 @@ func (s *Store) ListMembers(teamID string) ([]TeamMember, error) {
 	var members []TeamMember
 	for rows.Next() {
 		var m TeamMember
-		var model, role, session, worktree, turnStarted, lastAt, lastStatus, lastErr, nudged, planStatus sql.NullString
+		var model, role, session, worktree, turnStarted, lastAt, lastStatus, lastErr, nudged, planStatus, lastActive sql.NullString
 		var planRequired, stopRequested int
 		if err := rows.Scan(&m.ID, &m.TeamID, &m.Name, &m.Provider, &model, &role, &m.Mode, &m.Status, &session, &m.SessionEstablished, &planRequired, &planStatus, &stopRequested, &worktree,
-			&m.TurnCount, &turnStarted, &lastAt, &lastStatus, &lastErr, &nudged, &m.SpendUSD, &m.CreatedAt, &m.UpdatedAt); err != nil {
+			&m.TurnCount, &turnStarted, &lastAt, &lastStatus, &lastErr, &nudged, &lastActive, &m.SpendUSD, &m.CreatedAt, &m.UpdatedAt); err != nil {
 			return nil, err
 		}
 		m.Model, m.Role, m.SessionToken, m.Worktree = model.String, role.String, session.String, worktree.String
 		m.TurnStartedAt, m.LastTurnAt, m.LastTurnStatus, m.LastTurnError, m.NudgedAt = turnStarted.String, lastAt.String, lastStatus.String, lastErr.String, nudged.String
+		m.LastActiveAt = lastActive.String
 		m.PlanRequired = planRequired != 0
 		m.PlanStatus = planStatus.String
 		m.StopRequested = stopRequested != 0
