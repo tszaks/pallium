@@ -454,3 +454,80 @@ return { task, preflight, changed, reports, synthesis };
 func UnknownTemplateError(name string) error {
 	return fmt.Errorf("unknown workflow template %q; available templates: %v", name, TemplateNames())
 }
+
+// TeamMemberTemplate is one member a TeamTemplateInfo spawns. Provider is
+// deliberately left empty in every built-in template: an empty provider
+// resolves through the exact same ResolveProvider chain `team spawn`
+// already uses (explicit flag > env > detected steering agent > codex
+// fallback), so a team started from Claude Code gets claude teammates with
+// no configuration, matching the universality ruling every other provider
+// call site in this codebase already honors.
+type TeamMemberTemplate struct {
+	Name string `json:"name"`
+	Role string `json:"role"`
+	Mode string `json:"mode"`
+}
+
+type TeamTemplateInfo struct {
+	Name        string               `json:"name"`
+	Description string               `json:"description"`
+	WhenToUse   string               `json:"when_to_use"`
+	Members     []TeamMemberTemplate `json:"members"`
+	Example     string               `json:"example"`
+}
+
+// TeamTemplates encodes what actually worked, not theory: parallel-review
+// is built directly from the real 3-member team (correctness-reviewer,
+// concurrency-reviewer, zombie-hunter) that adversarially reviewed M2's own
+// diff live and found real bugs (see docs/releases/v0.9.16.md and the
+// project ledger) — same three lenses, generalized off "review Pallium's
+// own code" onto any artifact. adversarial-debate is new for M3 but follows
+// the identical shape Tyler specified: two members explicitly arguing
+// opposite sides of one contested question, each rebutting the other.
+func TeamTemplates() []TeamTemplateInfo {
+	return []TeamTemplateInfo{
+		{
+			Name:        "parallel-review",
+			Description: "Distinct-lens reviewers examine one diff or artifact independently and in parallel; the lead (whoever drives the team) synthesizes their findings afterward.",
+			WhenToUse:   "One piece of work (a diff, a design doc, a release) needs several independent expert lenses instead of one generalist pass. Each reviewer sees the SAME artifact but is blind to what the others find — their independent catches and disagreements are the signal, not a single averaged-out opinion.",
+			Members: []TeamMemberTemplate{
+				{Name: "correctness-reviewer", Role: "Reviews the artifact for logic errors, wrong assumptions, and behavior that doesn't match its stated intent.", Mode: "read-only"},
+				{Name: "concurrency-reviewer", Role: "Reviews the artifact for races, unsynchronized shared state, and ordering assumptions that only break under real concurrency.", Mode: "read-only"},
+				{Name: "zombie-hunter", Role: "Reviews the artifact for the inputs and failure paths a happy-path read would miss: stale/interrupted state, partial failures, resource cleanup, and side effects that can apply after the thing that should have stopped them is already gone.", Mode: "read-only"},
+			},
+			Example: `pallium team start "review the auth PR diff" --template parallel-review --cwd /path/to/repo`,
+		},
+		{
+			Name:        "adversarial-debate",
+			Description: "Two members argue opposing sides of one contested question, each explicitly trying to refute the other, so the lead sees the strongest version of both cases instead of whichever framing one agent saw first.",
+			WhenToUse:   "A decision is genuinely contested — an architecture choice, whether a finding is a real bug, build vs. buy — and a single agent's answer would just reflect its own framing. Competing, mutually-rebutting positions surface tradeoffs a lone reviewer glosses over.",
+			Members: []TeamMemberTemplate{
+				{Name: "advocate", Role: "Argues FOR the proposition under debate with the strongest real evidence available, and explicitly rebuts the skeptic's objections as they arrive.", Mode: "read-only"},
+				{Name: "skeptic", Role: "Argues AGAINST the proposition under debate, actively hunting for the case that breaks it, and explicitly rebuts the advocate's claims as they arrive.", Mode: "read-only"},
+			},
+			Example: `pallium team start "should we replace the polling loop with a webhook" --template adversarial-debate --cwd /path/to/repo`,
+		},
+	}
+}
+
+func TeamTemplate(name string) (TeamTemplateInfo, bool) {
+	for _, tmpl := range TeamTemplates() {
+		if tmpl.Name == name {
+			return tmpl, true
+		}
+	}
+	return TeamTemplateInfo{}, false
+}
+
+func TeamTemplateNames() []string {
+	templates := TeamTemplates()
+	names := make([]string, 0, len(templates))
+	for _, tmpl := range templates {
+		names = append(names, tmpl.Name)
+	}
+	return names
+}
+
+func UnknownTeamTemplateError(name string) error {
+	return fmt.Errorf("unknown team template %q; available templates: %v", name, TeamTemplateNames())
+}

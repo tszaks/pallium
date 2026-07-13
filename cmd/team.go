@@ -17,11 +17,13 @@ import (
 
 func runTeam(out io.Writer, args []string, jsonOutput bool) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: pallium team <start|spawn|member|tasks|send|inbox|nudge|status|run|approve|reject|gate|stop|attach> [--json]")
+		return fmt.Errorf("usage: pallium team <start|spawn|member|tasks|send|inbox|nudge|status|run|approve|reject|gate|stop|attach|template> [--json]")
 	}
 	switch args[0] {
 	case "start":
 		return runTeamStart(out, args[1:], jsonOutput)
+	case "template":
+		return runTeamTemplate(out, args[1:], jsonOutput)
 	case "spawn":
 		return runTeamSpawn(out, args[1:], jsonOutput)
 	case "member":
@@ -58,12 +60,21 @@ func runTeamStart(out io.Writer, args []string, jsonOutput bool) error {
 	dbPath := fs.String("db", "", "")
 	cwd := fs.String("cwd", "", "")
 	budget := fs.String("budget-usd", "", "")
-	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "cwd": {}, "budget-usd": {}}, nil); err != nil {
+	template := fs.String("template", "", "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "cwd": {}, "budget-usd": {}, "template": {}}, nil); err != nil {
 		return err
 	}
 	goal := strings.TrimSpace(strings.Join(fs.Args(), " "))
 	if goal == "" {
-		return fmt.Errorf("usage: pallium team start <goal> [--cwd path] [--budget-usd N] [--json]")
+		return fmt.Errorf("usage: pallium team start <goal> [--cwd path] [--budget-usd N] [--template name] [--json]")
+	}
+	var tmpl workflow.TeamTemplateInfo
+	if strings.TrimSpace(*template) != "" {
+		var ok bool
+		tmpl, ok = workflow.TeamTemplate(*template)
+		if !ok {
+			return workflow.UnknownTeamTemplateError(*template)
+		}
 	}
 	root := strings.TrimSpace(*cwd)
 	if root == "" {
@@ -93,15 +104,100 @@ func runTeamStart(out io.Writer, args []string, jsonOutput bool) error {
 	if err != nil {
 		return err
 	}
-	return output.Write(out, team, jsonOutput, func() string {
+	var spawned []workflow.TeamMember
+	for _, m := range tmpl.Members {
+		member, err := spawnTeamMember(store, team.ID, m.Name, "", "", m.Role, m.Mode, false)
+		if err != nil {
+			return fmt.Errorf("template %q: spawning %q: %w", tmpl.Name, m.Name, err)
+		}
+		spawned = append(spawned, member)
+	}
+	result := struct {
+		workflow.Team
+		TemplateMembers []workflow.TeamMember `json:"template_members,omitempty"`
+	}{Team: team, TemplateMembers: spawned}
+	return output.Write(out, result, jsonOutput, func() string {
 		msg := "Team started: " + team.ID + "\n  goal: " + team.Goal + "\n  cwd:  " + team.CWD
 		if team.BudgetUSDLimit > 0 {
 			msg += fmt.Sprintf("\n  budget: $%.4f (only self-enforces for cost-tracked providers — claude,"+
 				" or a wrapper that reports PALLIUM_WORKFLOW_USAGE_FILE; codex reports no usage/cost at all"+
 				" and won't count toward this ceiling — see `team status` after spawning members)", team.BudgetUSDLimit)
 		}
+		for _, m := range spawned {
+			msg += fmt.Sprintf("\n  spawned %s (provider=%s mode=%s): %s", m.Name, m.Provider, m.Mode, m.Role)
+		}
 		return msg
 	})
+}
+
+func runTeamTemplate(out io.Writer, args []string, jsonOutput bool) error {
+	if len(args) == 0 || hasHelpArg(args) {
+		return runTeamTemplateList(out, nil, jsonOutput)
+	}
+	switch args[0] {
+	case "list", "ls":
+		return runTeamTemplateList(out, args[1:], jsonOutput)
+	case "show":
+		return runTeamTemplateShow(out, args[1:], jsonOutput)
+	default:
+		if tmpl, ok := workflow.TeamTemplate(args[0]); ok {
+			return output.Write(out, tmpl, jsonOutput, func() string {
+				return renderTeamTemplate(tmpl)
+			})
+		}
+		return workflow.UnknownTeamTemplateError(args[0])
+	}
+}
+
+func runTeamTemplateList(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("team template list")
+	if err := parseSessionFlags(fs, args, nil, nil); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("usage: pallium team template list")
+	}
+	templates := workflow.TeamTemplates()
+	return output.Write(out, templates, jsonOutput, func() string {
+		lines := []string{"Team templates:"}
+		for _, tmpl := range templates {
+			lines = append(lines, fmt.Sprintf("- %s (%d members): %s", tmpl.Name, len(tmpl.Members), tmpl.Description))
+		}
+		return strings.Join(lines, "\n")
+	})
+}
+
+func runTeamTemplateShow(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("team template show")
+	if err := parseSessionFlags(fs, args, nil, nil); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: pallium team template show <name>")
+	}
+	tmpl, ok := workflow.TeamTemplate(fs.Arg(0))
+	if !ok {
+		return workflow.UnknownTeamTemplateError(fs.Arg(0))
+	}
+	return output.Write(out, tmpl, jsonOutput, func() string {
+		return renderTeamTemplate(tmpl)
+	})
+}
+
+func renderTeamTemplate(tmpl workflow.TeamTemplateInfo) string {
+	lines := []string{
+		"Team template " + tmpl.Name,
+		tmpl.Description,
+		"When to use: " + tmpl.WhenToUse,
+		"Members:",
+	}
+	for _, m := range tmpl.Members {
+		lines = append(lines, fmt.Sprintf("  - %s [%s]: %s", m.Name, m.Mode, m.Role))
+	}
+	if tmpl.Example != "" {
+		lines = append(lines, "Example: "+tmpl.Example)
+	}
+	return strings.Join(lines, "\n")
 }
 
 func defaultTeamCWD() (string, error) {
@@ -137,36 +233,52 @@ func runTeamSpawn(out io.Writer, args []string, jsonOutput bool) error {
 		return fmt.Errorf("usage: pallium team spawn <team-id> <name> [--provider p] [--model m] [--role r] [--mode read-only|edit] [--plan-required] [--json]")
 	}
 	teamID, name := positionals[0], positionals[1]
-	resolvedProvider := workflow.ResolveProvider("", *provider)
 	store, err := openPalliumStore(*dbPath)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
-	var member workflow.TeamMember
-	if *planRequired {
-		// A plan-required member is always spawned read-only regardless of
-		// --mode: it cannot edit anything until `team approve` flips it, so
-		// mode is enforced here, not merely defaulted.
-		member, err = store.SpawnPlanRequiredMember(teamID, name, resolvedProvider, *model, *role)
-	} else {
-		member, err = store.SpawnMember(teamID, name, resolvedProvider, *model, *role, *mode)
-	}
+	member, err := spawnTeamMember(store, teamID, name, *provider, *model, *role, *mode, *planRequired)
 	if err != nil {
 		return err
-	}
-	if resolvedProvider == "claude" {
-		if err := store.PersistMemberSession(teamID, name, uuid.NewString()); err != nil {
-			return err
-		}
-		member, err = store.GetMember(teamID, name)
-		if err != nil {
-			return err
-		}
 	}
 	return output.Write(out, member, jsonOutput, func() string {
 		return fmt.Sprintf("Spawned %s on team %s (provider=%s mode=%s)", member.Name, teamID, member.Provider, member.Mode)
 	})
+}
+
+// spawnTeamMember is the shared front door behind both `team spawn` and
+// `team start --template`: resolves the provider through the exact same
+// chain, mints and persists a claude session immediately (matching what
+// runTeamSpawn always did before this was factored out), and returns the
+// final member row. Kept as one function so a template-spawned member is
+// indistinguishable from one spawned by hand — no second, drifting copy of
+// the claude-session-minting step.
+func spawnTeamMember(store *workflow.Store, teamID, name, provider, model, role, mode string, planRequired bool) (workflow.TeamMember, error) {
+	resolvedProvider := workflow.ResolveProvider("", provider)
+	var member workflow.TeamMember
+	var err error
+	if planRequired {
+		// A plan-required member is always spawned read-only regardless of
+		// mode: it cannot edit anything until `team approve` flips it, so
+		// mode is enforced here, not merely defaulted.
+		member, err = store.SpawnPlanRequiredMember(teamID, name, resolvedProvider, model, role)
+	} else {
+		member, err = store.SpawnMember(teamID, name, resolvedProvider, model, role, mode)
+	}
+	if err != nil {
+		return workflow.TeamMember{}, err
+	}
+	if resolvedProvider == "claude" {
+		if err := store.PersistMemberSession(teamID, name, uuid.NewString()); err != nil {
+			return workflow.TeamMember{}, err
+		}
+		member, err = store.GetMember(teamID, name)
+		if err != nil {
+			return workflow.TeamMember{}, err
+		}
+	}
+	return member, nil
 }
 
 func runTeamTasks(out io.Writer, args []string, jsonOutput bool) error {
