@@ -647,7 +647,27 @@ func (r *Runner) jsTeam(ctx context.Context, vm *goja.Runtime) map[string]any {
 			if len(rawOpts) > 0 {
 				decodeOpts(rawOpts[0], &opts)
 			}
-			cwd := firstNonEmpty(strings.TrimSpace(opts.CWD), r.Run.CWD)
+			cwd := strings.TrimSpace(opts.CWD)
+			switch {
+			case cwd == "":
+				cwd = r.Run.CWD
+			case !filepath.IsAbs(cwd):
+				// Resolve against the WORKFLOW's own cwd, not
+				// filepath.Abs's implicit base (the Pallium process's own
+				// OS working directory, which can easily differ from
+				// r.Run.CWD and would silently resolve to the wrong repo).
+				cwd = filepath.Join(r.Run.CWD, cwd)
+			}
+			// Final normalize/clean — a no-op once cwd is already absolute
+			// (the common case), matching `pallium team start`'s own
+			// filepath.Abs(--cwd) call. Found by review: this team
+			// durably persists cwd for every future `pallium team
+			// run/attach`; an unresolved relative path stored as-is
+			// breaks or silently targets the wrong repo once resumed from
+			// anywhere else.
+			if absCWD, aerr := filepath.Abs(cwd); aerr == nil {
+				cwd = absCWD
+			}
 			team, err := r.Store.CreateTeam(goal, cwd, opts.BudgetUSD)
 			if err != nil {
 				panic(vm.ToValue(err.Error()))
@@ -749,6 +769,16 @@ func (r *Runner) jsTeam(ctx context.Context, vm *goja.Runtime) map[string]any {
 			}{}
 			if len(rawOpts) > 0 {
 				decodeOpts(rawOpts[0], &opts)
+			}
+			if opts.AgentTimeoutSeconds <= 0 {
+				// RunTeamTurn treats AgentTimeout<=0 as "no deadline at all"
+				// (unlike StaleAfterMinutes, which already has its own
+				// internal default via staleAfterString) — `pallium team
+				// run`'s own --agent-timeout CLI flag defaults to 600s, so
+				// team.wait needs the identical default when the script
+				// didn't specify one, or a stuck teammate can hang the
+				// whole workflow indefinitely. Found by review.
+				opts.AgentTimeoutSeconds = 600
 			}
 			turnOpts := TeamTurnOptions{
 				AgentTimeout:   time.Duration(opts.AgentTimeoutSeconds) * time.Second,
@@ -3107,10 +3137,26 @@ func (r *Runner) createWorktree(agentID, repoRoot string) (string, error) {
 		return "", err
 	}
 	if _, statErr := os.Stat(path); statErr == nil {
-		// A live, still-in-use worktree is never sitting at this exact path
-		// when createWorktree is about to be called again for the same id —
-		// if it were still in use, nothing would be calling createWorktree
-		// for it a second time. Safe to clear unconditionally.
+		// Accepted, documented risk (found by review, not fully solved
+		// here): a team member's stale-takeover window presumes the OLD
+		// turn is dead, same as every other stale-reconciliation in this
+		// system (ReconcileInterruptedMembers reassigning a session token
+		// or task ownership makes the identical presumption) — but unlike
+		// those, this cleanup can be WRONG in a way that actively harms the
+		// old turn if it merely exceeded --stale-after-minutes while
+		// genuinely still running: it deletes that live process's worktree
+		// out from under it mid-operation, instead of leaving it to fail
+		// (or succeed and be discarded by FinishMemberTurn's own lease
+		// check) on its own. Before this fix, the failure mode here was
+		// clean (`git worktree add` refuses, THIS turn errors, the old one
+		// is undisturbed); the tradeoff made here accepts a messier failure
+		// for the old turn in exchange for actually fixing the far more
+		// common case — the old turn's OWNING PROCESS was truly killed, not
+		// just slow — which otherwise permanently blocks this member's edit
+		// mode. A real fix needs per-turn liveness tracking for team
+		// members (the 0.9.15 owner_pid/heartbeat pattern exists for
+		// workflow runs, not team member turns) — bigger than this fix,
+		// tracked as a backlog item rather than attempted here.
 		r.removeWorktree(repoRoot, path)
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

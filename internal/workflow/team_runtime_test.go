@@ -570,6 +570,19 @@ func TestRunTeamTurnTeammateIdleGateForcesActiveOnRejection(t *testing.T) {
 	if !strings.Contains(member.LastTurnError, "still pending work") {
 		t.Fatalf("expected the gate's reason recorded as the turn note, got %+v", member)
 	}
+	// Regression proof for the review finding: forcing status back to
+	// active alone doesn't guarantee RunTeam's scheduler re-offers this
+	// member a turn — it only does if the board looks NEW since the
+	// member's own LastTurnAt (team.TasksUpdatedAt > member.LastTurnAt).
+	// Check the EXACT condition the scheduler evaluates, not just the
+	// member's own status field.
+	gotTeam, err := store.GetTeam(team.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !(gotTeam.TasksUpdatedAt > member.LastTurnAt) {
+		t.Fatalf("expected the task-board watermark bumped past this member's own LastTurnAt so RunTeam's scheduler re-offers it a turn, got team.TasksUpdatedAt=%q member.LastTurnAt=%q", gotTeam.TasksUpdatedAt, member.LastTurnAt)
+	}
 }
 
 func TestRunTeamTurnProviderFailureNotifiesLeadWithError(t *testing.T) {

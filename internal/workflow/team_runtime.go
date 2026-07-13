@@ -375,15 +375,35 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 	// gap; folding it into what gets passed to the one already-lease-guarded
 	// FinishMemberTurn call below sidesteps that entirely. The gate CHECK
 	// itself has no side effect to undo if this turn's lease turns out to be
-	// gone by the time FinishMemberTurn runs — it is read-only.
+	// gone by the time FinishMemberTurn runs — it is read-only. Uses turnCtx
+	// (the --agent-timeout-bounded context), not the unbounded outer ctx —
+	// found by review: a hung verifier here used to be unbounded by the same
+	// timeout as the teammate's own provider call, leaving the turn (and its
+	// lease) stuck past the requested timeout instead of failing within it.
+	rescheduleAfterIdleRejection := false
 	if status == "idle" && teamGateHasHook(team, "teammate_idle") {
-		approved, reason, gerr := r.runTeamGate(ctx, team, fmt.Sprintf("Teammate %q wants to go idle. Its own summary: %s", name, decision.Summary))
+		approved, reason, gateCostUSD, gerr := r.runTeamGate(turnCtx, team, fmt.Sprintf("Teammate %q wants to go idle. Its own summary: %s", name, decision.Summary))
+		if gateCostUSD > 0 {
+			// costUSD's turn-level cost was already added to team spend
+			// above (right after dispatchTeamTurn) — that call already
+			// ran, so the gate's cost needs its OWN AddTeamSpend rather
+			// than just folding into costUSD and hoping the earlier call
+			// retroactively sees it. Folding it into costUSD too is still
+			// correct and wanted: that local variable also flows into
+			// FinishMemberTurn's spendDelta below, attributing the gate's
+			// cost to the member's own turn-level spend as well.
+			costUSD += gateCostUSD
+			if _, serr := store.AddTeamSpend(teamID, gateCostUSD); serr != nil {
+				r.notifyLeadOfMemberError(store, teamID, name, fmt.Errorf("recording teammate_idle gate spend: %w", serr))
+			}
+		}
 		switch {
 		case gerr != nil:
 			statusNote = statusNote + fmt.Sprintf(" [teammate_idle gate failed to run: %v — proceeding idle]", gerr)
 		case !approved:
 			status = "active"
 			statusNote = "quality gate blocked going idle: " + reason
+			rescheduleAfterIdleRejection = true
 		}
 	}
 	// Lease-guard the decision's OWN side effects, not just mail delivery
@@ -399,6 +419,20 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 	// below ever runs — a stale-takeover zombie's decision mutates nothing.
 	if err := store.FinishMemberTurn(teamID, name, lease, status, capturedToken, statusNote, costUSD); err != nil {
 		return true, err
+	}
+	if rescheduleAfterIdleRejection {
+		// Forcing status back to "active" alone doesn't guarantee RunTeam's
+		// scheduler actually offers this member another turn — it only
+		// re-checks claimable work if the board looks NEW since the
+		// member's own last turn (LastTurnAt, just set to now by
+		// FinishMemberTurn above). Touching the watermark makes the
+		// (unchanged) board look new one more time, which is exactly what
+		// a gate rejection calls for. Lease-guarded same as everything
+		// else in this block — only reached once FinishMemberTurn already
+		// succeeded for this exact lease. Found by review.
+		if err := store.TouchTeamTasksWatermark(teamID); err != nil {
+			r.notifyLeadOfMemberError(store, teamID, name, fmt.Errorf("rescheduling after idle-gate rejection: %w", err))
+		}
 	}
 	deliverInjectedMessages()
 
@@ -458,7 +492,13 @@ func (r *Runner) CompleteTaskWithGate(ctx context.Context, store *Store, teamID,
 			return TeamTask{}, false, err
 		}
 		var reason string
-		approved, reason, err = r.runTeamGate(ctx, team, fmt.Sprintf("Task %q (%s), owned by %s, is proposed complete. Result:\n%s", task.Title, task.ID, owner, result))
+		var gateCostUSD float64
+		approved, reason, gateCostUSD, err = r.runTeamGate(ctx, team, fmt.Sprintf("Task %q (%s), owned by %s, is proposed complete. Result:\n%s", task.Title, task.ID, owner, result))
+		if gateCostUSD > 0 {
+			if _, serr := store.AddTeamSpend(teamID, gateCostUSD); serr != nil {
+				_, _ = store.SendTeamMessage(teamID, "quality-gate", "lead", fmt.Sprintf("recording task_completed gate spend for %s: %v", taskID, serr))
+			}
+		}
 		if err != nil {
 			_, _ = store.SendTeamMessage(teamID, "quality-gate", "lead", fmt.Sprintf("task_completed gate for %s failed to run: %v", taskID, err))
 			return task, false, err
@@ -573,7 +613,30 @@ func teamGateHasHook(team Team, hook string) bool {
 // no single enclosing run to key a cached gate on, and each hook firing
 // (a different task, a different idle declaration) is its own fresh
 // question anyway.
-func (r *Runner) runTeamGate(ctx context.Context, team Team, situation string) (approved bool, reason string, err error) {
+// runTeamGate returns costUSD alongside the verdict — a gate call is a real
+// provider invocation like any other (claude/wrapper report real cost), and
+// callers must add it to team spend themselves (AddTeamSpend) the same way
+// a teammate turn's cost gets recorded; runTeamGate has no team id to write
+// it against directly. Found by review: this used to silently drop gate
+// cost entirely, so a team's `--budget-usd` ceiling and `team status` spend
+// total were blind to real spend a configured gate incurred.
+// defaultTeamGateTimeout bounds a gate check when the caller's own context
+// carries no deadline yet — matches `pallium team run`'s own --agent-timeout
+// default (cmd/team.go). Applied via context.WithTimeout, which only ever
+// TIGHTENS an existing deadline (Go's context composition takes whichever
+// fires first), so a caller that already bounded ctx more tightly (e.g.
+// RunTeamTurn's turnCtx, built from a custom --agent-timeout) is never
+// loosened by this. Found by review: team.tasks.create/complete (the
+// workflow-script primitives) and the CLI's `team tasks add`/`team tasks
+// complete` all called through here with an unbounded context.Background(),
+// so a hung verifier could block a script or CLI command forever — unlike
+// every other real provider call in this codebase, which is always bounded
+// by SOME timeout.
+const defaultTeamGateTimeout = 600 * time.Second
+
+func (r *Runner) runTeamGate(ctx context.Context, team Team, situation string) (approved bool, reason string, costUSD float64, err error) {
+	ctx, cancel := context.WithTimeout(ctx, defaultTeamGateTimeout)
+	defer cancel()
 	// Same default RunProviderText applies (provider.go) — needed here for
 	// the identical reason: when ResolveProvider resolves to "codex" (no
 	// detected steering agent, e.g. CI with no CLAUDECODE env var), an empty
@@ -588,12 +651,12 @@ func (r *Runner) runTeamGate(ctx context.Context, team Team, situation string) (
 	if cwd == "" {
 		cwd, err = os.Getwd()
 		if err != nil {
-			return false, "", err
+			return false, "", 0, err
 		}
 	}
 	tmpDir, terr := os.MkdirTemp("", "pallium-team-gate-*")
 	if terr != nil {
-		return false, "", terr
+		return false, "", 0, terr
 	}
 	defer os.RemoveAll(tmpDir)
 	outFile := filepath.Join(tmpDir, "last-message.txt")
@@ -602,11 +665,27 @@ func (r *Runner) runTeamGate(ctx context.Context, team Team, situation string) (
 	prompt := buildGatePrompt("team-quality-gate", situation, team.GatePrompt)
 	agent := &Agent{Mode: "read-only", Prompt: prompt, Provider: provider}
 	output, derr := r.runProviderCommand(ctx, provider, tmpDir, outFile, usageFile, cwd, prompt, agent, AgentOptions{Schema: defaultGateSchema()}, false)
-	if derr != nil {
-		return false, "", derr
+	if _, usage := readAndRemoveAgentUsage(usageFile); usage != nil {
+		if cost, ok := usage["cost_usd"].(float64); ok && cost > 0 {
+			costUSD = cost
+		}
 	}
-	approved, reason = gateVerdict(parseAgentOutput(output))
-	return approved, reason, nil
+	if derr != nil {
+		return false, "", costUSD, derr
+	}
+	// Schema-validate the verdict the same way every other schema'd agent
+	// call does (parseAgentOutputWithSchema), not the schema-less
+	// parseAgentOutput this used before — found by review: a malformed
+	// verdict (e.g. approved:true with no required reason) used to still
+	// read as approved via gateVerdict's lenient type assertions, letting a
+	// misbehaving or misconfigured provider bypass a configured gate
+	// entirely instead of failing closed.
+	verdict, verr := parseAgentOutputWithSchema(output, defaultGateSchema())
+	if verr != nil {
+		return false, fmt.Sprintf("gate verdict failed schema validation, failing closed: %v", verr), costUSD, nil
+	}
+	approved, reason = gateVerdict(verdict)
+	return approved, reason, costUSD, nil
 }
 
 // CreateTeamTaskWithGate wraps Store.CreateTeamTask with the M2
@@ -641,7 +720,12 @@ func (r *Runner) CreateTeamTaskWithGate(ctx context.Context, store *Store, teamI
 	if err := store.SetTaskStatus(teamID, task.ID, "blocked", "quality gate check in progress"); err != nil {
 		return task, err
 	}
-	approved, reason, gerr := r.runTeamGate(ctx, team, fmt.Sprintf("A new task was proposed: %q. Description: %s", title, description))
+	approved, reason, gateCostUSD, gerr := r.runTeamGate(ctx, team, fmt.Sprintf("A new task was proposed: %q. Description: %s", title, description))
+	if gateCostUSD > 0 {
+		if _, serr := store.AddTeamSpend(teamID, gateCostUSD); serr != nil {
+			_, _ = store.SendTeamMessage(teamID, "quality-gate", "lead", fmt.Sprintf("recording task_created gate spend for %s: %v", task.ID, serr))
+		}
+	}
 	if gerr != nil {
 		_, _ = store.SendTeamMessage(teamID, "quality-gate", "lead", fmt.Sprintf("task_created gate for %s failed to run: %v", task.ID, gerr))
 		return store.GetTeamTask(teamID, task.ID) // stays blocked — safest default on a gate malfunction

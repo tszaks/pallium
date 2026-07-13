@@ -279,6 +279,20 @@ func bumpTeamTasksUpdated(exec interface {
 	return err
 }
 
+// TouchTeamTasksWatermark bumps the task-board watermark with no actual task
+// mutation — used when a teammate_idle gate rejection forces a member back
+// to "active" (team_runtime.go): RunTeam's scheduler only re-offers
+// claimable work to a member if the board looks NEW since that member's own
+// last turn (see the watermark comment above), so without this, forcing
+// status back to "active" alone doesn't guarantee the member actually gets
+// scheduled again — the next round can still find zero eligible members and
+// exit. Bumping the watermark makes the (unchanged) board look new to this
+// member one more time, which is exactly the outcome the gate rejection
+// calls for. Found by review.
+func (s *Store) TouchTeamTasksWatermark(teamID string) error {
+	return bumpTeamTasksUpdated(s.db, teamID, nowString())
+}
+
 func (s *Store) SetTeamStatus(id, status string) error {
 	_, err := s.db.Exec(`UPDATE teams SET status=?, updated_at=? WHERE id=?`, status, nowString(), id)
 	return err
