@@ -394,7 +394,7 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 	planPending := member.PlanRequired && member.PlanStatus == "pending"
 	rescheduleAfterIdleRejection := false
 	if status == "idle" && teamGateHasHook(team, "teammate_idle") {
-		situation := fmt.Sprintf("Teammate %q wants to go idle. Its own summary: %s\n%s", name, decision.Summary, describeClaimableWork(tasks))
+		situation := fmt.Sprintf("Teammate %q wants to go idle. Its own summary: %s\n%s", name, decision.Summary, describeClaimableWork(tasks, name))
 		approved, reason, gateCostUSD, gerr := r.runTeamGate(turnCtx, team, situation)
 		if gateCostUSD > 0 {
 			// costUSD's turn-level cost was already added to team spend
@@ -808,9 +808,30 @@ func UntrackedCostProviders(members []TeamMember) []string {
 // teammate's own summary, not whether the board backs that up. Found by
 // review. Deliberately terse (title + status only, no descriptions): this
 // is a factual check for the gate to weigh, not the gate's whole prompt.
-func describeClaimableWork(tasks []TeamTask) string {
+func describeClaimableWork(tasks []TeamTask, name string) string {
+	// ownedInProgress is checked FIRST and separately from the pending/
+	// claimable scan below: a member that already owns an in_progress task
+	// and declares idle has unfinished, ASSIGNED work the pending-task scan
+	// would never surface (it isn't pending, it's the member's own). Found
+	// by review: without this, a teammate_idle gate could approve idle
+	// while this member's own claimed task sits stuck — RunTeam doesn't
+	// reschedule a member merely for owning in-progress work, so it stays
+	// stuck until a manual nudge.
+	var ownedInProgress []string
+	for _, t := range tasks {
+		if t.Status == "in_progress" && t.Owner == name {
+			ownedInProgress = append(ownedInProgress, fmt.Sprintf("- %q (%s), claimed by this member, is still in_progress (never completed or handed back)", t.Title, t.ID))
+		}
+	}
+	var b strings.Builder
+	if len(ownedInProgress) > 0 {
+		b.WriteString("This member's own unfinished work:\n")
+		b.WriteString(strings.Join(ownedInProgress, "\n"))
+		b.WriteString("\n")
+	}
 	if len(tasks) == 0 {
-		return "The task board is empty."
+		b.WriteString("The task board is empty.")
+		return b.String()
 	}
 	completed := map[string]bool{}
 	for _, t := range tasks {
@@ -835,9 +856,12 @@ func describeClaimableWork(tasks []TeamTask) string {
 		}
 	}
 	if len(lines) == 0 {
-		return "No pending task is currently claimable (all remaining tasks are blocked, in progress, or completed)."
+		b.WriteString("No pending task is currently claimable (all remaining tasks are blocked, in progress, or completed).")
+		return b.String()
 	}
-	return "Claimable pending tasks:\n" + strings.Join(lines, "\n")
+	b.WriteString("Claimable pending tasks:\n")
+	b.WriteString(strings.Join(lines, "\n"))
+	return b.String()
 }
 
 // runTeamGate is the M2 quality-gate check: an autonomous read-only verifier
@@ -929,7 +953,14 @@ func (r *Runner) runTeamGate(ctx context.Context, team Team, situation string) (
 	outFile := filepath.Join(tmpDir, "last-message.txt")
 	usageFile := filepath.Join(tmpDir, "usage.json")
 	provider := ResolveProvider("", "")
-	prompt := buildGatePrompt("team-quality-gate", situation, team.GatePrompt)
+	// The team's Goal is prepended to situation, not folded into
+	// team.GatePrompt (the operator's own approval criteria, shared
+	// verbatim with buildGatePrompt's non-team gate() primitive callers,
+	// which have no such concept) — a criterion like "approve only tasks
+	// that advance the team goal" can't be evaluated without the goal
+	// itself being a stated fact. Found by review.
+	situationWithGoal := fmt.Sprintf("Team goal: %s\n\n%s", team.Goal, situation)
+	prompt := buildGatePrompt("team-quality-gate", situationWithGoal, team.GatePrompt)
 	agent := &Agent{Mode: "read-only", Prompt: prompt, Provider: provider}
 	output, derr := gateRunner.runProviderCommand(ctx, provider, tmpDir, outFile, usageFile, cwd, prompt, agent, AgentOptions{Schema: defaultGateSchema()}, false)
 	if _, usage := readAndRemoveAgentUsage(usageFile); usage != nil {

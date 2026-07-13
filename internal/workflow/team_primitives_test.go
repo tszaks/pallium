@@ -308,3 +308,53 @@ func TestTeamTasksCreatePrimitiveHonorsWorkflowStop(t *testing.T) {
 		t.Fatal("team.tasks.create did not return at all within 8s of the run being marked stopped")
 	}
 }
+
+// TestTeamCreatePrimitiveIsIdempotentAcrossResume is the regression test
+// for the review finding that team.create() had no replay key, unlike
+// agent()/gate() — a paused/resumed workflow re-executing the same script
+// from the top would create a SECOND active team every time, orphaning the
+// first one's state and spend. Simulated here by calling Execute twice on
+// the identical Run (exactly what a real pause/resume replays): both calls
+// must land on the same team id.
+func TestTeamCreatePrimitiveIsIdempotentAcrossResume(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	script := `const t = team.create("ship the feature", {cwd: "` + strings.ReplaceAll(tmp, `\`, `\\`) + `"}); return t.id;`
+	scriptPath, err := WriteRunScript("wf-team-create-resume", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-team-create-resume", Task: "team create resume", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstID, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulates the resume: a fresh Runner (same as a new `pallium workflow
+	// resume` process), same Run, same script — re-evaluates team.create()
+	// from the top exactly once, same as the original call.
+	secondID, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if firstID != secondID {
+		t.Fatalf("expected the resumed script's team.create() call to land on the SAME team id, got first=%q second=%q", firstID, secondID)
+	}
+	got, err := store.GetTeam(firstID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Goal != "ship the feature" {
+		t.Fatalf("expected the original team's state intact (not recreated), got %+v", got)
+	}
+}

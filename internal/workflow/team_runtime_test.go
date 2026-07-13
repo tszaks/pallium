@@ -381,6 +381,45 @@ func TestCreateTeamTaskWithGateAllowsApprovedTask(t *testing.T) {
 	}
 }
 
+// TestRunTeamGateIncludesTeamGoalInPrompt is the regression test for the
+// review finding that the team's Goal was never included in a gate's
+// prompt even though runTeamGate has the full Team — a criterion like
+// "approve only tasks that advance the team goal" couldn't be evaluated
+// from the facts actually given to the verifier.
+func TestRunTeamGateIncludesTeamGoalInPrompt(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER", "claude") // see TestCreateTeamTaskWithGateBlocksRejectedTask's comment
+	store, _ := newTeamTestStore(t)
+	repo := newTeamTestRepo(t)
+	team, err := store.CreateTeam("ship the payments refactor", repo, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetTeamGate(team.ID, "approve only tasks that advance the team goal", []string{"task_created"}); err != nil {
+		t.Fatal(err)
+	}
+
+	captured := filepath.Join(t.TempDir(), "captured-prompt.txt")
+	path := filepath.Join(t.TempDir(), "fake-claude-capture.sh")
+	script := "#!/bin/sh\ncat > '" + captured + "'\nprintf '%s' '{\"result\":\"{\\\"approved\\\":true,\\\"reason\\\":\\\"ok\\\"}\"}'\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	setClaudeCLI(t, path)
+
+	r := &Runner{Run: Run{ID: team.ID}}
+	if _, err := r.CreateTeamTaskWithGate(context.Background(), store, team.ID, "fix the bug", "", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(captured)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "ship the payments refactor") {
+		t.Fatalf("expected the team's goal included in the gate's prompt, got:\n%s", raw)
+	}
+}
+
 // TestCreateTeamTaskWithGateParksTeamWhenGateSpendCrossesBudget is the
 // regression test for the finding that AddTeamSpend's overBudget return
 // value was discarded at every gate-spend call site: a one-off call like
@@ -675,14 +714,14 @@ func TestRunTeamTurnTeammateIdleGateFailsClosedOnMalfunction(t *testing.T) {
 // summary (found by review: the gate used to see only the teammate's own
 // summary, with no factual board state to check an idle claim against).
 func TestDescribeClaimableWork(t *testing.T) {
-	if got := describeClaimableWork(nil); got != "The task board is empty." {
+	if got := describeClaimableWork(nil, "worker-1"); got != "The task board is empty." {
 		t.Fatalf("expected the empty-board message, got %q", got)
 	}
 	blocked := []TeamTask{
 		{ID: "t1", Title: "needs a dependency", Status: "pending", DependsOn: []string{"t0"}},
 		{ID: "t0", Title: "the dependency", Status: "in_progress"},
 	}
-	if got := describeClaimableWork(blocked); !strings.Contains(got, "No pending task is currently claimable") {
+	if got := describeClaimableWork(blocked, "worker-1"); !strings.Contains(got, "No pending task is currently claimable") {
 		t.Fatalf("expected the all-blocked message when every pending task has an unmet dependency, got %q", got)
 	}
 	claimable := []TeamTask{
@@ -690,9 +729,29 @@ func TestDescribeClaimableWork(t *testing.T) {
 		{ID: "t1", Title: "unblocked now", Status: "pending", DependsOn: []string{"t0"}},
 		{ID: "t2", Title: "already done", Status: "completed"},
 	}
-	got := describeClaimableWork(claimable)
+	got := describeClaimableWork(claimable, "worker-1")
 	if !strings.Contains(got, "unblocked now") || strings.Contains(got, "already done") {
 		t.Fatalf("expected only the claimable pending task named, got %q", got)
+	}
+}
+
+// TestDescribeClaimableWorkIncludesOwnUnfinishedTask is the regression test
+// for the review finding that describeClaimableWork only scanned PENDING
+// tasks — a member's own in_progress task (something it already claimed
+// but hasn't completed) was invisible to the teammate_idle gate, which
+// could then approve idle while that assigned work sat stuck (RunTeam
+// doesn't reschedule a member merely for owning in-progress work).
+func TestDescribeClaimableWorkIncludesOwnUnfinishedTask(t *testing.T) {
+	tasks := []TeamTask{
+		{ID: "t1", Title: "assigned to me", Status: "in_progress", Owner: "worker-1"},
+		{ID: "t2", Title: "assigned to someone else", Status: "in_progress", Owner: "worker-2"},
+	}
+	got := describeClaimableWork(tasks, "worker-1")
+	if !strings.Contains(got, "assigned to me") {
+		t.Fatalf("expected the member's own in_progress task named, got %q", got)
+	}
+	if strings.Contains(got, "assigned to someone else") {
+		t.Fatalf("expected another member's in_progress task NOT named, got %q", got)
 	}
 }
 

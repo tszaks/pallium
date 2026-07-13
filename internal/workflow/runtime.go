@@ -61,12 +61,18 @@ type Runner struct {
 	workflowDepth  int
 	stubIndex      int
 	agentCallIndex int
-	pipelineIndex  int
-	capture        *parallelCapture
-	scriptHash     string
-	argsHash       string
-	failures       []RunFailure
-	fatalErr       error
+	// teamCreateCallIndex mirrors agentCallIndex's own pattern (reset to 0
+	// at the start of Execute, incremented once per team.create() call)
+	// but keyed separately: a script's Nth team.create() call needs a
+	// counter scoped to team.create() calls specifically, not conflated
+	// with however many agent()/gate() calls happened to run before it.
+	teamCreateCallIndex int
+	pipelineIndex       int
+	capture             *parallelCapture
+	scriptHash          string
+	argsHash            string
+	failures            []RunFailure
+	fatalErr            error
 
 	// lockedRepos memoizes which canonical repo roots this run already holds
 	// the advisory edit lock for (see acquireRepoLock), so repeated
@@ -185,6 +191,7 @@ func (r *Runner) Execute(ctx context.Context, script string, args any) (string, 
 	r.agentCount = usedAgents
 	r.budgetSpent = usedBudget
 	r.agentCallIndex = 0
+	r.teamCreateCallIndex = 0
 	r.pipelineIndex = 0
 	r.failures = nil
 	r.fatalErr = nil
@@ -628,8 +635,16 @@ func resolveWaitAgentTimeoutSeconds(explicit *int) int {
 }
 
 func (r *Runner) jsTeam(ctx context.Context, vm *goja.Runtime) map[string]any {
-	teamRunner := func() *Runner {
-		return &Runner{CodexBinary: r.CodexBinary, PalliumBinary: r.PalliumBinary}
+	// teamRunner takes teamID explicitly (rather than leaving Run.ID empty
+	// and relying on RunTeam to set it) because two of its three callers —
+	// team.tasks.create/complete — call CreateTeamTaskWithGate/
+	// CompleteTaskWithGate directly, never through RunTeam at all, so
+	// nothing else would ever set it for them. Found by review: a
+	// configured wrapper provider still saw an empty PALLIUM_WORKFLOW_RUN_ID
+	// from these two primitives' gate calls even after the CLI's own
+	// one-off gate calls got the identical fix.
+	teamRunner := func(teamID string) *Runner {
+		return &Runner{CodexBinary: r.CodexBinary, PalliumBinary: r.PalliumBinary, Run: Run{ID: teamID}}
 	}
 	decodeOpts := func(raw any, out any) {
 		if raw == nil {
@@ -686,7 +701,16 @@ func (r *Runner) jsTeam(ctx context.Context, vm *goja.Runtime) map[string]any {
 			if absCWD, aerr := filepath.Abs(cwd); aerr == nil {
 				cwd = absCWD
 			}
-			team, err := r.Store.CreateTeam(goal, cwd, opts.BudgetUSD)
+			// Deterministic id (run id + this run's Nth team.create() call),
+			// not CreateTeam's own freshly-minted one — GetOrCreateTeam
+			// returns the EXISTING team on a match instead of inserting a
+			// duplicate. Found by review: unlike agent()/gate(), this
+			// primitive had no replay key at all, so a paused/resumed
+			// workflow re-executing the same script created a second
+			// active team every time, orphaning the first one's state and
+			// spend.
+			teamID := fmt.Sprintf("team-%s-%d", r.Run.ID, r.nextTeamCreateCallIndex())
+			team, err := r.Store.GetOrCreateTeam(teamID, goal, cwd, opts.BudgetUSD)
 			if err != nil {
 				panic(vm.ToValue(err.Error()))
 			}
@@ -809,7 +833,7 @@ func (r *Runner) jsTeam(ctx context.Context, vm *goja.Runtime) map[string]any {
 			// call in a workflow run. Found by review.
 			waitCtx, stopWatching := r.contextWithStoredStop(ctx)
 			defer stopWatching()
-			summary, err := teamRunner().RunTeam(waitCtx, r.Store, teamID, turnOpts)
+			summary, err := teamRunner(teamID).RunTeam(waitCtx, r.Store, teamID, turnOpts)
 			if err != nil {
 				panic(vm.ToValue(r.throwable(err)))
 			}
@@ -838,7 +862,7 @@ func (r *Runner) jsTeam(ctx context.Context, vm *goja.Runtime) map[string]any {
 				// by review.
 				gateCtx, stopWatching := r.contextWithStoredStop(ctx)
 				defer stopWatching()
-				task, err := teamRunner().CreateTeamTaskWithGate(gateCtx, r.Store, teamID, title, opts.Description, opts.DependsOn)
+				task, err := teamRunner(teamID).CreateTeamTaskWithGate(gateCtx, r.Store, teamID, title, opts.Description, opts.DependsOn)
 				if err != nil {
 					panic(vm.ToValue(err.Error()))
 				}
@@ -863,7 +887,7 @@ func (r *Runner) jsTeam(ctx context.Context, vm *goja.Runtime) map[string]any {
 				// why. Found by review.
 				gateCtx, stopWatching := r.contextWithStoredStop(ctx)
 				defer stopWatching()
-				task, approved, err := teamRunner().CompleteTaskWithGate(gateCtx, r.Store, teamID, taskID, as, strings.Join(result, ""))
+				task, approved, err := teamRunner(teamID).CompleteTaskWithGate(gateCtx, r.Store, teamID, taskID, as, strings.Join(result, ""))
 				if err != nil {
 					panic(vm.ToValue(err.Error()))
 				}
@@ -1698,6 +1722,13 @@ func (r *Runner) nextAgentCallIndex() int {
 	defer r.mu.Unlock()
 	r.agentCallIndex++
 	return r.agentCallIndex
+}
+
+func (r *Runner) nextTeamCreateCallIndex() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.teamCreateCallIndex++
+	return r.teamCreateCallIndex
 }
 
 func (r *Runner) activeCapture() *parallelCapture {

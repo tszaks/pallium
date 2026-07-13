@@ -228,6 +228,36 @@ func (s *Store) CreateTeam(goal, cwd string, budgetUSDLimit float64) (Team, erro
 	return t, nil
 }
 
+// GetOrCreateTeam is CreateTeam's idempotent sibling for the team.create()
+// workflow primitive: if id already names a team, that team is returned
+// as-is (whatever state it's since reached — spawned members, tasks,
+// spend — none of that is touched), otherwise a new team is created with
+// exactly this id. Found by review: unlike agent()/gate(), which persist a
+// replay key so a paused/resumed workflow re-executing the same script
+// finds its own prior call instead of repeating it, team.create() used to
+// mint a fresh id every evaluation — a resumed workflow would create a
+// SECOND active team, orphaning the first one's state and spend. The
+// caller (jsTeam's "create" primitive) derives id deterministically from
+// r.Run.ID and a per-run team.create()-call counter, mirroring how agent
+// calls key their own replay cache off (run id, call index).
+func (s *Store) GetOrCreateTeam(id, goal, cwd string, budgetUSDLimit float64) (Team, error) {
+	if existing, err := s.GetTeam(id); err == nil {
+		return existing, nil
+	}
+	goal = strings.TrimSpace(goal)
+	if goal == "" {
+		return Team{}, fmt.Errorf("team requires a goal")
+	}
+	now := nowString()
+	t := Team{ID: id, Goal: goal, CWD: cwd, Status: "active", BudgetUSDLimit: budgetUSDLimit, CreatedAt: now, UpdatedAt: now}
+	_, err := s.db.Exec(`INSERT INTO teams(id,goal,cwd,status,budget_usd_limit,spend_usd,created_at,updated_at) VALUES(?,?,?,?,?,0,?,?)`,
+		t.ID, t.Goal, t.CWD, t.Status, t.BudgetUSDLimit, t.CreatedAt, t.UpdatedAt)
+	if err != nil {
+		return Team{}, err
+	}
+	return t, nil
+}
+
 func (s *Store) GetTeam(id string) (Team, error) {
 	var t Team
 	var tasksUpdatedAt, gatePrompt, gateHooks sql.NullString
