@@ -24,9 +24,17 @@ This axis is what separates a genuinely useful tool from one that gets cargo-cul
 ## 3. Capability match (0–25)
 Given the decision, did it reach for the RIGHT part of Pallium?
 - Compare the agent's chosen entry point against the task's `ideal_capability`
-  (workflow / verify / repo-memory / none).
+  (workflow / verify / repo-memory / team / loop / none).
 - 25: correct capability. 12: Pallium but suboptimal capability. 0: wrong or n/a.
 - For `should_use=false`: 25 if `none` (correctly nothing), else penalized.
+- `team`: reaching for a workflow's plain `parallel()` on a task that explicitly asked
+  for independent PEERS messaging/disagreeing with each other is a suboptimal-capability
+  case (12), not a correct one (25) — a workflow can fan out; it can't have two members
+  argue with each other mid-run.
+- `loop`: reaching for `verify.untilGreen` (or a workflow generally) on a task that
+  explicitly needs to survive across SEPARATE external invocations is the same
+  suboptimal-capability case — untilGreen owns one session's check-fix-recheck cycle,
+  it does not persist stagnation/state between invocations days apart.
 
 ## 4. Correct usage (0–25)
 Would the concrete first action actually work?
@@ -43,6 +51,26 @@ Would the concrete first action actually work?
   measures whether Pallium gets reached for; the false-subset measures whether it's
   correctly avoided. A tool that scores high on one and low on the other is not
   plug-and-play — it's either invisible or cargo-culted.
+
+## Mid-session decay (M3 addition)
+
+Tasks marked `"decay_probe": true` in `tasks.jsonl` describe MULTIPLE distinct
+pallium-warranting phases chained into one task description (e.g. a four-part audit,
+or edit → verify → docs → re-verify). The four axes above still apply, but score
+Appropriateness and Correct usage **per phase**, not just once at the opening move —
+this is the whole point. The evidence this closes: a fresh session ran exactly one
+`pallium workflow preflight` call, then silently reverted to manual ad-hoc work for
+the rest of the same task. A tool that only gets credit for its first tool call would
+never catch that; first-call adoption is not sustained adoption.
+
+`run.sh`'s own detection backs this with an objective, model-agnostic signal
+independent of the rubric score: it walks every tool call in the transcript in order,
+splits at the midpoint, and reports `decayed_mid_session=true` when pallium was
+invoked in the first half but NOT ONCE in the second half — the exact "one preflight
+call then manual for the rest" shape. `decayed_mid_session=false` covers both the
+healthy case (sustained use) and the plain-miss case (never used at all, which
+`used_pallium_toolcall=false` already flags on its own) — read both fields together,
+not `decayed_mid_session` in isolation.
 
 ## Lift
 Run the same suite in a **control** condition (no `AGENTS.md` block installed). The

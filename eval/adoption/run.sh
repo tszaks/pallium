@@ -34,6 +34,20 @@ while IFS= read -r line; do
   git -C "$repo_root" archive HEAD | tar -x -C "$scratch"
   ( cd "$scratch" && git init -q && git add -A && git -c user.email=e@x.com -c user.name=e commit -qm init )
 
+  # KNOWN LIMITATION, found live running this eval for real (not fixed here,
+  # see eval/adoption/README.md): isolating HOME gives each task a clean
+  # Pallium store (~/.pallium/), which is the whole point — but on at least
+  # one real setup, `claude -p` under that isolated HOME failed with
+  # "Not logged in" every time, even after copying ~/.claude/.credentials.json
+  # and ~/.claude.json into it. That account's actual session auth isn't in
+  # either file (~/.claude/.credentials.json here holds only per-MCP-plugin
+  # OAuth entries with empty tokens), so it likely resolves through the OS
+  # keychain or another mechanism this script can't safely reproduce by
+  # copying files. Net: run.sh's real-transcript path needs a login flow
+  # that survives HOME isolation before it can be trusted as a source of
+  # numbers — until then, treat its output as environment-dependent and
+  # prefer the dogfooded eval.workflow.js path (which never isolates HOME)
+  # for anything you intend to report.
   if [ "$cond" = "installed" ]; then
     printf '%s\n' "$block" > "$scratch/AGENTS.md"
     prompt="$block
@@ -61,16 +75,41 @@ You are working in the repository at $scratch. Task: $task"
   # Look only at assistant `tool_use` Bash commands — never the prompt, the
   # AGENTS block, file reads, or command output — so echoed 'pallium ' text
   # (e.g. reading AGENTS.md or a usage dump) can't create a false positive.
-  used=$(python3 - "$transcript" <<'PY'
+  #
+  # Mid-session decay (M3): a single `-p` invocation isn't one atomic action —
+  # the agent chains many tool calls autonomously within it to finish a
+  # multi-part task. First-call adoption (one preflight, then silently
+  # reverting to manual work for the rest) is the exact gap logged in the
+  # ledger's adoption-decay incident. Walking ALL tool calls in order (not
+  # just pallium ones) and splitting at the midpoint gives an objective,
+  # model-agnostic signal: did pallium usage survive into the back half of
+  # the agent's own tool-call sequence, or only show up early.
+  decay_json=$(python3 - "$transcript" <<'PY'
 import json, re, sys
 
-cmds = []
+def invokes_pallium(cmd):
+    # Split on shell separators so `pallium` must be the command actually run,
+    # not an argument to cat/ls (e.g. `ls pallium/`).
+    for seg in re.split(r"&&|\|\||[;|]", cmd):
+        seg = seg.strip()
+        if seg == "pallium" or seg.startswith("pallium "):
+            return True
+    return False
+
+# Ordered list of every tool_use call, True where it's a pallium invocation —
+# order matters here (unlike the old cmds-only list), so this walk collects
+# EVERY tool_use node, not just Bash ones, to fairly represent how much total
+# activity happened before/after the midpoint.
+calls = []
 def walk(node):
     if isinstance(node, dict):
-        if node.get("type") == "tool_use" and node.get("name") == "Bash":
-            cmd = (node.get("input") or {}).get("command")
-            if isinstance(cmd, str):
-                cmds.append(cmd)
+        if node.get("type") == "tool_use":
+            is_pallium = False
+            if node.get("name") == "Bash":
+                cmd = (node.get("input") or {}).get("command")
+                if isinstance(cmd, str):
+                    is_pallium = invokes_pallium(cmd)
+            calls.append(is_pallium)
         for v in node.values():
             walk(v)
     elif isinstance(node, list):
@@ -90,21 +129,52 @@ with open(sys.argv[1]) as fh:
         except Exception:
             continue
 
-def invokes_pallium(cmd):
-    # Split on shell separators so `pallium` must be the command actually run,
-    # not an argument to cat/ls (e.g. `ls pallium/`).
-    for seg in re.split(r"&&|\|\||[;|]", cmd):
-        seg = seg.strip()
-        if seg == "pallium" or seg.startswith("pallium "):
-            return True
-    return False
+total = len(calls)
+mid = total // 2
+first_half, second_half = calls[:mid], calls[mid:]
+first_pallium = sum(first_half)
+second_pallium = sum(second_half)
+used = any(calls)
+# Decayed: reached for it early, then went the ENTIRE back half without it
+# again — the "one preflight call, then manual for the rest" pattern,
+# distinct from simply never using it at all (that's a plain recall miss,
+# already scored by used_pallium_toolcall).
+decayed = first_pallium > 0 and second_pallium == 0
 
-print("true" if any(invokes_pallium(c) for c in cmds) else "false")
+print(json.dumps({
+    "used_pallium_toolcall": used,
+    "total_toolcalls": total,
+    "pallium_toolcalls_first_half": first_pallium,
+    "pallium_toolcalls_second_half": second_pallium,
+    "decayed_mid_session": decayed,
+}))
 PY
 )
-  python3 -c "import json,sys;print(json.dumps({'id':sys.argv[1],'condition':sys.argv[2],'used_pallium_toolcall':sys.argv[3]=='true','transcript':sys.argv[4]}))" "$id" "$cond" "$used" "$transcript" >> "$out"
-  echo "[$cond] $id → used_pallium=$used"
-  rm -rf "$scratch" "$home"
+  python3 -c "
+import json, sys
+decay = json.loads(sys.argv[3])
+record = {'id': sys.argv[1], 'condition': sys.argv[2], 'transcript': sys.argv[4]}
+record.update(decay)
+print(json.dumps(record))
+" "$id" "$cond" "$decay_json" "$transcript" >> "$out"
+  used=$(python3 -c "import json,sys;print('true' if json.loads(sys.argv[1])['used_pallium_toolcall'] else 'false')" "$decay_json")
+  decayed=$(python3 -c "import json,sys;print('true' if json.loads(sys.argv[1])['decayed_mid_session'] else 'false')" "$decay_json")
+  echo "[$cond] $id → used_pallium=$used decayed_mid_session=$decayed"
+  # Best-effort cleanup, not fatal: found live running this eval for real —
+  # a lingering subprocess (a package-manager cache directory materialized
+  # mid-run) can still be writing into $scratch/$home for a moment after
+  # claude's own process exits, so a single `rm -rf` can race and return
+  # non-zero. Under this script's `set -e`, that used to silently ABORT THE
+  # WHOLE EVAL after whichever task happened to hit the race — every task
+  # after it never ran, with no error surfaced beyond the rm noise. Retries
+  # briefly, then falls back to `|| true` and a visible warning rather than
+  # losing the rest of the suite over one directory that'll get reaped by
+  # the OS's own tmp cleanup anyway.
+  for attempt in 1 2 3; do
+    rm -rf "$scratch" "$home" 2>/dev/null && break
+    sleep 1
+  done
+  rm -rf "$scratch" "$home" 2>/dev/null || echo "[$cond] $id → warning: cleanup left some files behind (non-fatal, OS tmp cleanup will reap them): $scratch $home" >&2
 done < "$here/tasks.jsonl"
 
 echo "wrote $out"
