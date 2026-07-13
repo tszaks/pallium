@@ -20,6 +20,15 @@ type Team struct {
 	Status         string  `json:"status"` // active | parked | stopped
 	BudgetUSDLimit float64 `json:"budget_usd_limit,omitempty"`
 	SpendUSD       float64 `json:"spend_usd"`
+	// GatePrompt/GateHooks configure the M2 quality-gate hook points (see
+	// runTeamGate in team_runtime.go): an autonomous read-only verifier call,
+	// same shape as the workflow gate() primitive, run at whichever of
+	// "task_created"/"task_completed"/"teammate_idle" are listed in
+	// GateHooks. Empty GateHooks means no gates configured — zero overhead
+	// for a team that never opts in, and every M1 team predates these
+	// columns entirely.
+	GatePrompt string   `json:"gate_prompt,omitempty"`
+	GateHooks  []string `json:"gate_hooks,omitempty"`
 	// TasksUpdatedAt is a team-wide watermark bumped on every task-board
 	// mutation (create/claim/complete/revert-to-pending) — NOT the same as
 	// any single task's own updated_at, because completing task A can make
@@ -56,17 +65,35 @@ type TeamMember struct {
 	// turn, but a failed claude turn may never have actually created the
 	// native session claude expects `--resume` to find. dispatchTeamTurn
 	// uses THIS field, not TurnCount, to decide `--session-id` vs `--resume`.
-	SessionEstablished bool    `json:"session_established"`
-	Worktree           string  `json:"worktree,omitempty"`
-	TurnCount          int     `json:"turn_count"`
-	TurnStartedAt      string  `json:"turn_started_at,omitempty"`
-	LastTurnAt         string  `json:"last_turn_at,omitempty"`
-	LastTurnStatus     string  `json:"last_turn_status,omitempty"`
-	LastTurnError      string  `json:"last_turn_error,omitempty"`
-	NudgedAt           string  `json:"nudged_at,omitempty"`
-	SpendUSD           float64 `json:"spend_usd"`
-	CreatedAt          string  `json:"created_at"`
-	UpdatedAt          string  `json:"updated_at"`
+	SessionEstablished bool `json:"session_established"`
+	// PlanRequired/PlanStatus back the M2 plan-approval flow: a plan-required
+	// member is spawned read-only and stays that way until `team approve`
+	// flips PlanStatus to "approved" (and mode to "edit"). PlanStatus is
+	// "pending" from spawn through any number of `team reject` rounds — a
+	// reject sends feedback (journaled as an ordinary team message) and
+	// leaves the member exactly where it was, free to submit a revised plan
+	// next turn; there is no separate terminal "rejected" state to model
+	// because rejection is not terminal here, approval is.
+	PlanRequired bool   `json:"plan_required,omitempty"`
+	PlanStatus   string `json:"plan_status,omitempty"`
+	// StopRequested backs M2 individual teammate supervision (`team member
+	// stop/restart`): soft-stop, not a kill — RunTeam's scheduler simply
+	// never offers this member another turn while it's set, so a turn
+	// already in flight when a stop is requested runs to its own natural
+	// completion first. See the migration comment on this column for why
+	// it's independent of Status rather than reusing the existing
+	// (currently dead) "stopped" enum value.
+	StopRequested  bool    `json:"stop_requested,omitempty"`
+	Worktree       string  `json:"worktree,omitempty"`
+	TurnCount      int     `json:"turn_count"`
+	TurnStartedAt  string  `json:"turn_started_at,omitempty"`
+	LastTurnAt     string  `json:"last_turn_at,omitempty"`
+	LastTurnStatus string  `json:"last_turn_status,omitempty"`
+	LastTurnError  string  `json:"last_turn_error,omitempty"`
+	NudgedAt       string  `json:"nudged_at,omitempty"`
+	SpendUSD       float64 `json:"spend_usd"`
+	CreatedAt      string  `json:"created_at"`
+	UpdatedAt      string  `json:"updated_at"`
 }
 
 // TeamTask is one item on the shared task board. DependsOn holds task ids
@@ -175,8 +202,34 @@ CREATE INDEX IF NOT EXISTS idx_team_messages_inbox ON team_messages(team_id, to_
 // rest of the schema, so a single Store (and its one sqlite connection) owns
 // both workflow and team state.
 func (s *Store) initTeams() error {
-	_, err := s.db.Exec(teamSchema)
-	return err
+	if _, err := s.db.Exec(teamSchema); err != nil {
+		return err
+	}
+	for _, stmt := range []string{
+		// M2: plan-approval flow (see TeamMember.PlanRequired/PlanStatus).
+		"ALTER TABLE team_members ADD COLUMN plan_required INTEGER DEFAULT 0",
+		"ALTER TABLE team_members ADD COLUMN plan_status TEXT",
+		// M2: quality-gate hook configuration (see Team.GatePrompt/GateHooks).
+		"ALTER TABLE teams ADD COLUMN gate_prompt TEXT",
+		"ALTER TABLE teams ADD COLUMN gate_hooks TEXT",
+		// M2: individual teammate supervision (see TeamMember.StopRequested).
+		// A separate column, not a reuse of Status, deliberately: FinishMemberTurn
+		// unconditionally writes Status to whatever the just-finished turn
+		// decided (active/idle/error) keyed only on the lease — a supervision
+		// request landing WHILE a turn is in flight would otherwise get
+		// silently overwritten the instant that turn completes. This column
+		// is never touched by FinishMemberTurn's own decision-application; it
+		// survives across turn completion by construction, and
+		// FinishMemberTurn's own status write is the one place that reads it
+		// back (see the CASE there) to make the stop visible once the
+		// in-flight turn actually finishes.
+		"ALTER TABLE team_members ADD COLUMN stop_requested INTEGER DEFAULT 0",
+	} {
+		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return err
+		}
+	}
+	return nil
 }
 
 // CreateTeam starts a new team in the "active" state.
@@ -195,16 +248,84 @@ func (s *Store) CreateTeam(goal, cwd string, budgetUSDLimit float64) (Team, erro
 	return t, nil
 }
 
+// GetOrCreateTeam is CreateTeam's idempotent sibling for the team.create()
+// workflow primitive: if id already names a team, that team is returned
+// as-is (whatever state it's since reached — spawned members, tasks,
+// spend — none of that is touched), otherwise a new team is created with
+// exactly this id. Found by review: unlike agent()/gate(), which persist a
+// replay key so a paused/resumed workflow re-executing the same script
+// finds its own prior call instead of repeating it, team.create() used to
+// mint a fresh id every evaluation — a resumed workflow would create a
+// SECOND active team, orphaning the first one's state and spend. The
+// caller (jsTeam's "create" primitive) derives id deterministically from
+// r.Run.ID and a per-run team.create()-call counter, mirroring how agent
+// calls key their own replay cache off (run id, call index).
+func (s *Store) GetOrCreateTeam(id, goal, cwd string, budgetUSDLimit float64) (Team, error) {
+	if existing, err := s.GetTeam(id); err == nil {
+		return existing, nil
+	}
+	goal = strings.TrimSpace(goal)
+	if goal == "" {
+		return Team{}, fmt.Errorf("team requires a goal")
+	}
+	now := nowString()
+	t := Team{ID: id, Goal: goal, CWD: cwd, Status: "active", BudgetUSDLimit: budgetUSDLimit, CreatedAt: now, UpdatedAt: now}
+	_, err := s.db.Exec(`INSERT INTO teams(id,goal,cwd,status,budget_usd_limit,spend_usd,created_at,updated_at) VALUES(?,?,?,?,?,0,?,?)`,
+		t.ID, t.Goal, t.CWD, t.Status, t.BudgetUSDLimit, t.CreatedAt, t.UpdatedAt)
+	if err != nil {
+		return Team{}, err
+	}
+	return t, nil
+}
+
 func (s *Store) GetTeam(id string) (Team, error) {
 	var t Team
-	var tasksUpdatedAt sql.NullString
-	err := s.db.QueryRow(`SELECT id,goal,cwd,status,budget_usd_limit,spend_usd,tasks_updated_at,created_at,updated_at FROM teams WHERE id=?`, id).
-		Scan(&t.ID, &t.Goal, &t.CWD, &t.Status, &t.BudgetUSDLimit, &t.SpendUSD, &tasksUpdatedAt, &t.CreatedAt, &t.UpdatedAt)
+	var tasksUpdatedAt, gatePrompt, gateHooks sql.NullString
+	err := s.db.QueryRow(`SELECT id,goal,cwd,status,budget_usd_limit,spend_usd,tasks_updated_at,COALESCE(gate_prompt,''),COALESCE(gate_hooks,''),created_at,updated_at FROM teams WHERE id=?`, id).
+		Scan(&t.ID, &t.Goal, &t.CWD, &t.Status, &t.BudgetUSDLimit, &t.SpendUSD, &tasksUpdatedAt, &gatePrompt, &gateHooks, &t.CreatedAt, &t.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return Team{}, fmt.Errorf("team %q not found", id)
 	}
 	t.TasksUpdatedAt = tasksUpdatedAt.String
+	t.GatePrompt = gatePrompt.String
+	if gateHooks.String != "" {
+		t.GateHooks = strings.Split(gateHooks.String, ",")
+	}
 	return t, err
+}
+
+// TeamGateHooks are the only valid hook-point names SetTeamGate accepts —
+// see runTeamGate (team_runtime.go) for what each fires on.
+var TeamGateHooks = map[string]bool{
+	"task_created":   true,
+	"task_completed": true,
+	"teammate_idle":  true,
+}
+
+// SetTeamGate configures the M2 quality-gate hooks: prompt is the shared
+// verifier instruction (same shape as gate()'s message/criteria), hooks
+// selects which of task_created/task_completed/teammate_idle actually fire
+// it. Passing an empty hooks list disables gating entirely — the team-wide
+// opt-in default.
+func (s *Store) SetTeamGate(teamID, prompt string, hooks []string) error {
+	for _, h := range hooks {
+		if !TeamGateHooks[h] {
+			return fmt.Errorf("unknown team gate hook %q (valid: task_created, task_completed, teammate_idle)", h)
+		}
+	}
+	// A non-empty hooks list with an empty prompt is a silently-inert
+	// config: teamGateHasHook always treats an empty GatePrompt as "no
+	// gating" regardless of GateHooks, so this combination would persist
+	// (and team.status would report) hooks that never actually fire. The
+	// CLI already rejects this at its own layer; guarded here too so every
+	// caller of the shared store method — including the team.gate()
+	// workflow primitive, which has no such guard of its own — gets the
+	// same protection. Found by review.
+	if strings.TrimSpace(prompt) == "" && len(hooks) > 0 {
+		return fmt.Errorf("team gate hooks %v require a non-empty prompt; pass an empty hooks list to disable gating instead", hooks)
+	}
+	_, err := s.db.Exec(`UPDATE teams SET gate_prompt=?, gate_hooks=?, updated_at=? WHERE id=?`, prompt, strings.Join(hooks, ","), nowString(), teamID)
+	return err
 }
 
 // bumpTeamTasksUpdated advances the team-wide task-board watermark (see
@@ -217,6 +338,20 @@ func bumpTeamTasksUpdated(exec interface {
 }, teamID, now string) error {
 	_, err := exec.Exec(`UPDATE teams SET tasks_updated_at=? WHERE id=?`, now, teamID)
 	return err
+}
+
+// TouchTeamTasksWatermark bumps the task-board watermark with no actual task
+// mutation — used when a teammate_idle gate rejection forces a member back
+// to "active" (team_runtime.go): RunTeam's scheduler only re-offers
+// claimable work to a member if the board looks NEW since that member's own
+// last turn (see the watermark comment above), so without this, forcing
+// status back to "active" alone doesn't guarantee the member actually gets
+// scheduled again — the next round can still find zero eligible members and
+// exit. Bumping the watermark makes the (unchanged) board look new to this
+// member one more time, which is exactly the outcome the gate rejection
+// calls for. Found by review.
+func (s *Store) TouchTeamTasksWatermark(teamID string) error {
+	return bumpTeamTasksUpdated(s.db, teamID, nowString())
 }
 
 func (s *Store) SetTeamStatus(id, status string) error {
@@ -273,20 +408,157 @@ func (s *Store) SpawnMember(teamID, name, provider, model, role, mode string) (T
 	return m, nil
 }
 
+// SpawnPlanRequiredMember is SpawnMember's plan-approval variant (M2): the
+// member is forced read-only (a plan can't include edits it hasn't been
+// approved to make yet) and starts with PlanStatus "pending" — see
+// ApproveMemberPlan/RejectMemberPlan and buildTeamTurnPrompt's plan-mode
+// framing.
+func (s *Store) SpawnPlanRequiredMember(teamID, name, provider, model, role string) (TeamMember, error) {
+	if _, err := s.SpawnMember(teamID, name, provider, model, role, "read-only"); err != nil {
+		return TeamMember{}, err
+	}
+	if _, err := s.db.Exec(`UPDATE team_members SET plan_required=1, plan_status='pending', updated_at=? WHERE team_id=? AND name=?`, nowString(), teamID, name); err != nil {
+		return TeamMember{}, err
+	}
+	return s.GetMember(teamID, name)
+}
+
+// ApproveMemberPlan flips a plan-required member into edit mode once its
+// plan is approved, and journals the approval as an ordinary team message
+// (the durable record every other coordination event already uses — no
+// separate "approval log" needed). Errors if the member never required a
+// plan, or its plan isn't currently pending (already approved, or a plain
+// read-only member with no plan flow at all).
+func (s *Store) ApproveMemberPlan(teamID, name string) (TeamMember, error) {
+	m, err := s.GetMember(teamID, name)
+	if err != nil {
+		return TeamMember{}, err
+	}
+	if !m.PlanRequired || m.PlanStatus != "pending" {
+		return TeamMember{}, fmt.Errorf("team member %q has no pending plan to approve (plan_required=%v plan_status=%q)", name, m.PlanRequired, m.PlanStatus)
+	}
+	now := nowString()
+	if _, err := s.db.Exec(`UPDATE team_members SET mode='edit', plan_status='approved', updated_at=? WHERE team_id=? AND name=?`, now, teamID, name); err != nil {
+		return TeamMember{}, err
+	}
+	if _, err := s.SendTeamMessage(teamID, "lead", name, "Your plan is approved. Proceed with edits."); err != nil {
+		return TeamMember{}, err
+	}
+	return s.GetMember(teamID, name)
+}
+
+// RejectMemberPlan delivers feedback on a pending plan and leaves the member
+// exactly where it was (read-only, plan_status still "pending") — rejection
+// is not terminal here, only approval is; the member submits a revised plan
+// on its next turn and lead reviews again. Same "no pending plan" guard as
+// ApproveMemberPlan.
+func (s *Store) RejectMemberPlan(teamID, name, feedback string) (TeamMember, error) {
+	m, err := s.GetMember(teamID, name)
+	if err != nil {
+		return TeamMember{}, err
+	}
+	if !m.PlanRequired || m.PlanStatus != "pending" {
+		return TeamMember{}, fmt.Errorf("team member %q has no pending plan to reject (plan_required=%v plan_status=%q)", name, m.PlanRequired, m.PlanStatus)
+	}
+	feedback = strings.TrimSpace(feedback)
+	if feedback == "" {
+		return TeamMember{}, fmt.Errorf("plan rejection requires feedback explaining what to revise")
+	}
+	if _, err := s.SendTeamMessage(teamID, "lead", name, "Your plan was NOT approved: "+feedback+" Please revise and resubmit."); err != nil {
+		return TeamMember{}, err
+	}
+	return s.GetMember(teamID, name)
+}
+
+// RequestMemberStop is the M2 individual-supervision soft-stop: sets
+// StopRequested so RunTeam's scheduler never offers this member another
+// turn, and — if no turn is currently in flight — immediately reflects
+// "stopped" in Status too, for accurate display without waiting on
+// anything. If a turn IS in flight, Status is left alone here on purpose:
+// it still shows whatever the member's own last-known state was, and only
+// flips to "stopped" once that in-flight turn actually finishes (see
+// FinishMemberTurn's effectiveStatus). This is the intended "takes effect
+// at the next turn boundary" semantics, not a bug — a genuinely immediate
+// kill of an in-flight provider call is a bigger, separately-scoped
+// feature (tracked, not built here: turn-based providers make killing an
+// in-flight call from a SEPARATE process risky to get right without real
+// PID-liveness tracking, the same class of care 0.9.15's owner_pid/
+// heartbeat work already went through for workflow runs).
+func (s *Store) RequestMemberStop(teamID, name string) (TeamMember, error) {
+	now := nowString()
+	res, err := s.db.Exec(`UPDATE team_members SET stop_requested=1, status=CASE WHEN turn_started_at IS NULL THEN 'stopped' ELSE status END, updated_at=? WHERE team_id=? AND name=?`, now, teamID, name)
+	if err != nil {
+		return TeamMember{}, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return TeamMember{}, fmt.Errorf("team member %q not found on team %s", name, teamID)
+	}
+	return s.GetMember(teamID, name)
+}
+
+// RestartMember clears a stop request and makes the member schedulable
+// again. If the member's turn was ALSO left stuck (turn_started_at set,
+// past staleAfter — e.g. a stop was requested mid-turn and that turn then
+// hung rather than finishing cleanly), this immediately reconciles it via
+// the same ReconcileInterruptedMembers path `team attach`/`team run`
+// already use — restart shouldn't require a separate manual attach just to
+// unstick a hung turn on top of clearing the stop. A turn that's still
+// genuinely IN FLIGHT (not yet stale) is left alone: it will finish
+// normally and land on whatever status it itself decides, since
+// stop_requested is already cleared by the time it does.
+func (s *Store) RestartMember(teamID, name, staleAfter string) (TeamMember, error) {
+	now := nowString()
+	res, err := s.db.Exec(`UPDATE team_members SET stop_requested=0, status=CASE WHEN turn_started_at IS NULL THEN 'active' ELSE status END, updated_at=? WHERE team_id=? AND name=?`, now, teamID, name)
+	if err != nil {
+		return TeamMember{}, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return TeamMember{}, fmt.Errorf("team member %q not found on team %s", name, teamID)
+	}
+	// ReconcileInterruptedMember (scoped to THIS member), not the team-wide
+	// ReconcileInterruptedMembers sweep — found by review: the sweep
+	// reconciles EVERY stale-looking member on the team, so an operator
+	// force-restarting one hung teammate with a short
+	// --stale-after-minutes cutoff could also clear (and revert the
+	// in-progress tasks of) other teammates whose turns were legitimately
+	// still in flight, letting a second turn double-run them.
+	if _, err := s.ReconcileInterruptedMember(teamID, name, staleAfter); err != nil {
+		return TeamMember{}, err
+	}
+	// NudgeMember: clearing stop_requested and reconciling a stale lease
+	// do NOT by themselves make RunTeam schedule this member again — the
+	// scheduler only offers a turn for undelivered mail, a nudge, or
+	// claimable work whose watermark is newer than the member's own last
+	// turn. Found by review: without an explicit signal, a member
+	// restarted after it already saw the current (unchanged) board would
+	// sit un-scheduled through the next `team run` despite restart
+	// reporting success. Nudge is the existing, purpose-built "give this
+	// member a turn regardless of board state" primitive — RunTeam clears
+	// it itself once a turn actually runs.
+	if err := s.NudgeMember(teamID, name); err != nil {
+		return TeamMember{}, err
+	}
+	return s.GetMember(teamID, name)
+}
+
 func scanMember(row *sql.Row) (TeamMember, error) {
 	var m TeamMember
-	var model, role, session, worktree, turnStarted, lastAt, lastStatus, lastErr, nudged sql.NullString
-	err := row.Scan(&m.ID, &m.TeamID, &m.Name, &m.Provider, &model, &role, &m.Mode, &m.Status, &session, &m.SessionEstablished, &worktree,
+	var model, role, session, worktree, turnStarted, lastAt, lastStatus, lastErr, nudged, planStatus sql.NullString
+	var planRequired, stopRequested int
+	err := row.Scan(&m.ID, &m.TeamID, &m.Name, &m.Provider, &model, &role, &m.Mode, &m.Status, &session, &m.SessionEstablished, &planRequired, &planStatus, &stopRequested, &worktree,
 		&m.TurnCount, &turnStarted, &lastAt, &lastStatus, &lastErr, &nudged, &m.SpendUSD, &m.CreatedAt, &m.UpdatedAt)
 	if err != nil {
 		return TeamMember{}, err
 	}
 	m.Model, m.Role, m.SessionToken, m.Worktree = model.String, role.String, session.String, worktree.String
 	m.TurnStartedAt, m.LastTurnAt, m.LastTurnStatus, m.LastTurnError, m.NudgedAt = turnStarted.String, lastAt.String, lastStatus.String, lastErr.String, nudged.String
+	m.PlanRequired = planRequired != 0
+	m.PlanStatus = planStatus.String
+	m.StopRequested = stopRequested != 0
 	return m, nil
 }
 
-const memberSelectCols = `id,team_id,name,provider,model,role,mode,status,session_token,session_established,worktree,turn_count,turn_started_at,last_turn_at,last_turn_status,last_turn_error,nudged_at,spend_usd,created_at,updated_at`
+const memberSelectCols = `id,team_id,name,provider,model,role,mode,status,session_token,session_established,COALESCE(plan_required,0),COALESCE(plan_status,''),COALESCE(stop_requested,0),worktree,turn_count,turn_started_at,last_turn_at,last_turn_status,last_turn_error,nudged_at,spend_usd,created_at,updated_at`
 
 func (s *Store) GetMember(teamID, name string) (TeamMember, error) {
 	m, err := scanMember(s.db.QueryRow(`SELECT `+memberSelectCols+` FROM team_members WHERE team_id=? AND name=?`, teamID, name))
@@ -305,13 +577,17 @@ func (s *Store) ListMembers(teamID string) ([]TeamMember, error) {
 	var members []TeamMember
 	for rows.Next() {
 		var m TeamMember
-		var model, role, session, worktree, turnStarted, lastAt, lastStatus, lastErr, nudged sql.NullString
-		if err := rows.Scan(&m.ID, &m.TeamID, &m.Name, &m.Provider, &model, &role, &m.Mode, &m.Status, &session, &m.SessionEstablished, &worktree,
+		var model, role, session, worktree, turnStarted, lastAt, lastStatus, lastErr, nudged, planStatus sql.NullString
+		var planRequired, stopRequested int
+		if err := rows.Scan(&m.ID, &m.TeamID, &m.Name, &m.Provider, &model, &role, &m.Mode, &m.Status, &session, &m.SessionEstablished, &planRequired, &planStatus, &stopRequested, &worktree,
 			&m.TurnCount, &turnStarted, &lastAt, &lastStatus, &lastErr, &nudged, &m.SpendUSD, &m.CreatedAt, &m.UpdatedAt); err != nil {
 			return nil, err
 		}
 		m.Model, m.Role, m.SessionToken, m.Worktree = model.String, role.String, session.String, worktree.String
 		m.TurnStartedAt, m.LastTurnAt, m.LastTurnStatus, m.LastTurnError, m.NudgedAt = turnStarted.String, lastAt.String, lastStatus.String, lastErr.String, nudged.String
+		m.PlanRequired = planRequired != 0
+		m.PlanStatus = planStatus.String
+		m.StopRequested = stopRequested != 0
 		members = append(members, m)
 	}
 	return members, rows.Err()
@@ -352,9 +628,18 @@ var errMemberTurnInFlight = fmt.Errorf("team member turn already in flight")
 // an idempotent same-holder refresh) rather than re-deriving it.
 func (s *Store) BeginMemberTurn(teamID, name string, staleAfter string) (lease string, err error) {
 	now := nowString()
+	// stop_requested=0 is part of the ACTUAL acquisition CAS, not just
+	// RunTeam's earlier eligibility snapshot (ListMembers, read before any
+	// goroutine calls this) — found by review: a stop landing in the gap
+	// between that snapshot and this UPDATE used to dispatch one more real
+	// provider call regardless, since nothing here re-checked it. This is
+	// the same class of guarantee turn_started_at's own CAS already gives
+	// against a second concurrent scheduler; stop_requested needed the
+	// identical treatment; a stale snapshot can never win a race the
+	// acquisition step itself re-validates.
 	res, err := s.db.Exec(
 		`UPDATE team_members SET turn_started_at=?, status='active', updated_at=?
-		 WHERE team_id=? AND name=? AND (turn_started_at IS NULL OR turn_started_at < ?)`,
+		 WHERE team_id=? AND name=? AND (turn_started_at IS NULL OR turn_started_at < ?) AND COALESCE(stop_requested,0)=0`,
 		now, now, teamID, name, staleAfter)
 	if err != nil {
 		return "", err
@@ -399,12 +684,27 @@ func (s *Store) FinishMemberTurn(teamID, name, lease, status, sessionToken, turn
 	if sessionToken != "" {
 		token = sessionToken
 	}
+	// effectiveStatus, not the turn's own decided status, is what actually
+	// gets written to the live status column: a `team member stop` issued
+	// WHILE this turn was in flight sets StopRequested on the row this
+	// SELECT above already read, independently of turn_started_at/lease —
+	// found by design review during M2 PR B: without this override, a
+	// stop requested mid-turn would be silently discarded the instant the
+	// in-flight turn completes, since this UPDATE otherwise unconditionally
+	// overwrites status with whatever the turn itself decided. last_turn_status
+	// still records the turn's OWN decision (for history/diagnostics), and
+	// the session_established check below still evaluates the turn's own
+	// outcome — a stopped member's last real turn can still have succeeded.
+	effectiveStatus := status
+	if current.StopRequested {
+		effectiveStatus = "stopped"
+	}
 	res, err := tx.Exec(
 		`UPDATE team_members SET turn_started_at=NULL, status=?, session_token=?, turn_count=turn_count+1,
 		 last_turn_at=?, last_turn_status=?, last_turn_error=?, spend_usd=spend_usd+?, updated_at=?,
 		 session_established = session_established OR (? <> 'error')
 		 WHERE team_id=? AND name=? AND turn_started_at=?`,
-		status, token, now, status, turnError, spendDelta, now, status, teamID, name, lease)
+		effectiveStatus, token, now, status, turnError, spendDelta, now, status, teamID, name, lease)
 	if err != nil {
 		return err
 	}
@@ -509,69 +809,113 @@ func (s *Store) ReconcileInterruptedMembers(teamID, staleAfter string) ([]string
 	now := nowString()
 	var reconciled []string
 	for _, name := range names {
-		// Both statements below run in ONE transaction: a live dogfooded
-		// review caught that they were previously two separate, individually
-		// autocommitted Exec calls — a crash between them (or a process kill
-		// mid-reconcile) could mark the member interrupted while leaving its
-		// task permanently stuck "in_progress" with no live owner, forever
-		// unclaimable (not pending) and never resumed (owner's turn already
-		// closed out).
-		if err := func() error {
-			tx, err := s.db.Begin()
-			if err != nil {
-				return err
-			}
-			defer tx.Rollback()
-			// CAS, matching BeginMemberTurn: re-check the exact staleness
-			// condition at UPDATE time, not just at the earlier SELECT.
-			// Found by the same review: without the re-check, a member
-			// whose turn legitimately restarted via stale-takeover — or
-			// finished cleanly — between the SELECT above and this UPDATE
-			// would get clobbered back to "interrupted" with
-			// turn_started_at wiped, letting a second BeginMemberTurn
-			// succeed and double-run the same member. Concurrent `team
-			// run`/`team attach` on one team is an explicitly supported
-			// scenario, so this window is real, not theoretical.
-			res, err := tx.Exec(`UPDATE team_members SET turn_started_at=NULL, status='interrupted', updated_at=?
-				WHERE team_id=? AND name=? AND turn_started_at IS NOT NULL AND turn_started_at < ?`, now, teamID, name, staleAfter)
-			if err != nil {
-				return err
-			}
-			if n, _ := res.RowsAffected(); n == 0 {
-				// Lost the race: this member's turn is no longer the stale
-				// one we observed (it restarted or finished already) —
-				// leave it alone.
-				return nil
-			}
-			reconciled = append(reconciled, name)
-			if sessions[name] != "" {
-				return tx.Commit()
-			}
-			revertRes, err := tx.Exec(`UPDATE team_tasks SET status='pending', owner=NULL, updated_at=? WHERE team_id=? AND owner=? AND status='in_progress'`, now, teamID, name)
-			if err != nil {
-				return err
-			}
-			if n, _ := revertRes.RowsAffected(); n > 0 {
-				// A task just became claimable again (owner cleared) — bump
-				// the board watermark so the scheduler doesn't treat this as
-				// the same unchanged board every other idle member already
-				// declined (see RunTeam / Team.TasksUpdatedAt).
-				if err := bumpTeamTasksUpdated(tx, teamID, now); err != nil {
-					return err
-				}
-			}
-			return tx.Commit()
-		}(); err != nil {
+		ok, err := s.reconcileOneStaleMember(teamID, name, sessions[name], staleAfter, now)
+		if err != nil {
 			return nil, err
+		}
+		if ok {
+			reconciled = append(reconciled, name)
 		}
 	}
 	return reconciled, nil
+}
+
+// ReconcileInterruptedMember is ReconcileInterruptedMembers scoped to ONE
+// named member, for `team member restart`: found by review, restart used
+// to call the team-wide sweep, which reconciles EVERY stale-looking member
+// on the team, not just the one requested. An operator force-restarting a
+// single hung teammate with a short --stale-after-minutes cutoff could
+// therefore also clear (and revert the in-progress tasks of) other
+// teammates whose turns were legitimately still in flight, letting a
+// second turn double-run them. This SELECTs only the named member's own
+// row before delegating to the identical CAS-protected reconciliation
+// logic ReconcileInterruptedMembers itself uses.
+func (s *Store) ReconcileInterruptedMember(teamID, name, staleAfter string) (bool, error) {
+	var sess sql.NullString
+	err := s.db.QueryRow(`SELECT session_token FROM team_members WHERE team_id=? AND name=? AND turn_started_at IS NOT NULL AND turn_started_at < ?`, teamID, name, staleAfter).Scan(&sess)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return s.reconcileOneStaleMember(teamID, name, sess.String, staleAfter, nowString())
+}
+
+// reconcileOneStaleMember is the CAS-protected reconciliation both
+// ReconcileInterruptedMembers (team-wide sweep) and ReconcileInterruptedMember
+// (single-member restart) delegate to — one implementation, two entry
+// points at different scopes.
+func (s *Store) reconcileOneStaleMember(teamID, name, sessionToken, staleAfter, now string) (bool, error) {
+	// Both statements below run in ONE transaction: a live dogfooded
+	// review caught that they were previously two separate, individually
+	// autocommitted Exec calls — a crash between them (or a process kill
+	// mid-reconcile) could mark the member interrupted while leaving its
+	// task permanently stuck "in_progress" with no live owner, forever
+	// unclaimable (not pending) and never resumed (owner's turn already
+	// closed out).
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	// CAS, matching BeginMemberTurn: re-check the exact staleness
+	// condition at UPDATE time, not just at the earlier SELECT. Found by
+	// review: without the re-check, a member whose turn legitimately
+	// restarted via stale-takeover — or finished cleanly — between the
+	// SELECT and this UPDATE would get clobbered back to "interrupted"
+	// with turn_started_at wiped, letting a second BeginMemberTurn succeed
+	// and double-run the same member. Concurrent `team run`/`team attach`
+	// on one team is an explicitly supported scenario, so this window is
+	// real, not theoretical.
+	res, err := tx.Exec(`UPDATE team_members SET turn_started_at=NULL, status='interrupted', updated_at=?
+		WHERE team_id=? AND name=? AND turn_started_at IS NOT NULL AND turn_started_at < ?`, now, teamID, name, staleAfter)
+	if err != nil {
+		return false, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		// Lost the race: this member's turn is no longer the stale one we
+		// observed (it restarted or finished already) — leave it alone.
+		return false, nil
+	}
+	if sessionToken != "" {
+		return true, tx.Commit()
+	}
+	revertRes, err := tx.Exec(`UPDATE team_tasks SET status='pending', owner=NULL, updated_at=? WHERE team_id=? AND owner=? AND status='in_progress'`, now, teamID, name)
+	if err != nil {
+		return false, err
+	}
+	if n, _ := revertRes.RowsAffected(); n > 0 {
+		// A task just became claimable again (owner cleared) — bump the
+		// board watermark so the scheduler doesn't treat this as the same
+		// unchanged board every other idle member already declined (see
+		// RunTeam / Team.TasksUpdatedAt).
+		if err := bumpTeamTasksUpdated(tx, teamID, now); err != nil {
+			return false, err
+		}
+	}
+	return true, tx.Commit()
 }
 
 // CreateTeamTask adds a task to the board. dependsOn task ids need not exist
 // yet (a task can be added before its dependency), but a task can never be
 // claimed while any dependency is missing or not completed — see ClaimTask.
 func (s *Store) CreateTeamTask(teamID, title, description string, dependsOn []string) (TeamTask, error) {
+	return s.createTeamTaskWithStatus(teamID, title, description, dependsOn, "pending")
+}
+
+// createTeamTaskWithStatus is CreateTeamTask's actual implementation, with
+// the initial status as a parameter so CreateTeamTaskWithGate
+// (team_runtime.go) can insert a task_created-gated task ALREADY "blocked"
+// — never claimable for even an instant — instead of creating it pending
+// and flipping it afterward. An adversarial M2 review round found exactly
+// that gap: create-then-flip leaves a real window (however short) where a
+// concurrently-running `team run` round can claim, and an edit-mode member
+// can even complete, a task whose gate hasn't run yet — the identical
+// zombie-side-effect bug class ticket #32 fixed elsewhere in this batch,
+// recurring in this batch's own new code. One INSERT with the right status
+// from the start closes the window entirely rather than merely shrinking it.
+func (s *Store) createTeamTaskWithStatus(teamID, title, description string, dependsOn []string, status string) (TeamTask, error) {
 	title = strings.TrimSpace(title)
 	if title == "" {
 		return TeamTask{}, fmt.Errorf("team task requires a title")
@@ -581,7 +925,7 @@ func (s *Store) CreateTeamTask(teamID, title, description string, dependsOn []st
 		return TeamTask{}, err
 	}
 	now := nowString()
-	t := TeamTask{ID: NewID("tt"), TeamID: teamID, Title: title, Description: description, Status: "pending", DependsOn: dependsOn, CreatedAt: now, UpdatedAt: now}
+	t := TeamTask{ID: NewID("tt"), TeamID: teamID, Title: title, Description: description, Status: status, DependsOn: dependsOn, CreatedAt: now, UpdatedAt: now}
 	_, err = s.db.Exec(`INSERT INTO team_tasks(id,team_id,title,description,status,depends_on,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`,
 		t.ID, t.TeamID, t.Title, t.Description, t.Status, string(deps), t.CreatedAt, t.UpdatedAt)
 	if err != nil {
@@ -704,6 +1048,25 @@ func (s *Store) CompleteTask(teamID, taskID, owner, result string) (TeamTask, er
 		return TeamTask{}, err
 	}
 	return s.GetTeamTask(teamID, taskID)
+}
+
+// SetTaskStatus is a general-purpose status/note write used by the M2
+// quality-gate hooks (team_runtime.go's runTeamGate call sites) — e.g.
+// blocking a task_created-gate-rejected task without ever letting it become
+// claimable. Deliberately does NOT gate on the task's current status the way
+// ClaimTask/CompleteTask do: those are teammate-facing CAS operations with a
+// race to protect against, this is Pallium's own single-writer bookkeeping
+// reacting to a verifier's verdict.
+func (s *Store) SetTaskStatus(teamID, taskID, status, note string) error {
+	now := nowString()
+	res, err := s.db.Exec(`UPDATE team_tasks SET status=?, result=?, updated_at=? WHERE team_id=? AND id=?`, status, note, now, teamID, taskID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("team task %q not found on team %s", taskID, teamID)
+	}
+	return bumpTeamTasksUpdated(s.db, teamID, now)
 }
 
 // HasClaimableWork reports whether any pending task's dependencies are all
