@@ -91,7 +91,7 @@ Usage:
   pallium start <task> [--workflow name] [--style auto|review|test-fix|research] [--cwd repo-path] [--dry-run] [--json]
   pallium team <start|spawn|tasks|send|inbox|nudge|status|run|approve|stop|attach> [--json]
   pallium loop <start|tick|status|list|stop|reset> [--json]
-	pallium index [repo-path] [--json]
+  pallium index [repo-path] [--json]
   pallium doctor [repo-path] [--json]
   pallium version [--version | -V] [--json]
   pallium explain <path> [repo-path] [--json]
