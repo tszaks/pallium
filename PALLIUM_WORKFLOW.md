@@ -225,6 +225,51 @@ consecutive check rounds fail identically (stall detection) or when
 `maxRounds` is exhausted; the patch is still captured so partial fixes are not
 lost.
 
+## Agent teams
+
+A team is a lead plus independent named peer agents that coordinate over a
+shared task board and mailbox, each with a real persistent provider session
+that survives across turns. Reach for `team.*` when the work genuinely
+benefits from PEERS reasoning independently and messaging each other —
+`parallel()`/`pipeline()` is still the right tool for fan-out work that
+doesn't need peer-to-peer coordination. A team is not a workflow run: it has
+its own SQLite rows (`teams`/`team_members`/`team_tasks`/`team_messages`),
+its own budget, and its own lifecycle, so it outlives the script that
+convenes it — the same team can be resumed later via `pallium team attach`
+or a later `team.wait()` call with the same team id.
+
+```js
+const crew = await team.create("review this diff", { budgetUsd: 2.0 });
+await team.spawn(crew.id, "correctness-reviewer", { role: "logic errors" });
+await team.spawn(crew.id, "concurrency-reviewer", { role: "races and shared state" });
+await team.tasks.create(crew.id, "review runtime.go", { description: "look for logic and concurrency bugs" });
+const summary = await team.wait(crew.id, { agentTimeoutSeconds: 300 });
+const status = await team.status(crew.id); // { team, members, tasks, untracked_cost_providers }
+```
+
+| Primitive | Signature | Notes |
+|-----------|-----------|-------|
+| `team.create` | `(goal, { cwd, budgetUsd })` | Idempotent across a paused/resumed run — the same script re-running gets the SAME team, not a duplicate. |
+| `team.spawn` | `(teamId, name, { provider, model, role, mode, planRequired })` | `provider` omitted resolves through the same chain workflow agents use (steering agent > codex fallback). `mode` is `"read-only"` or `"edit"`. |
+| `team.send` | `(teamId, to, body, from?)` | `from` defaults to `"lead"`. |
+| `team.status` | `(teamId)` | Read-only snapshot: team, members, tasks, and which providers never report cost. |
+| `team.wait` | `(teamId, { agentTimeoutSeconds, staleAfterMinutes, maxConcurrent })` | Runs bounded rounds of real teammate turns (the same scheduler `pallium team run` uses) until convergence, budget, or the round cap — then returns. Honors `workflow stop`/`pause`. |
+| `team.stop` | `(teamId)` | Stops the whole team. |
+| `team.approve` / `team.reject` | `(teamId, name)` / `(teamId, name, feedback)` | Plan-approval for a `planRequired` member. |
+| `team.gate` | `(teamId, prompt, hooks)` | `hooks` is a subset of `["task_created","task_completed","teammate_idle"]`. |
+| `team.tasks.create` / `.list` / `.claim` / `.complete` | see table row above | `create`/`complete` route through any configured gate. |
+| `team.member.stop` / `.restart` / `.steer` | `(teamId, name)` / `(teamId, name, { staleAfterMinutes })` / `(teamId, name, directive)` | Supervise ONE teammate. All SOFT: a turn already in flight runs to its own natural completion; the effect starts that member's NEXT turn. |
+
+### Team templates
+
+`pallium team start <goal> --template parallel-review` (or
+`adversarial-debate`) spawns a known-good team shape in one CLI call —
+`pallium team template list --json` to browse, `template show <name>` for
+the full member breakdown. Templates are a CLI convenience today; a script
+gets the identical shape by calling `team.create` then `team.spawn` once per
+member with the same names/roles/modes (see `internal/workflow/catalog.go`
+for the exact member list each template spawns).
+
 ## Limits
 
 | Limit | Value |
