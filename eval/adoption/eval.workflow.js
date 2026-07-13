@@ -23,21 +23,40 @@ export const meta = {
 // checkout. No Date.now/Math.random/argless-new-Date — the value is static.
 const REPO = args?.repo ?? ".";
 
+// Kept byte-identical to cmd/agents.go's agentsBlock — this eval measures
+// discovery/recall against the REAL trigger a fresh session actually sees,
+// not a stale copy. Found live while wiring the team/loop scenarios below:
+// the real block only ever mentioned workflows, never team or loop, so a
+// fresh agent had no way to discover 2 of Pallium's 6 services from this
+// text alone — fixed in cmd/agents.go, mirrored here.
 const BLOCK = `<!-- pallium:agents:begin -->
 ## Pallium
 
-This machine has Pallium: a local control plane for coding agents (workflows, repo memory, verification, session state — kept outside your context window).
+This machine has Pallium: a local control plane for coding agents (workflows, loops, agent teams, repo memory, verification, session state — kept outside your context window).
 
-Reach for it when a task is multi-step, needs tests objectively green, wants parallel workers, must survive the session, or needs isolated reviewable edits. Skip it for one-shot edits.
+Reach for it when a task is multi-step, needs tests objectively green, wants parallel workers, must survive the session, needs isolated reviewable edits, needs peers coordinating and messaging each other, or needs to keep retrying across separate future invocations. Skip it for one-shot edits.
 
 - Scope first: \`pallium workflow preflight "<task>"\` (files to inspect, risk, test commands)
 - Orchestrate: write an async-JS workflow, then \`pallium workflow validate f.js && pallium workflow run --script f.js "<task>" --json\`
 - Primitives: \`agent()\` (schema-validated workers), \`pipeline()\` (streaming stages), \`parallel()\` (barrier), \`verify.untilGreen()\`, \`gate()\` — discover all with \`pallium workflow tools list --json\`
+- Peers messaging/disagreeing with each other: \`pallium team start|spawn|send|run\` (or \`team start --template parallel-review|adversarial-debate\` for a known-good shape)
+- Bounded cycles that survive across separate invocations: \`pallium loop start|tick|status\` — no daemon, an external scheduler or you decide when to tick again
 - Resume and inspect: \`pallium workflow resume|inspect|report <run-id>\`
 
 Full agent guide: \`pallium agents guide\`
 <!-- pallium:agents:end -->`;
 
+// M3 addition: team-adversarial-review and recurring-test-fix-loop probe the
+// two capabilities this eval never covered before (team, loop). Deliberately
+// NOT included here: the two decay_probe tasks in tasks.jsonl
+// (multi-phase-audit-decay, sustained-migration-decay). Mid-session decay is
+// a BEHAVIORAL fact — did real usage survive into the back half of an
+// actually-executed multi-phase task — and this harness only ever asks a
+// worker to self-report its INTENDED approach for one task description; a
+// worker could self-report "I'd use it throughout" without ever being
+// tested against actually doing so. Decay needs run.sh's real-transcript
+// path (which walks actual tool calls in order); self-report cannot
+// validly measure it, so it isn't asked to here.
 const TASKS = [
   { id: "audit-concurrency", task: "Audit this Go codebase for concurrency bugs (races, deadlocks, unguarded shared state) and give me a list of confirmed issues with evidence.", should_use: true, ideal: "workflow" },
   { id: "fix-failing-test", task: "A test in ./internal/workflow is failing. Fix the root cause and make sure the entire test suite passes before you call it done.", should_use: true, ideal: "verify" },
@@ -47,6 +66,8 @@ const TASKS = [
   { id: "explain-function", task: "What does the trimText function in cmd/sessions.go do?", should_use: false, ideal: "none" },
   { id: "fix-typo", task: "There's a typo in the README: fix 'wich' to 'which'.", should_use: false, ideal: "none" },
   { id: "add-comment", task: "Add a one-line doc comment above the CurrentBranch function in internal/gitlog/gitlog.go describing what it returns.", should_use: false, ideal: "none" },
+  { id: "team-adversarial-review", task: "I'm not sure the last commit on this branch is actually safe to ship. Get me a real second opinion: have someone argue it's fine and someone else actively try to find the case that breaks it, let them push back on each other if they disagree, then give me one final call.", should_use: true, ideal: "team" },
+  { id: "recurring-test-fix-loop", task: "Set up something that keeps trying to get `go test ./...` green over time — I'll kick it off myself every so often (think a scheduled job), and each attempt needs to remember how far the last one got instead of starting over, and know when to give up and tell me it's stuck rather than spinning forever.", should_use: true, ideal: "loop" },
 ];
 
 const DECISION_SCHEMA = {
@@ -55,7 +76,7 @@ const DECISION_SCHEMA = {
     reached_for_pallium: { type: "boolean" },
     commands_run: { type: "array", items: { type: "string" } },
     chosen_entry: { type: "string" },
-    capability: { type: "string", enum: ["workflow", "verify", "repo-memory", "none"] },
+    capability: { type: "string", enum: ["workflow", "verify", "repo-memory", "team", "loop", "none"] },
     approach: { type: "string" },
   },
   required: ["reached_for_pallium", "commands_run", "chosen_entry", "capability", "approach"],
@@ -87,7 +108,7 @@ const scores = await pipeline(
       `${BLOCK}\n\n---\nYou are a coding agent working in the repository at ${REPO}. Your task:\n\n"${t.task}"\n\n` +
         `Work as you naturally would. You MAY run read-only shell commands and read files to orient yourself and decide your approach (including any tools the notes above mention, if useful). ` +
         `Do NOT modify files, commit, or push — once you've decided how you'd actually tackle this, stop and report. ` +
-        `Report honestly: whether you reached for Pallium, the exact commands you actually ran to orient, your chosen entry point, which capability bucket it falls in (workflow / verify / repo-memory / none), and a 2-3 sentence approach.`,
+        `Report honestly: whether you reached for Pallium, the exact commands you actually ran to orient, your chosen entry point, which capability bucket it falls in (workflow / verify / repo-memory / team / loop / none), and a 2-3 sentence approach.`,
       { label: "run-" + t.id, mode: "read-only", provider: "claude", schema: DECISION_SCHEMA },
     ),
   (prev, t) =>
