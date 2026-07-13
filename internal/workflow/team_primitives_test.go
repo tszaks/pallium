@@ -122,6 +122,63 @@ return {teamId: teamId, planner, worker, sent, task, claimed, listed, rejected, 
 	}
 }
 
+// TestWorkflowScriptCanSuperviseIndividualTeammates exercises the M2 PR B
+// goja bindings (team.member.*) — individual teammate supervision distinct
+// from team.stop (the whole team). All three are soft (no in-flight kill),
+// so this covers the JS<->Go marshaling boundary the same way the primary
+// primitives test does, on an idle member (nothing in flight to interact
+// with, matching that test's own scoping note).
+func TestWorkflowScriptCanSuperviseIndividualTeammates(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	script := `
+const newTeam = team.create("ship the feature", {cwd: "` + strings.ReplaceAll(tmp, `\`, `\\`) + `"});
+const teamId = newTeam.id;
+team.spawn(teamId, "worker-1", {provider: "claude"});
+const stopped = team.member.stop(teamId, "worker-1");
+const restarted = team.member.restart(teamId, "worker-1");
+const steered = team.member.steer(teamId, "worker-1", "drop module B, focus on the auth bug");
+return {teamId: teamId, stopped, restarted, steered};
+`
+	scriptPath, err := WriteRunScript("wf-team-supervision", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-team-supervision", Task: "team supervision", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resultText, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var result struct {
+		TeamID    string      `json:"teamId"`
+		Stopped   TeamMember  `json:"stopped"`
+		Restarted TeamMember  `json:"restarted"`
+		Steered   TeamMessage `json:"steered"`
+	}
+	if err := json.Unmarshal([]byte(resultText), &result); err != nil {
+		t.Fatalf("decode script result: %v\n%s", err, resultText)
+	}
+
+	if !result.Stopped.StopRequested || result.Stopped.Status != "stopped" {
+		t.Fatalf("expected team.member.stop to stop an idle member immediately, got %+v", result.Stopped)
+	}
+	if result.Restarted.StopRequested || result.Restarted.Status != "active" {
+		t.Fatalf("expected team.member.restart to make the member schedulable again, got %+v", result.Restarted)
+	}
+	if result.Steered.To != "worker-1" || !strings.Contains(result.Steered.Body, "STEERING DIRECTIVE") || !strings.Contains(result.Steered.Body, "drop module B") {
+		t.Fatalf("expected team.member.steer to deliver a distinctly-framed directive, got %+v", result.Steered)
+	}
+}
+
 // TestTeamWaitPrimitiveHonorsWorkflowStop is the regression test for the
 // review finding that team.wait passed the raw script context into RunTeam
 // instead of contextWithStoredStop's wrapper — the same stop/pause-aware

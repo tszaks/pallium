@@ -74,8 +74,16 @@ type TeamMember struct {
 	// leaves the member exactly where it was, free to submit a revised plan
 	// next turn; there is no separate terminal "rejected" state to model
 	// because rejection is not terminal here, approval is.
-	PlanRequired   bool    `json:"plan_required,omitempty"`
-	PlanStatus     string  `json:"plan_status,omitempty"`
+	PlanRequired bool   `json:"plan_required,omitempty"`
+	PlanStatus   string `json:"plan_status,omitempty"`
+	// StopRequested backs M2 individual teammate supervision (`team member
+	// stop/restart`): soft-stop, not a kill — RunTeam's scheduler simply
+	// never offers this member another turn while it's set, so a turn
+	// already in flight when a stop is requested runs to its own natural
+	// completion first. See the migration comment on this column for why
+	// it's independent of Status rather than reusing the existing
+	// (currently dead) "stopped" enum value.
+	StopRequested  bool    `json:"stop_requested,omitempty"`
 	Worktree       string  `json:"worktree,omitempty"`
 	TurnCount      int     `json:"turn_count"`
 	TurnStartedAt  string  `json:"turn_started_at,omitempty"`
@@ -204,6 +212,18 @@ func (s *Store) initTeams() error {
 		// M2: quality-gate hook configuration (see Team.GatePrompt/GateHooks).
 		"ALTER TABLE teams ADD COLUMN gate_prompt TEXT",
 		"ALTER TABLE teams ADD COLUMN gate_hooks TEXT",
+		// M2: individual teammate supervision (see TeamMember.StopRequested).
+		// A separate column, not a reuse of Status, deliberately: FinishMemberTurn
+		// unconditionally writes Status to whatever the just-finished turn
+		// decided (active/idle/error) keyed only on the lease — a supervision
+		// request landing WHILE a turn is in flight would otherwise get
+		// silently overwritten the instant that turn completes. This column
+		// is never touched by FinishMemberTurn's own decision-application; it
+		// survives across turn completion by construction, and
+		// FinishMemberTurn's own status write is the one place that reads it
+		// back (see the CASE there) to make the stop visible once the
+		// in-flight turn actually finishes.
+		"ALTER TABLE team_members ADD COLUMN stop_requested INTEGER DEFAULT 0",
 	} {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return err
@@ -450,11 +470,62 @@ func (s *Store) RejectMemberPlan(teamID, name, feedback string) (TeamMember, err
 	return s.GetMember(teamID, name)
 }
 
+// RequestMemberStop is the M2 individual-supervision soft-stop: sets
+// StopRequested so RunTeam's scheduler never offers this member another
+// turn, and — if no turn is currently in flight — immediately reflects
+// "stopped" in Status too, for accurate display without waiting on
+// anything. If a turn IS in flight, Status is left alone here on purpose:
+// it still shows whatever the member's own last-known state was, and only
+// flips to "stopped" once that in-flight turn actually finishes (see
+// FinishMemberTurn's effectiveStatus). This is the intended "takes effect
+// at the next turn boundary" semantics, not a bug — a genuinely immediate
+// kill of an in-flight provider call is a bigger, separately-scoped
+// feature (tracked, not built here: turn-based providers make killing an
+// in-flight call from a SEPARATE process risky to get right without real
+// PID-liveness tracking, the same class of care 0.9.15's owner_pid/
+// heartbeat work already went through for workflow runs).
+func (s *Store) RequestMemberStop(teamID, name string) (TeamMember, error) {
+	now := nowString()
+	res, err := s.db.Exec(`UPDATE team_members SET stop_requested=1, status=CASE WHEN turn_started_at IS NULL THEN 'stopped' ELSE status END, updated_at=? WHERE team_id=? AND name=?`, now, teamID, name)
+	if err != nil {
+		return TeamMember{}, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return TeamMember{}, fmt.Errorf("team member %q not found on team %s", name, teamID)
+	}
+	return s.GetMember(teamID, name)
+}
+
+// RestartMember clears a stop request and makes the member schedulable
+// again. If the member's turn was ALSO left stuck (turn_started_at set,
+// past staleAfter — e.g. a stop was requested mid-turn and that turn then
+// hung rather than finishing cleanly), this immediately reconciles it via
+// the same ReconcileInterruptedMembers path `team attach`/`team run`
+// already use — restart shouldn't require a separate manual attach just to
+// unstick a hung turn on top of clearing the stop. A turn that's still
+// genuinely IN FLIGHT (not yet stale) is left alone: it will finish
+// normally and land on whatever status it itself decides, since
+// stop_requested is already cleared by the time it does.
+func (s *Store) RestartMember(teamID, name, staleAfter string) (TeamMember, error) {
+	now := nowString()
+	res, err := s.db.Exec(`UPDATE team_members SET stop_requested=0, status=CASE WHEN turn_started_at IS NULL THEN 'active' ELSE status END, updated_at=? WHERE team_id=? AND name=?`, now, teamID, name)
+	if err != nil {
+		return TeamMember{}, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return TeamMember{}, fmt.Errorf("team member %q not found on team %s", name, teamID)
+	}
+	if _, err := s.ReconcileInterruptedMembers(teamID, staleAfter); err != nil {
+		return TeamMember{}, err
+	}
+	return s.GetMember(teamID, name)
+}
+
 func scanMember(row *sql.Row) (TeamMember, error) {
 	var m TeamMember
 	var model, role, session, worktree, turnStarted, lastAt, lastStatus, lastErr, nudged, planStatus sql.NullString
-	var planRequired int
-	err := row.Scan(&m.ID, &m.TeamID, &m.Name, &m.Provider, &model, &role, &m.Mode, &m.Status, &session, &m.SessionEstablished, &planRequired, &planStatus, &worktree,
+	var planRequired, stopRequested int
+	err := row.Scan(&m.ID, &m.TeamID, &m.Name, &m.Provider, &model, &role, &m.Mode, &m.Status, &session, &m.SessionEstablished, &planRequired, &planStatus, &stopRequested, &worktree,
 		&m.TurnCount, &turnStarted, &lastAt, &lastStatus, &lastErr, &nudged, &m.SpendUSD, &m.CreatedAt, &m.UpdatedAt)
 	if err != nil {
 		return TeamMember{}, err
@@ -463,10 +534,11 @@ func scanMember(row *sql.Row) (TeamMember, error) {
 	m.TurnStartedAt, m.LastTurnAt, m.LastTurnStatus, m.LastTurnError, m.NudgedAt = turnStarted.String, lastAt.String, lastStatus.String, lastErr.String, nudged.String
 	m.PlanRequired = planRequired != 0
 	m.PlanStatus = planStatus.String
+	m.StopRequested = stopRequested != 0
 	return m, nil
 }
 
-const memberSelectCols = `id,team_id,name,provider,model,role,mode,status,session_token,session_established,COALESCE(plan_required,0),COALESCE(plan_status,''),worktree,turn_count,turn_started_at,last_turn_at,last_turn_status,last_turn_error,nudged_at,spend_usd,created_at,updated_at`
+const memberSelectCols = `id,team_id,name,provider,model,role,mode,status,session_token,session_established,COALESCE(plan_required,0),COALESCE(plan_status,''),COALESCE(stop_requested,0),worktree,turn_count,turn_started_at,last_turn_at,last_turn_status,last_turn_error,nudged_at,spend_usd,created_at,updated_at`
 
 func (s *Store) GetMember(teamID, name string) (TeamMember, error) {
 	m, err := scanMember(s.db.QueryRow(`SELECT `+memberSelectCols+` FROM team_members WHERE team_id=? AND name=?`, teamID, name))
@@ -486,8 +558,8 @@ func (s *Store) ListMembers(teamID string) ([]TeamMember, error) {
 	for rows.Next() {
 		var m TeamMember
 		var model, role, session, worktree, turnStarted, lastAt, lastStatus, lastErr, nudged, planStatus sql.NullString
-		var planRequired int
-		if err := rows.Scan(&m.ID, &m.TeamID, &m.Name, &m.Provider, &model, &role, &m.Mode, &m.Status, &session, &m.SessionEstablished, &planRequired, &planStatus, &worktree,
+		var planRequired, stopRequested int
+		if err := rows.Scan(&m.ID, &m.TeamID, &m.Name, &m.Provider, &model, &role, &m.Mode, &m.Status, &session, &m.SessionEstablished, &planRequired, &planStatus, &stopRequested, &worktree,
 			&m.TurnCount, &turnStarted, &lastAt, &lastStatus, &lastErr, &nudged, &m.SpendUSD, &m.CreatedAt, &m.UpdatedAt); err != nil {
 			return nil, err
 		}
@@ -495,6 +567,7 @@ func (s *Store) ListMembers(teamID string) ([]TeamMember, error) {
 		m.TurnStartedAt, m.LastTurnAt, m.LastTurnStatus, m.LastTurnError, m.NudgedAt = turnStarted.String, lastAt.String, lastStatus.String, lastErr.String, nudged.String
 		m.PlanRequired = planRequired != 0
 		m.PlanStatus = planStatus.String
+		m.StopRequested = stopRequested != 0
 		members = append(members, m)
 	}
 	return members, rows.Err()
@@ -582,12 +655,27 @@ func (s *Store) FinishMemberTurn(teamID, name, lease, status, sessionToken, turn
 	if sessionToken != "" {
 		token = sessionToken
 	}
+	// effectiveStatus, not the turn's own decided status, is what actually
+	// gets written to the live status column: a `team member stop` issued
+	// WHILE this turn was in flight sets StopRequested on the row this
+	// SELECT above already read, independently of turn_started_at/lease —
+	// found by design review during M2 PR B: without this override, a
+	// stop requested mid-turn would be silently discarded the instant the
+	// in-flight turn completes, since this UPDATE otherwise unconditionally
+	// overwrites status with whatever the turn itself decided. last_turn_status
+	// still records the turn's OWN decision (for history/diagnostics), and
+	// the session_established check below still evaluates the turn's own
+	// outcome — a stopped member's last real turn can still have succeeded.
+	effectiveStatus := status
+	if current.StopRequested {
+		effectiveStatus = "stopped"
+	}
 	res, err := tx.Exec(
 		`UPDATE team_members SET turn_started_at=NULL, status=?, session_token=?, turn_count=turn_count+1,
 		 last_turn_at=?, last_turn_status=?, last_turn_error=?, spend_usd=spend_usd+?, updated_at=?,
 		 session_established = session_established OR (? <> 'error')
 		 WHERE team_id=? AND name=? AND turn_started_at=?`,
-		status, token, now, status, turnError, spendDelta, now, status, teamID, name, lease)
+		effectiveStatus, token, now, status, turnError, spendDelta, now, status, teamID, name, lease)
 	if err != nil {
 		return err
 	}
