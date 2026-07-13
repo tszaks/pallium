@@ -46,7 +46,15 @@ var teamDecisionSchema = map[string]any{
 		"complete_result":  map[string]any{"type": "string"},
 		"summary":          map[string]any{"type": "string"},
 	},
-	"required": []any{"status", "summary"},
+	// summary is deliberately NOT required: live dogfooding during M2 found
+	// real claude/codex teammates omitting it on effectively every turn,
+	// which used to discard the WHOLE decision — status, messages, claims,
+	// completions, everything — over one missing prose field the model
+	// itself considered optional. status stays required; the code below
+	// already treats a missing/empty status as "active" (see the fallback
+	// right after parseTeamDecision), so relaxing it too would only mask a
+	// genuinely malformed decision rather than tolerate a real one.
+	"required": []any{"status"},
 }
 
 type teamDecision struct {
@@ -357,6 +365,20 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 		if err := store.FinishMemberTurn(teamID, name, lease, "active", capturedToken, note, costUSD); err != nil {
 			return true, err
 		}
+		// A schema-failed decision must never be a SILENT no-op: the lead
+		// hears about it exactly like any other turn failure (same
+		// notifyLeadOfMemberError every other error path in this function
+		// already uses), and the member gets nudged so the scheduler's own
+		// "don't re-offer an unchanged board" optimization (see
+		// boardIsNewToMember in RunTeam) doesn't strand it — a malformed
+		// decision applies nothing, so the board genuinely didn't change,
+		// but this member still deserves another look next round rather
+		// than silently falling out of eligibility until someone runs
+		// `team nudge` by hand. Found live: 6 of 6 real decisions failed
+		// schema in one M2 dogfood session and every one of them stalled
+		// exactly this way.
+		r.notifyLeadOfMemberError(store, teamID, name, fmt.Errorf("decision did not match schema: %v", parseErr))
+		_ = store.NudgeMember(teamID, name)
 		deliverInjectedMessages()
 		return true, nil
 	}
