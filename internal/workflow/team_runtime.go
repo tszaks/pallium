@@ -896,6 +896,16 @@ func describeClaimableWork(tasks []TeamTask, name string) string {
 // by SOME timeout.
 const defaultTeamGateTimeout = 600 * time.Second
 
+// SteerDirectivePrefix marks a steering message (M2 PR B individual
+// supervision) distinctly from an ordinary `team send` FYI once it's
+// delivered and trust-wrapped for the recipient's next turn (see
+// teamAgentOrigin) — plain text, not a new message "kind" column: a full
+// typed-message system is M4 scope (findings/questions/votes/etc.), and
+// steer only needs to read as urgent, not to be machine-parsed as a
+// distinct type yet. Shared by the CLI (`team member steer`) and the
+// team.member.steer() workflow primitive so both frame it identically.
+const SteerDirectivePrefix = "STEERING DIRECTIVE FROM LEAD — reprioritize based on this now:\n"
+
 // gateCallContext returns ctx unchanged (with a no-op cancel) when it
 // already carries its own deadline, otherwise wraps it with
 // defaultTeamGateTimeout. Extracted so the deadline-preservation decision is
@@ -1203,7 +1213,13 @@ func (r *Runner) RunTeam(ctx context.Context, store *Store, teamID string, opts 
 		}
 		var eligible []string
 		for _, m := range members {
-			if m.Status == "stopped" || m.TurnStartedAt != "" {
+			// StopRequested (M2 individual supervision), not Status ==
+			// "stopped": StopRequested is the durable source of truth (see
+			// its own doc comment on TeamMember) — Status is display-only
+			// and can legitimately still show whatever this member's
+			// currently in-flight turn last recorded until that turn
+			// finishes and applies the override itself.
+			if m.Status == "stopped" || m.StopRequested || m.TurnStartedAt != "" {
 				continue
 			}
 			undelivered, err := store.UndeliveredMessages(teamID, m.Name)

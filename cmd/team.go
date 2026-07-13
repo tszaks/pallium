@@ -17,13 +17,15 @@ import (
 
 func runTeam(out io.Writer, args []string, jsonOutput bool) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: pallium team <start|spawn|tasks|send|inbox|nudge|status|run|approve|reject|gate|stop|attach> [--json]")
+		return fmt.Errorf("usage: pallium team <start|spawn|member|tasks|send|inbox|nudge|status|run|approve|reject|gate|stop|attach> [--json]")
 	}
 	switch args[0] {
 	case "start":
 		return runTeamStart(out, args[1:], jsonOutput)
 	case "spawn":
 		return runTeamSpawn(out, args[1:], jsonOutput)
+	case "member":
+		return runTeamMember(out, args[1:], jsonOutput)
 	case "tasks":
 		return runTeamTasks(out, args[1:], jsonOutput)
 	case "send":
@@ -497,6 +499,15 @@ func runTeamStatus(out io.Writer, args []string, jsonOutput bool) error {
 			if m.TurnStartedAt != "" {
 				fmt.Fprintf(&b, " (turn in flight since %s)", m.TurnStartedAt)
 			}
+			// StopRequested-but-Status-not-yet-"stopped" is the exact
+			// window between `team member stop` landing mid-turn and that
+			// turn actually finishing — same honest-reporting bar as the
+			// turn-in-flight note above: say what's ACTUALLY true (a stop
+			// is pending) rather than let status alone imply this member
+			// is still making unrestricted progress.
+			if m.StopRequested && m.Status != "stopped" {
+				b.WriteString(" (stop requested — will not be scheduled again once this turn finishes)")
+			}
 			if m.LastTurnError != "" {
 				fmt.Fprintf(&b, " last_error=%q", m.LastTurnError)
 			}
@@ -743,6 +754,117 @@ func runTeamAttach(out io.Writer, args []string, jsonOutput bool) error {
 	payload := map[string]any{"team": team, "members": members, "reconciled_interrupted": interrupted}
 	return output.Write(out, payload, jsonOutput, func() string {
 		return fmt.Sprintf("Attached to team %s [%s], %d member(s), reconciled %d interrupted", team.ID, team.Status, len(members), len(interrupted))
+	})
+}
+
+// runTeamMember dispatches individual-teammate supervision (M2 item 4,
+// PR B): stop/restart/steer, one specific member rather than the whole
+// team (`team stop` already covers that). All three are SOFT — see
+// steerDirectivePrefix's own comment and each subcommand's usage string:
+// none of this kills an in-flight provider call. A turn already running
+// when stop/steer lands keeps running to its own natural completion; the
+// supervision takes effect starting the member's NEXT turn. A true
+// mid-turn kill needs per-turn PID/liveness tracking (the same care
+// 0.9.15's owner_pid/heartbeat work went through for workflow runs) and is
+// a deliberately separate, bigger, not-yet-built feature — not attempted
+// here.
+func runTeamMember(out io.Writer, args []string, jsonOutput bool) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: pallium team member <stop|restart|steer> <team-id> <member-name> [args] [--json]")
+	}
+	switch args[0] {
+	case "stop":
+		return runTeamMemberStop(out, args[1:], jsonOutput)
+	case "restart":
+		return runTeamMemberRestart(out, args[1:], jsonOutput)
+	case "steer":
+		return runTeamMemberSteer(out, args[1:], jsonOutput)
+	default:
+		return fmt.Errorf("unknown team member subcommand: %s", args[0])
+	}
+}
+
+func runTeamMemberStop(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("team member stop")
+	dbPath := fs.String("db", "", "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}}, nil); err != nil {
+		return err
+	}
+	positionals := fs.Args()
+	if len(positionals) < 2 {
+		return fmt.Errorf("usage: pallium team member stop <team-id> <member-name> [--json]\n  soft stop: takes effect once this member's current turn (if any) finishes; does not kill an in-flight call")
+	}
+	teamID, name := positionals[0], positionals[1]
+	store, err := openPalliumStore(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	member, err := store.RequestMemberStop(teamID, name)
+	if err != nil {
+		return err
+	}
+	return output.Write(out, member, jsonOutput, func() string {
+		if member.TurnStartedAt != "" {
+			return fmt.Sprintf("Stop requested for %s — a turn is currently in flight; will not be scheduled again once it finishes", name)
+		}
+		return fmt.Sprintf("%s stopped", name)
+	})
+}
+
+func runTeamMemberRestart(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("team member restart")
+	dbPath := fs.String("db", "", "")
+	staleAfterMinutes := fs.Int("stale-after-minutes", 15, "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "stale-after-minutes": {}}, nil); err != nil {
+		return err
+	}
+	positionals := fs.Args()
+	if len(positionals) < 2 {
+		return fmt.Errorf("usage: pallium team member restart <team-id> <member-name> [--stale-after-minutes N] [--json]")
+	}
+	teamID, name := positionals[0], positionals[1]
+	store, err := openPalliumStore(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	staleAfter := time.Now().Add(-time.Duration(*staleAfterMinutes) * time.Minute).UTC().Format(time.RFC3339Nano)
+	member, err := store.RestartMember(teamID, name, staleAfter)
+	if err != nil {
+		return err
+	}
+	return output.Write(out, member, jsonOutput, func() string {
+		return fmt.Sprintf("%s restarted (status=%s)", name, member.Status)
+	})
+}
+
+func runTeamMemberSteer(out io.Writer, args []string, jsonOutput bool) error {
+	fs := newSessionFlagSet("team member steer")
+	dbPath := fs.String("db", "", "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}}, nil); err != nil {
+		return err
+	}
+	positionals := fs.Args()
+	if len(positionals) < 3 {
+		return fmt.Errorf("usage: pallium team member steer <team-id> <member-name> \"<directive>\" [--json]\n  soft steer: delivered as high-priority mail for this member's NEXT turn; does not interrupt a turn already in flight")
+	}
+	teamID, name := positionals[0], positionals[1]
+	directive := strings.Join(positionals[2:], " ")
+	store, err := openPalliumStore(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if _, err := store.GetMember(teamID, name); err != nil {
+		return err
+	}
+	msg, err := store.SendTeamMessage(teamID, "lead", name, workflow.SteerDirectivePrefix+directive)
+	if err != nil {
+		return err
+	}
+	return output.Write(out, msg, jsonOutput, func() string {
+		return "Steering directive delivered to " + name
 	})
 }
 

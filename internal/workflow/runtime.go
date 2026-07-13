@@ -845,6 +845,52 @@ func (r *Runner) jsTeam(ctx context.Context, vm *goja.Runtime) map[string]any {
 			}
 			return vm.ToValue(map[string]any{"team_id": teamID, "status": "stopped"})
 		},
+		// member.* is M2 PR B individual teammate supervision — ONE
+		// specific member, not the whole team (team.stop above already
+		// covers that). All SOFT (see cmd/team.go's own doc comment on
+		// runTeamMember for the full reasoning): a turn already in flight
+		// when stop/steer is requested keeps running to its own natural
+		// completion; the supervision takes effect starting that member's
+		// NEXT turn, not immediately.
+		"member": map[string]any{
+			"stop": func(teamID, name string) goja.Value {
+				member, err := r.Store.RequestMemberStop(teamID, name)
+				if err != nil {
+					panic(vm.ToValue(err.Error()))
+				}
+				return vm.ToValue(member)
+			},
+			"restart": func(teamID, name string, rawOpts ...any) goja.Value {
+				opts := struct {
+					StaleAfterMinutes int `json:"staleAfterMinutes"`
+				}{StaleAfterMinutes: 15}
+				if len(rawOpts) > 0 {
+					decodeOpts(rawOpts[0], &opts)
+				}
+				staleAfter := time.Now().Add(-time.Duration(opts.StaleAfterMinutes) * time.Minute).UTC().Format(time.RFC3339Nano)
+				member, err := r.Store.RestartMember(teamID, name, staleAfter)
+				if err != nil {
+					panic(vm.ToValue(err.Error()))
+				}
+				return vm.ToValue(member)
+			},
+			"steer": func(teamID, name, directive string) goja.Value {
+				// Validate the member exists first, mirroring the CLI path
+				// (cmd/team.go) — found by review: SendTeamMessage alone
+				// doesn't check the recipient is a real row, so a
+				// misspelled name used to return success while the
+				// directive sat addressed to nobody RunTeam would ever
+				// schedule, silently never delivered.
+				if _, err := r.Store.GetMember(teamID, name); err != nil {
+					panic(vm.ToValue(err.Error()))
+				}
+				msg, err := r.Store.SendTeamMessage(teamID, "lead", name, SteerDirectivePrefix+directive)
+				if err != nil {
+					panic(vm.ToValue(err.Error()))
+				}
+				return vm.ToValue(msg)
+			},
+		},
 		"tasks": map[string]any{
 			"create": func(teamID, title string, rawOpts ...any) goja.Value {
 				opts := struct {
