@@ -36,6 +36,8 @@ func (a *App) Run(args []string) error {
 	case "help", "-h", "--help":
 		a.printHelp()
 		return nil
+	case "version", "--version", "-V":
+		return runVersion(a.stdout, jsonOutput)
 	case "start":
 		return runStart(a.stdout, filtered[1:], jsonOutput)
 	case "team":
@@ -46,8 +48,6 @@ func (a *App) Run(args []string) error {
 		return runIndex(a.stdout, filtered[1:], jsonOutput)
 	case "doctor":
 		return runDoctor(a.stdout, filtered[1:], jsonOutput)
-	case "version":
-		return runVersion(a.stdout, jsonOutput)
 	case "explain":
 		return runExplain(a.stdout, filtered[1:], jsonOutput)
 	case "risk":
@@ -93,7 +93,7 @@ Usage:
   pallium loop <start|tick|status|list|stop|reset> [--json]
   pallium index [repo-path] [--json]
   pallium doctor [repo-path] [--json]
-  pallium version [--json]
+  pallium version [--version | -V] [--json]
   pallium explain <path> [repo-path] [--json]
   pallium risk <path> [repo-path] [--json]
   pallium neighbors <path> [repo-path] [--json]
