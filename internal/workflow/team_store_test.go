@@ -3,6 +3,7 @@ package workflow
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -355,5 +356,143 @@ func TestReconcileInterruptedMembersLeavesTaskOwnedWhenSessionResumable(t *testi
 	}
 	if stillOwned.Status != "in_progress" || stillOwned.Owner != "worker-1" {
 		t.Fatalf("expected the task to remain owned by worker-1 (it has a resumable session), got %+v", stillOwned)
+	}
+}
+
+func TestSpawnPlanRequiredMemberStartsReadOnlyPending(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	team, err := store.CreateTeam("goal", tmp, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := store.SpawnPlanRequiredMember(team.ID, "planner-1", "claude", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Mode != "read-only" || !m.PlanRequired || m.PlanStatus != "pending" {
+		t.Fatalf("expected read-only pending plan-required member, got %+v", m)
+	}
+}
+
+func TestApproveMemberPlanFlipsToEditAndJournalsMessage(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	team, err := store.CreateTeam("goal", tmp, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SpawnPlanRequiredMember(team.ID, "planner-1", "claude", "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := store.ApproveMemberPlan(team.ID, "planner-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Mode != "edit" || m.PlanStatus != "approved" {
+		t.Fatalf("expected edit mode + approved plan, got %+v", m)
+	}
+	inbox, err := store.UndeliveredMessages(team.ID, "planner-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inbox) != 1 || inbox[0].From != "lead" {
+		t.Fatalf("expected the approval journaled as a message from lead, got %+v", inbox)
+	}
+
+	if _, err := store.ApproveMemberPlan(team.ID, "planner-1"); err == nil {
+		t.Fatal("expected approving an already-approved plan to fail")
+	}
+}
+
+func TestRejectMemberPlanKeepsReadOnlyAndDeliversFeedback(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	team, err := store.CreateTeam("goal", tmp, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SpawnPlanRequiredMember(team.ID, "planner-1", "claude", "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := store.RejectMemberPlan(team.ID, "planner-1", "scope is too broad, narrow it to module A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Mode != "read-only" || m.PlanStatus != "pending" {
+		t.Fatalf("expected rejection to leave the member read-only and still pending (not terminal), got %+v", m)
+	}
+	inbox, err := store.UndeliveredMessages(team.ID, "planner-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inbox) != 1 || !strings.Contains(inbox[0].Body, "narrow it to module A") {
+		t.Fatalf("expected the feedback delivered as a message, got %+v", inbox)
+	}
+
+	if _, err := store.RejectMemberPlan(team.ID, "planner-1", ""); err == nil {
+		t.Fatal("expected rejecting with empty feedback to fail")
+	}
+}
+
+func TestApproveOrRejectPlanFailsForNonPlanRequiredMember(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	team, err := store.CreateTeam("goal", tmp, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SpawnMember(team.ID, "worker-1", "claude", "", "", "read-only"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ApproveMemberPlan(team.ID, "worker-1"); err == nil {
+		t.Fatal("expected approving a non-plan-required member to fail")
+	}
+	if _, err := store.RejectMemberPlan(team.ID, "worker-1", "feedback"); err == nil {
+		t.Fatal("expected rejecting a non-plan-required member to fail")
+	}
+}
+
+func TestSetTeamGateRoundTripAndRejectsUnknownHook(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	team, err := store.CreateTeam("goal", tmp, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetTeamGate(team.ID, "verify the result actually satisfies the task", []string{"task_completed", "teammate_idle"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetTeam(team.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GatePrompt != "verify the result actually satisfies the task" || len(got.GateHooks) != 2 {
+		t.Fatalf("expected gate config round-tripped, got %+v", got)
+	}
+	if err := store.SetTeamGate(team.ID, "prompt", []string{"not-a-real-hook"}); err == nil {
+		t.Fatal("expected an unknown hook name to be rejected")
 	}
 }

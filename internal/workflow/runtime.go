@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/dop251/goja"
+	"github.com/google/uuid"
 	"github.com/tszaks/pallium/internal/gitlog"
 )
 
@@ -322,6 +323,9 @@ func (r *Runner) executeScript(ctx context.Context, script string, args any, top
 	if err := vm.Set("gate", r.jsGate(ctx, vm)); err != nil {
 		return "", err
 	}
+	if err := vm.Set("team", r.jsTeam(ctx, vm)); err != nil {
+		return "", err
+	}
 
 	value, err := vm.RunString("(async function(){\n" + body + "\n})()")
 	r.mu.Lock()
@@ -588,6 +592,219 @@ func (r *Runner) runAgentGate(ctx context.Context, name, message string, opts Ga
 		return result, fmt.Errorf("workflow gate %q rejected by agent: %s", name, reason)
 	}
 	return result, nil
+}
+
+// jsTeam exposes team.* to workflow/loop scripts (M2 item 1): a loop tick or
+// a workflow can now convene and drive an Agent Team programmatically. Every
+// call below goes through the exact same Store methods (or the exact same
+// RunTeam/CreateTeamTaskWithGate/CompleteTaskWithGate runtime helpers)
+// `pallium team ...` uses — front-door composition per the kernel/services
+// architecture ruling, nothing here reaches into team internals a CLI caller
+// couldn't also reach.
+//
+// teamRunner constructs a FRESH *Runner for any call that dispatches real
+// provider turns (wait) or a gate check (tasks.create/tasks.complete) —
+// never r itself. r.Run.ID is THIS workflow run's id, already load-bearing
+// for every agent()/check() call elsewhere in this same script; RunTeam sets
+// r.Run.ID = teamID on whatever Runner it's given (see its own doc comment),
+// which would silently corrupt this run's own agent-call bookkeeping if it
+// ran on r directly.
+func (r *Runner) jsTeam(ctx context.Context, vm *goja.Runtime) map[string]any {
+	teamRunner := func() *Runner {
+		return &Runner{CodexBinary: r.CodexBinary, PalliumBinary: r.PalliumBinary}
+	}
+	decodeOpts := func(raw any, out any) {
+		if raw == nil {
+			return
+		}
+		encoded, err := json.Marshal(raw)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		if err := json.Unmarshal(encoded, out); err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+	}
+	mintClaudeSessionIfNeeded := func(teamID, name, provider string) TeamMember {
+		if provider == "claude" {
+			if err := r.Store.PersistMemberSession(teamID, name, uuid.NewString()); err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+		}
+		member, err := r.Store.GetMember(teamID, name)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		return member
+	}
+
+	return map[string]any{
+		"create": func(goal string, rawOpts ...any) goja.Value {
+			opts := struct {
+				CWD       string  `json:"cwd"`
+				BudgetUSD float64 `json:"budgetUsd"`
+			}{}
+			if len(rawOpts) > 0 {
+				decodeOpts(rawOpts[0], &opts)
+			}
+			cwd := firstNonEmpty(strings.TrimSpace(opts.CWD), r.Run.CWD)
+			team, err := r.Store.CreateTeam(goal, cwd, opts.BudgetUSD)
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			return vm.ToValue(team)
+		},
+		"spawn": func(teamID, name string, rawOpts ...any) goja.Value {
+			opts := struct {
+				Provider     string `json:"provider"`
+				Model        string `json:"model"`
+				Role         string `json:"role"`
+				Mode         string `json:"mode"`
+				PlanRequired bool   `json:"planRequired"`
+			}{Mode: "read-only"}
+			if len(rawOpts) > 0 {
+				decodeOpts(rawOpts[0], &opts)
+			}
+			provider := ResolveProvider("", opts.Provider)
+			var err error
+			if opts.PlanRequired {
+				_, err = r.Store.SpawnPlanRequiredMember(teamID, name, provider, opts.Model, opts.Role)
+			} else {
+				_, err = r.Store.SpawnMember(teamID, name, provider, opts.Model, opts.Role, opts.Mode)
+			}
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			return vm.ToValue(mintClaudeSessionIfNeeded(teamID, name, provider))
+		},
+		"send": func(teamID, to, body string, from ...string) goja.Value {
+			sender := firstNonEmpty(strings.Join(from, ""), "lead")
+			msg, err := r.Store.SendTeamMessage(teamID, sender, to, body)
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			return vm.ToValue(msg)
+		},
+		"approve": func(teamID, name string) goja.Value {
+			existing, err := r.Store.GetMember(teamID, name)
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			var member TeamMember
+			if existing.PlanRequired {
+				member, err = r.Store.ApproveMemberPlan(teamID, name)
+			} else {
+				if err = r.Store.SetMemberMode(teamID, name, "edit"); err == nil {
+					member, err = r.Store.GetMember(teamID, name)
+				}
+			}
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			return vm.ToValue(member)
+		},
+		"reject": func(teamID, name, feedback string) goja.Value {
+			member, err := r.Store.RejectMemberPlan(teamID, name, feedback)
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			return vm.ToValue(member)
+		},
+		"gate": func(teamID, prompt string, hooks []string) goja.Value {
+			if err := r.Store.SetTeamGate(teamID, prompt, hooks); err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			team, err := r.Store.GetTeam(teamID)
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			return vm.ToValue(team)
+		},
+		"status": func(teamID string) goja.Value {
+			team, err := r.Store.GetTeam(teamID)
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			members, err := r.Store.ListMembers(teamID)
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			tasks, err := r.Store.ListTeamTasks(teamID)
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			return vm.ToValue(map[string]any{"team": team, "members": members, "tasks": tasks})
+		},
+		// wait drives the team — the acceptance shape for "a loop tick
+		// convening a team": create/spawn/tasks.create set the board up,
+		// wait actually runs rounds of real teammate turns (same bounded
+		// scheduler `pallium team run` uses: rounds until convergence,
+		// budget, or the round cap, then returns — no daemon), then
+		// status/tasks.list read back what happened.
+		"wait": func(teamID string, rawOpts ...any) goja.Value {
+			opts := struct {
+				AgentTimeoutSeconds int `json:"agentTimeoutSeconds"`
+				StaleAfterMinutes   int `json:"staleAfterMinutes"`
+				MaxConcurrent       int `json:"maxConcurrent"`
+			}{}
+			if len(rawOpts) > 0 {
+				decodeOpts(rawOpts[0], &opts)
+			}
+			turnOpts := TeamTurnOptions{
+				AgentTimeout:   time.Duration(opts.AgentTimeoutSeconds) * time.Second,
+				StaleTurnAfter: time.Duration(opts.StaleAfterMinutes) * time.Minute,
+				MaxConcurrent:  opts.MaxConcurrent,
+			}
+			summary, err := teamRunner().RunTeam(ctx, r.Store, teamID, turnOpts)
+			if err != nil {
+				panic(vm.ToValue(r.throwable(err)))
+			}
+			return vm.ToValue(summary)
+		},
+		"stop": func(teamID string) goja.Value {
+			if err := r.Store.SetTeamStatus(teamID, "stopped"); err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			return vm.ToValue(map[string]any{"team_id": teamID, "status": "stopped"})
+		},
+		"tasks": map[string]any{
+			"create": func(teamID, title string, rawOpts ...any) goja.Value {
+				opts := struct {
+					Description string   `json:"description"`
+					DependsOn   []string `json:"dependsOn"`
+				}{}
+				if len(rawOpts) > 0 {
+					decodeOpts(rawOpts[0], &opts)
+				}
+				task, err := teamRunner().CreateTeamTaskWithGate(ctx, r.Store, teamID, title, opts.Description, opts.DependsOn)
+				if err != nil {
+					panic(vm.ToValue(err.Error()))
+				}
+				return vm.ToValue(task)
+			},
+			"list": func(teamID string) goja.Value {
+				tasks, err := r.Store.ListTeamTasks(teamID)
+				if err != nil {
+					panic(vm.ToValue(err.Error()))
+				}
+				return vm.ToValue(tasks)
+			},
+			"claim": func(teamID, taskID, as string) goja.Value {
+				task, err := r.Store.ClaimTask(teamID, taskID, as)
+				if err != nil {
+					panic(vm.ToValue(err.Error()))
+				}
+				return vm.ToValue(task)
+			},
+			"complete": func(teamID, taskID, as string, result ...string) goja.Value {
+				task, approved, err := teamRunner().CompleteTaskWithGate(ctx, r.Store, teamID, taskID, as, strings.Join(result, ""))
+				if err != nil {
+					panic(vm.ToValue(err.Error()))
+				}
+				return vm.ToValue(map[string]any{"task": task, "approved": approved})
+			},
+		},
+	}
 }
 
 func (r *Runner) jsPhase(vm *goja.Runtime) func(goja.FunctionCall) goja.Value {
@@ -2874,10 +3091,27 @@ func (r *Runner) worktreeSubdirCWD(repoRoot, worktree string) string {
 	return filepath.Join(worktree, rel)
 }
 
+// createWorktree's target path is deterministic per agentID (worktreePath),
+// which is exactly right for a fresh call — but a team member reuses the
+// SAME agentID (member.ID) on every turn, stable across retries. Found live
+// via this batch's own kill/resume acceptance proof: killing the steering
+// process mid-turn leaves that turn's worktree directory on disk (its own
+// cleanup never got to run), and the member's NEXT turn's createWorktree
+// call then fails outright — `git worktree add` refuses to target an
+// existing directory — permanently blocking that member's edit mode until
+// someone manually removes it. Pre-existing M1-era gap, not introduced by
+// M2; fixed here because M2's own live proof is what surfaced it.
 func (r *Runner) createWorktree(agentID, repoRoot string) (string, error) {
 	path, err := r.worktreePath(agentID)
 	if err != nil {
 		return "", err
+	}
+	if _, statErr := os.Stat(path); statErr == nil {
+		// A live, still-in-use worktree is never sitting at this exact path
+		// when createWorktree is about to be called again for the same id —
+		// if it were still in use, nothing would be calling createWorktree
+		// for it a second time. Safe to clear unconditionally.
+		r.removeWorktree(repoRoot, path)
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return "", err

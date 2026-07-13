@@ -20,6 +20,15 @@ type Team struct {
 	Status         string  `json:"status"` // active | parked | stopped
 	BudgetUSDLimit float64 `json:"budget_usd_limit,omitempty"`
 	SpendUSD       float64 `json:"spend_usd"`
+	// GatePrompt/GateHooks configure the M2 quality-gate hook points (see
+	// runTeamGate in team_runtime.go): an autonomous read-only verifier call,
+	// same shape as the workflow gate() primitive, run at whichever of
+	// "task_created"/"task_completed"/"teammate_idle" are listed in
+	// GateHooks. Empty GateHooks means no gates configured — zero overhead
+	// for a team that never opts in, and every M1 team predates these
+	// columns entirely.
+	GatePrompt string   `json:"gate_prompt,omitempty"`
+	GateHooks  []string `json:"gate_hooks,omitempty"`
 	// TasksUpdatedAt is a team-wide watermark bumped on every task-board
 	// mutation (create/claim/complete/revert-to-pending) — NOT the same as
 	// any single task's own updated_at, because completing task A can make
@@ -56,17 +65,27 @@ type TeamMember struct {
 	// turn, but a failed claude turn may never have actually created the
 	// native session claude expects `--resume` to find. dispatchTeamTurn
 	// uses THIS field, not TurnCount, to decide `--session-id` vs `--resume`.
-	SessionEstablished bool    `json:"session_established"`
-	Worktree           string  `json:"worktree,omitempty"`
-	TurnCount          int     `json:"turn_count"`
-	TurnStartedAt      string  `json:"turn_started_at,omitempty"`
-	LastTurnAt         string  `json:"last_turn_at,omitempty"`
-	LastTurnStatus     string  `json:"last_turn_status,omitempty"`
-	LastTurnError      string  `json:"last_turn_error,omitempty"`
-	NudgedAt           string  `json:"nudged_at,omitempty"`
-	SpendUSD           float64 `json:"spend_usd"`
-	CreatedAt          string  `json:"created_at"`
-	UpdatedAt          string  `json:"updated_at"`
+	SessionEstablished bool `json:"session_established"`
+	// PlanRequired/PlanStatus back the M2 plan-approval flow: a plan-required
+	// member is spawned read-only and stays that way until `team approve`
+	// flips PlanStatus to "approved" (and mode to "edit"). PlanStatus is
+	// "pending" from spawn through any number of `team reject` rounds — a
+	// reject sends feedback (journaled as an ordinary team message) and
+	// leaves the member exactly where it was, free to submit a revised plan
+	// next turn; there is no separate terminal "rejected" state to model
+	// because rejection is not terminal here, approval is.
+	PlanRequired   bool    `json:"plan_required,omitempty"`
+	PlanStatus     string  `json:"plan_status,omitempty"`
+	Worktree       string  `json:"worktree,omitempty"`
+	TurnCount      int     `json:"turn_count"`
+	TurnStartedAt  string  `json:"turn_started_at,omitempty"`
+	LastTurnAt     string  `json:"last_turn_at,omitempty"`
+	LastTurnStatus string  `json:"last_turn_status,omitempty"`
+	LastTurnError  string  `json:"last_turn_error,omitempty"`
+	NudgedAt       string  `json:"nudged_at,omitempty"`
+	SpendUSD       float64 `json:"spend_usd"`
+	CreatedAt      string  `json:"created_at"`
+	UpdatedAt      string  `json:"updated_at"`
 }
 
 // TeamTask is one item on the shared task board. DependsOn holds task ids
@@ -175,8 +194,22 @@ CREATE INDEX IF NOT EXISTS idx_team_messages_inbox ON team_messages(team_id, to_
 // rest of the schema, so a single Store (and its one sqlite connection) owns
 // both workflow and team state.
 func (s *Store) initTeams() error {
-	_, err := s.db.Exec(teamSchema)
-	return err
+	if _, err := s.db.Exec(teamSchema); err != nil {
+		return err
+	}
+	for _, stmt := range []string{
+		// M2: plan-approval flow (see TeamMember.PlanRequired/PlanStatus).
+		"ALTER TABLE team_members ADD COLUMN plan_required INTEGER DEFAULT 0",
+		"ALTER TABLE team_members ADD COLUMN plan_status TEXT",
+		// M2: quality-gate hook configuration (see Team.GatePrompt/GateHooks).
+		"ALTER TABLE teams ADD COLUMN gate_prompt TEXT",
+		"ALTER TABLE teams ADD COLUMN gate_hooks TEXT",
+	} {
+		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return err
+		}
+	}
+	return nil
 }
 
 // CreateTeam starts a new team in the "active" state.
@@ -197,14 +230,41 @@ func (s *Store) CreateTeam(goal, cwd string, budgetUSDLimit float64) (Team, erro
 
 func (s *Store) GetTeam(id string) (Team, error) {
 	var t Team
-	var tasksUpdatedAt sql.NullString
-	err := s.db.QueryRow(`SELECT id,goal,cwd,status,budget_usd_limit,spend_usd,tasks_updated_at,created_at,updated_at FROM teams WHERE id=?`, id).
-		Scan(&t.ID, &t.Goal, &t.CWD, &t.Status, &t.BudgetUSDLimit, &t.SpendUSD, &tasksUpdatedAt, &t.CreatedAt, &t.UpdatedAt)
+	var tasksUpdatedAt, gatePrompt, gateHooks sql.NullString
+	err := s.db.QueryRow(`SELECT id,goal,cwd,status,budget_usd_limit,spend_usd,tasks_updated_at,COALESCE(gate_prompt,''),COALESCE(gate_hooks,''),created_at,updated_at FROM teams WHERE id=?`, id).
+		Scan(&t.ID, &t.Goal, &t.CWD, &t.Status, &t.BudgetUSDLimit, &t.SpendUSD, &tasksUpdatedAt, &gatePrompt, &gateHooks, &t.CreatedAt, &t.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return Team{}, fmt.Errorf("team %q not found", id)
 	}
 	t.TasksUpdatedAt = tasksUpdatedAt.String
+	t.GatePrompt = gatePrompt.String
+	if gateHooks.String != "" {
+		t.GateHooks = strings.Split(gateHooks.String, ",")
+	}
 	return t, err
+}
+
+// TeamGateHooks are the only valid hook-point names SetTeamGate accepts —
+// see runTeamGate (team_runtime.go) for what each fires on.
+var TeamGateHooks = map[string]bool{
+	"task_created":   true,
+	"task_completed": true,
+	"teammate_idle":  true,
+}
+
+// SetTeamGate configures the M2 quality-gate hooks: prompt is the shared
+// verifier instruction (same shape as gate()'s message/criteria), hooks
+// selects which of task_created/task_completed/teammate_idle actually fire
+// it. Passing an empty hooks list disables gating entirely — the team-wide
+// opt-in default.
+func (s *Store) SetTeamGate(teamID, prompt string, hooks []string) error {
+	for _, h := range hooks {
+		if !TeamGateHooks[h] {
+			return fmt.Errorf("unknown team gate hook %q (valid: task_created, task_completed, teammate_idle)", h)
+		}
+	}
+	_, err := s.db.Exec(`UPDATE teams SET gate_prompt=?, gate_hooks=?, updated_at=? WHERE id=?`, prompt, strings.Join(hooks, ","), nowString(), teamID)
+	return err
 }
 
 // bumpTeamTasksUpdated advances the team-wide task-board watermark (see
@@ -273,20 +333,85 @@ func (s *Store) SpawnMember(teamID, name, provider, model, role, mode string) (T
 	return m, nil
 }
 
+// SpawnPlanRequiredMember is SpawnMember's plan-approval variant (M2): the
+// member is forced read-only (a plan can't include edits it hasn't been
+// approved to make yet) and starts with PlanStatus "pending" — see
+// ApproveMemberPlan/RejectMemberPlan and buildTeamTurnPrompt's plan-mode
+// framing.
+func (s *Store) SpawnPlanRequiredMember(teamID, name, provider, model, role string) (TeamMember, error) {
+	if _, err := s.SpawnMember(teamID, name, provider, model, role, "read-only"); err != nil {
+		return TeamMember{}, err
+	}
+	if _, err := s.db.Exec(`UPDATE team_members SET plan_required=1, plan_status='pending', updated_at=? WHERE team_id=? AND name=?`, nowString(), teamID, name); err != nil {
+		return TeamMember{}, err
+	}
+	return s.GetMember(teamID, name)
+}
+
+// ApproveMemberPlan flips a plan-required member into edit mode once its
+// plan is approved, and journals the approval as an ordinary team message
+// (the durable record every other coordination event already uses — no
+// separate "approval log" needed). Errors if the member never required a
+// plan, or its plan isn't currently pending (already approved, or a plain
+// read-only member with no plan flow at all).
+func (s *Store) ApproveMemberPlan(teamID, name string) (TeamMember, error) {
+	m, err := s.GetMember(teamID, name)
+	if err != nil {
+		return TeamMember{}, err
+	}
+	if !m.PlanRequired || m.PlanStatus != "pending" {
+		return TeamMember{}, fmt.Errorf("team member %q has no pending plan to approve (plan_required=%v plan_status=%q)", name, m.PlanRequired, m.PlanStatus)
+	}
+	now := nowString()
+	if _, err := s.db.Exec(`UPDATE team_members SET mode='edit', plan_status='approved', updated_at=? WHERE team_id=? AND name=?`, now, teamID, name); err != nil {
+		return TeamMember{}, err
+	}
+	if _, err := s.SendTeamMessage(teamID, "lead", name, "Your plan is approved. Proceed with edits."); err != nil {
+		return TeamMember{}, err
+	}
+	return s.GetMember(teamID, name)
+}
+
+// RejectMemberPlan delivers feedback on a pending plan and leaves the member
+// exactly where it was (read-only, plan_status still "pending") — rejection
+// is not terminal here, only approval is; the member submits a revised plan
+// on its next turn and lead reviews again. Same "no pending plan" guard as
+// ApproveMemberPlan.
+func (s *Store) RejectMemberPlan(teamID, name, feedback string) (TeamMember, error) {
+	m, err := s.GetMember(teamID, name)
+	if err != nil {
+		return TeamMember{}, err
+	}
+	if !m.PlanRequired || m.PlanStatus != "pending" {
+		return TeamMember{}, fmt.Errorf("team member %q has no pending plan to reject (plan_required=%v plan_status=%q)", name, m.PlanRequired, m.PlanStatus)
+	}
+	feedback = strings.TrimSpace(feedback)
+	if feedback == "" {
+		return TeamMember{}, fmt.Errorf("plan rejection requires feedback explaining what to revise")
+	}
+	if _, err := s.SendTeamMessage(teamID, "lead", name, "Your plan was NOT approved: "+feedback+" Please revise and resubmit."); err != nil {
+		return TeamMember{}, err
+	}
+	return s.GetMember(teamID, name)
+}
+
 func scanMember(row *sql.Row) (TeamMember, error) {
 	var m TeamMember
-	var model, role, session, worktree, turnStarted, lastAt, lastStatus, lastErr, nudged sql.NullString
-	err := row.Scan(&m.ID, &m.TeamID, &m.Name, &m.Provider, &model, &role, &m.Mode, &m.Status, &session, &m.SessionEstablished, &worktree,
+	var model, role, session, worktree, turnStarted, lastAt, lastStatus, lastErr, nudged, planStatus sql.NullString
+	var planRequired int
+	err := row.Scan(&m.ID, &m.TeamID, &m.Name, &m.Provider, &model, &role, &m.Mode, &m.Status, &session, &m.SessionEstablished, &planRequired, &planStatus, &worktree,
 		&m.TurnCount, &turnStarted, &lastAt, &lastStatus, &lastErr, &nudged, &m.SpendUSD, &m.CreatedAt, &m.UpdatedAt)
 	if err != nil {
 		return TeamMember{}, err
 	}
 	m.Model, m.Role, m.SessionToken, m.Worktree = model.String, role.String, session.String, worktree.String
 	m.TurnStartedAt, m.LastTurnAt, m.LastTurnStatus, m.LastTurnError, m.NudgedAt = turnStarted.String, lastAt.String, lastStatus.String, lastErr.String, nudged.String
+	m.PlanRequired = planRequired != 0
+	m.PlanStatus = planStatus.String
 	return m, nil
 }
 
-const memberSelectCols = `id,team_id,name,provider,model,role,mode,status,session_token,session_established,worktree,turn_count,turn_started_at,last_turn_at,last_turn_status,last_turn_error,nudged_at,spend_usd,created_at,updated_at`
+const memberSelectCols = `id,team_id,name,provider,model,role,mode,status,session_token,session_established,COALESCE(plan_required,0),COALESCE(plan_status,''),worktree,turn_count,turn_started_at,last_turn_at,last_turn_status,last_turn_error,nudged_at,spend_usd,created_at,updated_at`
 
 func (s *Store) GetMember(teamID, name string) (TeamMember, error) {
 	m, err := scanMember(s.db.QueryRow(`SELECT `+memberSelectCols+` FROM team_members WHERE team_id=? AND name=?`, teamID, name))
@@ -305,13 +430,16 @@ func (s *Store) ListMembers(teamID string) ([]TeamMember, error) {
 	var members []TeamMember
 	for rows.Next() {
 		var m TeamMember
-		var model, role, session, worktree, turnStarted, lastAt, lastStatus, lastErr, nudged sql.NullString
-		if err := rows.Scan(&m.ID, &m.TeamID, &m.Name, &m.Provider, &model, &role, &m.Mode, &m.Status, &session, &m.SessionEstablished, &worktree,
+		var model, role, session, worktree, turnStarted, lastAt, lastStatus, lastErr, nudged, planStatus sql.NullString
+		var planRequired int
+		if err := rows.Scan(&m.ID, &m.TeamID, &m.Name, &m.Provider, &model, &role, &m.Mode, &m.Status, &session, &m.SessionEstablished, &planRequired, &planStatus, &worktree,
 			&m.TurnCount, &turnStarted, &lastAt, &lastStatus, &lastErr, &nudged, &m.SpendUSD, &m.CreatedAt, &m.UpdatedAt); err != nil {
 			return nil, err
 		}
 		m.Model, m.Role, m.SessionToken, m.Worktree = model.String, role.String, session.String, worktree.String
 		m.TurnStartedAt, m.LastTurnAt, m.LastTurnStatus, m.LastTurnError, m.NudgedAt = turnStarted.String, lastAt.String, lastStatus.String, lastErr.String, nudged.String
+		m.PlanRequired = planRequired != 0
+		m.PlanStatus = planStatus.String
 		members = append(members, m)
 	}
 	return members, rows.Err()
@@ -572,6 +700,21 @@ func (s *Store) ReconcileInterruptedMembers(teamID, staleAfter string) ([]string
 // yet (a task can be added before its dependency), but a task can never be
 // claimed while any dependency is missing or not completed — see ClaimTask.
 func (s *Store) CreateTeamTask(teamID, title, description string, dependsOn []string) (TeamTask, error) {
+	return s.createTeamTaskWithStatus(teamID, title, description, dependsOn, "pending")
+}
+
+// createTeamTaskWithStatus is CreateTeamTask's actual implementation, with
+// the initial status as a parameter so CreateTeamTaskWithGate
+// (team_runtime.go) can insert a task_created-gated task ALREADY "blocked"
+// — never claimable for even an instant — instead of creating it pending
+// and flipping it afterward. An adversarial M2 review round found exactly
+// that gap: create-then-flip leaves a real window (however short) where a
+// concurrently-running `team run` round can claim, and an edit-mode member
+// can even complete, a task whose gate hasn't run yet — the identical
+// zombie-side-effect bug class ticket #32 fixed elsewhere in this batch,
+// recurring in this batch's own new code. One INSERT with the right status
+// from the start closes the window entirely rather than merely shrinking it.
+func (s *Store) createTeamTaskWithStatus(teamID, title, description string, dependsOn []string, status string) (TeamTask, error) {
 	title = strings.TrimSpace(title)
 	if title == "" {
 		return TeamTask{}, fmt.Errorf("team task requires a title")
@@ -581,7 +724,7 @@ func (s *Store) CreateTeamTask(teamID, title, description string, dependsOn []st
 		return TeamTask{}, err
 	}
 	now := nowString()
-	t := TeamTask{ID: NewID("tt"), TeamID: teamID, Title: title, Description: description, Status: "pending", DependsOn: dependsOn, CreatedAt: now, UpdatedAt: now}
+	t := TeamTask{ID: NewID("tt"), TeamID: teamID, Title: title, Description: description, Status: status, DependsOn: dependsOn, CreatedAt: now, UpdatedAt: now}
 	_, err = s.db.Exec(`INSERT INTO team_tasks(id,team_id,title,description,status,depends_on,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`,
 		t.ID, t.TeamID, t.Title, t.Description, t.Status, string(deps), t.CreatedAt, t.UpdatedAt)
 	if err != nil {
@@ -704,6 +847,25 @@ func (s *Store) CompleteTask(teamID, taskID, owner, result string) (TeamTask, er
 		return TeamTask{}, err
 	}
 	return s.GetTeamTask(teamID, taskID)
+}
+
+// SetTaskStatus is a general-purpose status/note write used by the M2
+// quality-gate hooks (team_runtime.go's runTeamGate call sites) — e.g.
+// blocking a task_created-gate-rejected task without ever letting it become
+// claimable. Deliberately does NOT gate on the task's current status the way
+// ClaimTask/CompleteTask do: those are teammate-facing CAS operations with a
+// race to protect against, this is Pallium's own single-writer bookkeeping
+// reacting to a verifier's verdict.
+func (s *Store) SetTaskStatus(teamID, taskID, status, note string) error {
+	now := nowString()
+	res, err := s.db.Exec(`UPDATE team_tasks SET status=?, result=?, updated_at=? WHERE team_id=? AND id=?`, status, note, now, teamID, taskID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("team task %q not found on team %s", taskID, teamID)
+	}
+	return bumpTeamTasksUpdated(s.db, teamID, now)
 }
 
 // HasClaimableWork reports whether any pending task's dependencies are all

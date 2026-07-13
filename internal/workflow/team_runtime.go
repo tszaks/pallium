@@ -100,6 +100,9 @@ func buildTeamTurnPrompt(team Team, member TeamMember, messages []TeamMessage, t
 	fmt.Fprintf(&b, "You are teammate %q on Pallium team %s. Role: %s. Mode: %s.\n", member.Name, team.ID, firstNonEmpty(member.Role, "(none)"), member.Mode)
 	fmt.Fprintf(&b, "Team goal: %s\n\n", team.Goal)
 	b.WriteString("You do not have coordination tools. Instead, end your turn with EXACTLY ONE JSON object (per the schema you'll be given) describing what you decided: any messages to send, a task id to claim, a task id to complete, and your status (\"active\" if you did real work and may have more to do, \"idle\" if you have nothing further right now, \"blocked\" if you're waiting on someone). Pallium applies your decision after you finish; do not expect any reply within this turn.\n\n")
+	if member.PlanRequired && member.PlanStatus == "pending" {
+		b.WriteString("You are in PLAN-REVIEW mode: you are read-only and CANNOT edit anything yet, and any claim_task_id/complete_task_id in your decision will be ignored until your plan is approved. Submit your plan as a message to \"lead\" describing exactly what you intend to do, then set status to \"blocked\" until lead reviews it. If lead already sent feedback rejecting an earlier plan, revise it and resubmit — do not repeat the same plan unchanged.\n\n")
+	}
 
 	if len(messages) == 0 {
 		b.WriteString("--- No new messages since your last turn ---\n\n")
@@ -357,6 +360,48 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 		return true, nil
 	}
 
+	status := decision.Status
+	if status == "" {
+		status = "active"
+	}
+	statusNote := decision.Summary
+	if decision.StatusReason != "" {
+		statusNote = decision.Summary + " (" + decision.StatusReason + ")"
+	}
+	// M2 quality gate, teammate_idle hook: checked BEFORE FinishMemberTurn
+	// (adjusting the status/note about to be persisted) rather than as a
+	// follow-up update after — a follow-up would itself need its own lease
+	// re-validation to avoid clobbering a brand new turn that started in the
+	// gap; folding it into what gets passed to the one already-lease-guarded
+	// FinishMemberTurn call below sidesteps that entirely. The gate CHECK
+	// itself has no side effect to undo if this turn's lease turns out to be
+	// gone by the time FinishMemberTurn runs — it is read-only.
+	if status == "idle" && teamGateHasHook(team, "teammate_idle") {
+		approved, reason, gerr := r.runTeamGate(ctx, team, fmt.Sprintf("Teammate %q wants to go idle. Its own summary: %s", name, decision.Summary))
+		switch {
+		case gerr != nil:
+			statusNote = statusNote + fmt.Sprintf(" [teammate_idle gate failed to run: %v — proceeding idle]", gerr)
+		case !approved:
+			status = "active"
+			statusNote = "quality gate blocked going idle: " + reason
+		}
+	}
+	// Lease-guard the decision's OWN side effects, not just mail delivery
+	// (ticket #32, the zombie decision-side-effect gap the M1 review round 2
+	// flagged for M2): finish the turn — the same atomic lease-check
+	// FinishMemberTurn already does for everything else — BEFORE sending any
+	// message or touching the task board. Before this fix, SendTeamMessage/
+	// ClaimTask/CompleteTask ran first and FinishMemberTurn's lease failure
+	// was only discovered afterward, by which point a zombie turn (its lease
+	// already reassigned by a stale takeover while its provider call was
+	// still in flight) had already mutated the board. Now: if the lease is
+	// gone, FinishMemberTurn errors and we return BEFORE any side effect
+	// below ever runs — a stale-takeover zombie's decision mutates nothing.
+	if err := store.FinishMemberTurn(teamID, name, lease, status, capturedToken, statusNote, costUSD); err != nil {
+		return true, err
+	}
+	deliverInjectedMessages()
+
 	for _, m := range decision.Messages {
 		to := strings.TrimSpace(m.To)
 		if to == "" {
@@ -366,34 +411,65 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 			r.notifyLeadOfMemberError(store, teamID, name, fmt.Errorf("relaying a message: %w", err))
 		}
 	}
-	if id := strings.TrimSpace(decision.ClaimTaskID); id != "" {
-		if _, err := store.ClaimTask(teamID, id, name); err != nil && err != errTaskNotClaimable {
-			r.notifyLeadOfMemberError(store, teamID, name, fmt.Errorf("claiming task %s: %w", id, err))
+	// Plan-approval enforcement (M2): a plan-required member whose plan is
+	// still pending cannot claim or complete anything — real enforcement,
+	// not just the prompt's polite ask (buildTeamTurnPrompt already tells it
+	// not to try). `member` is the snapshot from BEFORE this turn ran, which
+	// is the right thing to gate on: if lead approved mid-turn, this
+	// decision was still MADE under "still pending" framing and should not
+	// retroactively count as post-approval action — it gets to act on its
+	// next turn instead.
+	planPending := member.PlanRequired && member.PlanStatus == "pending"
+	if planPending && (decision.ClaimTaskID != "" || decision.CompleteTaskID != "") {
+		_, _ = store.SendTeamMessage(teamID, "lead", name, "Your plan is still pending approval — ignored the claim/complete in your last decision. Submit or wait for your plan to be approved first.")
+	} else {
+		if id := strings.TrimSpace(decision.ClaimTaskID); id != "" {
+			if _, err := store.ClaimTask(teamID, id, name); err != nil && err != errTaskNotClaimable {
+				r.notifyLeadOfMemberError(store, teamID, name, fmt.Errorf("claiming task %s: %w", id, err))
+			}
+		}
+		if id := strings.TrimSpace(decision.CompleteTaskID); id != "" {
+			if _, _, err := r.CompleteTaskWithGate(ctx, store, teamID, id, name, decision.CompleteResult); err != nil {
+				r.notifyLeadOfMemberError(store, teamID, name, fmt.Errorf("completing task %s: %w", id, err))
+			}
 		}
 	}
-	if id := strings.TrimSpace(decision.CompleteTaskID); id != "" {
-		if _, err := store.CompleteTask(teamID, id, name, decision.CompleteResult); err != nil {
-			r.notifyLeadOfMemberError(store, teamID, name, fmt.Errorf("completing task %s: %w", id, err))
-		}
-	}
-
-	status := decision.Status
-	if status == "" {
-		status = "active"
-	}
-	statusNote := decision.Summary
-	if decision.StatusReason != "" {
-		statusNote = decision.Summary + " (" + decision.StatusReason + ")"
-	}
-	// Same ordering rationale as the malformed-decision branch above: finish
-	// the turn (release the lease) BEFORE marking mail delivered, so a lost
-	// lease leaves the mail undelivered rather than silently consumed with
-	// an unrecorded outcome.
-	if err := store.FinishMemberTurn(teamID, name, lease, status, capturedToken, statusNote, costUSD); err != nil {
-		return true, err
-	}
-	deliverInjectedMessages()
 	return true, nil
+}
+
+// CompleteTaskWithGate wraps Store.CompleteTask with the M2 task_completed
+// hook (if the team has one configured) — the front door BOTH RunTeamTurn's
+// own decision-application (a member's own turn deciding it's done) and the
+// team.tasks.complete script primitive use, so a script-driven completion
+// gets the identical quality bar a member's own decision does, not a
+// backdoor around it. approved is false (not an error) on a genuine
+// rejection: the verifier's reason is delivered to owner as feedback and the
+// task is left exactly where it was — it was never marked completed in the
+// first place (checked before, not after), so there is nothing to literally
+// revert; staying "in_progress" is the same observable outcome as a revert.
+func (r *Runner) CompleteTaskWithGate(ctx context.Context, store *Store, teamID, taskID, owner, result string) (task TeamTask, approved bool, err error) {
+	team, err := store.GetTeam(teamID)
+	if err != nil {
+		return TeamTask{}, false, err
+	}
+	if teamGateHasHook(team, "task_completed") {
+		task, err = store.GetTeamTask(teamID, taskID)
+		if err != nil {
+			return TeamTask{}, false, err
+		}
+		var reason string
+		approved, reason, err = r.runTeamGate(ctx, team, fmt.Sprintf("Task %q (%s), owned by %s, is proposed complete. Result:\n%s", task.Title, task.ID, owner, result))
+		if err != nil {
+			_, _ = store.SendTeamMessage(teamID, "quality-gate", "lead", fmt.Sprintf("task_completed gate for %s failed to run: %v", taskID, err))
+			return task, false, err
+		}
+		if !approved {
+			_, _ = store.SendTeamMessage(teamID, "lead", owner, fmt.Sprintf("Your completion of task %s was NOT approved by the quality gate: %s Please address this and complete it again.", taskID, reason))
+			return task, false, nil
+		}
+	}
+	task, err = store.CompleteTask(teamID, taskID, owner, result)
+	return task, err == nil, err
 }
 
 // dispatchTeamTurn routes to the member's provider. Unlike a regular worker
@@ -467,6 +543,109 @@ func (r *Runner) notifyLeadOfMemberError(store *Store, teamID, name string, err 
 		return
 	}
 	_, _ = store.SendTeamMessage(teamID, name, "lead", fmt.Sprintf("turn failed: %v", err))
+}
+
+// teamGateHasHook reports whether team is configured to fire its quality
+// gate at the given hook point ("task_created" | "task_completed" |
+// "teammate_idle" — see TeamGateHooks). An empty GatePrompt always means no
+// gating, regardless of GateHooks, so a team can never end up "gated with no
+// actual instruction" through a partial config write.
+func teamGateHasHook(team Team, hook string) bool {
+	if strings.TrimSpace(team.GatePrompt) == "" {
+		return false
+	}
+	for _, h := range team.GateHooks {
+		if h == hook {
+			return true
+		}
+	}
+	return false
+}
+
+// runTeamGate is the M2 quality-gate check: an autonomous read-only verifier
+// call, same verdict shape as the workflow gate() primitive (defaultGateSchema/
+// gateVerdict in runtime.go) but WITHOUT gate()'s dependency on a
+// workflow_runs row existing — a team is not a workflow run, so
+// runAgentGate's r.Store.EnsureGate(r.Run.ID, ...) path would fail outright
+// if called here. Instead this reuses RunProviderText's run-independent
+// provider-dispatch shape (provider.go) with a schema added. No caching of
+// the verdict the way workflow gates persist approved/rejected: a team has
+// no single enclosing run to key a cached gate on, and each hook firing
+// (a different task, a different idle declaration) is its own fresh
+// question anyway.
+func (r *Runner) runTeamGate(ctx context.Context, team Team, situation string) (approved bool, reason string, err error) {
+	cwd := strings.TrimSpace(team.CWD)
+	if cwd == "" {
+		cwd, err = os.Getwd()
+		if err != nil {
+			return false, "", err
+		}
+	}
+	tmpDir, terr := os.MkdirTemp("", "pallium-team-gate-*")
+	if terr != nil {
+		return false, "", terr
+	}
+	defer os.RemoveAll(tmpDir)
+	outFile := filepath.Join(tmpDir, "last-message.txt")
+	usageFile := filepath.Join(tmpDir, "usage.json")
+	provider := ResolveProvider("", "")
+	prompt := buildGatePrompt("team-quality-gate", situation, team.GatePrompt)
+	agent := &Agent{Mode: "read-only", Prompt: prompt, Provider: provider}
+	output, derr := r.runProviderCommand(ctx, provider, tmpDir, outFile, usageFile, cwd, prompt, agent, AgentOptions{Schema: defaultGateSchema()}, false)
+	if derr != nil {
+		return false, "", derr
+	}
+	approved, reason = gateVerdict(parseAgentOutput(output))
+	return approved, reason, nil
+}
+
+// CreateTeamTaskWithGate wraps Store.CreateTeamTask with the M2
+// task_created hook: if configured, an autonomous verifier reviews the new
+// task before it can ever be claimed. A rejection leaves it "blocked" (the
+// verifier's reason recorded as the task's result) rather than deleting it —
+// a low-quality task's history stays visible/auditable, it just never
+// becomes claimable.
+//
+// A gated task is inserted ALREADY "blocked" (store.createTeamTaskWithStatus),
+// never "pending" then flipped afterward. This is a fix, not the original
+// design: an adversarial M2 review round found that create-then-flip left a
+// real window — while runTeamGate's provider round-trip (seconds) was still
+// in flight, a concurrently-running `team run` process could see the task as
+// claimable pending, claim it, and an edit-mode member could even complete
+// it, before the gate ever resolved — the identical zombie-side-effect bug
+// class ticket #32 fixed elsewhere in this batch, recurring in this batch's
+// own new code. Inserting with the correct terminal-until-approved status
+// from the single INSERT closes the window entirely instead of shrinking it.
+func (r *Runner) CreateTeamTaskWithGate(ctx context.Context, store *Store, teamID, title, description string, dependsOn []string) (TeamTask, error) {
+	team, err := store.GetTeam(teamID)
+	if err != nil {
+		return TeamTask{}, err
+	}
+	if !teamGateHasHook(team, "task_created") {
+		return store.CreateTeamTask(teamID, title, description, dependsOn)
+	}
+	task, err := store.createTeamTaskWithStatus(teamID, title, description, dependsOn, "blocked")
+	if err != nil {
+		return TeamTask{}, err
+	}
+	if err := store.SetTaskStatus(teamID, task.ID, "blocked", "quality gate check in progress"); err != nil {
+		return task, err
+	}
+	approved, reason, gerr := r.runTeamGate(ctx, team, fmt.Sprintf("A new task was proposed: %q. Description: %s", title, description))
+	if gerr != nil {
+		_, _ = store.SendTeamMessage(teamID, "quality-gate", "lead", fmt.Sprintf("task_created gate for %s failed to run: %v", task.ID, gerr))
+		return store.GetTeamTask(teamID, task.ID) // stays blocked — safest default on a gate malfunction
+	}
+	if !approved {
+		if serr := store.SetTaskStatus(teamID, task.ID, "blocked", "quality gate blocked this task: "+reason); serr != nil {
+			return task, serr
+		}
+		return store.GetTeamTask(teamID, task.ID)
+	}
+	if serr := store.SetTaskStatus(teamID, task.ID, "pending", ""); serr != nil {
+		return task, serr
+	}
+	return store.GetTeamTask(teamID, task.ID)
 }
 
 // runConfiguredProviderTeamTurn dispatches a team turn to an operator-configured

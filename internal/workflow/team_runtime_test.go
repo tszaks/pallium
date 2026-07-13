@@ -149,6 +149,419 @@ func TestRunTeamTurnAppliesDecisionAndDeliversMail(t *testing.T) {
 	}
 }
 
+// TestRunTeamTurnZombieDecisionMutatesNothing is the regression test for
+// ticket #32 (M1 review round 2, closed in M2): decision side effects used to
+// apply BEFORE FinishMemberTurn's lease check, so a turn whose lease was
+// stolen out from under it by a stale takeover WHILE its provider call was
+// still in flight could still send messages and claim/complete tasks — the
+// zombie's mutation landed, and only afterward did FinishMemberTurn discover
+// the lease was gone. This simulates that exact race with a real (slow) fake
+// claude binary: steal the lease mid-turn, then verify the in-flight turn's
+// decision — which claims one task, completes another it already owned, and
+// messages "lead" — mutates NOTHING once it finally finishes.
+func TestRunTeamTurnZombieDecisionMutatesNothing(t *testing.T) {
+	store, _ := newTeamTestStore(t)
+	repo := newTeamTestRepo(t)
+	team, err := store.CreateTeam("goal", repo, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SpawnMember(team.ID, "worker-1", "claude", "", "", "read-only"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PersistMemberSession(team.ID, "worker-1", "sess-1"); err != nil {
+		t.Fatal(err)
+	}
+	claimable, err := store.CreateTeamTask(team.ID, "claim me", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned, err := store.CreateTeamTask(team.ID, "already mine", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimTask(team.ID, owned.ID, "worker-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// A deliberately SLOW fake claude: sleeps long enough for the test to
+	// steal the lease while this "turn" is still in flight, then returns a
+	// decision that messages lead, claims `claimable`, and completes `owned`.
+	slow := filepath.Join(t.TempDir(), "fake-claude-slow.sh")
+	decision := fmt.Sprintf(`{"result":"{\"status\":\"idle\",\"summary\":\"done\",\"messages\":[{\"to\":\"lead\",\"body\":\"zombie speaking\"}],\"claim_task_id\":\"%s\",\"complete_task_id\":\"%s\",\"complete_result\":\"zombie result\"}"}`, claimable.ID, owned.ID)
+	script := "#!/bin/sh\ncat >/dev/null\nsleep 0.3\nprintf '%s' '" + decision + "'\n"
+	if err := os.WriteFile(slow, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	setClaudeCLI(t, slow)
+
+	r := &Runner{Run: Run{ID: team.ID}}
+	var wg sync.WaitGroup
+	var turnErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, turnErr = r.RunTeamTurn(context.Background(), store, team.ID, "worker-1", TeamTurnOptions{})
+	}()
+
+	// Give BeginMemberTurn time to acquire the real lease and dispatch into
+	// the slow provider call, then steal it: force turn_started_at stale and
+	// re-acquire, exactly what ReconcileInterruptedMembers/a second `team
+	// run` process does to a genuinely dead turn.
+	time.Sleep(100 * time.Millisecond)
+	if _, err := store.db.Exec(`UPDATE team_members SET turn_started_at='2000-01-01T00:00:00Z' WHERE team_id=? AND name='worker-1'`, team.ID); err != nil {
+		t.Fatal(err)
+	}
+	stolenLease, err := store.BeginMemberTurn(team.ID, "worker-1", nowString())
+	if err != nil {
+		t.Fatalf("expected the stale-takeover steal itself to succeed: %v", err)
+	}
+	if stolenLease == "" {
+		t.Fatal("expected a non-empty stolen lease")
+	}
+
+	wg.Wait()
+	if turnErr == nil {
+		t.Fatal("expected the zombie turn to surface an error once it discovers its lease is gone")
+	}
+	if !strings.Contains(turnErr.Error(), "not owned") {
+		t.Fatalf("expected a lease-not-owned error, got: %v", turnErr)
+	}
+
+	// The zombie's message to lead must never have been sent.
+	leadInbox, err := store.UndeliveredMessages(team.ID, "lead")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leadInbox) != 0 {
+		t.Fatalf("expected NO message from the zombie decision, got %+v", leadInbox)
+	}
+	// The task it tried to claim must still be pending/unowned.
+	gotClaimable, err := store.GetTeamTask(team.ID, claimable.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotClaimable.Status != "pending" || gotClaimable.Owner != "" {
+		t.Fatalf("expected the claim blocked, got %+v", gotClaimable)
+	}
+	// The task it tried to complete must still be in_progress, not completed.
+	gotOwned, err := store.GetTeamTask(team.ID, owned.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotOwned.Status != "in_progress" || gotOwned.Result != "" {
+		t.Fatalf("expected the completion blocked, got %+v", gotOwned)
+	}
+}
+
+// TestRunTeamTurnPlanPendingMemberCannotClaimOrComplete is the enforcement
+// test for the M2 plan-approval flow: buildTeamTurnPrompt politely asks a
+// plan-pending member not to claim/complete, but RunTeamTurn must actually
+// refuse to apply those decision fields regardless of what a member's turn
+// returns — a prompt is not enforcement.
+func TestRunTeamTurnPlanPendingMemberCannotClaimOrComplete(t *testing.T) {
+	store, _ := newTeamTestStore(t)
+	repo := newTeamTestRepo(t)
+	team, err := store.CreateTeam("goal", repo, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SpawnPlanRequiredMember(team.ID, "planner-1", "claude", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PersistMemberSession(team.ID, "planner-1", "sess-1"); err != nil {
+		t.Fatal(err)
+	}
+	claimable, err := store.CreateTeamTask(team.ID, "claim me", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Despite being read-only and plan-pending, the member's decision tries
+	// to claim a task anyway (a misbehaving or confused agent) — RunTeamTurn
+	// must ignore it.
+	setClaudeCLI(t, fakeClaudeBinary(t, fmt.Sprintf(`{"result":"{\"status\":\"blocked\",\"summary\":\"here is my plan\",\"messages\":[{\"to\":\"lead\",\"body\":\"my plan is X\"}],\"claim_task_id\":\"%s\"}"}`, claimable.ID)))
+
+	r := &Runner{Run: Run{ID: team.ID}}
+	if _, err := r.RunTeamTurn(context.Background(), store, team.ID, "planner-1", TeamTurnOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := store.GetTeamTask(team.ID, claimable.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "pending" || got.Owner != "" {
+		t.Fatalf("expected the claim ignored while plan is pending, got %+v", got)
+	}
+	// The plan message itself must still have gone through — enforcement
+	// blocks claim/complete, not the plan submission that's the whole point
+	// of this mode.
+	leadInbox, err := store.UndeliveredMessages(team.ID, "lead")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sawPlan, sawEnforcementNote := false, false
+	for _, m := range leadInbox {
+		if strings.Contains(m.Body, "my plan is X") {
+			sawPlan = true
+		}
+	}
+	planFeedback, err := store.UndeliveredMessages(team.ID, "planner-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range planFeedback {
+		if strings.Contains(m.Body, "still pending approval") {
+			sawEnforcementNote = true
+		}
+	}
+	if !sawPlan {
+		t.Fatalf("expected the plan message delivered to lead, got %+v", leadInbox)
+	}
+	if !sawEnforcementNote {
+		t.Fatalf("expected an enforcement explanation delivered to the member, got %+v", planFeedback)
+	}
+}
+
+// TestCreateTeamTaskWithGateBlocksRejectedTask exercises the task_created
+// quality-gate hook directly (no member turn involved — this hook fires
+// synchronously when a task is added, from the CLI or a workflow primitive,
+// never from inside a teammate's own decision).
+func TestCreateTeamTaskWithGateBlocksRejectedTask(t *testing.T) {
+	store, _ := newTeamTestStore(t)
+	repo := newTeamTestRepo(t)
+	team, err := store.CreateTeam("goal", repo, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetTeamGate(team.ID, "reject anything vague", []string{"task_created"}); err != nil {
+		t.Fatal(err)
+	}
+	setClaudeCLI(t, fakeClaudeBinary(t, `{"result":"{\"approved\":false,\"reason\":\"title is too vague to act on\"}"}`))
+
+	r := &Runner{Run: Run{ID: team.ID}}
+	task, err := r.CreateTeamTaskWithGate(context.Background(), store, team.ID, "do stuff", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != "blocked" || !strings.Contains(task.Result, "too vague") {
+		t.Fatalf("expected the task blocked with the gate's reason recorded, got %+v", task)
+	}
+}
+
+// TestCreateTeamTaskWithGateAllowsApprovedTask is the positive-path sibling:
+// an approved task must land exactly as CreateTeamTask alone would leave it.
+func TestCreateTeamTaskWithGateAllowsApprovedTask(t *testing.T) {
+	store, _ := newTeamTestStore(t)
+	repo := newTeamTestRepo(t)
+	team, err := store.CreateTeam("goal", repo, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetTeamGate(team.ID, "reject anything vague", []string{"task_created"}); err != nil {
+		t.Fatal(err)
+	}
+	setClaudeCLI(t, fakeClaudeBinary(t, `{"result":"{\"approved\":true,\"reason\":\"clear enough\"}"}`))
+
+	r := &Runner{Run: Run{ID: team.ID}}
+	task, err := r.CreateTeamTaskWithGate(context.Background(), store, team.ID, "fix the specific bug in auth.go line 42", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != "pending" {
+		t.Fatalf("expected the approved task to land pending as normal, got %+v", task)
+	}
+}
+
+// TestCreateTeamTaskWithGateNeverClaimableWhileGateInFlight is the
+// regression test for the race a live adversarial-review team found in this
+// batch's own new code (same session, same PR): a task_created-gated task
+// used to be created "pending" (claimable) and only flipped to "blocked"
+// AFTER the gate's provider round-trip returned, leaving a real window where
+// a concurrent claim (or even an edit-mode completion) could land before the
+// gate ever resolved. This simulates that exact race with a deliberately
+// slow fake claude binary standing in for the gate's verifier call, and
+// asserts a concurrent claim attempt fails throughout.
+func TestCreateTeamTaskWithGateNeverClaimableWhileGateInFlight(t *testing.T) {
+	store, _ := newTeamTestStore(t)
+	repo := newTeamTestRepo(t)
+	team, err := store.CreateTeam("goal", repo, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetTeamGate(team.ID, "reject anything vague", []string{"task_created"}); err != nil {
+		t.Fatal(err)
+	}
+
+	slow := filepath.Join(t.TempDir(), "fake-claude-slow-gate.sh")
+	script := "#!/bin/sh\ncat >/dev/null\nsleep 0.3\nprintf '%s' '{\"result\":\"{\\\"approved\\\":true,\\\"reason\\\":\\\"fine\\\"}\"}'\n"
+	if err := os.WriteFile(slow, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	setClaudeCLI(t, slow)
+
+	r := &Runner{}
+	var wg sync.WaitGroup
+	var task TeamTask
+	var createErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		task, createErr = r.CreateTeamTaskWithGate(context.Background(), store, team.ID, "do the thing", "", nil)
+	}()
+
+	// Give CreateTeamTaskWithGate time to insert the row and dispatch into
+	// the slow gate call, then attempt to claim it WHILE the gate is still
+	// in flight — this must fail: the row must already be "blocked", not
+	// the claimable "pending" the old create-then-flip order left exposed.
+	time.Sleep(100 * time.Millisecond)
+	tasks, err := store.ListTeamTasks(team.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("expected exactly one task visible while the gate is in flight, got %+v", tasks)
+	}
+	if tasks[0].Status != "blocked" {
+		t.Fatalf("expected the task already blocked while the gate is in flight (not claimable pending), got %+v", tasks[0])
+	}
+	if _, err := store.ClaimTask(team.ID, tasks[0].ID, "worker-1"); err != errTaskNotClaimable {
+		t.Fatalf("expected the concurrent claim to fail with errTaskNotClaimable while gated, got %v", err)
+	}
+
+	wg.Wait()
+	if createErr != nil {
+		t.Fatal(createErr)
+	}
+	if task.Status != "pending" {
+		t.Fatalf("expected the task to land pending once the gate approved it, got %+v", task)
+	}
+	// Now that the gate resolved, it must be claimable.
+	if _, err := store.ClaimTask(team.ID, task.ID, "worker-1"); err != nil {
+		t.Fatalf("expected the task claimable after gate approval, got %v", err)
+	}
+}
+
+// fakeClaudeBinaryBranching writes a fake claude CLI that inspects the piped
+// prompt to decide which of two envelopes to return — needed for any test
+// exercising a quality gate fired FROM WITHIN a member's own turn
+// (teammate_idle, task_completed): that turn makes TWO provider calls in
+// sequence (its own decision, then the gate's verdict), and both go through
+// the same fake binary. buildGatePrompt's fixed opening line ("You are an
+// autonomous workflow gate verifier") is what the branch checks for.
+func fakeClaudeBinaryBranching(t *testing.T, decisionEnvelope, gateEnvelope string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-claude-branch.sh")
+	script := "#!/bin/sh\ninput=\"$(cat)\"\nif echo \"$input\" | grep -q 'autonomous workflow gate verifier'; then\n  printf '%s' '" + gateEnvelope + "'\nelse\n  printf '%s' '" + decisionEnvelope + "'\nfi\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestRunTeamTurnTaskCompletedGateRejectsAndDeliversFeedback is Tyler's own
+// specified example for item 3: a completed task whose gate fails stays
+// in_progress (never actually transitioned, so nothing to "revert") with the
+// gate's output delivered to the owner as feedback.
+func TestRunTeamTurnTaskCompletedGateRejectsAndDeliversFeedback(t *testing.T) {
+	store, _ := newTeamTestStore(t)
+	repo := newTeamTestRepo(t)
+	team, err := store.CreateTeam("goal", repo, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetTeamGate(team.ID, "the result must mention tests passing", []string{"task_completed"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SpawnMember(team.ID, "worker-1", "claude", "", "", "read-only"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PersistMemberSession(team.ID, "worker-1", "sess-1"); err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.CreateTeamTask(team.ID, "fix the bug", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimTask(team.ID, task.ID, "worker-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	decision := fmt.Sprintf(`{"result":"{\"status\":\"idle\",\"summary\":\"done\",\"complete_task_id\":\"%s\",\"complete_result\":\"fixed it, did not run tests\"}"}`, task.ID)
+	gate := `{"result":"{\"approved\":false,\"reason\":\"no evidence tests were run\"}"}`
+	setClaudeCLI(t, fakeClaudeBinaryBranching(t, decision, gate))
+
+	r := &Runner{Run: Run{ID: team.ID}}
+	if _, err := r.RunTeamTurn(context.Background(), store, team.ID, "worker-1", TeamTurnOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := store.GetTeamTask(team.ID, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "in_progress" || got.Owner != "worker-1" {
+		t.Fatalf("expected the task to remain in_progress (gate-rejected completion never lands), got %+v", got)
+	}
+	feedback, err := store.UndeliveredMessages(team.ID, "worker-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, m := range feedback {
+		if strings.Contains(m.Body, "no evidence tests were run") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected the gate's reason delivered to the owner, got %+v", feedback)
+	}
+}
+
+// TestRunTeamTurnTeammateIdleGateForcesActiveOnRejection covers the third
+// hook: a member declares idle, the gate disagrees (there's still real work
+// it should keep doing), and the member's persisted status is forced back
+// to "active" with the gate's reason as the note instead of the member's
+// own claimed idle status.
+func TestRunTeamTurnTeammateIdleGateForcesActiveOnRejection(t *testing.T) {
+	store, _ := newTeamTestStore(t)
+	repo := newTeamTestRepo(t)
+	team, err := store.CreateTeam("goal", repo, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetTeamGate(team.ID, "don't go idle while any task is still pending", []string{"teammate_idle"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SpawnMember(team.ID, "worker-1", "claude", "", "", "read-only"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PersistMemberSession(team.ID, "worker-1", "sess-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	decision := `{"result":"{\"status\":\"idle\",\"summary\":\"nothing to do\"}"}`
+	gate := `{"result":"{\"approved\":false,\"reason\":\"there is still pending work on the board\"}"}`
+	setClaudeCLI(t, fakeClaudeBinaryBranching(t, decision, gate))
+
+	r := &Runner{Run: Run{ID: team.ID}}
+	if _, err := r.RunTeamTurn(context.Background(), store, team.ID, "worker-1", TeamTurnOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	member, err := store.GetMember(team.ID, "worker-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if member.Status != "active" {
+		t.Fatalf("expected the gate to force status back to active, got %+v", member)
+	}
+	if !strings.Contains(member.LastTurnError, "still pending work") {
+		t.Fatalf("expected the gate's reason recorded as the turn note, got %+v", member)
+	}
+}
+
 func TestRunTeamTurnProviderFailureNotifiesLeadWithError(t *testing.T) {
 	store, _ := newTeamTestStore(t)
 	repo := newTeamTestRepo(t)
@@ -858,5 +1271,42 @@ func TestRunTeamTurnRecordsRealClaudeSpend(t *testing.T) {
 	}
 	if updatedTeam.SpendUSD != 0.05 {
 		t.Fatalf("expected team spend recorded as 0.05, got %v", updatedTeam.SpendUSD)
+	}
+}
+
+// TestCreateWorktreeRecoversFromStaleDirectoryFromAKilledTurn is the
+// regression test for a real M1-era bug this batch's own live kill/resume
+// acceptance proof surfaced: killing the steering process mid-turn leaves
+// that turn's worktree directory on disk (its own cleanup never ran); a
+// team member reuses the SAME deterministic worktree path (keyed on
+// member.ID) on every turn, so the member's next turn's createWorktree call
+// used to fail outright with "already exists", permanently blocking that
+// member's edit mode. Not introduced by M2 — found because M2's live proof
+// exercised a real kill/resume for the first time in a while.
+func TestCreateWorktreeRecoversFromStaleDirectoryFromAKilledTurn(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // RunArtifactDir resolves under $HOME/.pallium — never touch the real one
+	repo := newTeamTestRepo(t)
+	r := &Runner{Run: Run{ID: "wf-stale-worktree-test"}}
+
+	path, err := r.createWorktree("tm-stale", repo)
+	if err != nil {
+		t.Fatalf("first createWorktree call: %v", err)
+	}
+	// Simulate the kill: leave the worktree exactly as a real interrupted
+	// turn would — never call removeWorktree/finalizeWorktreePatch. Confirm
+	// the deterministic path is genuinely still there before retrying.
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected the first worktree to still exist (simulating a killed turn's leftover): %v", err)
+	}
+
+	secondPath, err := r.createWorktree("tm-stale", repo)
+	if err != nil {
+		t.Fatalf("expected createWorktree to recover from the stale leftover directory, got: %v", err)
+	}
+	if secondPath != path {
+		t.Fatalf("expected the same deterministic path reused, got %q vs %q", secondPath, path)
+	}
+	if _, err := os.Stat(secondPath); err != nil {
+		t.Fatalf("expected a genuinely fresh worktree to exist after recovery: %v", err)
 	}
 }
