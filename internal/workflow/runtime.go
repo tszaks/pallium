@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -2332,6 +2333,19 @@ func validateSchemaValue(value any, schema map[string]any, path string) error {
 	if rawType, ok := schema["type"]; ok && !schemaTypeMatches(value, rawType) {
 		return fmt.Errorf("%s expected %s", path, schemaTypeName(rawType))
 	}
+	// enum applies regardless of type (JSON Schema allows it on any node),
+	// so it's checked here unconditionally, not folded into one of the
+	// type-specific branches below. Found by adversarial review of #52:
+	// teamDecisionSchema's own status field has always declared
+	// enum:["active","idle","blocked"], but nothing in this function ever
+	// read the "enum" keyword at all — a decision like {"status":"done"}
+	// passed validation and persisted a status value that matched none of
+	// the three the rest of the codebase actually branches on.
+	if rawEnum, ok := schema["enum"].([]any); ok {
+		if !enumAllows(rawEnum, value) {
+			return fmt.Errorf("%s must be one of %v, got %v", path, rawEnum, value)
+		}
+	}
 	switch schemaConcreteType(value, schema["type"], schema) {
 	case "object":
 		obj, ok := value.(map[string]any)
@@ -2409,6 +2423,46 @@ func schemaConcreteType(value any, rawType any, schema map[string]any) string {
 		return "array"
 	}
 	return ""
+}
+
+// enumAllows reports whether value equals one of the enum's declared
+// options. Numeric options get their own comparison (converted to float64
+// on both sides) rather than reflect.DeepEqual alone: a Go-source schema
+// literal like enum: []any{1, 2, 3} holds plain ints, but any value
+// decoded from real agent JSON output arrives as float64 — DeepEqual(1,
+// float64(1)) is false despite being the same logical number, which would
+// silently reject every legitimate integer enum value. Every OTHER type
+// (string, bool, nil, and any deliberately structured object/array option)
+// still goes through DeepEqual.
+func enumAllows(options []any, value any) bool {
+	for _, opt := range options {
+		if optNum, ok := toFloat64(opt); ok {
+			if valNum, ok := toFloat64(value); ok && optNum == valNum {
+				return true
+			}
+			continue
+		}
+		if reflect.DeepEqual(opt, value) {
+			return true
+		}
+	}
+	return false
+}
+
+func toFloat64(v any) (float64, bool) {
+	switch typed := v.(type) {
+	case float64:
+		return typed, true
+	case int:
+		return float64(typed), true
+	case int64:
+		return float64(typed), true
+	case json.Number:
+		f, err := typed.Float64()
+		return f, err == nil
+	default:
+		return 0, false
+	}
 }
 
 func schemaTypeMatches(value any, rawType any) bool {

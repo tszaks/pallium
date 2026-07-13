@@ -855,6 +855,24 @@ func (s *Store) ClearNudge(teamID, name string) error {
 	return err
 }
 
+// ClearNudgeIfUnchanged clears the nudge only if it still holds the exact
+// value it had before the just-finished turn started (expectedNudgedAt, an
+// empty string included). RunTeam uses this instead of the unconditional
+// ClearNudge specifically because a turn's OWN processing can set a FRESH
+// nudge mid-turn — the malformed-decision path in RunTeamTurn does exactly
+// this, nudging the member so it survives the scheduler's "unchanged
+// board" eligibility watermark — and the unconditional version cleared
+// that brand-new nudge in the very same round it was set, immediately
+// undoing the fix. Same CAS-on-a-specific-value shape as
+// BeginMemberTurn/FinishMemberTurn's lease check, applied to this column
+// instead of turn_started_at. Found by adversarial review of #52 (the
+// PR that introduced the mid-turn nudge in the first place).
+func (s *Store) ClearNudgeIfUnchanged(teamID, name, expectedNudgedAt string) error {
+	_, err := s.db.Exec(`UPDATE team_members SET nudged_at=NULL, updated_at=? WHERE team_id=? AND name=? AND COALESCE(nudged_at,'')=?`,
+		nowString(), teamID, name, expectedNudgedAt)
+	return err
+}
+
 // ReconcileInterruptedMembers finds members whose turn_started_at is older
 // than staleAfter (an owning `pallium team run` process died mid-turn) and
 // marks them "interrupted" so `team status` reports it honestly instead of
