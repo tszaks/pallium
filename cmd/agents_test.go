@@ -21,6 +21,24 @@ func TestAgentsBlockPrintsMarkers(t *testing.T) {
 	}
 }
 
+// TestAgentsBlockMentionsEveryService is the regression test for a real
+// staleness bug found while building M3's adoption eval: this block is the
+// ACTUAL text `pallium agents install` writes into real AGENTS.md/CLAUDE.md
+// files, and it only ever mentioned workflows — team and loop shipped whole
+// milestones ago with no update here, so a fresh agent relying on this exact
+// trigger had no textual path to discovering 2 of Pallium's 6 services. This
+// doesn't assert exact wording (that's expected to evolve) — just that the
+// CLI verb for every service that has one is mentioned somewhere, so adding
+// a 7th service without touching this block fails loudly instead of quietly
+// shipping another multi-milestone discovery gap.
+func TestAgentsBlockMentionsEveryService(t *testing.T) {
+	for _, verb := range []string{"pallium workflow", "pallium team", "pallium loop"} {
+		if !strings.Contains(agentsBlock, verb) {
+			t.Fatalf("expected the adoption trigger block to mention %q, it did not: %s", verb, agentsBlock)
+		}
+	}
+}
+
 func TestAgentsGuidePrintsGuide(t *testing.T) {
 	var out bytes.Buffer
 	if err := runAgents(&out, []string{"guide"}, false); err != nil {

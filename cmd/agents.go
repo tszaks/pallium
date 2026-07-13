@@ -22,13 +22,15 @@ const (
 const agentsBlock = agentsBlockBegin + "\n" +
 	"## Pallium\n" +
 	"\n" +
-	"This machine has Pallium: a local control plane for coding agents (workflows, repo memory, verification, session state — kept outside your context window).\n" +
+	"This machine has Pallium: a local control plane for coding agents (workflows, loops, agent teams, repo memory, verification, session state — kept outside your context window).\n" +
 	"\n" +
-	"Reach for it when a task is multi-step, needs tests objectively green, wants parallel workers, must survive the session, or needs isolated reviewable edits. Skip it for one-shot edits.\n" +
+	"Reach for it when a task is multi-step, needs tests objectively green, wants parallel workers, must survive the session, needs isolated reviewable edits, needs peers coordinating and messaging each other, or needs to keep retrying across separate future invocations. Skip it for one-shot edits.\n" +
 	"\n" +
 	"- Scope first: `pallium workflow preflight \"<task>\"` (files to inspect, risk, test commands)\n" +
 	"- Orchestrate: write an async-JS workflow, then `pallium workflow validate f.js && pallium workflow run --script f.js \"<task>\" --json`\n" +
 	"- Primitives: `agent()` (schema-validated workers), `pipeline()` (streaming stages), `parallel()` (barrier), `verify.untilGreen()`, `gate()` — discover all with `pallium workflow tools list --json`\n" +
+	"- Peers messaging/disagreeing with each other: `pallium team start|spawn|send|run` (or `team start --template parallel-review|adversarial-debate` for a known-good shape)\n" +
+	"- Bounded cycles that survive across separate invocations: `pallium loop start|tick|status` — no daemon, an external scheduler or you decide when to tick again\n" +
 	"- Resume and inspect: `pallium workflow resume|inspect|report <run-id>`\n" +
 	"\n" +
 	"Full agent guide: `pallium agents guide`\n" +
