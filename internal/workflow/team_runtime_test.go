@@ -381,6 +381,40 @@ func TestCreateTeamTaskWithGateAllowsApprovedTask(t *testing.T) {
 	}
 }
 
+// TestCreateTeamTaskWithGateParksTeamWhenGateSpendCrossesBudget is the
+// regression test for the finding that AddTeamSpend's overBudget return
+// value was discarded at every gate-spend call site: a one-off call like
+// this (outside RunTeam's own round loop, which separately re-derives the
+// same fact from team.SpendUSD at the end of each round) never parked the
+// team even after a gate's own reported cost pushed spend over the limit.
+func TestCreateTeamTaskWithGateParksTeamWhenGateSpendCrossesBudget(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER", "claude") // see TestCreateTeamTaskWithGateBlocksRejectedTask's comment
+	store, _ := newTeamTestStore(t)
+	repo := newTeamTestRepo(t)
+	team, err := store.CreateTeam("goal", repo, 0.01) // tiny budget
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetTeamGate(team.ID, "reject anything vague", []string{"task_created"}); err != nil {
+		t.Fatal(err)
+	}
+	// The gate's own reported cost alone (0.05) already exceeds the 0.01
+	// budget — no team turn cost involved at all.
+	setClaudeCLI(t, fakeClaudeBinary(t, `{"result":"{\"approved\":true,\"reason\":\"clear enough\"}","total_cost_usd":0.05}`))
+
+	r := &Runner{Run: Run{ID: team.ID}}
+	if _, err := r.CreateTeamTaskWithGate(context.Background(), store, team.ID, "fix the specific bug in auth.go line 42", "", nil); err != nil {
+		t.Fatal(err)
+	}
+	gotTeam, err := store.GetTeam(team.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotTeam.Status != "parked" {
+		t.Fatalf("expected the team parked once the gate's own cost crossed the budget, got status=%q spend=%v", gotTeam.Status, gotTeam.SpendUSD)
+	}
+}
+
 // TestCreateTeamTaskWithGateNeverClaimableWhileGateInFlight is the
 // regression test for the race a live adversarial-review team found in this
 // batch's own new code (same session, same PR): a task_created-gated task
@@ -585,6 +619,58 @@ func TestRunTeamTurnTeammateIdleGateForcesActiveOnRejection(t *testing.T) {
 	}
 }
 
+// TestRunTeamTurnTeammateIdleGateFailsClosedOnMalfunction is the regression
+// test for the review finding that a teammate_idle gate malfunction (the
+// verifier call itself erroring, not just a clean rejection) used to
+// proceed idle unchanged — the one hook point that quietly approved-by-
+// default instead of failing closed like task_created/task_completed
+// already do.
+func TestRunTeamTurnTeammateIdleGateFailsClosedOnMalfunction(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER", "claude") // see TestCreateTeamTaskWithGateBlocksRejectedTask's comment
+	store, _ := newTeamTestStore(t)
+	repo := newTeamTestRepo(t)
+	team, err := store.CreateTeam("goal", repo, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetTeamGate(team.ID, "don't go idle while any task is still pending", []string{"teammate_idle"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SpawnMember(team.ID, "worker-1", "claude", "", "", "read-only"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PersistMemberSession(team.ID, "worker-1", "sess-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	decision := `{"result":"{\"status\":\"idle\",\"summary\":\"nothing to do\"}"}`
+	gate := `{"is_error":true,"result":"verifier crashed"}` // a genuine gate-run failure, not a clean rejection
+	setClaudeCLI(t, fakeClaudeBinaryBranching(t, decision, gate))
+
+	r := &Runner{Run: Run{ID: team.ID}}
+	if _, err := r.RunTeamTurn(context.Background(), store, team.ID, "worker-1", TeamTurnOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	member, err := store.GetMember(team.ID, "worker-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if member.Status != "active" {
+		t.Fatalf("expected a gate malfunction to fail closed (force active), not approve idle by default, got %+v", member)
+	}
+	if !strings.Contains(member.LastTurnError, "failed to run") {
+		t.Fatalf("expected the malfunction recorded as the turn note, got %+v", member)
+	}
+	gotTeam, err := store.GetTeam(team.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !(gotTeam.TasksUpdatedAt > member.LastTurnAt) {
+		t.Fatalf("expected the watermark bumped so the scheduler re-offers this member a turn, same as an explicit rejection, got team.TasksUpdatedAt=%q member.LastTurnAt=%q", gotTeam.TasksUpdatedAt, member.LastTurnAt)
+	}
+}
+
 // TestDescribeClaimableWork covers the teammate_idle gate's task-board
 // summary (found by review: the gate used to see only the teammate's own
 // summary, with no factual board state to check an idle claim against).
@@ -665,6 +751,84 @@ func TestCompleteTaskWithGateSkipsGateForIneligibleTask(t *testing.T) {
 	}
 	if _, statErr := os.Stat(marker); statErr != nil {
 		t.Fatalf("expected the gate verifier invoked once the task became eligible: %v", statErr)
+	}
+}
+
+// TestRunTeamTurnCompletionGateRunsBeforeFinishMemberTurn is the regression
+// test for the durability finding: the task_completed gate's provider call
+// must happen BEFORE FinishMemberTurn releases the lease, not after — a
+// crash during a slow gate round-trip must never durably record the turn as
+// "finished" while the completion (and its gate verdict) was never applied.
+// Proven by observation, not simulated crash: the fake gate verifier sleeps
+// briefly, and this asserts the member's lease (turn_started_at) is STILL
+// held partway through that sleep — i.e. FinishMemberTurn has not run yet
+// even though the gate call is already in flight.
+func TestRunTeamTurnCompletionGateRunsBeforeFinishMemberTurn(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER", "claude") // see TestCreateTeamTaskWithGateBlocksRejectedTask's comment
+	store, _ := newTeamTestStore(t)
+	repo := newTeamTestRepo(t)
+	team, err := store.CreateTeam("goal", repo, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetTeamGate(team.ID, "verify the result", []string{"task_completed"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SpawnMember(team.ID, "worker-1", "claude", "", "", "read-only"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PersistMemberSession(team.ID, "worker-1", "sess-1"); err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.CreateTeamTask(team.ID, "fix the bug", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimTask(team.ID, task.ID, "worker-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	const gateSleep = "0.4"
+	decision := fmt.Sprintf(`{"result":"{\"status\":\"idle\",\"summary\":\"done\",\"complete_task_id\":\"%s\",\"complete_result\":\"fixed it\"}"}`, task.ID)
+	path := filepath.Join(t.TempDir(), "fake-claude-slow-gate.sh")
+	script := "#!/bin/sh\ninput=\"$(cat)\"\nif echo \"$input\" | grep -q 'autonomous workflow gate verifier'; then\n  sleep " + gateSleep + "\n  printf '%s' '{\"result\":\"{\\\"approved\\\":true,\\\"reason\\\":\\\"ok\\\"}\"}'\nelse\n  printf '%s' '" + decision + "'\nfi\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	setClaudeCLI(t, path)
+
+	r := &Runner{Run: Run{ID: team.ID}}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := r.RunTeamTurn(context.Background(), store, team.ID, "worker-1", TeamTurnOptions{}); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	time.Sleep(150 * time.Millisecond) // well inside the 400ms gate sleep
+	mid, err := store.GetMember(team.ID, "worker-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mid.TurnStartedAt == "" {
+		t.Fatalf("expected the lease STILL held while the task_completed gate's provider call is in flight (FinishMemberTurn must run after, not before, the gate resolves), but turn_started_at was already cleared")
+	}
+
+	<-done
+	final, err := store.GetMember(team.ID, "worker-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.TurnStartedAt != "" {
+		t.Fatalf("expected the lease released once the turn actually finished, got %+v", final)
+	}
+	gotTask, err := store.GetTeamTask(team.ID, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotTask.Status != "completed" {
+		t.Fatalf("expected the approved completion applied after the turn finished, got %+v", gotTask)
 	}
 }
 

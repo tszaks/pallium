@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -261,7 +262,7 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 
 	output, capturedToken, costUSD, turnErr := r.dispatchTeamTurn(turnCtx, store, teamID, lease, &member, cwd, prompt)
 	if costUSD > 0 {
-		if _, serr := store.AddTeamSpend(teamID, costUSD); serr != nil {
+		if serr := recordTeamSpend(store, teamID, costUSD); serr != nil {
 			r.notifyLeadOfMemberError(store, teamID, name, fmt.Errorf("recording spend: %w", serr))
 		}
 	}
@@ -380,6 +381,17 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 	// found by review: a hung verifier here used to be unbounded by the same
 	// timeout as the teammate's own provider call, leaving the turn (and its
 	// lease) stuck past the requested timeout instead of failing within it.
+	// Plan-approval enforcement (M2): a plan-required member whose plan is
+	// still pending cannot claim or complete anything — real enforcement,
+	// not just the prompt's polite ask (buildTeamTurnPrompt already tells it
+	// not to try). `member` is the snapshot from BEFORE this turn ran, which
+	// is the right thing to gate on: if lead approved mid-turn, this
+	// decision was still MADE under "still pending" framing and should not
+	// retroactively count as post-approval action — it gets to act on its
+	// next turn instead. Hoisted here (used below AND by the task_completed
+	// gate pre-resolution right after) rather than declared where it's first
+	// read further down.
+	planPending := member.PlanRequired && member.PlanStatus == "pending"
 	rescheduleAfterIdleRejection := false
 	if status == "idle" && teamGateHasHook(team, "teammate_idle") {
 		situation := fmt.Sprintf("Teammate %q wants to go idle. Its own summary: %s\n%s", name, decision.Summary, describeClaimableWork(tasks))
@@ -394,17 +406,56 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 			// FinishMemberTurn's spendDelta below, attributing the gate's
 			// cost to the member's own turn-level spend as well.
 			costUSD += gateCostUSD
-			if _, serr := store.AddTeamSpend(teamID, gateCostUSD); serr != nil {
+			if serr := recordTeamSpend(store, teamID, gateCostUSD); serr != nil {
 				r.notifyLeadOfMemberError(store, teamID, name, fmt.Errorf("recording teammate_idle gate spend: %w", serr))
 			}
 		}
 		switch {
 		case gerr != nil:
-			statusNote = statusNote + fmt.Sprintf(" [teammate_idle gate failed to run: %v — proceeding idle]", gerr)
+			// Fail CLOSED, matching task_created/task_completed's own
+			// malfunction handling (CreateTeamTaskWithGate leaves the task
+			// blocked; CompleteTaskWithGate returns approved=false) — found
+			// by review: this used to proceed idle unchanged on a gate
+			// malfunction, the one hook point that quietly approved-by-
+			// default instead of treating "the gate didn't answer" as a
+			// reason to keep the member active rather than let it stop.
+			status = "active"
+			statusNote = fmt.Sprintf("%s [teammate_idle gate failed to run: %v — staying active rather than approving idle by default]", statusNote, gerr)
+			rescheduleAfterIdleRejection = true
 		case !approved:
 			status = "active"
 			statusNote = "quality gate blocked going idle: " + reason
 			rescheduleAfterIdleRejection = true
+		}
+	}
+	// task_completed gate resolution (if a completion was decided AND the
+	// plan-pending check below won't ignore it anyway): same "run the slow
+	// part before FinishMemberTurn" pattern as the teammate_idle gate above,
+	// for a DIFFERENT reason — not a lease-safety concern (resolving the
+	// gate here writes nothing the decision's own claim/complete would; only
+	// applyTaskCompletionVerdict after FinishMemberTurn below does that), but
+	// a durability one. Found by review: with this gate call running AFTER
+	// FinishMemberTurn (where ticket #32's fix left it), a crash during the
+	// round-trip durably recorded the turn as finished while the completion
+	// — and its gate verdict — was never applied and never would be:
+	// silently lost, not merely delayed. Resolving it here means only the
+	// fast, local write in applyTaskCompletionVerdict remains in the
+	// post-finish window.
+	var completionVerdict taskCompletionVerdict
+	completionReady := false
+	if id := strings.TrimSpace(decision.CompleteTaskID); id != "" && !planPending {
+		_, verdict, gateCostUSD, cerr := r.resolveTaskCompletionGate(turnCtx, store, teamID, id, name, decision.CompleteResult)
+		if gateCostUSD > 0 {
+			costUSD += gateCostUSD
+			if serr := recordTeamSpend(store, teamID, gateCostUSD); serr != nil {
+				r.notifyLeadOfMemberError(store, teamID, name, fmt.Errorf("recording task_completed gate spend: %w", serr))
+			}
+		}
+		if cerr != nil {
+			r.notifyLeadOfMemberError(store, teamID, name, fmt.Errorf("completing task %s: %w", id, cerr))
+		} else {
+			completionVerdict = verdict
+			completionReady = true
 		}
 	}
 	// Lease-guard the decision's OWN side effects, not just mail delivery
@@ -446,15 +497,6 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 			r.notifyLeadOfMemberError(store, teamID, name, fmt.Errorf("relaying a message: %w", err))
 		}
 	}
-	// Plan-approval enforcement (M2): a plan-required member whose plan is
-	// still pending cannot claim or complete anything — real enforcement,
-	// not just the prompt's polite ask (buildTeamTurnPrompt already tells it
-	// not to try). `member` is the snapshot from BEFORE this turn ran, which
-	// is the right thing to gate on: if lead approved mid-turn, this
-	// decision was still MADE under "still pending" framing and should not
-	// retroactively count as post-approval action — it gets to act on its
-	// next turn instead.
-	planPending := member.PlanRequired && member.PlanStatus == "pending"
 	if planPending && (decision.ClaimTaskID != "" || decision.CompleteTaskID != "") {
 		_, _ = store.SendTeamMessage(teamID, "lead", name, "Your plan is still pending approval — ignored the claim/complete in your last decision. Submit or wait for your plan to be approved first.")
 	} else {
@@ -463,74 +505,118 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 				r.notifyLeadOfMemberError(store, teamID, name, fmt.Errorf("claiming task %s: %w", id, err))
 			}
 		}
-		if id := strings.TrimSpace(decision.CompleteTaskID); id != "" {
-			// turnCtx, not the unbounded outer ctx — same fix as the
-			// teammate_idle gate above (line ~385) and for the identical
-			// reason: a hung task_completed verifier here used to be
-			// unbounded by --agent-timeout, leaving the goroutine (and the
-			// already-finished turn's lease) stuck past the requested
-			// timeout instead of failing within it. Found by review.
-			if _, _, err := r.CompleteTaskWithGate(turnCtx, store, teamID, id, name, decision.CompleteResult); err != nil {
-				r.notifyLeadOfMemberError(store, teamID, name, fmt.Errorf("completing task %s: %w", id, err))
+		if completionReady {
+			// The gate (if any) already resolved above, before
+			// FinishMemberTurn — only the fast, local write remains here.
+			if _, _, err := r.applyTaskCompletionVerdict(store, teamID, name, decision.CompleteResult, completionVerdict); err != nil {
+				r.notifyLeadOfMemberError(store, teamID, name, fmt.Errorf("completing task %s: %w", completionVerdict.task.ID, err))
 			}
 		}
 	}
 	return true, nil
 }
 
-// CompleteTaskWithGate wraps Store.CompleteTask with the M2 task_completed
-// hook (if the team has one configured) — the front door BOTH RunTeamTurn's
-// own decision-application (a member's own turn deciding it's done) and the
-// team.tasks.complete script primitive use, so a script-driven completion
-// gets the identical quality bar a member's own decision does, not a
-// backdoor around it. approved is false (not an error) on a genuine
-// rejection: the verifier's reason is delivered to owner as feedback and the
-// task is left exactly where it was — it was never marked completed in the
-// first place (checked before, not after), so there is nothing to literally
-// revert; staying "in_progress" is the same observable outcome as a revert.
-func (r *Runner) CompleteTaskWithGate(ctx context.Context, store *Store, teamID, taskID, owner, result string) (task TeamTask, approved bool, err error) {
+// errTaskCompletionNotEligible distinguishes "this request could never
+// succeed" (wrong owner, already completed) from a genuine gate-run failure
+// — CompleteTaskWithGate returns it silently (no lead notification, just the
+// error), while a gate-run failure gets an explicit "quality-gate" message
+// to lead. RunTeamTurn's caller checks errors.Is against this to decide
+// whether it needs its own notification on top.
+var errTaskCompletionNotEligible = errors.New("team task completion not eligible")
+
+// taskCompletionVerdict is what resolveTaskCompletionGate decides — approved
+// or rejected, and why — without applying either outcome yet.
+type taskCompletionVerdict struct {
+	task     TeamTask
+	approved bool
+	reason   string
+}
+
+// resolveTaskCompletionGate runs the task_completed hook (if the team has
+// one configured) and decides approved/rejected, but does not write
+// anything a completion or rejection would normally write — see
+// applyTaskCompletionVerdict for that. Split out so RunTeamTurn's decision-
+// application path can run this (the only slow, external part — the gate's
+// provider round-trip) BEFORE FinishMemberTurn releases the turn's lease,
+// deferring the fast, local-only write until after. Found by review: with
+// the gate check running after FinishMemberTurn (as ticket #32's fix left
+// it), a crash during that round-trip durably recorded the turn as
+// "finished" while the completion decision — and its gate verdict — was
+// never applied and never would be: silently lost, not merely delayed.
+// CompleteTaskWithGate (the CLI/script front door, with no lease/turn to
+// protect) just calls this immediately followed by applyTaskCompletionVerdict,
+// getting the identical checks in one call as before this split.
+func (r *Runner) resolveTaskCompletionGate(ctx context.Context, store *Store, teamID, taskID, owner, result string) (task TeamTask, verdict taskCompletionVerdict, costUSD float64, err error) {
 	team, err := store.GetTeam(teamID)
 	if err != nil {
-		return TeamTask{}, false, err
+		return TeamTask{}, taskCompletionVerdict{}, 0, err
 	}
-	if teamGateHasHook(team, "task_completed") {
-		task, err = store.GetTeamTask(teamID, taskID)
-		if err != nil {
-			return TeamTask{}, false, err
-		}
-		// Check eligibility BEFORE spending a real gate call: CompleteTask's
-		// own CAS (owner=? AND status='in_progress') is the actual authority
-		// and still runs below regardless, but a request that can't
-		// possibly succeed (wrong owner, already completed, reclaimed away
-		// from a stale owner) shouldn't cost a provider round-trip to find
-		// that out. Found by review. Non-atomic — a task reassigned between
-		// this check and CompleteTask's CAS just falls through to the same
-		// error CompleteTask already produces, which is fine: this is a
-		// cost-avoidance shortcut for the common case, not a second source
-		// of truth.
-		if task.Status != "in_progress" || task.Owner != owner {
-			return task, false, fmt.Errorf("team task %q is not owned by %q (or already completed); cannot complete it", taskID, owner)
-		}
-		var reason string
-		var gateCostUSD float64
-		situation := fmt.Sprintf("Task %q (%s), owned by %s, is proposed complete. Description:\n%s\nResult:\n%s", task.Title, task.ID, owner, task.Description, result)
-		approved, reason, gateCostUSD, err = r.runTeamGate(ctx, team, situation)
-		if gateCostUSD > 0 {
-			if _, serr := store.AddTeamSpend(teamID, gateCostUSD); serr != nil {
-				_, _ = store.SendTeamMessage(teamID, "quality-gate", "lead", fmt.Sprintf("recording task_completed gate spend for %s: %v", taskID, serr))
-			}
-		}
-		if err != nil {
-			_, _ = store.SendTeamMessage(teamID, "quality-gate", "lead", fmt.Sprintf("task_completed gate for %s failed to run: %v", taskID, err))
-			return task, false, err
-		}
-		if !approved {
-			_, _ = store.SendTeamMessage(teamID, "lead", owner, fmt.Sprintf("Your completion of task %s was NOT approved by the quality gate: %s Please address this and complete it again.", taskID, reason))
-			return task, false, nil
-		}
+	task, err = store.GetTeamTask(teamID, taskID)
+	if err != nil {
+		return TeamTask{}, taskCompletionVerdict{}, 0, err
 	}
-	task, err = store.CompleteTask(teamID, taskID, owner, result)
+	if !teamGateHasHook(team, "task_completed") {
+		return task, taskCompletionVerdict{task: task, approved: true}, 0, nil
+	}
+	// Check eligibility BEFORE spending a real gate call: CompleteTask's own
+	// CAS (owner=? AND status='in_progress') is the actual authority and
+	// still runs in applyTaskCompletionVerdict regardless, but a request
+	// that can't possibly succeed (wrong owner, already completed,
+	// reclaimed away from a stale owner) shouldn't cost a provider
+	// round-trip to find that out. Found by review. Non-atomic — a task
+	// reassigned between this check and CompleteTask's CAS just falls
+	// through to the same error CompleteTask already produces, which is
+	// fine: this is a cost-avoidance shortcut for the common case, not a
+	// second source of truth.
+	if task.Status != "in_progress" || task.Owner != owner {
+		return task, taskCompletionVerdict{}, 0, fmt.Errorf("%w: team task %q is not owned by %q (or already completed); cannot complete it", errTaskCompletionNotEligible, taskID, owner)
+	}
+	situation := fmt.Sprintf("Task %q (%s), owned by %s, is proposed complete. Description:\n%s\nResult:\n%s", task.Title, task.ID, owner, task.Description, result)
+	approved, reason, gateCostUSD, gerr := r.runTeamGate(ctx, team, situation)
+	if gerr != nil {
+		return task, taskCompletionVerdict{}, gateCostUSD, gerr
+	}
+	return task, taskCompletionVerdict{task: task, approved: approved, reason: reason}, gateCostUSD, nil
+}
+
+// applyTaskCompletionVerdict writes the outcome resolveTaskCompletionGate
+// already decided: CompleteTask on approval, a feedback message to owner on
+// rejection. Both are fast, local-only SQL — deliberately nothing here ever
+// makes a provider call, which is the entire point of the split above.
+func (r *Runner) applyTaskCompletionVerdict(store *Store, teamID, owner, result string, verdict taskCompletionVerdict) (TeamTask, bool, error) {
+	if !verdict.approved {
+		_, _ = store.SendTeamMessage(teamID, "lead", owner, fmt.Sprintf("Your completion of task %s was NOT approved by the quality gate: %s Please address this and complete it again.", verdict.task.ID, verdict.reason))
+		return verdict.task, false, nil
+	}
+	task, err := store.CompleteTask(teamID, verdict.task.ID, owner, result)
 	return task, err == nil, err
+}
+
+// CompleteTaskWithGate wraps Store.CompleteTask with the M2 task_completed
+// hook (if the team has one configured) — the front door BOTH RunTeamTurn's
+// own decision-application (a member's own turn deciding it's done, via the
+// resolve/apply split above) and the team.tasks.complete script primitive
+// use, so a script-driven completion gets the identical quality bar a
+// member's own decision does, not a backdoor around it. approved is false
+// (not an error) on a genuine rejection: the verifier's reason is delivered
+// to owner as feedback and the task is left exactly where it was — it was
+// never marked completed in the first place (checked before, not after), so
+// there is nothing to literally revert; staying "in_progress" is the same
+// observable outcome as a revert.
+func (r *Runner) CompleteTaskWithGate(ctx context.Context, store *Store, teamID, taskID, owner, result string) (TeamTask, bool, error) {
+	task, verdict, gateCostUSD, err := r.resolveTaskCompletionGate(ctx, store, teamID, taskID, owner, result)
+	if gateCostUSD > 0 {
+		if serr := recordTeamSpend(store, teamID, gateCostUSD); serr != nil {
+			_, _ = store.SendTeamMessage(teamID, "quality-gate", "lead", fmt.Sprintf("recording task_completed gate spend for %s: %v", taskID, serr))
+		}
+	}
+	if err != nil {
+		if !errors.Is(err, errTaskCompletionNotEligible) {
+			_, _ = store.SendTeamMessage(teamID, "quality-gate", "lead", fmt.Sprintf("task_completed gate for %s failed to run: %v", taskID, err))
+		}
+		return task, false, err
+	}
+	return r.applyTaskCompletionVerdict(store, teamID, owner, result, verdict)
 }
 
 // dispatchTeamTurn routes to the member's provider. Unlike a regular worker
@@ -604,6 +690,28 @@ func (r *Runner) notifyLeadOfMemberError(store *Store, teamID, name string, err 
 		return
 	}
 	_, _ = store.SendTeamMessage(teamID, name, "lead", fmt.Sprintf("turn failed: %v", err))
+}
+
+// recordTeamSpend wraps AddTeamSpend so every spend-adding call site — the
+// member's own turn cost AND every gate call's cost — reacts to going over
+// budget the same way, not just the ones that happen to run inside RunTeam's
+// own round loop (which separately re-derives the identical fact from
+// team.SpendUSD at the end of each round). Found by review: a gate call
+// invoked from a one-off CLI command or workflow primitive (team tasks add/
+// complete, team.tasks.create/complete) never goes through that loop at all,
+// so nothing parked the team even after spend crossed BudgetUSDLimit.
+// Best-effort like every other spend-recording error path in this file: a
+// failure to even attempt parking is not itself fatal to the turn/call
+// already in flight.
+func recordTeamSpend(store *Store, teamID string, amount float64) error {
+	overBudget, err := store.AddTeamSpend(teamID, amount)
+	if err != nil {
+		return err
+	}
+	if overBudget {
+		_ = store.SetTeamStatus(teamID, "parked")
+	}
+	return nil
 }
 
 // teamGateHasHook reports whether team is configured to fire its quality
@@ -808,7 +916,7 @@ func (r *Runner) CreateTeamTaskWithGate(ctx context.Context, store *Store, teamI
 	}
 	approved, reason, gateCostUSD, gerr := r.runTeamGate(ctx, team, situation)
 	if gateCostUSD > 0 {
-		if _, serr := store.AddTeamSpend(teamID, gateCostUSD); serr != nil {
+		if serr := recordTeamSpend(store, teamID, gateCostUSD); serr != nil {
 			_, _ = store.SendTeamMessage(teamID, "quality-gate", "lead", fmt.Sprintf("recording task_created gate spend for %s: %v", task.ID, serr))
 		}
 	}
