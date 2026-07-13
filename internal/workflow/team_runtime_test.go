@@ -63,6 +63,41 @@ func TestTasksForPromptFiltersToOpenPlusRecentCompletions(t *testing.T) {
 	}
 }
 
+// TestBuildTeamTurnPromptDemandsClaimCompleteWhenTaskIsOpen is the
+// regression test for a live finding from M3's external-attach acceptance
+// proof: a real teammate did the exact work an open task described (a
+// genuine code change, verified) but never set claim_task_id/
+// complete_task_id in its decision, so the board still showed the task
+// pending despite the work landing on disk. The prompt always showed the
+// open task; nothing in it ever said doing the work isn't enough by
+// itself. Directive must appear when an open task exists, and must NOT
+// appear when the board is empty or only has completed tasks (no point
+// insisting on claiming/completing nothing).
+func TestBuildTeamTurnPromptDemandsClaimCompleteWhenTaskIsOpen(t *testing.T) {
+	team := Team{ID: "team-1", Goal: "ship the feature"}
+	member := TeamMember{Name: "worker-1", Mode: "edit"}
+	const directive = "you MUST reflect that in your decision"
+
+	noTasks := buildTeamTurnPrompt(team, member, nil, nil)
+	if strings.Contains(noTasks, directive) {
+		t.Fatalf("expected no claim/complete directive with an empty board, got:\n%s", noTasks)
+	}
+
+	onlyCompleted := buildTeamTurnPrompt(team, member, nil, []TeamTask{
+		{ID: "t1", Title: "already done", Status: "completed", CompletedAt: "2026-01-01T00:00:00Z"},
+	})
+	if strings.Contains(onlyCompleted, directive) {
+		t.Fatalf("expected no claim/complete directive when nothing is open, got:\n%s", onlyCompleted)
+	}
+
+	withOpenTask := buildTeamTurnPrompt(team, member, nil, []TeamTask{
+		{ID: "t2", Title: "add the Goodbye function", Status: "pending"},
+	})
+	if !strings.Contains(withOpenTask, directive) {
+		t.Fatalf("expected the claim/complete directive when an open task exists, got:\n%s", withOpenTask)
+	}
+}
+
 func newTeamTestStore(t *testing.T) (*Store, string) {
 	t.Helper()
 	tmp := t.TempDir()
