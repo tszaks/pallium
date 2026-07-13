@@ -206,3 +206,77 @@ func TestTeamTasksAddRoutesThroughGate(t *testing.T) {
 		t.Fatalf("expected a normal pending task with no gate configured, got %+v", task)
 	}
 }
+
+// TestTeamMemberStopRestartRoundTrip covers the CLI routing for M2 PR B's
+// individual supervision: stop an idle member (immediate, since nothing is
+// in flight), then restart it back to schedulable.
+func TestTeamMemberStopRestartRoundTrip(t *testing.T) {
+	dbPath := newTeamCmdTestDB(t)
+	var out bytes.Buffer
+	if err := runTeam(&out, []string{"start", "goal", "--db", dbPath, "--cwd", t.TempDir()}, true); err != nil {
+		t.Fatal(err)
+	}
+	var team workflow.Team
+	if err := json.Unmarshal(out.Bytes(), &team); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := runTeam(&out, []string{"spawn", team.ID, "worker-1", "--provider", "claude", "--db", dbPath}, true); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	if err := runTeam(&out, []string{"member", "stop", team.ID, "worker-1", "--db", dbPath}, true); err != nil {
+		t.Fatal(err)
+	}
+	var stopped workflow.TeamMember
+	if err := json.Unmarshal(out.Bytes(), &stopped); err != nil {
+		t.Fatal(err)
+	}
+	if !stopped.StopRequested || stopped.Status != "stopped" {
+		t.Fatalf("expected an idle member stopped immediately, got %+v", stopped)
+	}
+
+	out.Reset()
+	if err := runTeam(&out, []string{"member", "restart", team.ID, "worker-1", "--db", dbPath}, true); err != nil {
+		t.Fatal(err)
+	}
+	var restarted workflow.TeamMember
+	if err := json.Unmarshal(out.Bytes(), &restarted); err != nil {
+		t.Fatal(err)
+	}
+	if restarted.StopRequested || restarted.Status != "active" {
+		t.Fatalf("expected the member schedulable again after restart, got %+v", restarted)
+	}
+}
+
+// TestTeamMemberSteerDeliversDirective covers the CLI routing for steer:
+// it must land as a real, retrievable mailbox message (same delivery path
+// `team send` already uses), distinctly framed.
+func TestTeamMemberSteerDeliversDirective(t *testing.T) {
+	dbPath := newTeamCmdTestDB(t)
+	var out bytes.Buffer
+	if err := runTeam(&out, []string{"start", "goal", "--db", dbPath, "--cwd", t.TempDir()}, true); err != nil {
+		t.Fatal(err)
+	}
+	var team workflow.Team
+	if err := json.Unmarshal(out.Bytes(), &team); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := runTeam(&out, []string{"spawn", team.ID, "worker-1", "--provider", "claude", "--db", dbPath}, true); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	if err := runTeam(&out, []string{"member", "steer", team.ID, "worker-1", "drop module B, focus on the auth bug", "--db", dbPath}, true); err != nil {
+		t.Fatal(err)
+	}
+	var msg workflow.TeamMessage
+	if err := json.Unmarshal(out.Bytes(), &msg); err != nil {
+		t.Fatal(err)
+	}
+	if msg.To != "worker-1" || !strings.Contains(msg.Body, "STEERING DIRECTIVE") || !strings.Contains(msg.Body, "drop module B") {
+		t.Fatalf("expected a distinctly-framed steering message delivered to worker-1, got %+v", msg)
+	}
+}
