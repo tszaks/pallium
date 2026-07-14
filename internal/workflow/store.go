@@ -148,13 +148,7 @@ func Open(path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
-func (s *Store) init() error {
-	for _, stmt := range []string{"PRAGMA busy_timeout=60000", "PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL"} {
-		if _, err := s.db.Exec(stmt); err != nil {
-			return err
-		}
-	}
-	_, err := s.db.Exec(`
+const workflowSchema = `
 CREATE TABLE IF NOT EXISTS workflow_runs (
   id TEXT PRIMARY KEY,
   task TEXT NOT NULL,
@@ -260,7 +254,15 @@ CREATE TABLE IF NOT EXISTS workflow_repo_locks (
   acquired_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
-`)
+`
+
+func (s *Store) init() error {
+	for _, stmt := range []string{"PRAGMA busy_timeout=60000", "PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL"} {
+		if _, err := s.db.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	_, err := s.db.Exec(workflowSchema)
 	if err != nil {
 		return err
 	}
@@ -333,7 +335,7 @@ WHERE id IN (SELECT id FROM ordered);
 	if err := s.initLoops(); err != nil {
 		return err
 	}
-	return nil
+	return verifySchemaCompleteness(s.db, workflowSchema, teamSchema, loopSchema)
 }
 
 func (s *Store) CreateRun(run Run) (Run, error) {
