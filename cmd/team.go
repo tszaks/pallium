@@ -755,6 +755,9 @@ func runTeamStatus(out io.Writer, args []string, jsonOutput bool) error {
 			if m.LastTurnError != "" {
 				fmt.Fprintf(&b, " last_error=%q", m.LastTurnError)
 			}
+			if m.LastTurnSummary != "" {
+				fmt.Fprintf(&b, " last_summary=%q", m.LastTurnSummary)
+			}
 			b.WriteString("\n")
 		}
 		pending, inProgress, completed := 0, 0, 0

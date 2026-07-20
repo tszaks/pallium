@@ -1169,7 +1169,7 @@ func workflowRunFailedEntirely(snapshot workflow.Snapshot) bool {
 		return false
 	}
 	for _, agent := range snapshot.Agents {
-		if agent.Status != "failed" {
+		if agent.Status != "failed" && agent.Status != "timed_out" {
 			return false
 		}
 	}
@@ -2062,6 +2062,7 @@ type workflowStatus struct {
 	AgentsRunning     int    `json:"agents_running"`
 	AgentsCompleted   int    `json:"agents_completed"`
 	AgentsFailed      int    `json:"agents_failed"`
+	AgentsTimedOut    int    `json:"agents_timed_out"`
 	AgentsStopped     int    `json:"agents_stopped"`
 	AgentsPaused      int    `json:"agents_paused"`
 	AgentsInterrupted int    `json:"agents_interrupted"`
@@ -2087,6 +2088,7 @@ type phaseStats struct {
 	AgentsCompleted   int `json:"agents_completed"`
 	AgentsRunning     int `json:"agents_running"`
 	AgentsFailed      int `json:"agents_failed"`
+	AgentsTimedOut    int `json:"agents_timed_out"`
 	AgentsStopped     int `json:"agents_stopped"`
 	AgentsPaused      int `json:"agents_paused"`
 	AgentsInterrupted int `json:"agents_interrupted"`
@@ -2115,6 +2117,8 @@ func workflowStatusSummary(snapshot workflow.Snapshot) workflowStatus {
 			status.AgentsCompleted++
 		case "failed":
 			status.AgentsFailed++
+		case "timed_out":
+			status.AgentsTimedOut++
 		case "running":
 			status.AgentsRunning++
 		case "stopped":
@@ -2143,7 +2147,7 @@ func workflowInspection(snapshot workflow.Snapshot) workflowInspectionReport {
 		if agent.PatchPath != "" {
 			report.Patches = append(report.Patches, agent.PatchPath)
 		}
-		if agent.Status == "failed" {
+		if agent.Status == "failed" || agent.Status == "timed_out" {
 			report.FailedAgents = append(report.FailedAgents, agent)
 		}
 		stats := report.ByPhase[agent.Phase]
@@ -2152,6 +2156,8 @@ func workflowInspection(snapshot workflow.Snapshot) workflowInspectionReport {
 			stats.AgentsCompleted++
 		case "failed":
 			stats.AgentsFailed++
+		case "timed_out":
+			stats.AgentsTimedOut++
 		case "running":
 			stats.AgentsRunning++
 		case "stopped":
@@ -2172,7 +2178,7 @@ func renderWorkflowStatus(status workflowStatus) string {
 		fmt.Sprintf("Workflow %s: %s", status.ID, status.Status),
 		"Task: " + status.Task,
 		fmt.Sprintf("Phases: %d/%d completed", status.PhasesCompleted, status.PhasesTotal),
-		fmt.Sprintf("Agents: %d completed, %d running, %d failed, %d paused, %d stopped, %d interrupted, %d total", status.AgentsCompleted, status.AgentsRunning, status.AgentsFailed, status.AgentsPaused, status.AgentsStopped, status.AgentsInterrupted, status.AgentsTotal),
+		fmt.Sprintf("Agents: %d completed, %d running, %d failed, %d timed out, %d paused, %d stopped, %d interrupted, %d total", status.AgentsCompleted, status.AgentsRunning, status.AgentsFailed, status.AgentsTimedOut, status.AgentsPaused, status.AgentsStopped, status.AgentsInterrupted, status.AgentsTotal),
 		"Updated: " + status.UpdatedAt,
 	}
 	if status.ScriptChanged {
@@ -2196,7 +2202,7 @@ func renderWorkflowInspection(report workflowInspectionReport) string {
 		lines = append(lines, "Phase stats:")
 		for _, phase := range report.Phases {
 			stats := report.ByPhase[phase.Name]
-			lines = append(lines, fmt.Sprintf("- %s: %d completed, %d running, %d failed, %d paused, %d stopped, %d interrupted", phase.Name, stats.AgentsCompleted, stats.AgentsRunning, stats.AgentsFailed, stats.AgentsPaused, stats.AgentsStopped, stats.AgentsInterrupted))
+			lines = append(lines, fmt.Sprintf("- %s: %d completed, %d running, %d failed, %d timed out, %d paused, %d stopped, %d interrupted", phase.Name, stats.AgentsCompleted, stats.AgentsRunning, stats.AgentsFailed, stats.AgentsTimedOut, stats.AgentsPaused, stats.AgentsStopped, stats.AgentsInterrupted))
 		}
 	}
 	if len(report.Patches) > 0 {

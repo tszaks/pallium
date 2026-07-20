@@ -2051,7 +2051,11 @@ func (r *Runner) runAgentAtCallIndex(ctx context.Context, prompt string, opts Ag
 			_ = r.Store.FinishAgentStatus(agent, interruptedStatus(normalized), output, interruptedMessage(normalized))
 			return "", normalized
 		}
-		_ = r.Store.FinishAgent(agent, output, err.Error())
+		status := "failed"
+		if strings.Contains(err.Error(), "Pallium enforced the configured agent timeout after") {
+			status = "timed_out"
+		}
+		_ = r.Store.FinishAgentStatus(agent, status, output, err.Error())
 		return "", err
 	}
 	if err := r.ensureNotStopped(ctx); err != nil {
@@ -3090,7 +3094,14 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 		}
 	}
 	if err != nil {
-		return output, "", worktree, agentCommandError(ctx, timeout, err)
+		normalized := agentCommandError(ctx, timeout, err)
+		patchPath := ""
+		if editIntent && timeout > 0 && errors.Is(ctx.Err(), context.DeadlineExceeded) && worktree != "" {
+			patchPath, _ = r.writeWorktreePatch(agent.ID+"-recovery", worktree)
+			normalized = fmt.Errorf("%w\n%s", normalized, timeoutRecoveryReport(worktree, repoRoot, patchPath,
+				fmt.Sprintf("pallium workflow resume %s --agent-timeout %d", r.Run.ID, largerTimeoutSeconds(timeout))))
+		}
+		return output, patchPath, worktree, normalized
 	}
 	// Reached a clean provider exit: finalizeWorktreePatch now owns the
 	// worktree's disposition (discard for containment, capture for edit), so
@@ -3381,6 +3392,57 @@ func (r *Runner) writeWorktreePatch(agentID, worktree string) (string, error) {
 		return "", err
 	}
 	return patchPath, nil
+}
+
+func largerTimeoutSeconds(timeout time.Duration) int {
+	seconds := int(timeout / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	return seconds * 2
+}
+
+// timeoutRecoveryReport inspects a preserved edit worktree without changing
+// the live checkout. The patch it names is intentionally not auto-applied.
+func timeoutRecoveryReport(worktree, repoRoot, patchPath, resumeCommand string) string {
+	lines := []string{"timeout recovery: incomplete edits were not applied"}
+	if worktree != "" {
+		lines = append(lines, "preserved worktree: "+worktree)
+		if out, err := recoveryGitOutput(worktree, "status", "--short"); err == nil {
+			if out == "" {
+				out = "(none)"
+			}
+			lines = append(lines, "changed files:\n"+out)
+		}
+		if out, err := recoveryGitOutput(worktree, "branch", "--show-current"); err == nil {
+			if out == "" {
+				out = "(detached HEAD)"
+			}
+			lines = append(lines, "branch: "+out)
+		}
+		if base, err := recoveryGitOutput(repoRoot, "rev-parse", "HEAD"); err == nil {
+			if out, logErr := recoveryGitOutput(worktree, "log", "--oneline", base+"..HEAD"); logErr == nil {
+				if out == "" {
+					out = "(none)"
+				}
+				lines = append(lines, "commits after worker base:\n"+out)
+			}
+		}
+	}
+	if patchPath != "" {
+		lines = append(lines, "recovery patch (not applied): "+patchPath)
+	} else {
+		lines = append(lines, "recovery patch: unavailable")
+	}
+	lines = append(lines, "safe resume: "+resumeCommand)
+	return strings.Join(lines, "\n")
+}
+
+func recoveryGitOutput(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	raw, err := cmd.Output()
+	return strings.TrimSpace(string(raw)), err
 }
 
 // finalizeWorktreePatch decides what happens to an agent's worktree once the

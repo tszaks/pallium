@@ -3730,7 +3730,7 @@ return { results };`
 	}
 	timedOut := 0
 	for _, agent := range agents {
-		if agent.Status == "failed" && strings.Contains(agent.Error, "Pallium enforced the configured agent timeout after 1s") && strings.Contains(agent.Error, "--agent-timeout SECONDS") {
+		if agent.Status == "timed_out" && strings.Contains(agent.Error, "Pallium enforced the configured agent timeout after 1s") && strings.Contains(agent.Error, "--agent-timeout SECONDS") {
 			timedOut++
 		}
 	}
@@ -3767,8 +3767,52 @@ func TestAgentTimeoutOptionFailsDirectCall(t *testing.T) {
 	if snapshot.Run.Status != "failed" {
 		t.Fatalf("expected failed run, got %+v", snapshot.Run)
 	}
-	if len(snapshot.Agents) != 1 || snapshot.Agents[0].Status != "failed" {
-		t.Fatalf("expected one failed agent, got %+v", snapshot.Agents)
+	if len(snapshot.Agents) != 1 || snapshot.Agents[0].Status != "timed_out" {
+		t.Fatalf("expected one timed-out agent, got %+v", snapshot.Agents)
+	}
+}
+
+func TestWorkflowEditTimeoutPreservesRecoveryWithoutApplying(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	repo := t.TempDir()
+	runGit(t, repo, "init")
+	runGit(t, repo, "config", "user.email", "test@example.com")
+	runGit(t, repo, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("root\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "README.md")
+	runGit(t, repo, "commit", "-m", "initial")
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_SLOWEDIT_COMMAND", `echo partial > partial.txt; sleep 5`)
+	store, err := Open(filepath.Join(repo, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `return agent("edit", {label:"editor", provider:"slowedit", mode:"edit", isolation:"worktree"});`
+	scriptPath, _ := WriteRunScript("wf-timeout-recovery", repo, script)
+	run, _ := store.CreateRun(Run{ID: "wf-timeout-recovery", Task: "edit", CWD: repo, ScriptPath: scriptPath})
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 2, AgentTimeoutSeconds: 1}).Execute(context.Background(), script, nil)
+	if err == nil {
+		t.Fatal("expected timeout")
+	}
+	agents, _ := store.ListAgents(run.ID)
+	if len(agents) != 1 || agents[0].Status != "timed_out" || agents[0].PatchPath == "" || agents[0].Worktree == "" || !strings.Contains(agents[0].Error, "pallium workflow resume wf-timeout-recovery --agent-timeout 2") {
+		t.Fatalf("expected durable workflow timeout recovery, got %+v", agents)
+	}
+	for _, detail := range []string{"changed files:\nA partial.txt", "branch: (detached HEAD)", "commits after worker base:\n(none)", "recovery patch (not applied):"} {
+		if !strings.Contains(agents[0].Error, detail) {
+			t.Fatalf("expected recovery detail %q in %q", detail, agents[0].Error)
+		}
+	}
+	if raw, err := os.ReadFile(agents[0].PatchPath); err != nil || !strings.Contains(string(raw), "partial.txt") {
+		t.Fatalf("expected readable non-applied recovery patch, err=%v patch=%q", err, raw)
+	}
+	if _, err := os.Stat(agents[0].Worktree); err != nil {
+		t.Fatalf("expected timeout worktree preserved: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repo, "partial.txt")); !os.IsNotExist(err) {
+		t.Fatalf("partial edit must not be applied, stat=%v", err)
 	}
 }
 

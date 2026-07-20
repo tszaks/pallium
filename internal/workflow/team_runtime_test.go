@@ -166,6 +166,9 @@ func TestRunTeamTurnAppliesDecisionAndDeliversMail(t *testing.T) {
 	if member.SessionToken != "seed-session-1" {
 		t.Fatalf("expected the minted session id preserved, got %q", member.SessionToken)
 	}
+	if member.LastTurnSummary != "looked at module A" || member.LastTurnError != "" {
+		t.Fatalf("expected successful summary separate from last_turn_error, got %+v", member)
+	}
 	// The lead's own inbound message must now be delivered (consumed by the turn).
 	stillUndelivered, err := store.UndeliveredMessages(team.ID, "researcher-1")
 	if err != nil {
@@ -675,7 +678,7 @@ func TestRunTeamTurnTeammateIdleGateForcesActiveOnRejection(t *testing.T) {
 	if member.Status != "active" {
 		t.Fatalf("expected the gate to force status back to active, got %+v", member)
 	}
-	if !strings.Contains(member.LastTurnError, "still pending work") {
+	if !strings.Contains(member.LastTurnSummary, "still pending work") || member.LastTurnError != "" {
 		t.Fatalf("expected the gate's reason recorded as the turn note, got %+v", member)
 	}
 	// Regression proof for the review finding: forcing status back to
@@ -733,7 +736,7 @@ func TestRunTeamTurnTeammateIdleGateFailsClosedOnMalfunction(t *testing.T) {
 	if member.Status != "active" {
 		t.Fatalf("expected a gate malfunction to fail closed (force active), not approve idle by default, got %+v", member)
 	}
-	if !strings.Contains(member.LastTurnError, "failed to run") {
+	if !strings.Contains(member.LastTurnSummary, "failed to run") || member.LastTurnError != "" {
 		t.Fatalf("expected the malfunction recorded as the turn note, got %+v", member)
 	}
 	gotTeam, err := store.GetTeam(team.ID)
@@ -1179,8 +1182,38 @@ printf '%s' '{"result":"{\"status\":\"idle\",\"summary\":\"ok\"}"}'
 	if !strings.Contains(lines[0], "--session-id seed-session-1") {
 		t.Fatalf("expected turn 1 to use --session-id, got %q", lines[0])
 	}
-	if !strings.Contains(lines[1], "--session-id seed-session-1") || strings.Contains(lines[1], "--resume") {
-		t.Fatalf("expected turn 2 to RETRY with --session-id (turn 1 never established a session), not --resume — got %q", lines[1])
+	if strings.Contains(lines[1], "--session-id seed-session-1") || !strings.Contains(lines[1], "--session-id") || strings.Contains(lines[1], "--resume") {
+		t.Fatalf("expected turn 2 to rotate the UUID and retry with a fresh --session-id, got %q", lines[1])
+	}
+}
+
+func TestTeamEditTimeoutPreservesRecoveryWithoutApplying(t *testing.T) {
+	store, _ := newTeamTestStore(t)
+	repo := newTeamTestRepo(t)
+	team, _ := store.CreateTeam("edit", repo, 0)
+	_, _ = store.SpawnMember(team.ID, "editor", "claude", "", "", "edit")
+	_ = store.PersistMemberSession(team.ID, "editor", "seed")
+	script := filepath.Join(t.TempDir(), "slow-edit.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\ncat >/dev/null\necho partial > partial.txt\nsleep 5\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	setClaudeCLI(t, script)
+	r := &Runner{Run: Run{ID: team.ID}}
+	if _, err := r.RunTeamTurn(context.Background(), store, team.ID, "editor", TeamTurnOptions{AgentTimeout: 100 * time.Millisecond}); err != nil {
+		t.Fatal(err)
+	}
+	member, _ := store.GetMember(team.ID, "editor")
+	if member.LastTurnStatus != "timed_out" || member.Worktree == "" || !strings.Contains(member.LastTurnError, "recovery patch (not applied)") || !strings.Contains(member.LastTurnError, "pallium team run "+team.ID+" --agent-timeout 2") {
+		t.Fatalf("expected durable timeout recovery details, got %+v", member)
+	}
+	if member.SessionEstablished {
+		t.Fatal("timed-out first turn must leave the Claude session unestablished so the next attempt rotates its UUID")
+	}
+	if _, err := os.Stat(member.Worktree); err != nil {
+		t.Fatalf("expected timeout worktree preserved: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repo, "partial.txt")); !os.IsNotExist(err) {
+		t.Fatalf("partial edit must not be applied, stat=%v", err)
 	}
 }
 

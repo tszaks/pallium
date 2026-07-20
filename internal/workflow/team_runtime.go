@@ -250,6 +250,11 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 	if err != nil {
 		return true, err
 	}
+	member, err = store.RotateUnestablishedClaudeSession(teamID, name)
+	if err != nil {
+		_ = store.FinishMemberTurn(teamID, name, lease, "error", "", err.Error(), 0)
+		return true, err
+	}
 	team, err := store.GetTeam(teamID)
 	if err != nil {
 		return true, err
@@ -299,6 +304,19 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 	}
 
 	if turnErr != nil {
+		if opts.AgentTimeout > 0 && errors.Is(turnCtx.Err(), context.DeadlineExceeded) {
+			patchPath := ""
+			if worktree != "" {
+				patchPath, _ = r.writeWorktreePatch(member.ID+"-recovery", worktree)
+				_ = store.SetMemberWorktree(teamID, name, worktree)
+			}
+			detail := timeoutRecoveryReport(worktree, repoRoot, patchPath,
+				fmt.Sprintf("pallium team run %s --agent-timeout %d", teamID, largerTimeoutSeconds(opts.AgentTimeout)))
+			turnErr = fmt.Errorf("team agent timed out after %ds: %w\n%s", int(opts.AgentTimeout/time.Second), turnErr, detail)
+			_ = store.FinishMemberTurnResult(teamID, name, lease, "timed_out", capturedToken, "", turnErr.Error(), costUSD)
+			r.notifyLeadOfMemberError(store, teamID, name, turnErr)
+			return true, nil
+		}
 		// A failed provider call (crash, timeout, nonzero exit) leaves the
 		// worktree's contents untrustworthy — discard it rather than
 		// capture/apply a possibly-garbage partial edit. (Found by the same
@@ -385,7 +403,7 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 		// to see, rather than vanishing from view while the outcome recorded
 		// as uncertain.
 		note := fmt.Sprintf("decision did not match schema: %v (raw: %s)", parseErr, truncateForError(output))
-		if err := store.FinishMemberTurn(teamID, name, lease, "active", capturedToken, note, costUSD); err != nil {
+		if err := store.FinishMemberTurnResult(teamID, name, lease, "active", capturedToken, "", note, costUSD); err != nil {
 			return true, err
 		}
 		// A schema-failed decision must never be a SILENT no-op: the lead
@@ -556,7 +574,7 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 	// still in flight) had already mutated the board. Now: if the lease is
 	// gone, FinishMemberTurn errors and we return BEFORE any side effect
 	// below ever runs — a stale-takeover zombie's decision mutates nothing.
-	if err := store.FinishMemberTurn(teamID, name, lease, status, capturedToken, statusNote, costUSD); err != nil {
+	if err := store.FinishMemberTurnResult(teamID, name, lease, status, capturedToken, statusNote, "", costUSD); err != nil {
 		return true, err
 	}
 	if rescheduleAfterIdleRejection {
