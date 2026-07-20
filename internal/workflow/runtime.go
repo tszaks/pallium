@@ -1911,6 +1911,9 @@ func (r *Runner) runAgentAtCallIndex(ctx context.Context, prompt string, opts Ag
 	if mode == "" {
 		mode = "read-only"
 	}
+	if mode == "edit" {
+		prompt = editWorkerPrompt(prompt)
+	}
 	provider := ResolveProvider("", opts.Provider)
 	if provider == "internal" {
 		// "internal" is reserved for registerUntilGreenPatch's own
@@ -2684,7 +2687,7 @@ func defaultGateSchema() map[string]any {
 				"items": map[string]any{"type": "string"},
 			},
 		},
-		"required": []any{"approved", "reason"},
+		"required": []any{"approved", "reason", "evidence"},
 	}
 }
 
@@ -2822,9 +2825,13 @@ func agentCommandError(ctx context.Context, timeout time.Duration, err error) er
 		// after printing a quota error, so the underlying error is still the
 		// most useful diagnostic even though the proximate cause of exit was
 		// Pallium's own timeout killing it.
-		return fmt.Errorf("workflow agent timed out after %ds: %w", int(timeout/time.Second), err)
+		return fmt.Errorf("Pallium enforced the configured agent timeout after %ds; rerun with --agent-timeout SECONDS to allow more time: %w", int(timeout/time.Second), err)
 	}
 	return err
+}
+
+func editWorkerPrompt(prompt string) string {
+	return prompt + "\n\nPallium edit-worker note: detached HEAD is intentional. Pallium captures your edits as a patch. Do not create or switch branches merely to fix detached HEAD."
 }
 
 func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOptions) (string, string, string, error) {

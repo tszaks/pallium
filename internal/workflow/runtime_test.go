@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -576,8 +577,8 @@ func TestGateSeesPriorEditAgentChanges(t *testing.T) {
 	tmp := t.TempDir()
 	initEditTargetRepo(t, tmp)
 	provider := writeEditThenVerifyProvider(t, t.TempDir(),
-		`{"approved":true,"reason":"target edited"}`,
-		`{"approved":false,"reason":"target not edited"}`)
+		`{"approved":true,"reason":"target edited","evidence":["target contains the edit"]}`,
+		`{"approved":false,"reason":"target not edited","evidence":[]}`)
 	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_FAKE_COMMAND", provider)
 
 	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
@@ -1613,7 +1614,7 @@ return { count: decisions.length, title: decisions[0].title };`
 }
 
 func TestRunnerAgentGateApprovesAndContinues(t *testing.T) {
-	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"approved":true,"reason":"checks passed"}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"approved":true,"reason":"checks passed","evidence":[]}`)
 	tmp := t.TempDir()
 	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
 	if err != nil {
@@ -1649,7 +1650,7 @@ return { verdict, result };`
 }
 
 func TestRunnerAgentGateRejectsByDefault(t *testing.T) {
-	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"approved":false,"reason":"tests are failing"}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"approved":false,"reason":"tests are failing","evidence":[]}`)
 	tmp := t.TempDir()
 	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
 	if err != nil {
@@ -3729,7 +3730,7 @@ return { results };`
 	}
 	timedOut := 0
 	for _, agent := range agents {
-		if agent.Status == "failed" && strings.Contains(agent.Error, "workflow agent timed out after 1s") {
+		if agent.Status == "failed" && strings.Contains(agent.Error, "Pallium enforced the configured agent timeout after 1s") && strings.Contains(agent.Error, "--agent-timeout SECONDS") {
 			timedOut++
 		}
 	}
@@ -3756,7 +3757,7 @@ func TestAgentTimeoutOptionFailsDirectCall(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
-	if err == nil || !strings.Contains(err.Error(), "workflow agent timed out after 1s") {
+	if err == nil || !strings.Contains(err.Error(), "Pallium enforced the configured agent timeout after 1s") || !strings.Contains(err.Error(), "--agent-timeout SECONDS") {
 		t.Fatalf("expected agent timeout error, got %v", err)
 	}
 	snapshot, err := store.Snapshot(run.ID)
@@ -3768,6 +3769,44 @@ func TestAgentTimeoutOptionFailsDirectCall(t *testing.T) {
 	}
 	if len(snapshot.Agents) != 1 || snapshot.Agents[0].Status != "failed" {
 		t.Fatalf("expected one failed agent, got %+v", snapshot.Agents)
+	}
+}
+
+func TestAgentCommandErrorPreservesProviderDetailAndGivesRerunGuidance(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	err := agentCommandError(ctx, time.Second, errors.New("provider quota exhausted"))
+	for _, want := range []string{"Pallium enforced the configured agent timeout after 1s", "--agent-timeout SECONDS", "provider quota exhausted"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("timeout diagnostic missing %q: %v", want, err)
+		}
+	}
+}
+
+func TestDefaultGateSchemaRequiresEveryProperty(t *testing.T) {
+	schema := defaultGateSchema()
+	properties := schema["properties"].(map[string]any)
+	required := schema["required"].([]any)
+	if len(properties) != 3 || len(required) != 3 {
+		t.Fatalf("expected three properties and all three required, got properties=%v required=%v", properties, required)
+	}
+	want := []any{"approved", "reason", "evidence"}
+	if !reflect.DeepEqual(required, want) {
+		t.Fatalf("expected exact required contract %v, got %v", want, required)
+	}
+	for _, name := range want {
+		if _, ok := properties[name.(string)]; !ok {
+			t.Fatalf("required property %q missing from properties: %v", name, properties)
+		}
+	}
+}
+
+func TestEditWorkerPromptExplainsDetachedHeadPatchContract(t *testing.T) {
+	got := editWorkerPrompt("fix it")
+	for _, want := range []string{"detached HEAD is intentional", "captures your edits as a patch", "Do not create or switch branches"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("edit-worker prompt missing %q: %s", want, got)
+		}
 	}
 }
 

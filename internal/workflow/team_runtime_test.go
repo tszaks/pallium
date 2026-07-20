@@ -379,7 +379,7 @@ func TestCreateTeamTaskWithGateBlocksRejectedTask(t *testing.T) {
 	if err := store.SetTeamGate(team.ID, "reject anything vague", []string{"task_created"}); err != nil {
 		t.Fatal(err)
 	}
-	setClaudeCLI(t, fakeClaudeBinary(t, `{"result":"{\"approved\":false,\"reason\":\"title is too vague to act on\"}"}`))
+	setClaudeCLI(t, fakeClaudeBinary(t, `{"result":"{\"approved\":false,\"reason\":\"title is too vague to act on\",\"evidence\":[]}"}`))
 
 	r := &Runner{Run: Run{ID: team.ID}}
 	task, err := r.CreateTeamTaskWithGate(context.Background(), store, team.ID, "do stuff", "", nil)
@@ -404,7 +404,7 @@ func TestCreateTeamTaskWithGateAllowsApprovedTask(t *testing.T) {
 	if err := store.SetTeamGate(team.ID, "reject anything vague", []string{"task_created"}); err != nil {
 		t.Fatal(err)
 	}
-	setClaudeCLI(t, fakeClaudeBinary(t, `{"result":"{\"approved\":true,\"reason\":\"clear enough\"}"}`))
+	setClaudeCLI(t, fakeClaudeBinary(t, `{"result":"{\"approved\":true,\"reason\":\"clear enough\",\"evidence\":[]}"}`))
 
 	r := &Runner{Run: Run{ID: team.ID}}
 	task, err := r.CreateTeamTaskWithGate(context.Background(), store, team.ID, "fix the specific bug in auth.go line 42", "", nil)
@@ -435,7 +435,7 @@ func TestRunTeamGateIncludesTeamGoalInPrompt(t *testing.T) {
 
 	captured := filepath.Join(t.TempDir(), "captured-prompt.txt")
 	path := filepath.Join(t.TempDir(), "fake-claude-capture.sh")
-	script := "#!/bin/sh\ncat > '" + captured + "'\nprintf '%s' '{\"result\":\"{\\\"approved\\\":true,\\\"reason\\\":\\\"ok\\\"}\"}'\n"
+	script := "#!/bin/sh\ncat > '" + captured + "'\nprintf '%s' '{\"result\":\"{\\\"approved\\\":true,\\\"reason\\\":\\\"ok\\\",\\\"evidence\\\":[]}\"}'\n"
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -474,7 +474,7 @@ func TestCreateTeamTaskWithGateParksTeamWhenGateSpendCrossesBudget(t *testing.T)
 	}
 	// The gate's own reported cost alone (0.05) already exceeds the 0.01
 	// budget — no team turn cost involved at all.
-	setClaudeCLI(t, fakeClaudeBinary(t, `{"result":"{\"approved\":true,\"reason\":\"clear enough\"}","total_cost_usd":0.05}`))
+	setClaudeCLI(t, fakeClaudeBinary(t, `{"result":"{\"approved\":true,\"reason\":\"clear enough\",\"evidence\":[]}","total_cost_usd":0.05}`))
 
 	r := &Runner{Run: Run{ID: team.ID}}
 	if _, err := r.CreateTeamTaskWithGate(context.Background(), store, team.ID, "fix the specific bug in auth.go line 42", "", nil); err != nil {
@@ -511,7 +511,7 @@ func TestCreateTeamTaskWithGateNeverClaimableWhileGateInFlight(t *testing.T) {
 	}
 
 	slow := filepath.Join(t.TempDir(), "fake-claude-slow-gate.sh")
-	script := "#!/bin/sh\ncat >/dev/null\nsleep 0.3\nprintf '%s' '{\"result\":\"{\\\"approved\\\":true,\\\"reason\\\":\\\"fine\\\"}\"}'\n"
+	script := "#!/bin/sh\ncat >/dev/null\nsleep 0.3\nprintf '%s' '{\"result\":\"{\\\"approved\\\":true,\\\"reason\\\":\\\"fine\\\",\\\"evidence\\\":[]}\"}'\n"
 	if err := os.WriteFile(slow, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -606,7 +606,7 @@ func TestRunTeamTurnTaskCompletedGateRejectsAndDeliversFeedback(t *testing.T) {
 	}
 
 	decision := fmt.Sprintf(`{"result":"{\"status\":\"idle\",\"summary\":\"done\",\"complete_task_id\":\"%s\",\"complete_result\":\"fixed it, did not run tests\"}"}`, task.ID)
-	gate := `{"result":"{\"approved\":false,\"reason\":\"no evidence tests were run\"}"}`
+	gate := `{"result":"{\"approved\":false,\"reason\":\"no evidence tests were run\",\"evidence\":[]}"}`
 	setClaudeCLI(t, fakeClaudeBinaryBranching(t, decision, gate))
 
 	r := &Runner{Run: Run{ID: team.ID}}
@@ -660,7 +660,7 @@ func TestRunTeamTurnTeammateIdleGateForcesActiveOnRejection(t *testing.T) {
 	}
 
 	decision := `{"result":"{\"status\":\"idle\",\"summary\":\"nothing to do\"}"}`
-	gate := `{"result":"{\"approved\":false,\"reason\":\"there is still pending work on the board\"}"}`
+	gate := `{"result":"{\"approved\":false,\"reason\":\"there is still pending work on the board\",\"evidence\":[]}"}`
 	setClaudeCLI(t, fakeClaudeBinaryBranching(t, decision, gate))
 
 	r := &Runner{Run: Run{ID: team.ID}}
@@ -815,7 +815,7 @@ func TestCompleteTaskWithGateSkipsGateForIneligibleTask(t *testing.T) {
 	// Deliberately left "pending", never claimed — no owner can legitimately
 	// complete it yet.
 	marker := filepath.Join(t.TempDir(), "gate-was-called")
-	script := "#!/bin/sh\ncat >/dev/null\ntouch '" + marker + "'\nprintf '%s' '{\"result\":\"{\\\"approved\\\":true,\\\"reason\\\":\\\"ok\\\"}\"}'\n"
+	script := "#!/bin/sh\ncat >/dev/null\ntouch '" + marker + "'\nprintf '%s' '{\"result\":\"{\\\"approved\\\":true,\\\"reason\\\":\\\"ok\\\",\\\"evidence\\\":[]}\"}'\n"
 	fakeBin := filepath.Join(t.TempDir(), "fake-claude-marker.sh")
 	if err := os.WriteFile(fakeBin, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -885,7 +885,7 @@ func TestRunTeamTurnCompletionGateRunsBeforeFinishMemberTurn(t *testing.T) {
 	const gateSleep = "0.4"
 	decision := fmt.Sprintf(`{"result":"{\"status\":\"idle\",\"summary\":\"done\",\"complete_task_id\":\"%s\",\"complete_result\":\"fixed it\"}"}`, task.ID)
 	path := filepath.Join(t.TempDir(), "fake-claude-slow-gate.sh")
-	script := "#!/bin/sh\ninput=\"$(cat)\"\nif echo \"$input\" | grep -q 'autonomous workflow gate verifier'; then\n  sleep " + gateSleep + "\n  printf '%s' '{\"result\":\"{\\\"approved\\\":true,\\\"reason\\\":\\\"ok\\\"}\"}'\nelse\n  printf '%s' '" + decision + "'\nfi\n"
+	script := "#!/bin/sh\ninput=\"$(cat)\"\nif echo \"$input\" | grep -q 'autonomous workflow gate verifier'; then\n  sleep " + gateSleep + "\n  printf '%s' '{\"result\":\"{\\\"approved\\\":true,\\\"reason\\\":\\\"ok\\\",\\\"evidence\\\":[]}\"}'\nelse\n  printf '%s' '" + decision + "'\nfi\n"
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -959,7 +959,7 @@ func TestRunTeamTurnSameTurnClaimAndCompleteSucceedsUnderGate(t *testing.T) {
 	// completes it in the same turn.
 
 	decision := fmt.Sprintf(`{"result":"{\"status\":\"idle\",\"summary\":\"done\",\"claim_task_id\":\"%s\",\"complete_task_id\":\"%s\",\"complete_result\":\"fixed it\"}"}`, task.ID, task.ID)
-	gate := `{"result":"{\"approved\":true,\"reason\":\"looks good\"}"}`
+	gate := `{"result":"{\"approved\":true,\"reason\":\"looks good\",\"evidence\":[]}"}`
 	setClaudeCLI(t, fakeClaudeBinaryBranching(t, decision, gate))
 
 	r := &Runner{Run: Run{ID: team.ID}}
@@ -1547,6 +1547,92 @@ printf '%s' '{"result":"{\"status\":\"idle\",\"summary\":\"nothing here for me\"
 		if m.TurnCount != 1 {
 			t.Fatalf("expected %s to take exactly one turn, got %d turns (a re-spin keeps re-showing the same unclaimed task)", name, m.TurnCount)
 		}
+	}
+}
+
+func TestRunTeamTurnKeepsIdleOwnerActiveWithoutCompletion(t *testing.T) {
+	store, _ := newTeamTestStore(t)
+	repo := newTeamTestRepo(t)
+	team, err := store.CreateTeam("goal", repo, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SpawnMember(team.ID, "worker-1", "claude", "", "", "read-only"); err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.CreateTeamTask(team.ID, "implement fix", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimTask(team.ID, task.ID, "worker-1"); err != nil {
+		t.Fatal(err)
+	}
+	setClaudeCLI(t, fakeClaudeBinary(t, `{"result":"{\"status\":\"idle\",\"summary\":\"implemented the fix\"}"}`))
+	r := &Runner{}
+	r.Run.ID = team.ID
+	if ran, err := r.RunTeamTurn(context.Background(), store, team.ID, "worker-1", TeamTurnOptions{}); err != nil || !ran {
+		t.Fatalf("expected turn to run: ran=%v err=%v", ran, err)
+	}
+	member, err := store.GetMember(team.ID, "worker-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if member.Status != "active" || member.NudgedAt == "" {
+		t.Fatalf("expected unfinished owner kept active and nudged, got %+v", member)
+	}
+	gotTask, err := store.GetTeamTask(team.ID, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotTask.Status != "in_progress" {
+		t.Fatalf("expected completion prose not to complete or infer task state, got %+v", gotTask)
+	}
+	messages, err := store.UndeliveredMessages(team.ID, "worker-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 || !strings.Contains(messages[0].Body, "complete_task_id") {
+		t.Fatalf("expected actionable coordination recovery message, got %+v", messages)
+	}
+}
+
+func TestMemberHasClaimableWorkIsDependencyAwareForSpecialists(t *testing.T) {
+	tasks := []TeamTask{
+		{ID: "build", Title: "Implement the fix", Status: "pending"},
+		{ID: "review", Title: "Review the fix", Status: "pending", DependsOn: []string{"build"}},
+	}
+	if memberHasClaimableWork(tasks, TeamMember{Name: "reviewer", Role: "review correctness"}) {
+		t.Fatal("expected reviewer whose matching task is dependency-blocked to be ineligible")
+	}
+	if !memberHasClaimableWork(tasks, TeamMember{Name: "peer", Role: ""}) {
+		t.Fatal("expected free-form peer to remain eligible for the general claimable task")
+	}
+	tasks[0].Status = "completed"
+	if !memberHasClaimableWork(tasks, TeamMember{Name: "reviewer", Role: "review correctness"}) {
+		t.Fatal("expected reviewer eligible once its matching task dependency completes")
+	}
+}
+
+func TestRunTeamSummaryReportsIncompleteBoardRecovery(t *testing.T) {
+	store, _ := newTeamTestStore(t)
+	repo := newTeamTestRepo(t)
+	team, err := store.CreateTeam("goal", repo, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.CreateTeamTask(team.ID, "unclaimed work", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary, err := (&Runner{}).RunTeam(context.Background(), store, team.ID, TeamTurnOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.OpenTasks) != 1 || summary.OpenTasks[0].ID != task.ID {
+		t.Fatalf("expected exact open task in summary, got %+v", summary)
+	}
+	if !strings.Contains(summary.IncompleteStopReason, "converged") || !strings.Contains(summary.Recovery, "team run "+team.ID) {
+		t.Fatalf("expected explicit incomplete reason and actionable recovery, got %+v", summary)
 	}
 }
 

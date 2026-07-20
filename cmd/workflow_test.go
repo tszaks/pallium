@@ -943,7 +943,7 @@ return agent("slow", { label: "slow" });`), 0o644); err != nil {
 		"--agent-timeout", "1",
 		"timeout test",
 	}, false)
-	if err == nil || !strings.Contains(err.Error(), "timed out after 1s") {
+	if err == nil || !strings.Contains(err.Error(), "Pallium enforced the configured agent timeout after 1s") || !strings.Contains(err.Error(), "--agent-timeout SECONDS") {
 		t.Fatalf("expected initial run to hit the 1s agent timeout, got %v", err)
 	}
 	store, err := workflow.Open(dbPath)
@@ -962,7 +962,7 @@ return agent("slow", { label: "slow" });`), 0o644); err != nil {
 	// flag default.
 	out.Reset()
 	err = runWorkflow(&out, []string{"resume", "wf-resume-timeout", "--db", dbPath}, false)
-	if err == nil || !strings.Contains(err.Error(), "timed out after 1s") {
+	if err == nil || !strings.Contains(err.Error(), "Pallium enforced the configured agent timeout after 1s") || !strings.Contains(err.Error(), "--agent-timeout SECONDS") {
 		t.Fatalf("expected resume to reuse the stored agent timeout, got %v", err)
 	}
 	// An explicit flag on resume overrides the stored value.
@@ -1294,7 +1294,7 @@ return result;`), 0o644); err != nil {
 }
 
 func TestWorkflowAgentGateApprovesDuringRun(t *testing.T) {
-	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"approved":true,"reason":"ok"}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"approved":true,"reason":"ok","evidence":[]}`)
 	t.Setenv("HOME", t.TempDir())
 	tmp := t.TempDir()
 	runGit(t, tmp, "init")
