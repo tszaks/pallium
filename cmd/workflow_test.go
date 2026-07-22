@@ -2006,3 +2006,163 @@ func TestWorkflowStatusVerdictIsUnmistakableWhenNotFinished(t *testing.T) {
 		t.Fatalf("expected verdict as the first line so a skim can't miss it, got:\n%s", out.String())
 	}
 }
+
+// TestWorkflowInspectDefaultsToMostRecentRunningRun proves `workflow inspect`
+// with no run-id doesn't just print usage: it should pick a run for you,
+// preferring one that's still running over an older completed run even if
+// the completed one was touched more recently.
+func TestWorkflowInspectDefaultsToMostRecentRunningRun(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	store, err := workflow.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	older, err := store.CreateRun(workflow.Run{Task: "older running", CWD: tmp, ScriptPath: filepath.Join(tmp, "workflow.js"), Status: "running"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	// The completed run is the most recently touched row overall, but
+	// inspect should still prefer the still-running one over it.
+	newer, err := store.CreateRun(workflow.Run{Task: "newer completed", CWD: tmp, ScriptPath: filepath.Join(tmp, "workflow.js"), Status: "completed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{"inspect", "--db", dbPath}, true); err != nil {
+		t.Fatalf("workflow inspect with no run-id failed: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("decode inspect json: %v\n%s", err, out.String())
+	}
+	status, ok := payload["status"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected a status object in inspect payload, got %#v", payload)
+	}
+	if status["id"] != older.ID {
+		t.Fatalf("expected inspect to default to the running run %q, got %#v (newer completed run was %q)", older.ID, status["id"], newer.ID)
+	}
+}
+
+// TestWorkflowInspectDefaultsToMostRecentRunOverallWhenNoneRunning proves the
+// fallback: with no running run at all, default to the single most recently
+// updated run.
+func TestWorkflowInspectDefaultsToMostRecentRunOverallWhenNoneRunning(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	store, err := workflow.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateRun(workflow.Run{Task: "first", CWD: tmp, ScriptPath: filepath.Join(tmp, "workflow.js"), Status: "completed"}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	latest, err := store.CreateRun(workflow.Run{Task: "second", CWD: tmp, ScriptPath: filepath.Join(tmp, "workflow.js"), Status: "failed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{"report", "--db", dbPath}, true); err != nil {
+		t.Fatalf("workflow report with no run-id failed: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("decode report json: %v\n%s", err, out.String())
+	}
+	if payload["id"] != latest.ID {
+		t.Fatalf("expected report to default to the most recent run %q, got %#v", latest.ID, payload["id"])
+	}
+}
+
+// TestWorkflowInspectWithNoRunsErrors proves an empty store gives a clear
+// error instead of a bare usage line or a panic.
+func TestWorkflowInspectWithNoRunsErrors(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+
+	var out bytes.Buffer
+	err := runWorkflow(&out, []string{"inspect", "--db", dbPath}, false)
+	if err == nil {
+		t.Fatal("expected an error when no runs exist")
+	}
+	if !strings.Contains(err.Error(), "no workflow runs found") {
+		t.Fatalf("expected a clear no-runs error, got: %v", err)
+	}
+}
+
+// TestWorkflowStopDefaultsWhenExactlyOneRunRunning proves `workflow stop`
+// with no run-id is allowed to guess when there's exactly one running
+// candidate.
+func TestWorkflowStopDefaultsWhenExactlyOneRunRunning(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	store, err := workflow.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	only, err := store.CreateRun(workflow.Run{Task: "solo running", CWD: tmp, ScriptPath: filepath.Join(tmp, "workflow.js"), Status: "running"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := runWorkflow(&out, []string{"stop", "--db", dbPath}, true); err != nil {
+		t.Fatalf("workflow stop with no run-id failed with exactly one running run: %v", err)
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("decode stop json: %v\n%s", err, out.String())
+	}
+	if payload["id"] != only.ID {
+		t.Fatalf("expected stop to default to the sole running run %q, got %#v", only.ID, payload)
+	}
+}
+
+// TestWorkflowStopRefusesToGuessWithMultipleRunningRuns proves stopping the
+// wrong run is destructive enough that `workflow stop` with no run-id must
+// refuse — never silently pick one — when more than one run is running.
+func TestWorkflowStopRefusesToGuessWithMultipleRunningRuns(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	store, err := workflow.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateRun(workflow.Run{Task: "first running", CWD: tmp, ScriptPath: filepath.Join(tmp, "workflow.js"), Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateRun(workflow.Run{Task: "second running", CWD: tmp, ScriptPath: filepath.Join(tmp, "workflow.js"), Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	err = runWorkflow(&out, []string{"stop", "--db", dbPath}, false)
+	if err == nil {
+		t.Fatal("expected an error when more than one run is running and no run-id was given")
+	}
+	if !strings.Contains(err.Error(), "running") {
+		t.Fatalf("expected an ambiguity error mentioning the running runs, got: %v", err)
+	}
+}

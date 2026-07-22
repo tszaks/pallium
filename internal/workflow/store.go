@@ -633,6 +633,15 @@ func (s *Store) CreateAgent(agent Agent) (Agent, error) {
 	}
 	_, err := s.db.Exec(`INSERT INTO workflow_agents(id,run_id,call_index,phase,label,prompt,provider,repo,mode,isolation,model,schema_hash,script_hash,args_hash,estimated_cost_usd,usage_json,status,output,error,patch_path,worktree,networked,created_at,updated_at,completed_at)
 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, agent.ID, agent.RunID, agent.CallIndex, agent.Phase, agent.Label, agent.Prompt, agent.Provider, agent.Repo, agent.Mode, agent.Isolation, agent.Model, agent.SchemaHash, agent.ScriptHash, agent.ArgsHash, agent.EstimatedCostUSD, agent.UsageJSON, agent.Status, agent.Output, agent.Error, agent.PatchPath, agent.Worktree, agent.Networked, agent.CreatedAt, agent.UpdatedAt, agent.CompletedAt)
+	if err != nil {
+		return agent, err
+	}
+	// A new agent starting is a run-level state transition too — bump the
+	// run's updated_at so `workflow inspect`'s "Updated:" header reflects
+	// activity that happened after the run itself started, not just after
+	// its last status flip (which is all SetRunStatus covers). Best-effort:
+	// never fails agent creation over this.
+	_, _ = s.db.Exec(`UPDATE workflow_runs SET updated_at=? WHERE id=?`, agent.CreatedAt, agent.RunID)
 	return agent, err
 }
 
@@ -656,6 +665,12 @@ func (s *Store) FinishAgentStatus(agent Agent, status, outputText, errorText str
 	// Advisory only (see run_liveness.go) — a failure here never fails the
 	// agent's own completion.
 	_, _ = s.db.Exec(`UPDATE workflow_runs SET heartbeat_at=? WHERE id=? AND status='running'`, now, agent.RunID)
+	// Also bump the run's own updated_at unconditionally (not gated on
+	// status='running' like the heartbeat above) so the last-activity
+	// timestamp `workflow inspect` shows keeps moving as agents finish, even
+	// if the run's status has already flipped away from "running" by the
+	// time this write lands.
+	_, _ = s.db.Exec(`UPDATE workflow_runs SET updated_at=? WHERE id=?`, now, agent.RunID)
 	return nil
 }
 
