@@ -104,6 +104,17 @@ type AgentOptions struct {
 	// honored when the run was launched with --allow-network (the operator
 	// ceiling); otherwise the agent runs sandboxed. Default false.
 	Network bool `json:"network,omitempty"`
+	// OnError controls what a direct (non-parallel/pipeline) agent() call
+	// does when the agent fails: "throw" (default, current behavior) raises
+	// the error into the script; "null" returns null instead, matching how
+	// parallel()/pipeline() already turn a per-item agent failure into null
+	// so the rest of the script can continue — the same parity Claude
+	// Ultracode's agent() has (it returns null on failure rather than
+	// throwing). Only applies to ordinary, non-fatal failures: a run-fatal
+	// cause (budget exhausted, max agents, repo lock contention, or a
+	// stop/pause interrupt — see isWorkflowFatalAgentError) still throws
+	// regardless, since those end the run, not just this one call.
+	OnError string `json:"on_error,omitempty"`
 }
 
 type CheckOptions struct {
@@ -1024,6 +1035,9 @@ func (r *Runner) jsAgent(ctx context.Context, vm *goja.Runtime) func(goja.Functi
 		if err := validateUserIsolation(opts.Isolation); err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
+		if err := validateUserOnError(opts.OnError); err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
 		if capture := r.activeCapture(); capture != nil {
 			index := len(capture.Calls)
 			capture.Calls = append(capture.Calls, parallelAgentCall{Prompt: prompt, Opts: opts})
@@ -1031,6 +1045,17 @@ func (r *Runner) jsAgent(ctx context.Context, vm *goja.Runtime) func(goja.Functi
 		}
 		output, err := r.runAgentAtCallIndex(ctx, prompt, opts, r.nextAgentCallIndex())
 		if err != nil {
+			// on_error: "null" mirrors how parallel()/pipeline() already turn
+			// a per-item agent failure into null (see
+			// runAgentCallsWithSemaphore) rather than aborting the whole
+			// script — Claude Ultracode's own agent() has this same
+			// null-on-failure shape. Run-fatal causes (budget/max-agents/
+			// repo-lock/stop/pause) are excluded: those end the run itself,
+			// not just this call, so they always throw.
+			if strings.TrimSpace(opts.OnError) == "null" && !isWorkflowFatalAgentError(err) {
+				r.recordDroppedItem(firstNonEmpty(opts.Label, "agent"), err.Error())
+				return vm.ToValue(nil)
+			}
 			panic(vm.ToValue(r.throwable(err)))
 		}
 		return vm.ToValue(parseAgentOutput(output))
@@ -1911,6 +1936,9 @@ func (r *Runner) runAgentAtCallIndex(ctx context.Context, prompt string, opts Ag
 	if mode == "" {
 		mode = "read-only"
 	}
+	if mode == "edit" {
+		prompt = editWorkerPrompt(prompt)
+	}
 	provider := ResolveProvider("", opts.Provider)
 	if provider == "internal" {
 		// "internal" is reserved for registerUntilGreenPatch's own
@@ -2048,7 +2076,11 @@ func (r *Runner) runAgentAtCallIndex(ctx context.Context, prompt string, opts Ag
 			_ = r.Store.FinishAgentStatus(agent, interruptedStatus(normalized), output, interruptedMessage(normalized))
 			return "", normalized
 		}
-		_ = r.Store.FinishAgent(agent, output, err.Error())
+		status := "failed"
+		if strings.Contains(err.Error(), "Pallium enforced the configured agent timeout after") {
+			status = "timed_out"
+		}
+		_ = r.Store.FinishAgentStatus(agent, status, output, err.Error())
 		return "", err
 	}
 	if err := r.ensureNotStopped(ctx); err != nil {
@@ -2684,7 +2716,7 @@ func defaultGateSchema() map[string]any {
 				"items": map[string]any{"type": "string"},
 			},
 		},
-		"required": []any{"approved", "reason"},
+		"required": []any{"approved", "reason", "evidence"},
 	}
 }
 
@@ -2708,6 +2740,17 @@ func validateUserIsolation(isolation string) error {
 		return nil
 	default:
 		return fmt.Errorf("invalid agent isolation %q: allowed values are \"\" and \"worktree\"", isolation)
+	}
+}
+
+// validateUserOnError guards the JS option boundary for agent()'s `on_error`
+// opt: scripts may only pick "" (default, same as "throw") or "null".
+func validateUserOnError(onError string) error {
+	switch strings.TrimSpace(onError) {
+	case "", "throw", "null":
+		return nil
+	default:
+		return fmt.Errorf("invalid agent on_error %q: allowed values are \"throw\" and \"null\"", onError)
 	}
 }
 
@@ -2822,9 +2865,13 @@ func agentCommandError(ctx context.Context, timeout time.Duration, err error) er
 		// after printing a quota error, so the underlying error is still the
 		// most useful diagnostic even though the proximate cause of exit was
 		// Pallium's own timeout killing it.
-		return fmt.Errorf("workflow agent timed out after %ds: %w", int(timeout/time.Second), err)
+		return fmt.Errorf("Pallium enforced the configured agent timeout after %ds; rerun with --agent-timeout SECONDS to allow more time: %w", int(timeout/time.Second), err)
 	}
 	return err
+}
+
+func editWorkerPrompt(prompt string) string {
+	return prompt + "\n\nPallium edit-worker note: detached HEAD is intentional. Pallium captures your edits as a patch. Do not create or switch branches merely to fix detached HEAD."
 }
 
 func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOptions) (string, string, string, error) {
@@ -3083,7 +3130,14 @@ func (r *Runner) runAgentCommand(ctx context.Context, agent *Agent, opts AgentOp
 		}
 	}
 	if err != nil {
-		return output, "", worktree, agentCommandError(ctx, timeout, err)
+		normalized := agentCommandError(ctx, timeout, err)
+		patchPath := ""
+		if editIntent && timeout > 0 && errors.Is(ctx.Err(), context.DeadlineExceeded) && worktree != "" {
+			patchPath, _ = r.writeWorktreePatch(agent.ID+"-recovery", worktree)
+			normalized = fmt.Errorf("%w\n%s", normalized, timeoutRecoveryReport(worktree, repoRoot, patchPath,
+				fmt.Sprintf("pallium workflow resume %s --agent-timeout %d", r.Run.ID, largerTimeoutSeconds(timeout))))
+		}
+		return output, patchPath, worktree, normalized
 	}
 	// Reached a clean provider exit: finalizeWorktreePatch now owns the
 	// worktree's disposition (discard for containment, capture for edit), so
@@ -3152,7 +3206,7 @@ func (r *Runner) runConfiguredProviderCommand(ctx context.Context, command, tmpD
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		baseErr := formatProviderFailure(fmt.Sprintf("workflow provider %q", agent.Provider), err, stderr.String())
+		baseErr := formatProviderFailure(fmt.Sprintf("workflow provider %q", agent.Provider), err, truncateForError(strings.TrimSpace(stderr.String())))
 		return strings.TrimSpace(stdout.String()), wrapProviderCommandError(baseErr, stdout.String()+stderr.String())
 	}
 	raw, readErr := os.ReadFile(outFile)
@@ -3374,6 +3428,57 @@ func (r *Runner) writeWorktreePatch(agentID, worktree string) (string, error) {
 		return "", err
 	}
 	return patchPath, nil
+}
+
+func largerTimeoutSeconds(timeout time.Duration) int {
+	seconds := int(timeout / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	return seconds * 2
+}
+
+// timeoutRecoveryReport inspects a preserved edit worktree without changing
+// the live checkout. The patch it names is intentionally not auto-applied.
+func timeoutRecoveryReport(worktree, repoRoot, patchPath, resumeCommand string) string {
+	lines := []string{"timeout recovery: incomplete edits were not applied"}
+	if worktree != "" {
+		lines = append(lines, "preserved worktree: "+worktree)
+		if out, err := recoveryGitOutput(worktree, "status", "--short"); err == nil {
+			if out == "" {
+				out = "(none)"
+			}
+			lines = append(lines, "changed files:\n"+out)
+		}
+		if out, err := recoveryGitOutput(worktree, "branch", "--show-current"); err == nil {
+			if out == "" {
+				out = "(detached HEAD)"
+			}
+			lines = append(lines, "branch: "+out)
+		}
+		if base, err := recoveryGitOutput(repoRoot, "rev-parse", "HEAD"); err == nil {
+			if out, logErr := recoveryGitOutput(worktree, "log", "--oneline", base+"..HEAD"); logErr == nil {
+				if out == "" {
+					out = "(none)"
+				}
+				lines = append(lines, "commits after worker base:\n"+out)
+			}
+		}
+	}
+	if patchPath != "" {
+		lines = append(lines, "recovery patch (not applied): "+patchPath)
+	} else {
+		lines = append(lines, "recovery patch: unavailable")
+	}
+	lines = append(lines, "safe resume: "+resumeCommand)
+	return strings.Join(lines, "\n")
+}
+
+func recoveryGitOutput(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	raw, err := cmd.Output()
+	return strings.TrimSpace(string(raw)), err
 }
 
 // finalizeWorktreePatch decides what happens to an agent's worktree once the

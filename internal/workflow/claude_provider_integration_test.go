@@ -72,6 +72,54 @@ return { out };`
 	}
 }
 
+// TestRunnerRecordsRealClaudeUsageOverFlatDefault proves the built-in claude
+// provider's parsed cost/token usage — not the flat per-agent default —
+// ends up on the stored agent row. The cost/token values here are
+// deliberately distinctive (never 0.01, the value workflowAgentCostUSD
+// falls back to) so this test would fail if the real usage from the CLI's
+// JSON envelope were silently dropped in favor of the flat default, which
+// TestRunnerAdoptsClaudeProviderWhenSteering's 0.01 fixture can't catch
+// since it happens to collide with the default.
+func TestRunnerRecordsRealClaudeUsageOverFlatDefault(t *testing.T) {
+	clearProviderEnv(t)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_COST_USD", "0.01")
+	setClaudeCLI(t, fakeClaudeBinary(t, `{"result":"done editing","total_cost_usd":0.4321,"usage":{"input_tokens":12345,"output_tokens":6789}}`))
+
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `phase("work");
+const out = await agent("do a long edit", { label: "edit-worker", provider: "claude" });
+return { out };`
+	scriptPath, err := WriteRunScript("wf-claude-real-usage", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-claude-real-usage", Task: "usage", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil); err != nil {
+		t.Fatal(err)
+	}
+	agents, err := store.ListAgents(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].Provider != "claude" {
+		t.Fatalf("expected one claude agent, got %+v", agents)
+	}
+	if agents[0].EstimatedCostUSD != 0.4321 {
+		t.Fatalf("expected real parsed cost_usd 0.4321 to replace the flat default, got %v", agents[0].EstimatedCostUSD)
+	}
+	if !strings.Contains(agents[0].UsageJSON, "12345") || !strings.Contains(agents[0].UsageJSON, "6789") {
+		t.Fatalf("expected stored usage JSON to carry the parsed token counts, got %q", agents[0].UsageJSON)
+	}
+}
+
 func TestRunnerExplicitCodexProviderWinsUnderClaudeCode(t *testing.T) {
 	clearProviderEnv(t)
 	t.Setenv("CLAUDECODE", "1")

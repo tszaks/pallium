@@ -350,7 +350,7 @@ func TestTeamTasksCreatePrimitiveHonorsWorkflowStop(t *testing.T) {
 	startedMarker := filepath.Join(tmp, "gate-started")
 	finishedMarker := filepath.Join(tmp, "gate-finished")
 	path := filepath.Join(tmp, "fake-claude-slow-gate.sh")
-	if err := os.WriteFile(path, []byte("#!/bin/sh\ncat >/dev/null\ntouch '"+startedMarker+"'\nsleep 5\ntouch '"+finishedMarker+"'\nprintf '%s' '{\"result\":\"{\\\"approved\\\":true,\\\"reason\\\":\\\"ok\\\"}\"}'\n"), 0o755); err != nil {
+	if err := os.WriteFile(path, []byte("#!/bin/sh\ncat >/dev/null\ntouch '"+startedMarker+"'\nsleep 5\ntouch '"+finishedMarker+"'\nprintf '%s' '{\"result\":\"{\\\"approved\\\":true,\\\"reason\\\":\\\"ok\\\",\\\"evidence\\\":[]}\"}'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	setClaudeCLI(t, path)

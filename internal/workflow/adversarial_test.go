@@ -64,7 +64,7 @@ return agent("failing provider", { label: "fail", provider: "fail" });`
 }
 
 func TestAdversarialGateApproveWrongNameDoesNotMutateAgentGate(t *testing.T) {
-	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"approved":true,"reason":"ok"}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"approved":true,"reason":"ok","evidence":[]}`)
 	tmp := t.TempDir()
 	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
 	if err != nil {

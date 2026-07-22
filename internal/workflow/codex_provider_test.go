@@ -77,6 +77,36 @@ func TestRunCodexCommandFailurePropagatesStderr(t *testing.T) {
 	}
 }
 
+// TestRunCodexCommandBoundsStderrToTail proves a codex process that dies
+// after writing a large amount of stderr keeps the LAST bytes of that
+// stderr in the error record, not the first — the tail is what a hung or
+// killed process printed right before dying, and so the most diagnostic
+// part of the output.
+func TestRunCodexCommandBoundsStderrToTail(t *testing.T) {
+	tmp := t.TempDir()
+	failing := filepath.Join(tmp, "fake-codex-noisy.sh")
+	script := "#!/bin/sh\n" +
+		"printf 'HEAD_MARKER_NEVER_SHOULD_SURVIVE\\n' >&2\n" +
+		"yes filler | head -c 8192 >&2\n" +
+		"echo REAL_FAILURE_REASON_AT_THE_END >&2\n" +
+		"exit 1\n"
+	if err := os.WriteFile(failing, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := &Runner{CodexBinary: failing}
+	agent := &Agent{Mode: "read-only", Prompt: "hi"}
+	_, err := r.runCodexCommand(context.Background(), tmp, filepath.Join(tmp, "last-message.txt"), t.TempDir(), agent.Prompt, agent, AgentOptions{}, false)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "REAL_FAILURE_REASON_AT_THE_END") {
+		t.Fatalf("expected the tail of stderr (the real failure reason) to survive truncation, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "HEAD_MARKER_NEVER_SHOULD_SURVIVE") {
+		t.Fatalf("expected the head of a too-long stderr to be dropped, got: %v", err)
+	}
+}
+
 func TestRunCodexCommandSurfacesMeaningfulErrorLineFromStdout(t *testing.T) {
 	tmp := t.TempDir()
 	failing := filepath.Join(tmp, "fake-codex-quota.sh")

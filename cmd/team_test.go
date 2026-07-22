@@ -21,6 +21,22 @@ func newTeamCmdTestDB(t *testing.T) string {
 	return filepath.Join(t.TempDir(), "sessions.sqlite")
 }
 
+func TestTeamHelpAliasesSucceed(t *testing.T) {
+	for _, arg := range []string{"--help", "help"} {
+		t.Run(arg, func(t *testing.T) {
+			var out bytes.Buffer
+			if err := runTeam(&out, []string{arg}, false); err != nil {
+				t.Fatalf("team %s returned error: %v", arg, err)
+			}
+			for _, want := range []string{"Usage:", "pallium team start", "pallium team run", "--agent-timeout"} {
+				if !strings.Contains(out.String(), want) {
+					t.Fatalf("team %s help missing %q: %s", arg, want, out.String())
+				}
+			}
+		})
+	}
+}
+
 func TestTeamSpawnPlanRequiredForcesReadOnly(t *testing.T) {
 	dbPath := newTeamCmdTestDB(t)
 	var out bytes.Buffer
@@ -179,6 +195,30 @@ func TestTeamGateSetCanBeCleared(t *testing.T) {
 	}
 	if task.Status != "pending" {
 		t.Fatalf("expected no gate to fire after clearing, got %+v", task)
+	}
+}
+
+func TestTeamRunTextReportsIncompleteBoardRecovery(t *testing.T) {
+	dbPath := newTeamCmdTestDB(t)
+	var out bytes.Buffer
+	if err := runTeam(&out, []string{"start", "goal", "--db", dbPath, "--cwd", t.TempDir()}, true); err != nil {
+		t.Fatal(err)
+	}
+	var team workflow.Team
+	if err := json.Unmarshal(out.Bytes(), &team); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := runTeam(&out, []string{"tasks", "add", team.ID, "unfinished", "--db", dbPath}, true); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := runTeam(&out, []string{"run", team.ID, "--db", dbPath}, false); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "open_tasks=1") || !strings.Contains(got, "Incomplete:") || !strings.Contains(got, "Recovery:") {
+		t.Fatalf("expected text summary to expose incomplete board and recovery, got %q", got)
 	}
 }
 
