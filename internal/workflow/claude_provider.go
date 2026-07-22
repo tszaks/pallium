@@ -223,11 +223,19 @@ func (r *Runner) runClaudeTeamTurn(ctx context.Context, mode, model, sessionToke
 // a huge or malformed response can't bloat the stored error record.
 const maxErrorOutputBytes = 4096
 
+// truncateForError bounds a provider's captured output to its last
+// maxErrorOutputBytes bytes. A worker that's hung or gets killed (a timeout,
+// a SIGKILL) has already printed whatever it's going to print by the time it
+// dies, and the most diagnostic content — the last thing it said before
+// going silent — sits at the END of that output, not the start. Keeping the
+// head instead (as this used to) discards exactly the part of a long-running
+// agent's stderr most likely to explain why it died.
 func truncateForError(s string) string {
 	if len(s) <= maxErrorOutputBytes {
 		return s
 	}
-	return s[:maxErrorOutputBytes] + fmt.Sprintf("... [truncated %d bytes]", len(s)-maxErrorOutputBytes)
+	skipped := len(s) - maxErrorOutputBytes
+	return fmt.Sprintf("...[truncated %d earlier bytes]... ", skipped) + s[skipped:]
 }
 
 // extractClaudeOutput pulls the final answer text (and, if present, usage/

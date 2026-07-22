@@ -104,6 +104,17 @@ type AgentOptions struct {
 	// honored when the run was launched with --allow-network (the operator
 	// ceiling); otherwise the agent runs sandboxed. Default false.
 	Network bool `json:"network,omitempty"`
+	// OnError controls what a direct (non-parallel/pipeline) agent() call
+	// does when the agent fails: "throw" (default, current behavior) raises
+	// the error into the script; "null" returns null instead, matching how
+	// parallel()/pipeline() already turn a per-item agent failure into null
+	// so the rest of the script can continue — the same parity Claude
+	// Ultracode's agent() has (it returns null on failure rather than
+	// throwing). Only applies to ordinary, non-fatal failures: a run-fatal
+	// cause (budget exhausted, max agents, repo lock contention, or a
+	// stop/pause interrupt — see isWorkflowFatalAgentError) still throws
+	// regardless, since those end the run, not just this one call.
+	OnError string `json:"on_error,omitempty"`
 }
 
 type CheckOptions struct {
@@ -1024,6 +1035,9 @@ func (r *Runner) jsAgent(ctx context.Context, vm *goja.Runtime) func(goja.Functi
 		if err := validateUserIsolation(opts.Isolation); err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
+		if err := validateUserOnError(opts.OnError); err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
 		if capture := r.activeCapture(); capture != nil {
 			index := len(capture.Calls)
 			capture.Calls = append(capture.Calls, parallelAgentCall{Prompt: prompt, Opts: opts})
@@ -1031,6 +1045,17 @@ func (r *Runner) jsAgent(ctx context.Context, vm *goja.Runtime) func(goja.Functi
 		}
 		output, err := r.runAgentAtCallIndex(ctx, prompt, opts, r.nextAgentCallIndex())
 		if err != nil {
+			// on_error: "null" mirrors how parallel()/pipeline() already turn
+			// a per-item agent failure into null (see
+			// runAgentCallsWithSemaphore) rather than aborting the whole
+			// script — Claude Ultracode's own agent() has this same
+			// null-on-failure shape. Run-fatal causes (budget/max-agents/
+			// repo-lock/stop/pause) are excluded: those end the run itself,
+			// not just this call, so they always throw.
+			if strings.TrimSpace(opts.OnError) == "null" && !isWorkflowFatalAgentError(err) {
+				r.recordDroppedItem(firstNonEmpty(opts.Label, "agent"), err.Error())
+				return vm.ToValue(nil)
+			}
 			panic(vm.ToValue(r.throwable(err)))
 		}
 		return vm.ToValue(parseAgentOutput(output))
@@ -2718,6 +2743,17 @@ func validateUserIsolation(isolation string) error {
 	}
 }
 
+// validateUserOnError guards the JS option boundary for agent()'s `on_error`
+// opt: scripts may only pick "" (default, same as "throw") or "null".
+func validateUserOnError(onError string) error {
+	switch strings.TrimSpace(onError) {
+	case "", "throw", "null":
+		return nil
+	default:
+		return fmt.Errorf("invalid agent on_error %q: allowed values are \"throw\" and \"null\"", onError)
+	}
+}
+
 // validateUserNetwork guards the JS option boundary for the `network` opt:
 // scripts may only pass a boolean (true or false). A non-boolean (string,
 // number, object) is a script mistake and is rejected with a clear message
@@ -3170,7 +3206,7 @@ func (r *Runner) runConfiguredProviderCommand(ctx context.Context, command, tmpD
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		baseErr := formatProviderFailure(fmt.Sprintf("workflow provider %q", agent.Provider), err, stderr.String())
+		baseErr := formatProviderFailure(fmt.Sprintf("workflow provider %q", agent.Provider), err, truncateForError(strings.TrimSpace(stderr.String())))
 		return strings.TrimSpace(stdout.String()), wrapProviderCommandError(baseErr, stdout.String()+stderr.String())
 	}
 	raw, readErr := os.ReadFile(outFile)
