@@ -115,6 +115,39 @@ func TestRunConfiguredProviderCommandNeverProducesEmptyTrailingError(t *testing.
 	}
 }
 
+// TestRunConfiguredProviderCommandBoundsStderrToTail proves a configured
+// provider wrapper that dies after writing a large amount of stderr keeps
+// the LAST bytes of that stderr in the error record, not the first, mirroring
+// the same tail-bounding the codex and claude built-ins apply.
+func TestRunConfiguredProviderCommandBoundsStderrToTail(t *testing.T) {
+	clearProviderEnv(t)
+	tmp := t.TempDir()
+	wrapperScript := filepath.Join(tmp, "noisy-fail.sh")
+	if err := os.WriteFile(wrapperScript, []byte(`#!/bin/sh
+printf 'HEAD_MARKER_NEVER_SHOULD_SURVIVE\n' >&2
+yes filler | head -c 8192 >&2
+echo REAL_FAILURE_REASON_AT_THE_END >&2
+exit 1
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_GROK_COMMAND", wrapperScript)
+
+	agent := &Agent{Mode: "read-only", Prompt: "hello", Provider: "grok"}
+	r := &Runner{}
+	callTmp := t.TempDir()
+	_, err := r.runProviderCommand(context.Background(), "grok", callTmp, filepath.Join(callTmp, "out.txt"), filepath.Join(callTmp, "usage.json"), callTmp, agent.Prompt, agent, AgentOptions{}, false)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "REAL_FAILURE_REASON_AT_THE_END") {
+		t.Fatalf("expected the tail of stderr (the real failure reason) to survive truncation, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "HEAD_MARKER_NEVER_SHOULD_SURVIVE") {
+		t.Fatalf("expected the head of a too-long stderr to be dropped, got: %v", err)
+	}
+}
+
 func TestFormatProviderFailureNamesEmptyStderrExplicitly(t *testing.T) {
 	err := formatProviderFailure("workflow provider \"claude\"", fmt.Errorf("exit status 1"), "   ")
 	if err == nil {

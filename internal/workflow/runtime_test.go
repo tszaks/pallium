@@ -3772,6 +3772,108 @@ func TestAgentTimeoutOptionFailsDirectCall(t *testing.T) {
 	}
 }
 
+// TestAgentOnErrorNullReturnsNullAndContinuesScript proves the Ultracode-
+// parity opt-in: a direct agent() call with on_error: "null" must not abort
+// the script when the agent fails. Instead it returns null for that call
+// (matching parallel()/pipeline()'s own null-on-failure behavior), records
+// the drop in the run's failures list, and lets the rest of the script keep
+// running.
+func TestAgentOnErrorNullReturnsNullAndContinuesScript(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_TEST_COMMAND", `PALLIUM_WORKFLOW_PROMPT="$(cat "$PALLIUM_WORKFLOW_PROMPT_FILE")"; if printf '%s' "$PALLIUM_WORKFLOW_PROMPT" | grep -q bad; then echo "boom" >&2; exit 1; fi; printf '{"prompt":"%s"}' "$PALLIUM_WORKFLOW_PROMPT" > "$PALLIUM_WORKFLOW_OUTPUT_FILE"`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `const failed = await agent("this is bad", { label: "first", provider: "test", on_error: "null" });
+const ok = await agent("this is fine", { label: "second", provider: "test" });
+return { failed, ok };`
+	scriptPath, err := WriteRunScript("wf-agent-onerror-null", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-agent-onerror-null", Task: "on_error null", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err != nil {
+		t.Fatalf("on_error: \"null\" must not abort the script when the agent fails, got %v", err)
+	}
+	if !strings.Contains(result, `"failed": null`) {
+		t.Fatalf("expected the failed call to resolve to null, got %s", result)
+	}
+	if !strings.Contains(result, "this is fine") {
+		t.Fatalf("expected the script to keep running after the failed call, got %s", result)
+	}
+	snapshot, err := store.Snapshot(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Run.Status != "completed" {
+		t.Fatalf("expected the run to complete despite the dropped agent, got %+v", snapshot.Run)
+	}
+	if len(snapshot.Run.Failures) != 1 || !strings.Contains(snapshot.Run.Failures[0].Error, "boom") {
+		t.Fatalf("expected the drop to be recorded in the run's failures list, got %+v", snapshot.Run.Failures)
+	}
+	if len(snapshot.Agents) != 2 || snapshot.Agents[0].Status != "failed" || snapshot.Agents[1].Status != "completed" {
+		t.Fatalf("expected one failed and one completed agent record, got %+v", snapshot.Agents)
+	}
+}
+
+// TestAgentOnErrorNullStillThrowsOnFatalError proves on_error: "null" is not
+// a blanket try/catch: a run-fatal cause (here, exceeding --max-agents)
+// still aborts the run exactly like the default "throw" behavior, since
+// that failure ends the whole run, not just this one call.
+func TestAgentOnErrorNullStillThrowsOnFatalError(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `await agent("warmup");
+return await agent("hi", { on_error: "null" });`
+	scriptPath, err := WriteRunScript("wf-agent-onerror-fatal", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-agent-onerror-fatal", Task: "on_error fatal", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 1}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), "exceeded max agents") {
+		t.Fatalf("expected on_error: \"null\" to still surface a run-fatal error, got %v", err)
+	}
+}
+
+// TestAgentOnErrorRejectsInvalidValue proves a typo in on_error fails fast
+// with a clear message rather than silently falling back to either mode.
+func TestAgentOnErrorRejectsInvalidValue(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `return await agent("hi", { on_error: "ignore" });`
+	scriptPath, err := WriteRunScript("wf-agent-onerror-invalid", tmp, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-agent-onerror-invalid", Task: "on_error invalid", CWD: tmp, ScriptPath: scriptPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&Runner{Store: store, Run: run, MaxAgents: 10}).Execute(context.Background(), script, nil)
+	if err == nil || !strings.Contains(err.Error(), `invalid agent on_error "ignore"`) {
+		t.Fatalf("expected invalid on_error to be rejected, got %v", err)
+	}
+}
+
 func TestWorkflowEditTimeoutPreservesRecoveryWithoutApplying(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	repo := t.TempDir()

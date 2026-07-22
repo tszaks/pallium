@@ -154,9 +154,20 @@ func TestTruncateForError(t *testing.T) {
 	if got := truncateForError("short"); got != "short" {
 		t.Fatalf("short string changed: %q", got)
 	}
-	got := truncateForError(strings.Repeat("x", maxErrorOutputBytes+100))
-	if len(got) <= maxErrorOutputBytes || !strings.Contains(got, "truncated") {
+	head := strings.Repeat("h", maxErrorOutputBytes)
+	tail := strings.Repeat("t", 100)
+	got := truncateForError(head + tail)
+	if !strings.Contains(got, "truncated") {
 		t.Fatalf("truncate failed: len=%d", len(got))
+	}
+	// The tail — what a hung/killed provider printed most recently, and so
+	// the most diagnostic part of its output — must survive; the head must
+	// not.
+	if !strings.HasSuffix(got, tail) {
+		t.Fatalf("expected truncation to keep the tail (most recent output), got %q", got)
+	}
+	if strings.Contains(got, head) {
+		t.Fatalf("expected truncation to drop the head, got %q", got)
 	}
 }
 
