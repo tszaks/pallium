@@ -19,6 +19,10 @@ pallium workflow report <run-id> --json
 pallium workflow gc --older-than 7 --dry-run
 ```
 
+`<run-id>` is optional on `inspect`, `report`, and `stop`: omit it and inspect/report
+fall back to the most recent run (preferring one still running), and `stop` falls
+back only when exactly one run is currently running.
+
 Discover primitives first:
 
 ```bash

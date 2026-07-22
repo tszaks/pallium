@@ -1411,8 +1411,8 @@ func runWorkflowInspect(out io.Writer, args []string, jsonOutput bool) error {
 	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}}, nil); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: pallium workflow inspect <run-id>")
+	if fs.NArg() > 1 {
+		return fmt.Errorf("usage: pallium workflow inspect [run-id]")
 	}
 	store, err := workflow.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
@@ -1420,7 +1420,11 @@ func runWorkflowInspect(out io.Writer, args []string, jsonOutput bool) error {
 	}
 	defer store.Close()
 	autoReconcileStale(store)
-	snapshot, err := store.Snapshot(fs.Arg(0))
+	runID, err := resolveWorkflowRunArg(store, fs)
+	if err != nil {
+		return err
+	}
+	snapshot, err := store.Snapshot(runID)
 	if err != nil {
 		return err
 	}
@@ -1428,6 +1432,67 @@ func runWorkflowInspect(out io.Writer, args []string, jsonOutput bool) error {
 	return output.Write(out, inspection, jsonOutput, func() string {
 		return renderWorkflowInspection(inspection)
 	})
+}
+
+// resolveWorkflowRunArg returns the explicit run-id the caller passed, or
+// falls back to resolveDefaultRunID's convenience default when it was
+// omitted — the shared "no run-id given" behavior for inspect/report, so a
+// caller mid-run doesn't have to go dig a run-id out of `workflow list`
+// first. `stop` has its own stricter call site (see
+// runWorkflowInterruptStatus) since defaulting there is destructive.
+func resolveWorkflowRunArg(store *workflow.Store, fs *flag.FlagSet) (string, error) {
+	if fs.NArg() == 1 {
+		return fs.Arg(0), nil
+	}
+	return resolveDefaultRunID(store, false)
+}
+
+// resolveDefaultRunID picks a run when no run-id was given on the command
+// line.
+//
+// requireSingleRunning=false (inspect/report): a convenience default — most
+// recent running run if any exist, else the single most recent run overall.
+// Showing the wrong run's status/report is harmless annoyance, not damage,
+// so "freshest thing" is a fine guess even with several runs going.
+//
+// requireSingleRunning=true (stop): stopping the wrong run is destructive,
+// so this only ever defaults when exactly one run is currently running.
+// Zero or multiple running runs is treated as ambiguous and requires an
+// explicit run-id.
+func resolveDefaultRunID(store *workflow.Store, requireSingleRunning bool) (string, error) {
+	runs, err := store.ListRuns(50)
+	if err != nil {
+		return "", err
+	}
+	if len(runs) == 0 {
+		return "", fmt.Errorf("no workflow runs found; pass a run-id")
+	}
+	var running []workflow.Run
+	for _, run := range runs {
+		if run.Status == "running" {
+			running = append(running, run)
+		}
+	}
+	if requireSingleRunning {
+		switch len(running) {
+		case 1:
+			return running[0].ID, nil
+		case 0:
+			return "", fmt.Errorf("no workflow runs are currently running; pass a run-id")
+		default:
+			ids := make([]string, len(running))
+			for i, run := range running {
+				ids[i] = run.ID
+			}
+			return "", fmt.Errorf("%d workflow runs are running; pass a run-id (running: %s)", len(running), strings.Join(ids, ", "))
+		}
+	}
+	// runs is already ordered most-recent-updated-first (see ListRuns), so
+	// running[0]/runs[0] are each already the freshest candidate.
+	if len(running) > 0 {
+		return running[0].ID, nil
+	}
+	return runs[0].ID, nil
 }
 
 func runWorkflowShow(out io.Writer, args []string, jsonOutput bool) error {
@@ -1505,14 +1570,19 @@ func runWorkflowReport(out io.Writer, args []string, jsonOutput bool) error {
 	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}}, map[string]struct{}{"related": {}}); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: pallium workflow report <run-id> [--related]")
+	if fs.NArg() > 1 {
+		return fmt.Errorf("usage: pallium workflow report [run-id] [--related]")
 	}
 	store, err := workflow.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
-	snapshot, err := store.Snapshot(fs.Arg(0))
+	runID, err := resolveWorkflowRunArg(store, fs)
+	if err != nil {
+		_ = store.Close()
+		return err
+	}
+	snapshot, err := store.Snapshot(runID)
 	if err != nil {
 		_ = store.Close()
 		return err
@@ -1651,14 +1721,31 @@ func runWorkflowInterruptStatus(out io.Writer, args []string, jsonOutput bool, c
 	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}}, nil); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 {
+	// "stop" may default to the run-id when there is exactly one run
+	// currently running — stopping the wrong run is destructive, so any
+	// other ambiguity still requires an explicit run-id. "pause" keeps the
+	// stricter always-explicit requirement.
+	if commandName == "stop" {
+		if fs.NArg() > 1 {
+			return fmt.Errorf("usage: pallium workflow %s [run-id]", commandName)
+		}
+	} else if fs.NArg() != 1 {
 		return fmt.Errorf("usage: pallium workflow %s <run-id>", commandName)
 	}
 	store, err := workflow.Open(resolvePalliumDBPath(*dbPath))
 	if err != nil {
 		return err
 	}
-	run, err := store.Run(fs.Arg(0))
+	runID := fs.Arg(0)
+	if commandName == "stop" && fs.NArg() == 0 {
+		var resolveErr error
+		runID, resolveErr = resolveDefaultRunID(store, true)
+		if resolveErr != nil {
+			_ = store.Close()
+			return resolveErr
+		}
+	}
+	run, err := store.Run(runID)
 	_ = store.Close()
 	if err != nil {
 		return err
@@ -2612,14 +2699,14 @@ Usage:
   pallium workflow run /saved-name "task input"
   pallium workflow list [--limit n] [--json]
   pallium workflow status <run-id> [--json]
-  pallium workflow inspect <run-id> [--json]
+  pallium workflow inspect [run-id] [--json]  (defaults to the most recent run, preferring one still running)
   pallium workflow show <run-id> [--json]
   pallium workflow read <run-id> [--json]
-  pallium workflow report <run-id> [--related] [--json]
+  pallium workflow report [run-id] [--related] [--json]  (defaults like inspect)
   pallium workflow watch <run-id>
   pallium workflow pause <run-id> [--json]
   pallium workflow resume <run-id> [--background] [--json]
-  pallium workflow stop <run-id> [--json]
+  pallium workflow stop [run-id] [--json]  (defaults only if exactly one run is running)
   pallium workflow save <run-id> --name name [--user] [--json]
   pallium workflow apply <run-id> [--json]
   pallium workflow revert <run-id> [--json]

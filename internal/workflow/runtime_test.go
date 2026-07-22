@@ -5844,3 +5844,70 @@ func TestAgentNetworkDefaultOff(t *testing.T) {
 		t.Fatalf("did not expect network-enabled log for a non-opted agent, got stderr: %s", logs)
 	}
 }
+
+// TestAgentStateTransitionsBumpRunUpdatedAt guards against a stale "Updated:"
+// header on `workflow inspect` while a run is very much alive: an agent
+// starting or finishing is proof the run made progress, so the run's own
+// updated_at must move past whatever it was at run creation — not stay
+// pinned there until the run's status itself flips (which is all
+// SetRunStatus ever touches).
+func TestAgentStateTransitionsBumpRunUpdatedAt(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	run, err := store.CreateRun(Run{Task: "bump test", CWD: tmp, ScriptPath: filepath.Join(tmp, "workflow.js"), Status: "running"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startedAt := run.UpdatedAt
+
+	time.Sleep(2 * time.Millisecond)
+	agent, err := store.CreateAgent(Agent{RunID: run.ID, Prompt: "p", Status: "running"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterCreate, err := store.Run(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !startedAtTime(t, afterCreate.UpdatedAt).After(startedAtTime(t, startedAt)) {
+		t.Fatalf("expected run.updated_at to advance after CreateAgent, started at %q, got %q", startedAt, afterCreate.UpdatedAt)
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	// Flip the run's own status away from "running" first — FinishAgentStatus's
+	// updated_at bump must still fire even though the heartbeat write next to
+	// it is gated on status='running' and would no-op here.
+	if err := store.SetRunStatus(run.ID, "failed", "", "boom"); err != nil {
+		t.Fatal(err)
+	}
+	afterStatusFlip, err := store.Run(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	if err := store.FinishAgentStatus(agent, "failed", "", "boom"); err != nil {
+		t.Fatal(err)
+	}
+	afterFinish, err := store.Run(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !startedAtTime(t, afterFinish.UpdatedAt).After(startedAtTime(t, afterStatusFlip.UpdatedAt)) {
+		t.Fatalf("expected run.updated_at to advance after FinishAgentStatus even on a non-running run, before %q, after %q", afterStatusFlip.UpdatedAt, afterFinish.UpdatedAt)
+	}
+}
+
+func startedAtTime(t *testing.T, s string) time.Time {
+	t.Helper()
+	parsed, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		t.Fatalf("parse timestamp %q: %v", s, err)
+	}
+	return parsed
+}
