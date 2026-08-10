@@ -2,11 +2,16 @@ package cmd
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
+
+	"github.com/tszaks/pallium/internal/sessionmemory"
 )
 
 func TestSessionsIndexHelpDoesNotStartIndex(t *testing.T) {
@@ -29,6 +34,66 @@ func TestSessionsEmbedHelpDoesNotStartEmbedding(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "pallium sessions") {
 		t.Fatalf("expected sessions help, got %q", out.String())
+	}
+}
+
+func TestSessionsEmbeddingConfigurePersistsAndBecomesEmbedDefault(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), ".pallium", "embedding.json")
+	t.Setenv("PALLIUM_EMBED_CONFIG", configPath)
+	for _, key := range []string{"PALLIUM_EMBED_PROVIDER", "PALLIUM_EMBED_BASE_URL", "PALLIUM_EMBED_MODEL", "PALLIUM_EMBED_API_KEY", "OPENAI_API_KEY", "OPENAI_ADMIN_API_KEY"} {
+		t.Setenv(key, "")
+	}
+	var out bytes.Buffer
+	if err := runSessions(&out, []string{"embedding", "configure", "--provider", "ollama", "--model", "embeddinggemma"}, true); err != nil {
+		t.Fatal(err)
+	}
+	var status sessionmemory.EmbeddingStatus
+	if err := json.Unmarshal(out.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.Provider != "ollama" || status.Model != "embeddinggemma" || status.ProviderSource != "config" {
+		t.Fatalf("unexpected configured status: %+v", status)
+	}
+
+	out.Reset()
+	dbPath := filepath.Join(t.TempDir(), "sessions.sqlite")
+	if err := runSessions(&out, []string{"embed", "--db", dbPath, "--limit", "1"}, true); err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["model"] != "embeddinggemma" || payload["embedded"] != float64(0) {
+		t.Fatalf("saved model did not become embed default: %v", payload)
+	}
+}
+
+func TestSessionsEmbeddingConfigureAcceptsKeychain(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), ".pallium", "embedding.json")
+	t.Setenv("PALLIUM_EMBED_CONFIG", configPath)
+	for _, key := range []string{"PALLIUM_EMBED_PROVIDER", "PALLIUM_EMBED_BASE_URL", "PALLIUM_EMBED_MODEL", "PALLIUM_EMBED_API_KEY", "OPENAI_API_KEY", "OPENAI_ADMIN_API_KEY"} {
+		t.Setenv(key, "")
+	}
+
+	var out bytes.Buffer
+	err := runSessions(&out, []string{"embedding", "configure", "--provider", "openai", "--model", "text-embedding-3-small", "--credential-store", "keychain"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var status sessionmemory.EmbeddingStatus
+	if err := json.Unmarshal(out.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.Provider != "openai" || status.Model != "text-embedding-3-small" || !status.Configured {
+		t.Fatalf("unexpected embedding status: %+v", status)
+	}
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte(`"credential_store": "keychain"`)) {
+		t.Fatalf("keychain selection not persisted: %s", raw)
 	}
 }
 
@@ -142,5 +207,140 @@ func TestSessionFlagsCanFollowPositionals(t *testing.T) {
 	}
 	if fs.NArg() != 1 || fs.Arg(0) != "repo" {
 		t.Fatalf("positionals=%v, want repo", fs.Args())
+	}
+}
+
+func TestSessionsDoctorReportsMissingDatabaseAsJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing.sqlite")
+	var out bytes.Buffer
+	if err := runSessions(&out, []string{"doctor", "--db", path}, true); err != nil {
+		t.Fatal(err)
+	}
+	var report sessionmemory.SessionDoctorReport
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.DBExists || len(report.Issues) == 0 {
+		t.Fatalf("unexpected doctor report: %+v", report)
+	}
+}
+
+func TestSessionsForgetPreviewsBeforeConfirmedDeletion(t *testing.T) {
+	tmp := t.TempDir()
+	claudeHome := filepath.Join(tmp, ".claude")
+	projectDir := filepath.Join(claudeHome, "projects", "-tmp-repo")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	transcript := strings.Join([]string{
+		`{"type":"user","message":{"role":"user","content":"remember this"},"timestamp":"2026-06-10T12:00:00Z","sessionId":"forget-command","cwd":"/tmp/repo"}`,
+		`{"type":"assistant","message":{"role":"assistant","content":"remembered"},"timestamp":"2026-06-10T12:01:00Z","sessionId":"forget-command","cwd":"/tmp/repo"}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(projectDir, "forget-command.jsonl"), []byte(transcript), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(tmp, "sessions.sqlite")
+	if _, err := sessionmemory.Index(context.Background(), sessionmemory.Options{DBPath: path, ClaudeHome: claudeHome, Provider: "claude", Force: true}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := runSessions(&out, []string{"forget", "forget-command", "--db", path}, false); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "Preview only") {
+		t.Fatalf("expected safe preview, got %q", out.String())
+	}
+	out.Reset()
+	if err := runSessions(&out, []string{"forget", "forget-command", "--db", path, "--confirm"}, false); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "Forgot session") {
+		t.Fatalf("expected deletion result, got %q", out.String())
+	}
+}
+
+func TestParseSessionRetentionAge(t *testing.T) {
+	for input, want := range map[string]string{
+		"180d": "4320h0m0s",
+		"12w":  "2016h0m0s",
+		"720h": "720h0m0s",
+	} {
+		got, err := parseSessionRetentionAge(input)
+		if err != nil {
+			t.Fatalf("%s: %v", input, err)
+		}
+		if got.String() != want {
+			t.Fatalf("%s parsed as %s, want %s", input, got, want)
+		}
+	}
+	if _, err := parseSessionRetentionAge("0d"); err == nil {
+		t.Fatal("expected zero age to fail")
+	}
+}
+
+func TestSessionsContinuityCommandsReturnStructuredJSON(t *testing.T) {
+	tmp := t.TempDir()
+	claudeHome := filepath.Join(tmp, ".claude")
+	projectDir := filepath.Join(claudeHome, "projects", "-tmp-repo")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	transcriptPath := filepath.Join(projectDir, "continuity-command.jsonl")
+	transcript := strings.Join([]string{
+		`{"type":"user","message":{"role":"user","content":"checkout continuity"},"timestamp":"2026-06-10T12:00:00Z","sessionId":"continuity-command","cwd":"/tmp/repo"}`,
+		`{"type":"assistant","message":{"role":"assistant","content":"Next action: run the smoke test"},"timestamp":"2026-06-10T12:01:00Z","sessionId":"continuity-command","cwd":"/tmp/repo"}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(transcriptPath, []byte(transcript), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-10 * time.Minute)
+	if err := os.Chtimes(transcriptPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	if _, err := sessionmemory.Index(context.Background(), sessionmemory.Options{DBPath: dbPath, ClaudeHome: claudeHome, Provider: "claude", Force: true}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	var recallOut bytes.Buffer
+	if err := runSessions(&recallOut, []string{"recall", "checkout", "continuity", "--db", dbPath, "--lexical-only"}, true); err != nil {
+		t.Fatal(err)
+	}
+	var recall sessionmemory.RecallReport
+	if err := json.Unmarshal(recallOut.Bytes(), &recall); err != nil {
+		t.Fatalf("invalid recall JSON: %v: %s", err, recallOut.String())
+	}
+	if recall.SessionID != "continuity-command" || recall.NextAction != "run the smoke test" {
+		t.Fatalf("unexpected recall: %+v", recall)
+	}
+
+	var showOut bytes.Buffer
+	if err := runSessions(&showOut, []string{"show", "continuity-command", "--db", dbPath}, true); err != nil {
+		t.Fatal(err)
+	}
+	var show map[string]any
+	if err := json.Unmarshal(showOut.Bytes(), &show); err != nil || show["capsule"] == nil {
+		t.Fatalf("invalid show JSON: %v: %s", err, showOut.String())
+	}
+
+	var readOut bytes.Buffer
+	if err := runSessions(&readOut, []string{"read", "continuity-command", "--db", dbPath, "--limit", "1"}, true); err != nil {
+		t.Fatal(err)
+	}
+	var read map[string]any
+	if err := json.Unmarshal(readOut.Bytes(), &read); err != nil || read["messages"] == nil {
+		t.Fatalf("invalid read JSON: %v: %s", err, readOut.String())
+	}
+
+	var openOut bytes.Buffer
+	if err := runSessions(&openOut, []string{"open", "continuity-command", "--db", dbPath}, true); err != nil {
+		t.Fatal(err)
+	}
+	var location sessionmemory.SessionLocation
+	if err := json.Unmarshal(openOut.Bytes(), &location); err != nil || location.RolloutPath != transcriptPath {
+		t.Fatalf("invalid open JSON: %v: %s", err, openOut.String())
 	}
 }

@@ -12,7 +12,6 @@ import (
 	"io"
 	"math"
 	"net/http"
-	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -25,6 +24,10 @@ func Embed(ctx context.Context, model string, limit, batchSize int) (int, error)
 }
 
 func EmbedSession(ctx context.Context, sessionID, model string, limit, batchSize int) (int, error) {
+	return EmbedSessionPath(ctx, "", sessionID, model, limit, batchSize, nil)
+}
+
+func EmbedSessionPath(ctx context.Context, dbPath, sessionID, model string, limit, batchSize int, progress func(completed, total int)) (int, error) {
 	model = resolveEmbeddingModel(model)
 	provider := embeddingProvider()
 	if batchSize <= 0 {
@@ -33,7 +36,7 @@ func EmbedSession(ctx context.Context, sessionID, model string, limit, batchSize
 	if limit <= 0 {
 		limit = 1000000
 	}
-	store, err := Open("")
+	store, err := Open(dbPath)
 	if err != nil {
 		return 0, err
 	}
@@ -64,6 +67,9 @@ func EmbedSession(ctx context.Context, sessionID, model string, limit, batchSize
 	if err := rows.Err(); err != nil {
 		return 0, err
 	}
+	if progress != nil {
+		progress(0, len(chunks))
+	}
 	total := 0
 	for i := 0; i < len(chunks); i += batchSize {
 		end := i + batchSize
@@ -84,6 +90,9 @@ func EmbedSession(ctx context.Context, sessionID, model string, limit, batchSize
 				return total, err
 			}
 			total++
+		}
+		if progress != nil {
+			progress(total, len(chunks))
 		}
 	}
 	if sessionID == "" && total < limit {
@@ -115,7 +124,7 @@ func Semantic(ctx context.Context, query, model string, limit int, sessionsOnly 
 		return nil, err
 	}
 	defer store.Close()
-	rows, err := store.db.Query(`SELECT e.vector_blob,c.id,c.session_id,c.kind,c.text,s.title,s.cwd,s.updated_at FROM codex_session_embeddings e JOIN codex_session_chunks c ON c.id=e.chunk_id JOIN codex_sessions s ON s.id=c.session_id WHERE e.provider=? AND e.model=?`, provider, model)
+	rows, err := store.db.Query(`SELECT e.vector_blob,c.id,c.session_id,c.kind,c.text,s.title,s.cwd,s.updated_at FROM codex_session_embeddings e JOIN codex_session_chunks c ON c.id=e.chunk_id AND e.text_sha256=c.text_sha256 JOIN codex_sessions s ON s.id=c.session_id WHERE e.provider=? AND e.model=?`, provider, model)
 	if err != nil {
 		return nil, err
 	}
@@ -148,63 +157,21 @@ func Semantic(ctx context.Context, query, model string, limit int, sessionsOnly 
 	return out, nil
 }
 
-// embeddingSettings is the resolved embedding provider configuration for the current process.
-type embeddingSettings struct {
-	provider string
-	baseURL  string
-	apiKey   string
-}
-
-// resolveEmbeddingSettings reads the active embedding provider from the environment so a user can
-// bring their own key against any OpenAI-compatible host, or run fully local with no key at all.
-// The embedding ecosystem largely standardized on the OpenAI /v1/embeddings wire format (OpenAI,
-// Ollama, LM Studio, llama.cpp, vLLM, Together, Mistral, Jina, OpenRouter, ...), so one
-// configurable client covers "as many models as possible" without a bespoke adapter per provider.
-func resolveEmbeddingSettings() embeddingSettings {
-	provider := strings.TrimSpace(os.Getenv("PALLIUM_EMBED_PROVIDER"))
-	if provider == "" {
-		provider = "openai"
-	}
-	baseURL := strings.TrimSpace(os.Getenv("PALLIUM_EMBED_BASE_URL"))
-	if baseURL == "" {
-		if provider == "ollama" {
-			baseURL = "http://localhost:11434/v1"
-		} else {
-			baseURL = "https://api.openai.com/v1"
-		}
-	}
-	apiKey := strings.TrimSpace(os.Getenv("PALLIUM_EMBED_API_KEY"))
-	if apiKey == "" && provider == "openai" {
-		apiKey = strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
-		if apiKey == "" {
-			apiKey = strings.TrimSpace(os.Getenv("OPENAI_ADMIN_API_KEY"))
-		}
-	}
-	return embeddingSettings{provider: provider, baseURL: strings.TrimRight(baseURL, "/"), apiKey: apiKey}
-}
-
-// embeddingProvider is the label embeddings are stored and queried under. A similarity search only
-// compares vectors within one (provider, model) space, since embeddings from different models live
-// in different vector spaces and are not comparable. Switching providers/models re-embeds the
-// backlog rather than mixing spaces.
-func embeddingProvider() string { return resolveEmbeddingSettings().provider }
-
-// resolveEmbeddingModel applies the explicit model override, then PALLIUM_EMBED_MODEL, then the
-// built-in default.
-func resolveEmbeddingModel(model string) string {
-	if strings.TrimSpace(model) != "" {
-		return model
-	}
-	if env := strings.TrimSpace(os.Getenv("PALLIUM_EMBED_MODEL")); env != "" {
-		return env
-	}
-	return DefaultEmbeddingModel
-}
-
 // openAICompatibleEmbeddings calls any OpenAI-compatible /v1/embeddings endpoint. The API key is
 // optional, so local runtimes (Ollama, LM Studio, llama.cpp) work without one.
 func openAICompatibleEmbeddings(ctx context.Context, model string, texts []string) ([][]float64, error) {
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+	}
 	s := resolveEmbeddingSettings()
+	if s.configError != nil {
+		return nil, s.configError
+	}
+	if s.credentialError != nil {
+		return nil, s.credentialError
+	}
 	if s.apiKey == "" && strings.Contains(s.baseURL, "api.openai.com") {
 		return nil, errors.New("OpenAI embeddings require OPENAI_API_KEY or PALLIUM_EMBED_API_KEY; set PALLIUM_EMBED_PROVIDER=ollama (or another local provider) to run without a key")
 	}
@@ -231,6 +198,9 @@ func openAICompatibleEmbeddings(ctx context.Context, model string, texts []strin
 		if resp.StatusCode < 300 {
 			break
 		}
+		if summary, permanent := permanentEmbeddingFailure(payload); permanent {
+			return nil, fmt.Errorf("%s embeddings failed: %s: %s", s.provider, resp.Status, summary)
+		}
 		if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
 			return nil, fmt.Errorf("%s embeddings failed: %s: %s", s.provider, resp.Status, short(string(payload), 500))
 		}
@@ -239,7 +209,7 @@ func openAICompatibleEmbeddings(ctx context.Context, model string, texts []strin
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return nil, ctx.Err()
+			return nil, fmt.Errorf("%s embeddings failed: %s: %s", s.provider, status, short(string(payload), 500))
 		case <-timer.C:
 		}
 	}
@@ -259,6 +229,24 @@ func openAICompatibleEmbeddings(ctx context.Context, model string, texts []strin
 		out[i] = item.Embedding
 	}
 	return out, nil
+}
+
+func permanentEmbeddingFailure(payload []byte) (string, bool) {
+	var decoded struct {
+		Error struct {
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(payload, &decoded) != nil {
+		return "", false
+	}
+	permanent := decoded.Error.Type == "insufficient_quota" || decoded.Error.Code == "credit_balance_exhausted"
+	if !permanent {
+		return "", false
+	}
+	return short(strings.TrimSpace(decoded.Error.Code+": "+decoded.Error.Message), 500), true
 }
 
 func retryDelay(retryAfter, payload string, attempt int) time.Duration {
@@ -323,23 +311,91 @@ type chunkRecord struct {
 }
 
 func buildChunks(p ParsedSession) []chunkRecord {
-	overview := strings.Join([]string{"Title: " + p.Session.Title, "CWD: " + p.Session.CWD, "Git: " + p.Session.GitOriginURL + " " + p.Session.GitBranch, "First ask: " + p.Session.FirstUserMessage, "Last agent message: " + p.Session.LastAgentMessage, "Files touched:\n" + strings.Join(p.Session.FilesTouched, "\n"), "Commands:\n" + strings.Join(p.Session.Commands, "\n"), "Errors:\n" + strings.Join(p.Session.Errors, "\n")}, "\n")
-	var transcriptParts []string
-	for _, m := range p.Messages {
-		if m.Text != "" {
-			transcriptParts = append(transcriptParts, fmt.Sprintf("[%s/%s line %d]\n%s", m.Role, m.Kind, m.LineNo, m.Text))
-		}
+	if p.Session.Status == "" {
+		p.Session.Status = "seen"
 	}
-	var out []chunkRecord
-	idx := 0
-	for _, piece := range []struct{ kind, text string }{{"overview", overview}, {"transcript", strings.Join(transcriptParts, "\n\n")}} {
-		for _, text := range chunkText(piece.text, 6000, 600) {
-			sha := fmt.Sprintf("%x", sha256.Sum256([]byte(text)))
-			out = append(out, chunkRecord{ID: fmt.Sprintf("%s:%04d", p.Session.ID, idx), SessionID: p.Session.ID, Index: idx, Kind: piece.kind, Text: text, TextSHA256: sha, TokenEstimate: max(1, len(text)/4), Metadata: map[string]any{"session_title": p.Session.Title, "cwd": p.Session.CWD}})
-			idx++
+	return buildContinuityChunks(p, buildSessionCapsule(p))
+}
+
+func buildContinuityChunks(p ParsedSession, capsule SessionCapsule) []chunkRecord {
+	parts := []string{
+		"Title: " + short(p.Session.Title, 240),
+		"CWD: " + short(p.Session.CWD, 400),
+		"Repository: " + short(strings.TrimSpace(p.Session.GitOriginURL+" "+p.Session.GitBranch), 300),
+		"Status: " + short(capsule.Status, 60),
+		"Goal: " + short(capsule.Goal, 700),
+		"Stopped at: " + short(capsule.StoppedAt, 700),
+		"Next action: " + short(capsule.NextAction, 350),
+		"Completed: " + compactContinuityItems(capsule.Completed, 3, 400),
+		"Remaining: " + compactContinuityItems(capsule.Remaining, 3, 400),
+		"Blockers: " + compactContinuityItems(capsule.Blockers, 3, 400),
+		"Conversation evidence: " + continuityEvidenceText(p.Messages, 4, 6, 700),
+		"Files: " + compactContinuityItems(p.Session.FilesTouched, 8, 800),
+		"Commands: " + compactContinuityItems(p.Session.Commands, 4, 600),
+	}
+	text := truncate(strings.TrimSpace(strings.Join(nonEmptyContinuityParts(parts), "\n")), 6000)
+	if text == "" {
+		return nil
+	}
+	sha := fmt.Sprintf("%x", sha256.Sum256([]byte(text)))
+	return []chunkRecord{{
+		ID:            fmt.Sprintf("%s:%04d", p.Session.ID, 0),
+		SessionID:     p.Session.ID,
+		Index:         0,
+		Kind:          "continuity",
+		Text:          text,
+		TextSHA256:    sha,
+		TokenEstimate: max(1, len(text)/4),
+		Metadata:      map[string]any{"session_title": p.Session.Title, "cwd": p.Session.CWD, "coverage": capsule.Coverage.Mode},
+	}}
+}
+
+func nonEmptyContinuityParts(parts []string) []string {
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		separator := strings.Index(part, ":")
+		if separator >= 0 && strings.TrimSpace(part[separator+1:]) == "" {
+			continue
 		}
+		out = append(out, part)
 	}
 	return out
+}
+
+func compactContinuityItems(items []string, limit, maxChars int) string {
+	if limit <= 0 || maxChars <= 0 {
+		return ""
+	}
+	values := make([]string, 0, min(limit, len(items)))
+	for _, item := range items {
+		item = short(redact(item), maxChars)
+		if item == "" {
+			continue
+		}
+		values = append(values, item)
+		if len(values) >= limit {
+			break
+		}
+	}
+	return truncate(strings.Join(values, " | "), maxChars)
+}
+
+func continuityEvidenceText(messages []Message, headLimit, tailLimit, maxChars int) string {
+	conversation := make([]Message, 0, len(messages))
+	for _, message := range messages {
+		if (message.Role == "user" || message.Role == "assistant") && strings.TrimSpace(message.Text) != "" {
+			conversation = append(conversation, message)
+		}
+	}
+	selected := make([]Message, 0, headLimit+tailLimit)
+	selected = append(selected, conversation[:min(headLimit, len(conversation))]...)
+	tailStart := max(len(selected), len(conversation)-tailLimit)
+	selected = append(selected, conversation[tailStart:]...)
+	parts := make([]string, 0, len(selected))
+	for _, message := range selected {
+		parts = append(parts, fmt.Sprintf("[%s line %d] %s", message.Role, message.LineNo, short(redact(message.Text), 240)))
+	}
+	return truncate(strings.Join(parts, " | "), maxChars)
 }
 
 func chunkText(text string, maxChars, overlap int) []string {

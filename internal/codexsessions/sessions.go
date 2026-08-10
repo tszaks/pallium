@@ -30,11 +30,15 @@ const (
 	providerClaude            = "claude"
 	activeSessionStatus       = "active"
 	inactiveSessionStatus     = "inactive"
+	idleSessionStatus         = "idle"
 	startingSessionTitle      = "(starting up)"
 	defaultRecentActionSuffix = "ToolCall: "
+	liveActivityWindow        = 2 * time.Minute
+	openDesktopSessionWindow  = 24 * time.Hour
 )
 
 var changeDirCommandRegex = regexp.MustCompile(`^\s*cd\s+(?:"([^"]+)"|'([^']+)'|([^&|;]+))\s*&&`)
+var rolloutThreadIDRegex = regexp.MustCompile(`([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$`)
 
 var (
 	nowFunc                    = time.Now
@@ -43,6 +47,7 @@ var (
 	claudeHomeDirFunc          = claudeHomeDir
 	listLiveCodexProcessesVar  = listLiveCodexProcesses
 	listLiveClaudeProcessesVar = listLiveClaudeProcesses
+	listOpenCodexRolloutsVar   = listOpenCodexRollouts
 	processCWDVar              = processCWD
 )
 
@@ -55,6 +60,7 @@ type SessionSnapshot struct {
 	GeneratedAt time.Time        `json:"generated_at"`
 	Host        string           `json:"host"`
 	Sessions    []SessionSummary `json:"sessions"`
+	Warnings    []string         `json:"warnings"`
 }
 
 type SessionSummary struct {
@@ -80,6 +86,12 @@ type liveAgentProcess struct {
 	TTY        string
 	AgeSeconds int64
 	CWD        string
+}
+
+type openCodexRollout struct {
+	PID      int
+	ThreadID string
+	Path     string
 }
 
 type processThreadRow struct {
@@ -126,22 +138,36 @@ type toolCall struct {
 func CollectSessions(ctx context.Context, opts SessionCollectOptions) (*SessionSnapshot, error) {
 	generatedAt := nowFunc().UTC()
 	host, _ := hostnameFunc()
-
-	var sessions []SessionSummary
-	codexSessions, err := collectCodexSessions(ctx, opts, generatedAt)
-	if err != nil {
-		return nil, err
+	type providerResult struct {
+		provider string
+		sessions []SessionSummary
+		err      error
 	}
-	sessions = append(sessions, codexSessions...)
-
-	claudeSessions, err := collectClaudeSessions(ctx, opts, generatedAt)
-	if err != nil {
-		return nil, err
+	results := make(chan providerResult, 2)
+	go func() {
+		sessions, err := collectCodexSessions(ctx, opts, generatedAt)
+		results <- providerResult{provider: providerCodex, sessions: sessions, err: err}
+	}()
+	go func() {
+		sessions, err := collectClaudeSessions(ctx, opts, generatedAt)
+		results <- providerResult{provider: providerClaude, sessions: sessions, err: err}
+	}()
+	sessions := []SessionSummary{}
+	warnings := []string{}
+	for range 2 {
+		result := <-results
+		if result.err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			warnings = append(warnings, fmt.Sprintf("%s live discovery failed: %s", result.provider, result.err))
+			continue
+		}
+		sessions = append(sessions, result.sessions...)
 	}
-	sessions = append(sessions, claudeSessions...)
 
 	sortSessions(sessions)
-	return &SessionSnapshot{GeneratedAt: generatedAt, Host: host, Sessions: sessions}, nil
+	return &SessionSnapshot{GeneratedAt: generatedAt, Host: host, Sessions: sessions, Warnings: warnings}, nil
 }
 
 func collectCodexSessions(ctx context.Context, opts SessionCollectOptions, generatedAt time.Time) ([]SessionSummary, error) {
@@ -228,6 +254,7 @@ func collectCodexSessions(ctx context.Context, opts SessionCollectOptions, gener
 	for threadID, session := range activeByThread {
 		if row, ok := threadsByID[threadID]; ok {
 			enrichSession(&session, row, logsByThread[threadID], opts.IncludeDetails)
+			session.Status = liveSessionStatus(session.LastActiveAt, generatedAt, session.AgeSeconds)
 		}
 		sessions = append(sessions, session)
 	}
@@ -263,16 +290,32 @@ func collectCodexSessionsWithoutLogs(ctx context.Context, dbPath string, opts Se
 	}
 
 	activeByID := matchActiveSessions(summaries, liveProcesses, generatedAt, startingCodexSession)
+	openByID := map[string]openCodexRollout{}
+	if openRollouts, openErr := listOpenCodexRolloutsVar(ctx, filepath.Dir(dbPath)); openErr == nil {
+		for _, rollout := range openRollouts {
+			openByID[rollout.ThreadID] = rollout
+		}
+	}
 	sessions := make([]SessionSummary, 0, len(summaries)+len(liveProcesses))
 	seen := make(map[string]bool, len(summaries))
 
 	for _, session := range summaries {
 		if active, ok := activeByID[session.ThreadID]; ok {
 			session = active
+		} else if opened, ok := openByID[session.ThreadID]; ok {
+			if info, statErr := os.Stat(opened.Path); statErr == nil && info.ModTime().After(session.LastActiveAt) {
+				session.LastActiveAt = info.ModTime().UTC()
+			}
+			if !opts.IncludeAll && (session.LastActiveAt.IsZero() || generatedAt.Sub(session.LastActiveAt) > openDesktopSessionWindow) {
+				continue
+			}
+			session.PID = opened.PID
+			session.TTY = "desktop"
+			session.Status = liveSessionStatus(session.LastActiveAt, generatedAt, 0)
 		} else if !opts.IncludeAll {
 			continue
 		}
-		if session.Status == activeSessionStatus || opts.IncludeDetails {
+		if opts.IncludeDetails && (session.Status == activeSessionStatus || session.Status == idleSessionStatus) {
 			enrichCodexSessionFromRollout(&session, rolloutPathsByID[session.ThreadID], opts.IncludeDetails)
 		}
 		sessions = append(sessions, session)
@@ -284,12 +327,34 @@ func collectCodexSessionsWithoutLogs(ctx context.Context, dbPath string, opts Se
 			sessions = append(sessions, session)
 		}
 	}
+	for threadID, opened := range openByID {
+		if seen[threadID] {
+			continue
+		}
+		info, err := os.Stat(opened.Path)
+		if err != nil || (!opts.IncludeAll && generatedAt.Sub(info.ModTime()) > openDesktopSessionWindow) {
+			continue
+		}
+		sessions = append(sessions, SessionSummary{
+			Provider:     providerCodex,
+			PID:          opened.PID,
+			TTY:          "desktop",
+			ThreadID:     threadID,
+			Title:        startingSessionTitle,
+			LastActiveAt: info.ModTime().UTC(),
+			Status:       liveSessionStatus(info.ModTime().UTC(), generatedAt, 0),
+		})
+	}
 
 	sortSessions(sessions)
 	return sessions, nil
 }
 
 func startingCodexSession(proc liveAgentProcess, generatedAt time.Time) SessionSummary {
+	status := idleSessionStatus
+	if time.Duration(proc.AgeSeconds)*time.Second <= liveActivityWindow {
+		status = activeSessionStatus
+	}
 	return SessionSummary{
 		Provider:         providerCodex,
 		PID:              proc.PID,
@@ -298,21 +363,22 @@ func startingCodexSession(proc liveAgentProcess, generatedAt time.Time) SessionS
 		Title:            startingSessionTitle,
 		SessionCWD:       proc.CWD,
 		EffectiveWorkdir: proc.CWD,
-		LastActiveAt:     generatedAt,
-		Status:           activeSessionStatus,
+		Status:           status,
 	}
 }
 
 func enrichSession(session *SessionSummary, row threadRow, logs []threadLogRow, includeDetails bool) {
-	session.Title = firstNonEmpty(row.Title, row.FirstUserMessage, startingSessionTitle)
-	session.FirstUserMessage = row.FirstUserMessage
+	session.Title = compactSummaryText(firstNonEmpty(row.Title, row.FirstUserMessage, startingSessionTitle), 240)
+	if includeDetails {
+		session.FirstUserMessage = compactSummaryText(row.FirstUserMessage, 500)
+	}
 	session.SessionCWD = row.CWD
 	session.EffectiveWorkdir = inferEffectiveWorkdir(logs, row.CWD)
 	session.LastActiveAt = unixSecondsToTime(row.UpdatedAt)
 	session.GitBranch = row.GitBranch
 	session.GitOriginURL = row.GitOriginURL
 	if includeDetails {
-		session.RecentAction = summarizeRecentAction(logs)
+		session.RecentAction = compactSummaryText(summarizeRecentAction(logs), 500)
 	}
 }
 
@@ -348,12 +414,22 @@ func matchActiveSessions(sessions []SessionSummary, liveProcesses []liveAgentPro
 		match.PID = proc.PID
 		match.TTY = proc.TTY
 		match.AgeSeconds = proc.AgeSeconds
-		match.Status = activeSessionStatus
+		match.Status = liveSessionStatus(match.LastActiveAt, generatedAt, proc.AgeSeconds)
 		activeByID[match.ThreadID] = match
 		used[match.ThreadID] = true
 	}
 
 	return activeByID
+}
+
+func liveSessionStatus(lastActiveAt, generatedAt time.Time, processAgeSeconds int64) string {
+	if !lastActiveAt.IsZero() && generatedAt.Sub(lastActiveAt) <= liveActivityWindow {
+		return activeSessionStatus
+	}
+	if lastActiveAt.IsZero() && time.Duration(processAgeSeconds)*time.Second <= liveActivityWindow {
+		return activeSessionStatus
+	}
+	return idleSessionStatus
 }
 
 func findSessionForProcess(sessions []SessionSummary, proc liveAgentProcess, generatedAt time.Time, used map[string]bool) (SessionSummary, bool) {
@@ -419,7 +495,7 @@ func queryThreads(ctx context.Context, dbPath string, includeAll bool, activeThr
 		rolloutPathColumn = "rollout_path"
 	}
 
-	query := "SELECT id, " + rolloutPathColumn + ", title, first_user_message, cwd, updated_at, git_branch, git_origin_url FROM threads WHERE archived = 0"
+	query := "SELECT id, " + rolloutPathColumn + ", substr(title,1,500) AS title, substr(first_user_message,1,1000) AS first_user_message, cwd, updated_at, git_branch, git_origin_url FROM threads WHERE archived = 0"
 	if !includeAll && len(activeThreadIDs) > 0 {
 		query += " AND id IN (" + sqliteStringList(activeThreadIDs) + ")"
 	}
@@ -565,6 +641,43 @@ func listLiveCodexProcesses(ctx context.Context) ([]liveAgentProcess, error) {
 
 func listLiveClaudeProcesses(ctx context.Context) ([]liveAgentProcess, error) {
 	return listLiveAgentProcesses(ctx, providerClaude, looksLikeClaudeCommand, true)
+}
+
+func listOpenCodexRollouts(ctx context.Context, codexHome string) ([]openCodexRollout, error) {
+	processName := providerCodex
+	cmd := exec.CommandContext(ctx, lsofCommand, "-n", "-Fpn", "-c", processName)
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect open Codex transcripts: %w", err)
+	}
+	return parseOpenCodexRollouts(output, codexHome), nil
+}
+
+func parseOpenCodexRollouts(output []byte, codexHome string) []openCodexRollout {
+	sessionsRoot := filepath.Clean(filepath.Join(codexHome, "sessions")) + string(filepath.Separator)
+	currentPID := 0
+	seen := map[string]bool{}
+	rollouts := []openCodexRollout{}
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.HasPrefix(line, "p") {
+			currentPID, _ = strconv.Atoi(strings.TrimPrefix(line, "p"))
+			continue
+		}
+		if !strings.HasPrefix(line, "n") || currentPID <= 0 {
+			continue
+		}
+		path := filepath.Clean(strings.TrimPrefix(line, "n"))
+		if !strings.HasPrefix(path, sessionsRoot) {
+			continue
+		}
+		match := rolloutThreadIDRegex.FindStringSubmatch(filepath.Base(path))
+		if len(match) != 2 || seen[match[1]] {
+			continue
+		}
+		seen[match[1]] = true
+		rollouts = append(rollouts, openCodexRollout{PID: currentPID, ThreadID: match[1], Path: path})
+	}
+	return rollouts
 }
 
 func listLiveAgentProcesses(ctx context.Context, provider string, predicate func(string) bool, includeCWD bool) ([]liveAgentProcess, error) {
@@ -780,6 +893,15 @@ func compactWhitespace(value string) string {
 	return strings.Join(strings.Fields(value), " ")
 }
 
+func compactSummaryText(value string, limit int) string {
+	value = compactWhitespace(value)
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit-1]) + "…"
+}
+
 func sqliteStringList(values []string) string {
 	quoted := make([]string, 0, len(values))
 	for _, value := range values {
@@ -813,10 +935,21 @@ func threadIDsForLogs(includeAll bool, threads []threadRow, activeThreadIDs []st
 func sortSessions(sessions []SessionSummary) {
 	sort.Slice(sessions, func(i, j int) bool {
 		if sessions[i].Status != sessions[j].Status {
-			return sessions[i].Status == activeSessionStatus
+			return liveStatusRank(sessions[i].Status) < liveStatusRank(sessions[j].Status)
 		}
 		return sessions[i].LastActiveAt.After(sessions[j].LastActiveAt)
 	})
+}
+
+func liveStatusRank(status string) int {
+	switch status {
+	case activeSessionStatus:
+		return 0
+	case idleSessionStatus:
+		return 1
+	default:
+		return 2
+	}
 }
 
 func codexHomeDir() (string, error) {

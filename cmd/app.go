@@ -107,7 +107,7 @@ Usage:
   pallium task start <goal> [scope-paths...] [--json]
   pallium task show [--json]
   pallium task clear [--json]
-	  pallium sessions <live|watch|index|list|search|related|grep|show|embed|semantic|stats> [--json]
+	  pallium sessions <live|watch|sync|recall|search|show|read|open|doctor|forget|prune|index|list|related|grep|embedding|embed|semantic|stats> [--json]
 	  pallium console <ls|watch|show|manifest|handoff|claim|action|authority|gate|review> [--json]
 	  pallium workflow <preflight|generate|validate|tools|template|trigger|fleet|run|list|status|inspect|show|read|report|watch|pause|resume|stop|save|apply> [--json]
 	  pallium agents <guide|block|install> [--dir path] [--json]`)

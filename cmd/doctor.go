@@ -48,8 +48,8 @@ func runDoctor(out io.Writer, args []string, jsonOutput bool) error {
 		RepoDBPath:         db.DefaultDBPath(repoRoot),
 		IndexStatus:        "missing",
 		SessionDBPath:      sessionmemory.DefaultDBPath(),
-		EmbeddingModel:     sessionmemory.DefaultEmbeddingModel,
-		OpenAIKeyAvailable: os.Getenv("OPENAI_API_KEY") != "" || os.Getenv("OPENAI_ADMIN_API_KEY") != "",
+		EmbeddingModel:     sessionmemory.ActiveEmbeddingModel(),
+		OpenAIKeyAvailable: sessionmemory.ReadEmbeddingStatus().APIKeyConfigured,
 	}
 	report.ExecutablePath, _ = os.Executable()
 

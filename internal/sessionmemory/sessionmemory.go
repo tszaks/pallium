@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
 )
@@ -23,13 +25,26 @@ const (
 	maxStoredRawEventJSON        = 20_000
 	maxStoredRawEventsPerSession = 100
 	maxStoredMessageText         = 50_000
+	maxStoredFirstUserText       = 4_000
+	maxStoredCommandText         = 20_000
+	maxStoredCommands            = 1_000
+	maxStoredErrors              = 200
 	maxSearchBlobText            = 1_000_000
-	maxParseRolloutBytes         = 100 * 1024 * 1024
+	largeTranscriptHeadMessages  = 200
+	largeTranscriptTailMessages  = 200
 	activeRolloutQuietPeriod     = 2 * time.Minute
 	defaultIndexSafetyBuffer     = 30 * time.Minute
 )
 
+var (
+	largeTranscriptThresholdBytes int64 = 100 * 1024 * 1024
+	errSessionTombstoned                = errors.New("session is tombstoned")
+)
+
 var secretPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----`),
+	regexp.MustCompile(`(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://[^\s'"` + "`" + `]+`),
+	regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`),
 	regexp.MustCompile(`(?i)(api[_-]?key|secret|token|password|passwd|authorization|bearer)\s*[:=]\s*['"]?([A-Za-z0-9_./+=:-]{12,})`),
 	regexp.MustCompile(`sk-[A-Za-z0-9_-]{20,}`),
 	regexp.MustCompile(`gh[pousr]_[A-Za-z0-9_]{20,}`),
@@ -59,6 +74,7 @@ type Options struct {
 	Since          time.Duration
 	SafetyBuffer   time.Duration
 	EmbeddingModel string
+	StoreRawEvents bool
 }
 
 type Session struct {
@@ -100,6 +116,22 @@ type ParsedSession struct {
 	RawEvents   []RawEvent
 	EventCounts map[string]int
 	SearchBlob  string
+	Coverage    SessionCoverage
+
+	messageCount int
+	messageTail  []Message
+	tailNext     int
+	lastMessage  Message
+	hasLast      bool
+}
+
+type SessionCoverage struct {
+	Mode            string `json:"mode"`
+	RawBytes        int64  `json:"raw_bytes"`
+	MessagesSeen    int    `json:"messages_seen"`
+	MessagesStored  int    `json:"messages_stored"`
+	MessagesDropped int    `json:"messages_dropped"`
+	Warning         string `json:"warning,omitempty"`
 }
 
 type RawEvent struct {
@@ -112,9 +144,40 @@ type RawEvent struct {
 
 type SearchResult struct {
 	Session
-	Rank    float64  `json:"rank,omitempty"`
-	Score   int      `json:"score,omitempty"`
-	Signals []string `json:"signals,omitempty"`
+	Rank          float64         `json:"rank,omitempty"`
+	Score         int             `json:"score,omitempty"`
+	HybridScore   float64         `json:"hybrid_score,omitempty"`
+	LexicalScore  float64         `json:"lexical_score,omitempty"`
+	SemanticScore float64         `json:"semantic_score,omitempty"`
+	Snippet       string          `json:"snippet,omitempty"`
+	Signals       []string        `json:"signals,omitempty"`
+	Citation      SearchCitation  `json:"citation"`
+	Coverage      SessionCoverage `json:"coverage"`
+	Warnings      []string        `json:"warnings"`
+}
+
+type SearchCitation struct {
+	SessionID   string `json:"session_id"`
+	LineNo      int    `json:"line_no,omitempty"`
+	Source      string `json:"source"`
+	UpdatedAt   string `json:"updated_at"`
+	RolloutPath string `json:"rollout_path,omitempty"`
+}
+
+type SessionSearchOptions struct {
+	DBPath               string
+	Query                string
+	Limit                int
+	Hybrid               bool
+	Model                string
+	MinimumSemanticScore float64
+	Source               string
+	CWD                  string
+	RepoRoot             string
+	GitOriginURL         string
+	Files                []string
+	After                time.Time
+	Before               time.Time
 }
 
 type SemanticResult struct {
@@ -134,6 +197,7 @@ type Stats struct {
 	Messages   int              `json:"messages"`
 	Chunks     int              `json:"chunks"`
 	Embeddings int              `json:"embeddings"`
+	Capsules   int              `json:"capsules"`
 	Models     []EmbeddingModel `json:"models"`
 }
 
@@ -186,11 +250,20 @@ func DefaultClaudeHome() string {
 }
 
 func Open(path string) (*Store, error) {
+	useDefaultPath := path == ""
 	if path == "" {
 		path = DefaultDBPath()
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	_, statErr := os.Stat(dir)
+	directoryCreated := os.IsNotExist(statErr)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
+	}
+	if useDefaultPath || filepath.Clean(path) == filepath.Clean(DefaultDBPath()) || directoryCreated {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return nil, fmt.Errorf("secure session database directory: %w", err)
+		}
 	}
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -202,7 +275,26 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := hardenDatabaseFiles(path); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return store, nil
+}
+
+func hardenDatabaseFiles(path string) error {
+	for _, candidate := range []string{path, path + "-wal", path + "-shm"} {
+		if _, err := os.Stat(candidate); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("stat session database file %s: %w", candidate, err)
+		}
+		if err := os.Chmod(candidate, 0o600); err != nil {
+			return fmt.Errorf("secure session database file %s: %w", candidate, err)
+		}
+	}
+	return nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -302,6 +394,23 @@ CREATE TABLE IF NOT EXISTS codex_session_state (
   value TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS codex_session_capsules (
+  session_id TEXT PRIMARY KEY,
+  schema_version INTEGER NOT NULL,
+  capsule_json TEXT NOT NULL,
+  search_text TEXT NOT NULL,
+  generated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS codex_session_tombstones (
+  session_id TEXT PRIMARY KEY,
+  source TEXT,
+  rollout_path TEXT,
+  deleted_at TEXT NOT NULL,
+  reason TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_codex_session_tombstones_rollout_path
+  ON codex_session_tombstones(rollout_path)
+  WHERE rollout_path IS NOT NULL AND rollout_path != '';
 `)
 	return err
 }
@@ -334,11 +443,23 @@ func Index(ctx context.Context, opts Options, include []string) (int, error) {
 	if provider == "all" || provider == "codex" {
 		state := loadStateMetadata(filepath.Join(opts.CodexHome, "state_5.sqlite"))
 		files := findRollouts(filepath.Join(opts.CodexHome, "sessions"), include, cutoff)
+		archiveCutoff := time.Time{}
+		if !opts.Force && opts.Since > 0 {
+			archiveCutoff = time.Now().Add(-opts.Since)
+		}
+		files = mergeSessionPaths(files, findRollouts(filepath.Join(opts.CodexHome, "archived_sessions"), nil, archiveCutoff))
 		for _, file := range files {
 			select {
 			case <-ctx.Done():
 				return count, ctx.Err()
 			default:
+			}
+			tombstoned, err := store.sessionTombstoned("", file)
+			if err != nil {
+				return count, err
+			}
+			if tombstoned {
+				continue
 			}
 			skip, err := store.rolloutSkipReason(file, opts.Force)
 			if err != nil {
@@ -360,10 +481,23 @@ func Index(ctx context.Context, opts Options, include []string) (int, error) {
 			if err != nil {
 				return count, fmt.Errorf("parse %s: %w", file, err)
 			}
+			tombstoned, err = store.sessionTombstoned(parsed.Session.ID, file)
+			if err != nil {
+				return count, err
+			}
+			if tombstoned {
+				continue
+			}
 			mergeState(&parsed.Session, state[parsed.Session.ID])
 			parsed.Session.Machine = opts.Machine
 			parsed.Session.Source = first(parsed.Session.Source, "codex")
+			if !opts.StoreRawEvents {
+				parsed.RawEvents = nil
+			}
 			if err := store.upsert(parsed, state[parsed.Session.ID]); err != nil {
+				if errors.Is(err, errSessionTombstoned) {
+					continue
+				}
 				return count, err
 			}
 			count++
@@ -377,6 +511,13 @@ func Index(ctx context.Context, opts Options, include []string) (int, error) {
 				return count, ctx.Err()
 			default:
 			}
+			tombstoned, err := store.sessionTombstoned("", file)
+			if err != nil {
+				return count, err
+			}
+			if tombstoned {
+				continue
+			}
 			skip, err := store.rolloutSkipReason(file, opts.Force)
 			if err != nil {
 				return count, err
@@ -388,14 +529,114 @@ func Index(ctx context.Context, opts Options, include []string) (int, error) {
 			if err != nil {
 				return count, fmt.Errorf("parse %s: %w", file, err)
 			}
+			tombstoned, err = store.sessionTombstoned(parsed.Session.ID, file)
+			if err != nil {
+				return count, err
+			}
+			if tombstoned {
+				continue
+			}
 			parsed.Session.Machine = opts.Machine
+			if !opts.StoreRawEvents {
+				parsed.RawEvents = nil
+			}
 			if err := store.upsert(parsed, map[string]any{"provider": "claude"}); err != nil {
+				if errors.Is(err, errSessionTombstoned) {
+					continue
+				}
 				return count, err
 			}
 			count++
 		}
 	}
 	return count, nil
+}
+
+func (s *Store) sessionTombstoned(sessionID, rolloutPath string) (bool, error) {
+	return querySessionTombstone(s.db, sessionID, rolloutPath)
+}
+
+type sessionTombstoneQuerier interface {
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+type sessionSQLTransaction interface {
+	sessionTombstoneQuerier
+	Exec(query string, args ...any) (sql.Result, error)
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
+type immediateSessionTransaction struct {
+	ctx  context.Context
+	conn *sql.Conn
+	done bool
+}
+
+func (s *Store) beginImmediateSessionTransaction() (*immediateSessionTransaction, error) {
+	ctx := context.Background()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return &immediateSessionTransaction{ctx: ctx, conn: conn}, nil
+}
+
+func (tx *immediateSessionTransaction) Exec(query string, args ...any) (sql.Result, error) {
+	return tx.conn.ExecContext(tx.ctx, query, args...)
+}
+
+func (tx *immediateSessionTransaction) Query(query string, args ...any) (*sql.Rows, error) {
+	return tx.conn.QueryContext(tx.ctx, query, args...)
+}
+
+func (tx *immediateSessionTransaction) QueryRow(query string, args ...any) *sql.Row {
+	return tx.conn.QueryRowContext(tx.ctx, query, args...)
+}
+
+func (tx *immediateSessionTransaction) Commit() error {
+	if tx.done {
+		return sql.ErrTxDone
+	}
+	if _, err := tx.conn.ExecContext(tx.ctx, `COMMIT`); err != nil {
+		return err
+	}
+	tx.done = true
+	return tx.conn.Close()
+}
+
+func (tx *immediateSessionTransaction) Rollback() error {
+	if tx.done {
+		return nil
+	}
+	_, err := tx.conn.ExecContext(tx.ctx, `ROLLBACK`)
+	tx.done = true
+	closeErr := tx.conn.Close()
+	if err != nil {
+		return err
+	}
+	return closeErr
+}
+
+func querySessionTombstone(querier sessionTombstoneQuerier, sessionID, rolloutPath string) (bool, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	rolloutPath = strings.TrimSpace(rolloutPath)
+	if rolloutPath != "" {
+		rolloutPath = filepath.Clean(rolloutPath)
+	}
+	if sessionID == "" && rolloutPath == "" {
+		return false, nil
+	}
+	var count int
+	err := querier.QueryRow(`SELECT COUNT(*) FROM codex_session_tombstones
+		WHERE (? != '' AND session_id=?) OR (? != '' AND rollout_path=?)`, sessionID, sessionID, rolloutPath, rolloutPath).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("check session deletion tombstone: %w", err)
+	}
+	return count > 0, nil
 }
 
 func (s *Store) indexCutoff(opts Options) time.Time {
@@ -405,10 +646,7 @@ func (s *Store) indexCutoff(opts Options) time.Time {
 	if opts.Since > 0 {
 		return time.Now().Add(-opts.Since)
 	}
-	model := strings.TrimSpace(opts.EmbeddingModel)
-	if model == "" {
-		model = DefaultEmbeddingModel
-	}
+	model := resolveEmbeddingModel(opts.EmbeddingModel)
 	cursor := s.embeddingCursor(model)
 	if cursor.IsZero() {
 		return time.Time{}
@@ -521,11 +759,6 @@ func parseSessionTime(raw string) time.Time {
 }
 
 func (s *Store) upsert(parsed ParsedSession, metadata map[string]any) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
 	sess := parsed.Session
 	if sess.Title == "" {
 		sess.Title = short(sess.FirstUserMessage, 240)
@@ -536,13 +769,31 @@ func (s *Store) upsert(parsed ParsedSession, metadata map[string]any) error {
 	sess = sanitizeSession(sess)
 	parsed.Session = sess
 	parsed.SearchBlob = redact(parsed.SearchBlob)
+	capsule := buildSessionCapsule(parsed)
+	chunks := buildContinuityChunks(parsed, capsule)
 	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.beginImmediateSessionTransaction()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	tombstoned, err := querySessionTombstone(tx, sess.ID, sess.RolloutPath)
+	if err != nil {
+		return err
+	}
+	if tombstoned {
+		return errSessionTombstoned
+	}
+	if err := removeChangedSessionEmbeddings(tx, sess.ID, chunks); err != nil {
+		return err
+	}
 	for _, stmt := range []string{
 		"DELETE FROM codex_session_events WHERE session_id=?",
 		"DELETE FROM codex_session_messages WHERE session_id=?",
 		"DELETE FROM codex_session_chunks WHERE session_id=?",
 		"DELETE FROM codex_session_fts WHERE session_id=?",
 		"DELETE FROM codex_message_fts WHERE session_id=?",
+		"DELETE FROM codex_session_capsules WHERE session_id=?",
 	} {
 		if _, err := tx.Exec(stmt, sess.ID); err != nil {
 			return err
@@ -572,15 +823,65 @@ ON CONFLICT(id) DO UPDATE SET machine=excluded.machine,title=excluded.title,firs
 			return err
 		}
 	}
-	if _, err := tx.Exec(`INSERT INTO codex_session_fts(session_id,title,cwd,first_user_message,last_agent_message,files,commands,text) VALUES(?,?,?,?,?,?,?,?)`, sess.ID, sess.Title, sess.CWD, sess.FirstUserMessage, sess.LastAgentMessage, strings.Join(sess.FilesTouched, "\n"), strings.Join(sess.Commands, "\n"), parsed.SearchBlob); err != nil {
+	searchText := strings.Join([]string{parsed.SearchBlob, capsuleSearchText(capsule)}, "\n")
+	if _, err := tx.Exec(`INSERT INTO codex_session_fts(session_id,title,cwd,first_user_message,last_agent_message,files,commands,text) VALUES(?,?,?,?,?,?,?,?)`, sess.ID, sess.Title, sess.CWD, sess.FirstUserMessage, sess.LastAgentMessage, strings.Join(sess.FilesTouched, "\n"), strings.Join(sess.Commands, "\n"), searchText); err != nil {
 		return err
 	}
-	for _, c := range buildChunks(parsed) {
+	for _, c := range chunks {
 		if _, err := tx.Exec(`INSERT INTO codex_session_chunks(id,session_id,chunk_index,kind,text,text_sha256,token_estimate,metadata_json) VALUES(?,?,?,?,?,?,?,?)`, c.ID, c.SessionID, c.Index, c.Kind, c.Text, c.TextSHA256, c.TokenEstimate, j(c.Metadata)); err != nil {
 			return err
 		}
 	}
+	capsuleJSON, err := json.Marshal(capsule)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO codex_session_capsules(session_id,schema_version,capsule_json,search_text,generated_at) VALUES(?,?,?,?,?)
+ON CONFLICT(session_id) DO UPDATE SET schema_version=excluded.schema_version,capsule_json=excluded.capsule_json,search_text=excluded.search_text,generated_at=excluded.generated_at`, sess.ID, capsule.SchemaVersion, string(capsuleJSON), capsuleSearchText(capsule), capsule.GeneratedAt); err != nil {
+		return err
+	}
 	return tx.Commit()
+}
+
+func removeChangedSessionEmbeddings(tx sessionSQLTransaction, sessionID string, chunks []chunkRecord) error {
+	currentHashes := make(map[string]string, len(chunks))
+	for _, chunk := range chunks {
+		currentHashes[chunk.ID] = chunk.TextSHA256
+	}
+	rows, err := tx.Query(`SELECT e.chunk_id,e.provider,e.model,e.text_sha256,c.text_sha256
+		FROM codex_session_embeddings e
+		JOIN codex_session_chunks c ON c.id=e.chunk_id
+		WHERE c.session_id=?`, sessionID)
+	if err != nil {
+		return err
+	}
+	type embeddingKey struct {
+		chunkID  string
+		provider string
+		model    string
+	}
+	var remove []embeddingKey
+	for rows.Next() {
+		var key embeddingKey
+		var embeddingHash, oldChunkHash string
+		if err := rows.Scan(&key.chunkID, &key.provider, &key.model, &embeddingHash, &oldChunkHash); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		newHash, exists := currentHashes[key.chunkID]
+		if !exists || embeddingHash != newHash || oldChunkHash != newHash {
+			remove = append(remove, key)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, key := range remove {
+		if _, err := tx.Exec(`DELETE FROM codex_session_embeddings WHERE chunk_id=? AND provider=? AND model=?`, key.chunkID, key.provider, key.model); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func List(limit int) ([]Session, error) {
@@ -619,7 +920,22 @@ func Grep(query string, limit int) ([]map[string]any, error) {
 		return nil, err
 	}
 	defer store.Close()
-	rows, err := store.db.Query(`SELECT m.session_id,m.line_no,m.role,m.kind,m.text,s.title FROM codex_message_fts f JOIN codex_session_messages m ON m.session_id=f.session_id AND m.line_no=f.line_no JOIN codex_sessions s ON s.id=m.session_id WHERE codex_message_fts MATCH ? ORDER BY bm25(codex_message_fts) LIMIT ?`, query, limit)
+	terms := uniqueStrings(searchTermPattern.FindAllString(strings.ToLower(query), -1), 24)
+	if len(terms) == 0 {
+		return []map[string]any{}, nil
+	}
+	results, err := store.grepMessages(quotedFTSTerms(terms, " AND "), limit)
+	if err != nil {
+		return nil, err
+	}
+	if len(results) == 0 && len(terms) > 1 {
+		return store.grepMessages(quotedFTSTerms(terms, " OR "), limit)
+	}
+	return results, nil
+}
+
+func (s *Store) grepMessages(expression string, limit int) ([]map[string]any, error) {
+	rows, err := s.db.Query(`SELECT m.session_id,m.line_no,m.role,m.kind,m.text,s.title FROM codex_message_fts f JOIN codex_session_messages m ON m.session_id=f.session_id AND m.line_no=f.line_no JOIN codex_sessions s ON s.id=m.session_id WHERE codex_message_fts MATCH ? ORDER BY bm25(codex_message_fts) LIMIT ?`, expression, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -637,7 +953,11 @@ func Grep(query string, limit int) ([]map[string]any, error) {
 }
 
 func Show(id string, transcript bool) (Session, []Message, error) {
-	store, err := Open("")
+	return ShowPath("", id, transcript)
+}
+
+func ShowPath(dbPath, id string, transcript bool) (Session, []Message, error) {
+	store, err := Open(dbPath)
 	if err != nil {
 		return Session{}, nil, err
 	}
@@ -652,14 +972,14 @@ func Show(id string, transcript bool) (Session, []Message, error) {
 		return Session{}, nil, err
 	}
 	if !transcript {
-		return sess, nil, nil
+		return sess, []Message{}, nil
 	}
-	rows, err := store.db.Query(`SELECT line_no,timestamp,role,kind,text FROM codex_session_messages WHERE session_id=? ORDER BY line_no`, sid)
+	rows, err := store.db.Query(`SELECT line_no,COALESCE(timestamp,''),COALESCE(role,''),COALESCE(kind,''),COALESCE(text,'') FROM codex_session_messages WHERE session_id=? ORDER BY line_no`, sid)
 	if err != nil {
 		return Session{}, nil, err
 	}
 	defer rows.Close()
-	var msgs []Message
+	msgs := []Message{}
 	for rows.Next() {
 		var m Message
 		if err := rows.Scan(&m.LineNo, &m.Timestamp, &m.Role, &m.Kind, &m.Text); err != nil {
@@ -668,6 +988,66 @@ func Show(id string, transcript bool) (Session, []Message, error) {
 		msgs = append(msgs, m)
 	}
 	return sess, msgs, rows.Err()
+}
+
+func ReadMessages(dbPath, id string, fromLine, limit int) (Session, []Message, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	store, err := Open(dbPath)
+	if err != nil {
+		return Session{}, nil, err
+	}
+	defer store.Close()
+	sessionID, err := store.resolveID(id)
+	if err != nil {
+		return Session{}, nil, err
+	}
+	sess, err := store.loadSession(sessionID)
+	if err != nil {
+		return Session{}, nil, err
+	}
+	rows, err := store.db.Query(`SELECT line_no,COALESCE(timestamp,''),COALESCE(role,''),COALESCE(kind,''),COALESCE(text,'') FROM codex_session_messages WHERE session_id=? AND line_no>=? ORDER BY line_no LIMIT ?`, sessionID, max(0, fromLine), limit)
+	if err != nil {
+		return Session{}, nil, err
+	}
+	defer rows.Close()
+	messages := []Message{}
+	for rows.Next() {
+		var message Message
+		if err := rows.Scan(&message.LineNo, &message.Timestamp, &message.Role, &message.Kind, &message.Text); err != nil {
+			return Session{}, nil, err
+		}
+		messages = append(messages, message)
+	}
+	return sess, messages, rows.Err()
+}
+
+type SessionLocation struct {
+	SessionID   string `json:"session_id"`
+	Source      string `json:"source"`
+	RolloutPath string `json:"rollout_path"`
+	UpdatedAt   string `json:"updated_at"`
+}
+
+func LocateSession(dbPath, id string) (SessionLocation, error) {
+	store, err := Open(dbPath)
+	if err != nil {
+		return SessionLocation{}, err
+	}
+	defer store.Close()
+	sessionID, err := store.resolveID(id)
+	if err != nil {
+		return SessionLocation{}, err
+	}
+	var location SessionLocation
+	if err := store.db.QueryRow(`SELECT id,COALESCE(source,''),COALESCE(rollout_path,''),COALESCE(NULLIF(updated_at,''),created_at,'') FROM codex_sessions WHERE id=?`, sessionID).Scan(&location.SessionID, &location.Source, &location.RolloutPath, &location.UpdatedAt); err != nil {
+		return SessionLocation{}, err
+	}
+	return location, nil
 }
 
 func StatsRead() (Stats, error) {
@@ -686,6 +1066,7 @@ func StatsReadPath(path string) (Stats, error) {
 	_ = store.db.QueryRow(`SELECT COUNT(*) FROM codex_session_messages`).Scan(&st.Messages)
 	_ = store.db.QueryRow(`SELECT COUNT(*) FROM codex_session_chunks`).Scan(&st.Chunks)
 	_ = store.db.QueryRow(`SELECT COUNT(*) FROM codex_session_embeddings`).Scan(&st.Embeddings)
+	_ = store.db.QueryRow(`SELECT COUNT(*) FROM codex_session_capsules`).Scan(&st.Capsules)
 	rows, err := store.db.Query(`SELECT provider, model, dim, COUNT(*) FROM codex_session_embeddings GROUP BY provider, model, dim ORDER BY COUNT(*) DESC`)
 	if err == nil {
 		defer rows.Close()
@@ -699,9 +1080,7 @@ func StatsReadPath(path string) (Stats, error) {
 }
 
 func EmbeddingBacklogPath(path, model string) (int, error) {
-	if model == "" {
-		model = DefaultEmbeddingModel
-	}
+	model = resolveEmbeddingModel(model)
 	store, err := Open(path)
 	if err != nil {
 		return 0, err
@@ -811,8 +1190,8 @@ func mergeState(s *Session, m map[string]any) {
 	if m == nil {
 		return
 	}
-	s.Title = first(s.Title, str(m["title"]), str(m["preview"]))
-	s.FirstUserMessage = first(s.FirstUserMessage, str(m["first_user_message"]))
+	s.Title = first(s.Title, normalizeUserText(str(m["title"])), normalizeUserText(str(m["preview"])))
+	s.FirstUserMessage = first(s.FirstUserMessage, normalizeUserText(str(m["first_user_message"])))
 	s.CWD = first(s.CWD, str(m["cwd"]))
 	s.Source = first(s.Source, str(m["source"]))
 	s.ModelProvider = first(s.ModelProvider, str(m["model_provider"]))
@@ -854,6 +1233,22 @@ func findRollouts(root string, include []string, cutoff time.Time) []string {
 	}
 	sort.Strings(files)
 	return files
+}
+
+func mergeSessionPaths(groups ...[]string) []string {
+	seen := map[string]struct{}{}
+	var paths []string
+	for _, group := range groups {
+		for _, path := range group {
+			if _, exists := seen[path]; exists {
+				continue
+			}
+			seen[path] = struct{}{}
+			paths = append(paths, path)
+		}
+	}
+	sort.Strings(paths)
+	return paths
 }
 
 func isCodexRolloutPath(path string) bool {
@@ -994,13 +1389,17 @@ func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n]
+	end := n
+	for end > 0 && !utf8.ValidString(s[:end]) {
+		end--
+	}
+	return s[:end]
 }
 func capMessageText(s string) string {
 	if len(s) <= maxStoredMessageText {
 		return s
 	}
-	return s[:maxStoredMessageText] + fmt.Sprintf("\n...[truncated message from %d bytes]", len(s))
+	return truncate(s, maxStoredMessageText) + fmt.Sprintf("\n...[truncated message from %d bytes]", len(s))
 }
 func isoAny(v any) string {
 	raw := str(v)
@@ -1021,13 +1420,67 @@ func isoAny(v any) string {
 }
 func parseInt(s string) (int64, error) { var n int64; _, err := fmt.Sscan(s, &n); return n, err }
 func isContextNoise(s string) bool {
+	return normalizeUserText(s) == ""
+}
+
+var injectedContextBlocks = []*regexp.Regexp{
+	regexp.MustCompile(`(?is)<recommended_plugins>.*?</recommended_plugins>`),
+	regexp.MustCompile(`(?is)<app-context>.*?</app-context>`),
+	regexp.MustCompile(`(?is)<skills_instructions>.*?</skills_instructions>`),
+	regexp.MustCompile(`(?is)<environment_context>.*?</environment_context>`),
+	regexp.MustCompile(`(?is)<permissions instructions>.*?</permissions instructions>`),
+	regexp.MustCompile(`(?is)<apps_instructions>.*?</apps_instructions>`),
+	regexp.MustCompile(`(?is)<plugins_instructions>.*?</plugins_instructions>`),
+	regexp.MustCompile(`(?is)<collaboration_mode>.*?</collaboration_mode>`),
+	regexp.MustCompile(`(?is)<INSTRUCTIONS>.*?</INSTRUCTIONS>`),
+	regexp.MustCompile(`(?is)<!--\s*pallium:agents:begin\s*-->.*?<!--\s*pallium:agents:end\s*-->`),
+}
+
+func normalizeUserText(s string) string {
 	t := strings.TrimSpace(s)
-	for _, p := range []string{"# AGENTS.md instructions", "<environment_context>", "<permissions instructions>", "<apps_instructions>", "<INSTRUCTIONS>"} {
-		if strings.HasPrefix(t, p) {
-			return true
+	lower := strings.ToLower(t)
+	startsWithInjectedContext := false
+	for _, prefix := range []string{
+		"<recommended_plugins>",
+		"<app-context>",
+		"<skills_instructions>",
+		"<environment_context>",
+		"<permissions instructions>",
+		"<apps_instructions>",
+		"<plugins_instructions>",
+		"<collaboration_mode>",
+		"<instructions>",
+		"# agents.md instructions",
+		"<!-- pallium:agents:begin -->",
+		"the following is the codex agent history whose request action you are assessing.",
+	} {
+		if strings.HasPrefix(lower, prefix) {
+			startsWithInjectedContext = true
+			break
 		}
 	}
-	return false
+	if !startsWithInjectedContext {
+		return t
+	}
+	for _, pattern := range injectedContextBlocks {
+		t = pattern.ReplaceAllString(t, "\n")
+	}
+	var lines []string
+	for _, line := range strings.Split(t, "\n") {
+		trimmed := strings.ToLower(strings.TrimSpace(line))
+		switch {
+		case strings.HasPrefix(trimmed, "# agents.md instructions"), trimmed == "# codex loader note":
+			continue
+		}
+		lines = append(lines, line)
+	}
+	t = strings.TrimSpace(strings.Join(lines, "\n"))
+	for _, prefix := range []string{"<recommended_plugins>", "<environment_context>", "<permissions instructions>", "<apps_instructions>", "<instructions>", "<!-- pallium:agents:begin -->", "the following is the codex agent history whose request action you are assessing."} {
+		if strings.HasPrefix(strings.ToLower(t), prefix) {
+			return ""
+		}
+	}
+	return t
 }
 func contentText(v any) string {
 	switch x := v.(type) {

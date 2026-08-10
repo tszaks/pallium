@@ -2,6 +2,7 @@ package sessionmemory
 
 import (
 	"bufio"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,7 +12,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"time"
 )
 
 func parseRollout(path string) (ParsedSession, error) {
@@ -19,21 +19,17 @@ func parseRollout(path string) (ParsedSession, error) {
 	if err != nil {
 		return ParsedSession{}, err
 	}
-	sha, _ := fileSHA(path)
-	if info.Size() > maxParseRolloutBytes {
-		return parseRolloutMetadataOnly(path, info, sha), nil
-	}
 	f, err := os.Open(path)
 	if err != nil {
 		return ParsedSession{}, err
 	}
 	defer f.Close()
-	p := ParsedSession{EventCounts: map[string]int{}}
+	p := newParsedSession(info.Size())
 	p.Session.RolloutPath = path
-	p.Session.RolloutSHA256 = sha
 	files := map[string]bool{}
 	tools := map[string]bool{}
-	reader := bufio.NewReader(f)
+	hasher := sha256.New()
+	reader := bufio.NewReader(io.TeeReader(f, hasher))
 	lineNo := 0
 	for {
 		line, err := reader.ReadBytes('\n')
@@ -59,7 +55,7 @@ func parseRollout(path string) (ParsedSession, error) {
 					raw, _ := json.Marshal(obj)
 					rawJSON := string(raw)
 					if len(rawJSON) > maxStoredRawEventJSON {
-						rawJSON = rawJSON[:maxStoredRawEventJSON] + fmt.Sprintf("\n...[truncated raw event from %d bytes]", len(rawJSON))
+						rawJSON = truncate(rawJSON, maxStoredRawEventJSON) + fmt.Sprintf("\n...[truncated raw event from %d bytes]", len(rawJSON))
 					}
 					rawJSON = redact(rawJSON)
 					p.RawEvents = append(p.RawEvents, RawEvent{lineNo, ts, typ, ptype, rawJSON})
@@ -88,6 +84,8 @@ func parseRollout(path string) (ParsedSession, error) {
 			return p, err
 		}
 	}
+	p.Session.RolloutSHA256 = fmt.Sprintf("%x", hasher.Sum(nil))
+	finalizeParsedMessages(&p)
 	if p.Session.ID == "" {
 		p.Session.ID = strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	}
@@ -104,47 +102,25 @@ func parseRollout(path string) (ParsedSession, error) {
 	return p, nil
 }
 
-func parseRolloutMetadataOnly(path string, info os.FileInfo, sha string) ParsedSession {
-	id := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	p := ParsedSession{EventCounts: map[string]int{"skipped_large_rollout": 1}}
-	p.Session.ID = id
-	p.Session.RolloutPath = path
-	p.Session.RolloutSHA256 = sha
-	p.Session.UpdatedAt = info.ModTime().UTC().Format(time.RFC3339Nano)
-	p.Session.CreatedAt = p.Session.UpdatedAt
-	p.Session.Status = "skipped_large_rollout"
-	p.Session.Errors = append(p.Session.Errors, fmt.Sprintf("skipped full parse: rollout is %d bytes (> %d byte safety limit)", info.Size(), maxParseRolloutBytes))
-	p.Session.Title = id
-	p.SearchBlob = strings.Join([]string{p.Session.Title, p.Session.RolloutPath, strings.Join(p.Session.Errors, "\n")}, "\n")
-	return p
-}
-
 func parseClaudeTranscript(path string) (ParsedSession, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return ParsedSession{}, err
-	}
-	sha, _ := fileSHA(path)
-	if info.Size() > maxParseRolloutBytes {
-		p := parseRolloutMetadataOnly(path, info, sha)
-		p.Session.Source = "claude"
-		p.Session.ModelProvider = "anthropic"
-		return p, nil
 	}
 	f, err := os.Open(path)
 	if err != nil {
 		return ParsedSession{}, err
 	}
 	defer f.Close()
-	p := ParsedSession{EventCounts: map[string]int{}}
+	p := newParsedSession(info.Size())
 	p.Session.RolloutPath = path
-	p.Session.RolloutSHA256 = sha
 	p.Session.Source = "claude"
 	p.Session.ModelProvider = "anthropic"
 	p.Session.ID = strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	files := map[string]bool{}
 	tools := map[string]bool{}
-	reader := bufio.NewReader(f)
+	hasher := sha256.New()
+	reader := bufio.NewReader(io.TeeReader(f, hasher))
 	lineNo := 0
 	for {
 		line, err := reader.ReadBytes('\n')
@@ -162,6 +138,8 @@ func parseClaudeTranscript(path string) (ParsedSession, error) {
 			return p, err
 		}
 	}
+	p.Session.RolloutSHA256 = fmt.Sprintf("%x", hasher.Sum(nil))
+	finalizeParsedMessages(&p)
 	for f := range files {
 		p.Session.FilesTouched = append(p.Session.FilesTouched, f)
 	}
@@ -173,6 +151,64 @@ func parseClaudeTranscript(path string) (ParsedSession, error) {
 	p.Session.Title = short(first(p.Session.Title, p.Session.FirstUserMessage, p.Session.ID), 240)
 	p.SearchBlob = truncate(strings.Join([]string{p.Session.Title, p.Session.CWD, strings.Join(p.Session.Commands, "\n"), strings.Join(p.Session.FilesTouched, "\n"), messagesText(p.Messages)}, "\n"), maxSearchBlobText)
 	return p, nil
+}
+
+func newParsedSession(rawBytes int64) ParsedSession {
+	mode := "full"
+	if rawBytes > largeTranscriptThresholdBytes {
+		mode = "sampled"
+	}
+	return ParsedSession{
+		EventCounts: map[string]int{},
+		Coverage: SessionCoverage{
+			Mode:     mode,
+			RawBytes: rawBytes,
+		},
+	}
+}
+
+func appendParsedMessage(p *ParsedSession, message Message) {
+	if p.hasLast && duplicateSessionMessage(p.lastMessage, message) {
+		return
+	}
+	p.lastMessage = message
+	p.hasLast = true
+	p.messageCount++
+	if p.Coverage.Mode != "sampled" || len(p.Messages) < largeTranscriptHeadMessages {
+		p.Messages = append(p.Messages, message)
+		return
+	}
+	if len(p.messageTail) < largeTranscriptTailMessages {
+		p.messageTail = append(p.messageTail, message)
+		return
+	}
+	p.messageTail[p.tailNext] = message
+	p.tailNext = (p.tailNext + 1) % len(p.messageTail)
+}
+
+func duplicateSessionMessage(previous, current Message) bool {
+	return previous.Timestamp != "" &&
+		previous.Timestamp == current.Timestamp &&
+		previous.Role == current.Role &&
+		previous.Text == current.Text
+}
+
+func finalizeParsedMessages(p *ParsedSession) {
+	if len(p.messageTail) > 0 {
+		if len(p.messageTail) == largeTranscriptTailMessages {
+			p.Messages = append(p.Messages, p.messageTail[p.tailNext:]...)
+			p.Messages = append(p.Messages, p.messageTail[:p.tailNext]...)
+		} else {
+			p.Messages = append(p.Messages, p.messageTail...)
+		}
+	}
+	p.Coverage.MessagesSeen = p.messageCount
+	p.Coverage.MessagesStored = len(p.Messages)
+	p.Coverage.MessagesDropped = max(0, p.messageCount-len(p.Messages))
+	if p.Coverage.MessagesDropped > 0 {
+		p.Coverage.Warning = fmt.Sprintf("Large transcript sampled: retained the first %d and last %d of %d useful messages.", largeTranscriptHeadMessages, largeTranscriptTailMessages, p.messageCount)
+	}
+	p.messageTail = nil
 }
 
 func handleClaudeLine(p *ParsedSession, obj map[string]any, lineNo int, files, tools map[string]bool) {
@@ -189,7 +225,7 @@ func handleClaudeLine(p *ParsedSession, obj map[string]any, lineNo int, files, t
 	p.Session.CWD = first(p.Session.CWD, str(obj["cwd"]))
 	p.Session.CLIVersion = first(p.Session.CLIVersion, str(obj["version"]))
 	p.Session.GitBranch = first(p.Session.GitBranch, str(obj["gitBranch"]))
-	p.Session.Title = first(p.Session.Title, str(obj["aiTitle"]))
+	p.Session.Title = first(p.Session.Title, normalizeUserText(str(obj["aiTitle"])))
 	if model := str(obj["model"]); model != "" {
 		p.Session.Model = first(p.Session.Model, model)
 	}
@@ -197,17 +233,17 @@ func handleClaudeLine(p *ParsedSession, obj map[string]any, lineNo int, files, t
 		raw, _ := json.Marshal(redactObj(obj))
 		rawJSON := string(raw)
 		if len(rawJSON) > maxStoredRawEventJSON {
-			rawJSON = rawJSON[:maxStoredRawEventJSON] + fmt.Sprintf("\n...[truncated raw event from %d bytes]", len(rawJSON))
+			rawJSON = truncate(rawJSON, maxStoredRawEventJSON) + fmt.Sprintf("\n...[truncated raw event from %d bytes]", len(rawJSON))
 		}
 		p.RawEvents = append(p.RawEvents, RawEvent{lineNo, ts, typ, "", rawJSON})
 	}
 	switch typ {
 	case "ai-title":
-		p.Session.Title = first(str(obj["aiTitle"]), p.Session.Title)
+		p.Session.Title = first(normalizeUserText(str(obj["aiTitle"])), p.Session.Title)
 	case "last-prompt", "queue-operation":
-		text := capMessageText(first(str(obj["lastPrompt"]), str(obj["content"])))
-		if text != "" && !isContextNoise(text) && p.Session.FirstUserMessage == "" {
-			p.Session.FirstUserMessage = short(text, maxStoredMessageText)
+		text := capMessageText(normalizeUserText(first(str(obj["lastPrompt"]), str(obj["content"]))))
+		if text != "" && p.Session.FirstUserMessage == "" {
+			p.Session.FirstUserMessage = short(text, maxStoredFirstUserText)
 		}
 	case "user", "assistant", "system":
 		handleClaudeMessage(p, obj, lineNo, ts, files, tools)
@@ -228,15 +264,19 @@ func handleClaudeMessage(p *ParsedSession, obj map[string]any, lineNo int, ts st
 		kind := str(item["type"])
 		switch kind {
 		case "", "text", "thinking":
-			text := capMessageText(first(str(item["text"]), str(item["content"])))
-			if text != "" && !isContextNoise(text) {
+			text := first(str(item["text"]), str(item["content"]))
+			if role == "user" {
+				text = normalizeUserText(text)
+			}
+			text = capMessageText(text)
+			if text != "" {
 				if role == "user" && p.Session.FirstUserMessage == "" {
-					p.Session.FirstUserMessage = short(text, maxStoredMessageText)
+					p.Session.FirstUserMessage = short(text, maxStoredFirstUserText)
 				}
 				if role == "assistant" {
 					p.Session.LastAgentMessage = short(text, maxStoredMessageText)
 				}
-				p.Messages = append(p.Messages, Message{messageLineNo, ts, role, first(kind, "message"), text})
+				appendParsedMessage(p, Message{messageLineNo, ts, role, first(kind, "message"), text})
 			}
 		case "tool_use":
 			name := str(item["name"])
@@ -250,21 +290,21 @@ func handleClaudeMessage(p *ParsedSession, obj map[string]any, lineNo int, ts st
 				files[path] = true
 			}
 			if cmd != "" {
-				p.Session.Commands = append(p.Session.Commands, cmd)
+				appendSessionCommand(p, cmd)
 				addPaths(files, cmd)
 			}
 			text := capMessageText(first(cmd, path, compactJSON(item["input"])))
 			if text != "" {
-				p.Messages = append(p.Messages, Message{messageLineNo, ts, "tool", name, text})
+				appendParsedMessage(p, Message{messageLineNo, ts, "tool", name, text})
 			}
 		case "tool_result":
 			text := capMessageText(claudeToolResultText(item["content"]))
 			addPaths(files, text)
 			if regexp.MustCompile(`(?i)(error|traceback|failed|exception|permission denied)`).MatchString(text) {
-				p.Session.Errors = append(p.Session.Errors, short(text, 500))
+				appendSessionError(p, short(text, 500))
 			}
 			if text != "" {
-				p.Messages = append(p.Messages, Message{messageLineNo, ts, "tool", "tool_result", text})
+				appendParsedMessage(p, Message{messageLineNo, ts, "tool", "tool_result", text})
 			}
 		}
 	}
@@ -318,30 +358,30 @@ func handleEventMessage(p *ParsedSession, payload map[string]any, lineNo int, ts
 	ptype := str(payload["type"])
 	switch ptype {
 	case "user_message":
-		text := capMessageText(str(payload["message"]))
-		if text != "" && !isContextNoise(text) {
+		text := capMessageText(normalizeUserText(str(payload["message"])))
+		if text != "" {
 			if p.Session.FirstUserMessage == "" {
-				p.Session.FirstUserMessage = short(text, maxStoredMessageText)
+				p.Session.FirstUserMessage = short(text, maxStoredFirstUserText)
 			}
-			p.Messages = append(p.Messages, Message{lineNo, ts, "user", "message", text})
+			appendParsedMessage(p, Message{lineNo, ts, "user", "message", text})
 		}
 	case "agent_message":
 		text := capMessageText(str(payload["message"]))
 		if text != "" {
 			p.Session.LastAgentMessage = short(text, maxStoredMessageText)
-			p.Messages = append(p.Messages, Message{lineNo, ts, "assistant", "message", text})
+			appendParsedMessage(p, Message{lineNo, ts, "assistant", "message", text})
 		}
 	case "task_complete":
 		p.Session.Status = "complete"
 		text := capMessageText(str(payload["last_agent_message"]))
 		if text != "" {
 			p.Session.LastAgentMessage = short(text, maxStoredMessageText)
-			p.Messages = append(p.Messages, Message{lineNo, ts, "assistant", "task_complete", text})
+			appendParsedMessage(p, Message{lineNo, ts, "assistant", "task_complete", text})
 		}
 	case "turn_aborted":
 		p.Session.Status = "aborted"
 		if r := str(payload["reason"]); r != "" {
-			p.Session.Errors = append(p.Session.Errors, "aborted: "+r)
+			appendSessionError(p, "aborted: "+r)
 		}
 	case "patch_apply_end":
 		addPaths(files, str(payload["stdout"]))
@@ -358,15 +398,19 @@ func handleResponseItem(p *ParsedSession, payload map[string]any, lineNo int, ts
 	switch ptype {
 	case "message":
 		role := str(payload["role"])
-		text := capMessageText(contentText(payload["content"]))
-		if (role == "user" || role == "assistant") && text != "" && !isContextNoise(text) {
+		text := contentText(payload["content"])
+		if role == "user" {
+			text = normalizeUserText(text)
+		}
+		text = capMessageText(text)
+		if (role == "user" || role == "assistant") && text != "" {
 			if role == "user" && p.Session.FirstUserMessage == "" {
-				p.Session.FirstUserMessage = short(text, maxStoredMessageText)
+				p.Session.FirstUserMessage = short(text, maxStoredFirstUserText)
 			}
 			if role == "assistant" {
 				p.Session.LastAgentMessage = short(text, maxStoredMessageText)
 			}
-			p.Messages = append(p.Messages, Message{lineNo, ts, role, "message", text})
+			appendParsedMessage(p, Message{lineNo, ts, role, "message", text})
 		}
 	case "function_call":
 		name := str(payload["name"])
@@ -377,8 +421,8 @@ func handleResponseItem(p *ParsedSession, payload map[string]any, lineNo int, ts
 			cmd = str(args["command"])
 		}
 		if cmd != "" {
-			p.Session.Commands = append(p.Session.Commands, cmd)
-			p.Messages = append(p.Messages, Message{lineNo, ts, "tool", name, cmd})
+			appendSessionCommand(p, cmd)
+			appendParsedMessage(p, Message{lineNo, ts, "tool", name, capMessageText(cmd)})
 		}
 	case "custom_tool_call":
 		name := str(payload["name"])
@@ -386,13 +430,27 @@ func handleResponseItem(p *ParsedSession, payload map[string]any, lineNo int, ts
 		input := str(payload["input"])
 		addPatchPaths(files, input)
 		if input != "" {
-			p.Messages = append(p.Messages, Message{lineNo, ts, "tool", name, input})
+			appendParsedMessage(p, Message{lineNo, ts, "tool", name, capMessageText(input)})
 		}
 	case "function_call_output", "custom_tool_call_output":
 		out := str(payload["output"])
 		addPaths(files, out)
 		if regexp.MustCompile(`(?i)(error|traceback|failed|exception|permission denied)`).MatchString(out) {
-			p.Session.Errors = append(p.Session.Errors, short(out, 500))
+			appendSessionError(p, short(out, 500))
 		}
 	}
+}
+
+func appendSessionCommand(p *ParsedSession, command string) {
+	if len(p.Session.Commands) >= maxStoredCommands {
+		return
+	}
+	p.Session.Commands = append(p.Session.Commands, truncate(command, maxStoredCommandText))
+}
+
+func appendSessionError(p *ParsedSession, message string) {
+	if len(p.Session.Errors) >= maxStoredErrors {
+		return
+	}
+	p.Session.Errors = append(p.Session.Errors, message)
 }

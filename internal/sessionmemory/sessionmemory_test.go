@@ -89,6 +89,103 @@ func TestIndexProviderCodexSkipsClaudeIncludes(t *testing.T) {
 	}
 }
 
+func TestIndexIncludesArchivedCodexRollouts(t *testing.T) {
+	tmp := t.TempDir()
+	codexHome := filepath.Join(tmp, ".codex")
+	archiveDir := filepath.Join(codexHome, "archived_sessions", "2026")
+	if err := os.MkdirAll(archiveDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rolloutPath := filepath.Join(archiveDir, "rollout-2026-06-22T12-00-00-archived-session.jsonl")
+	content := strings.Join([]string{
+		`{"type":"session_meta","timestamp":"2026-06-22T12:00:00Z","payload":{"id":"archived-session","cwd":"/tmp/repo","source":"codex"}}`,
+		`{"type":"event_msg","timestamp":"2026-06-22T12:01:00Z","payload":{"type":"user_message","message":"archived prompt"}}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(rolloutPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	old := now.Add(-3 * time.Hour)
+	if err := os.Chtimes(rolloutPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.setEmbeddingCursor(DefaultEmbeddingModel, now.Add(-1*time.Hour)); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	count, err := Index(context.Background(), Options{DBPath: dbPath, CodexHome: codexHome, Provider: "codex", SafetyBuffer: 15 * time.Minute}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("indexed archived sessions=%d, want 1", count)
+	}
+}
+
+func TestIndexArchivedCodexRolloutsHonorsExplicitSince(t *testing.T) {
+	tmp := t.TempDir()
+	codexHome := filepath.Join(tmp, ".codex")
+	archiveDir := filepath.Join(codexHome, "archived_sessions", "2026")
+	if err := os.MkdirAll(archiveDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	for _, item := range []struct {
+		id   string
+		age  time.Duration
+		path string
+	}{
+		{id: "archived-too-old", age: 3 * time.Hour, path: filepath.Join(archiveDir, "rollout-2026-06-22T10-00-00-archived-too-old.jsonl")},
+		{id: "archived-recent", age: 10 * time.Minute, path: filepath.Join(archiveDir, "rollout-2026-06-22T12-00-00-archived-recent.jsonl")},
+	} {
+		content := strings.Join([]string{
+			fmt.Sprintf(`{"type":"session_meta","timestamp":"2026-06-22T12:00:00Z","payload":{"id":%q,"cwd":"/tmp/repo","source":"codex"}}`, item.id),
+			fmt.Sprintf(`{"type":"event_msg","timestamp":"2026-06-22T12:01:00Z","payload":{"type":"user_message","message":"%s prompt"}}`, item.id),
+			"",
+		}, "\n")
+		if err := os.WriteFile(item.path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		modified := now.Add(-item.age)
+		if err := os.Chtimes(item.path, modified, modified); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	dbPath := filepath.Join(tmp, "sessions.sqlite")
+	count, err := Index(context.Background(), Options{DBPath: dbPath, CodexHome: codexHome, Provider: "codex", Since: time.Hour}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("indexed archived sessions=%d, want only the explicit --since window", count)
+	}
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var oldCount, recentCount int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM codex_sessions WHERE id='archived-too-old'`).Scan(&oldCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM codex_sessions WHERE id='archived-recent'`).Scan(&recentCount); err != nil {
+		t.Fatal(err)
+	}
+	if oldCount != 0 || recentCount != 1 {
+		t.Fatalf("archive --since filtering old=%d recent=%d", oldCount, recentCount)
+	}
+}
+
 func TestIndexAllDirectClaudeIncludeIsNotClaimedByCodex(t *testing.T) {
 	tmp := t.TempDir()
 	claudePath := filepath.Join(tmp, "claude-1.jsonl")

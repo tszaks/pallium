@@ -42,6 +42,20 @@ type claudeToolInput struct {
 	Description string `json:"description"`
 }
 
+type claudeHistoryEntry struct {
+	Display   string `json:"display"`
+	Timestamp int64  `json:"timestamp"`
+	Project   string `json:"project"`
+	SessionID string `json:"sessionId"`
+}
+
+type claudeHistorySummary struct {
+	FirstPrompt string
+	LastPrompt  string
+	Project     string
+	UpdatedAt   time.Time
+}
+
 func collectClaudeSessions(ctx context.Context, opts SessionCollectOptions, generatedAt time.Time) ([]SessionSummary, error) {
 	claudeHome, err := claudeHomeDirFunc()
 	if err != nil {
@@ -51,6 +65,9 @@ func collectClaudeSessions(ctx context.Context, opts SessionCollectOptions, gene
 	liveProcesses, err := listLiveClaudeProcessesVar(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if len(liveProcesses) == 0 && !opts.IncludeAll {
+		return []SessionSummary{}, nil
 	}
 
 	projectsRoot := filepath.Join(claudeHome, claudeProjectsDir)
@@ -70,13 +87,43 @@ func collectClaudeSessions(ctx context.Context, opts SessionCollectOptions, gene
 		return nil, err
 	}
 
+	history, err := readClaudeHistory(filepath.Join(claudeHome, "history.jsonl"))
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
 	summaries := make([]SessionSummary, 0, len(sessionFiles))
+	pathsByID := make(map[string]string, len(sessionFiles))
 	for _, path := range sessionFiles {
-		session, err := readClaudeSessionFile(path, opts.IncludeDetails)
-		if err != nil {
-			return nil, err
+		id := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+		pathsByID[id] = path
+		summary := SessionSummary{Provider: providerClaude, ThreadID: id, Status: inactiveSessionStatus}
+		item, hasHistory := history[id]
+		if hasHistory {
+			summary.Title = compactSummaryText(firstNonEmpty(item.FirstPrompt, item.LastPrompt, id), 240)
+			if opts.IncludeDetails {
+				summary.FirstUserMessage = compactSummaryText(item.FirstPrompt, 500)
+			}
+			summary.SessionCWD = item.Project
+			summary.EffectiveWorkdir = item.Project
+			summary.LastActiveAt = item.UpdatedAt
 		}
-		summaries = append(summaries, session)
+		needsTranscript := !hasHistory || summary.Title == "" || summary.SessionCWD == "" || summary.EffectiveWorkdir == "" || summary.LastActiveAt.IsZero() || (opts.IncludeDetails && summary.FirstUserMessage == "")
+		if needsTranscript {
+			if transcriptSummary, readErr := readClaudeSessionFile(path, opts.IncludeDetails); readErr == nil {
+				if hasHistory {
+					mergeMissingClaudeSessionSummary(&summary, transcriptSummary)
+				} else {
+					summary = transcriptSummary
+				}
+			} else if !hasHistory {
+				if info, statErr := os.Stat(path); statErr == nil {
+					summary.Title = id
+					summary.LastActiveAt = info.ModTime().UTC()
+				}
+			}
+		}
+		pathsByID[summary.ThreadID] = path
+		summaries = append(summaries, summary)
 	}
 
 	activeByID := matchActiveSessions(summaries, liveProcesses, generatedAt, startingClaudeSession)
@@ -86,6 +133,9 @@ func collectClaudeSessions(ctx context.Context, opts SessionCollectOptions, gene
 	for _, session := range summaries {
 		if active, ok := activeByID[session.ThreadID]; ok {
 			session = active
+			if opts.IncludeDetails {
+				enrichClaudeSessionFromTail(&session, pathsByID[session.ThreadID])
+			}
 		} else if !opts.IncludeAll {
 			continue
 		}
@@ -102,7 +152,35 @@ func collectClaudeSessions(ctx context.Context, opts SessionCollectOptions, gene
 	return sessions, nil
 }
 
+func mergeMissingClaudeSessionSummary(summary *SessionSummary, transcript SessionSummary) {
+	if summary.Title == "" {
+		summary.Title = transcript.Title
+	}
+	if summary.FirstUserMessage == "" {
+		summary.FirstUserMessage = transcript.FirstUserMessage
+	}
+	if summary.SessionCWD == "" {
+		summary.SessionCWD = transcript.SessionCWD
+	}
+	if summary.EffectiveWorkdir == "" {
+		summary.EffectiveWorkdir = transcript.EffectiveWorkdir
+	}
+	if summary.LastActiveAt.IsZero() {
+		summary.LastActiveAt = transcript.LastActiveAt
+	}
+	if summary.GitBranch == "" {
+		summary.GitBranch = transcript.GitBranch
+	}
+	if summary.RecentAction == "" {
+		summary.RecentAction = transcript.RecentAction
+	}
+}
+
 func startingClaudeSession(proc liveAgentProcess, generatedAt time.Time) SessionSummary {
+	status := idleSessionStatus
+	if time.Duration(proc.AgeSeconds)*time.Second <= liveActivityWindow {
+		status = activeSessionStatus
+	}
 	return SessionSummary{
 		Provider:         providerClaude,
 		PID:              proc.PID,
@@ -111,8 +189,95 @@ func startingClaudeSession(proc liveAgentProcess, generatedAt time.Time) Session
 		Title:            startingSessionTitle,
 		SessionCWD:       proc.CWD,
 		EffectiveWorkdir: proc.CWD,
-		LastActiveAt:     generatedAt,
-		Status:           activeSessionStatus,
+		Status:           status,
+	}
+}
+
+func readClaudeHistory(path string) (map[string]claudeHistorySummary, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	summaries := map[string]claudeHistorySummary{}
+	reader := bufio.NewReader(file)
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		if len(bytes.TrimSpace(line)) > 0 {
+			var entry claudeHistoryEntry
+			if json.Unmarshal(bytes.TrimSpace(line), &entry) == nil && entry.SessionID != "" {
+				summary := summaries[entry.SessionID]
+				if summary.FirstPrompt == "" && strings.TrimSpace(entry.Display) != "" {
+					summary.FirstPrompt = compactWhitespace(entry.Display)
+				}
+				if strings.TrimSpace(entry.Display) != "" {
+					summary.LastPrompt = compactWhitespace(entry.Display)
+				}
+				if entry.Project != "" {
+					summary.Project = entry.Project
+				}
+				if entry.Timestamp > 0 {
+					updatedAt := time.UnixMilli(entry.Timestamp).UTC()
+					if updatedAt.After(summary.UpdatedAt) {
+						summary.UpdatedAt = updatedAt
+					}
+				}
+				summaries[entry.SessionID] = summary
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return nil, readErr
+		}
+	}
+	return summaries, nil
+}
+
+func enrichClaudeSessionFromTail(session *SessionSummary, path string) {
+	if path == "" {
+		return
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return
+	}
+	const tailBytes = int64(512 * 1024)
+	start := max(int64(0), info.Size()-tailBytes)
+	if _, err := file.Seek(start, io.SeekStart); err != nil {
+		return
+	}
+	reader := bufio.NewReader(file)
+	if start > 0 {
+		_, _ = reader.ReadBytes('\n')
+	}
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		if len(bytes.TrimSpace(line)) > 0 {
+			var entry claudeLogEntry
+			if json.Unmarshal(bytes.TrimSpace(line), &entry) == nil {
+				if entry.CWD != "" {
+					session.EffectiveWorkdir = entry.CWD
+				}
+				if entry.GitBranch != "" {
+					session.GitBranch = entry.GitBranch
+				}
+				if entry.Type == "assistant" {
+					if action := claudeRecentAction(entry.Message.Content); action != "" {
+						session.RecentAction = action
+					}
+				}
+			}
+		}
+		if readErr != nil {
+			break
+		}
 	}
 }
 
@@ -214,8 +379,8 @@ func readClaudeSessionFile(path string, includeDetails bool) (SessionSummary, er
 		}
 	}
 
-	session.FirstUserMessage = firstUserMessage
-	session.Title = firstNonEmpty(title, agentName, firstUserMessage, lastPrompt, startingSessionTitle)
+	session.FirstUserMessage = compactSummaryText(firstUserMessage, 500)
+	session.Title = compactSummaryText(firstNonEmpty(title, agentName, firstUserMessage, lastPrompt, startingSessionTitle), 240)
 	if session.LastActiveAt.IsZero() {
 		session.LastActiveAt = info.ModTime().UTC()
 	}
@@ -223,7 +388,7 @@ func readClaudeSessionFile(path string, includeDetails bool) (SessionSummary, er
 		session.EffectiveWorkdir = session.SessionCWD
 	}
 	if includeDetails {
-		session.RecentAction = recentAction
+		session.RecentAction = compactSummaryText(recentAction, 500)
 	}
 	return session, nil
 }

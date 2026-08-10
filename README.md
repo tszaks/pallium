@@ -103,12 +103,60 @@ pallium handoff origin/main --json
 
 ### Session awareness and decisions
 
-Recall prior agent sessions across tools, and record the decisions behind the
-work so the reasoning outlives any one context.
+Recall where prior Codex and Claude work stopped, what was completed, what is
+still open, and the evidence behind the answer. Session memory stays local in
+SQLite. Search results are compact and cite the source session and transcript
+line instead of returning entire conversations.
 
 ```bash
-pallium sessions live --json
+pallium sessions sync
+pallium sessions embedding status
+pallium sessions embedding configure --provider openai --model text-embedding-3-small --credential-store keychain
+pallium sessions embedding check
+pallium sessions recall "where did the checkout migration stop?" --repo .
+pallium sessions search "production smoke test" --hybrid --source codex
+pallium sessions show <session-id>
+pallium sessions read <session-id> --from-line 120 --limit 50
+pallium sessions live --details
 pallium decisions "why did we choose worktrees" --json
+```
+
+`sessions sync` indexes changed transcripts, creates bounded continuity
+capsules, and catches up embeddings when a provider is configured. It
+automatically performs a full upgrade pass when it detects legacy noisy titles,
+metadata-only large sessions, or missing capsules. Raw provider events are not
+stored unless `--raw-events` is explicitly supplied.
+
+`sessions embedding configure` saves the provider, OpenAI-compatible base URL,
+model, and optional credential-store selection in `~/.pallium/embedding.json`
+with mode `0600`. On macOS, `--credential-store keychain` reads the provider key
+from the login Keychain service `app.pallium.embedding`; the secret never enters
+Pallium's JSON configuration, database, logs, or command line.
+`PALLIUM_EMBED_API_KEY` remains an explicit per-process override. Use `sessions
+embedding check` to verify the active vector space before a large embed.
+
+`sessions recall` uses BM25 plus current embeddings when available. If semantic
+retrieval is unavailable or times out, it returns lexical evidence and says so.
+Filter recall and search with `--repo`, `--cwd`, `--source`, `--file`, `--since`,
+or `--before`.
+
+Semantic retrieval stores one bounded continuity vector per session, built from
+the capsule, repository metadata, touched files, commands, and first/last
+conversation evidence. Exact search still covers the full indexed transcript.
+
+`sessions live` discovers terminal agents and Codex desktop tasks. A task is
+`active` only when recent transcript activity supports that label. A live task
+with no recent activity is `idle`; inactivity alone is not reported as a hang.
+
+Maintenance is explicit and safe by default:
+
+```bash
+pallium sessions doctor
+pallium sessions doctor --repair --prune-raw-events --vacuum
+pallium sessions forget <session-id>          # preview
+pallium sessions forget <session-id> --confirm
+pallium sessions prune --older-than 180d      # preview
+pallium sessions prune --older-than 180d --confirm
 ```
 
 ## A worked example
