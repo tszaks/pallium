@@ -196,6 +196,99 @@ func TestSessionsSearchBareHelpShowsHelp(t *testing.T) {
 	}
 }
 
+func TestFindGoalAttachmentLastOccurrenceWins(t *testing.T) {
+	tmp := t.TempDir()
+	rollout := filepath.Join(tmp, "rollout-test.jsonl")
+	content := `{"text":"see /Users/x/.codex/attachments/aaaaaaaa-1111-1111-1111-111111111111/goal-objective.md"}
+{"text":"unrelated line"}
+{"text":"now /Users/x/.codex/attachments/bbbbbbbb-2222-2222-2222-222222222222/goal-objective.md and also /Users/x/.codex/attachments/cccccccc-3333-3333-3333-333333333333/other.md"}
+`
+	if err := os.WriteFile(rollout, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, others, err := findGoalAttachment(rollout)
+	if err != nil {
+		t.Fatalf("findGoalAttachment: %v", err)
+	}
+	want := "/Users/x/.codex/attachments/cccccccc-3333-3333-3333-333333333333/other.md"
+	if got != want {
+		t.Fatalf("goalPath = %q, want %q", got, want)
+	}
+	if len(others) != 2 {
+		t.Fatalf("otherCandidates = %v, want 2 entries", others)
+	}
+}
+
+func TestExpandTildeExpandsHomeRelativePath(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	got := expandTilde("~/.codex/attachments/x/goal-objective.md")
+	want := filepath.Join(tmp, ".codex/attachments/x/goal-objective.md")
+	if got != want {
+		t.Fatalf("expandTilde = %q, want %q", got, want)
+	}
+	if got := expandTilde("/already/absolute/path.md"); got != "/already/absolute/path.md" {
+		t.Fatalf("expandTilde changed absolute path: %q", got)
+	}
+}
+
+func TestSessionsGoalResolvesLastReferenceAndExpandsTilde(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	sessionID := "11112222-3333-4444-5555-666677778888"
+	dir := filepath.Join(tmp, ".codex", "sessions", "2026", "02", "02")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rollout := filepath.Join(dir, "rollout-2026-02-02T00-00-00-"+sessionID+".jsonl")
+	lines := []string{
+		`{"text":"first ~/.codex/attachments/1111aaaa-1111-1111-1111-111111111111/old-goal.md"}`,
+		`{"text":"noise"}`,
+		`{"text":"latest ~/.codex/attachments/2222bbbb-2222-2222-2222-222222222222/goal-objective.md"}`,
+	}
+	if err := os.WriteFile(rollout, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runSessionsGoal(&out, []string{sessionID}, true); err != nil {
+		t.Fatalf("runSessionsGoal: %v", err)
+	}
+	var result sessionGoalResult
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	want := filepath.Join(tmp, ".codex/attachments/2222bbbb-2222-2222-2222-222222222222/goal-objective.md")
+	if result.GoalPath != want {
+		t.Fatalf("goalPath = %q, want %q", result.GoalPath, want)
+	}
+	if len(result.OtherCandidates) != 1 {
+		t.Fatalf("otherCandidates = %v, want 1 entry", result.OtherCandidates)
+	}
+}
+
+func TestSessionsGoalNoAttachmentReferenceErrors(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	sessionID := "abcdefab-1234-1234-1234-abcdefabcdef"
+	dir := filepath.Join(tmp, ".codex", "sessions", "2026", "01", "01")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rollout := filepath.Join(dir, "rollout-2026-01-01T00-00-00-"+sessionID+".jsonl")
+	if err := os.WriteFile(rollout, []byte(`{"type":"other"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	err := runSessionsGoal(&out, []string{sessionID}, false)
+	if err == nil {
+		t.Fatal("expected error for missing goal reference")
+	}
+	want := "no goal file reference found in session " + sessionID
+	if err.Error() != want {
+		t.Fatalf("error = %q, want %q", err.Error(), want)
+	}
+}
+
 func TestSessionFlagsCanFollowPositionals(t *testing.T) {
 	fs := newSessionFlagSet("test")
 	limit := fs.Int("limit", 10, "")

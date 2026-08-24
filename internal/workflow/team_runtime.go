@@ -250,6 +250,11 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 	if err != nil {
 		return true, err
 	}
+	member, err = store.RotateUnestablishedClaudeSession(teamID, name)
+	if err != nil {
+		_ = store.FinishMemberTurn(teamID, name, lease, "error", "", err.Error(), 0)
+		return true, err
+	}
 	team, err := store.GetTeam(teamID)
 	if err != nil {
 		return true, err
@@ -263,6 +268,9 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 		return true, err
 	}
 	prompt := buildTeamTurnPrompt(team, member, undelivered, tasks)
+	if member.Mode == "edit" {
+		prompt = editWorkerPrompt(prompt)
+	}
 
 	turnCtx := ctx
 	var cancel context.CancelFunc
@@ -286,6 +294,9 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 	}
 
 	output, capturedToken, costUSD, turnErr := r.dispatchTeamTurn(turnCtx, store, teamID, lease, &member, cwd, prompt)
+	if turnErr != nil && opts.AgentTimeout > 0 && errors.Is(turnCtx.Err(), context.DeadlineExceeded) {
+		turnErr = agentCommandError(turnCtx, opts.AgentTimeout, turnErr)
+	}
 	if costUSD > 0 {
 		if serr := recordTeamSpend(store, teamID, costUSD); serr != nil {
 			r.notifyLeadOfMemberError(store, teamID, name, fmt.Errorf("recording spend: %w", serr))
@@ -293,6 +304,19 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 	}
 
 	if turnErr != nil {
+		if opts.AgentTimeout > 0 && errors.Is(turnCtx.Err(), context.DeadlineExceeded) {
+			patchPath := ""
+			if worktree != "" {
+				patchPath, _ = r.writeWorktreePatch(member.ID+"-recovery", worktree)
+				_ = store.SetMemberWorktree(teamID, name, worktree)
+			}
+			detail := timeoutRecoveryReport(worktree, repoRoot, patchPath,
+				fmt.Sprintf("pallium team run %s --agent-timeout %d", teamID, largerTimeoutSeconds(opts.AgentTimeout)))
+			turnErr = fmt.Errorf("team agent timed out after %ds: %w\n%s", int(opts.AgentTimeout/time.Second), turnErr, detail)
+			_ = store.FinishMemberTurnResult(teamID, name, lease, "timed_out", capturedToken, "", turnErr.Error(), costUSD)
+			r.notifyLeadOfMemberError(store, teamID, name, turnErr)
+			return true, nil
+		}
 		// A failed provider call (crash, timeout, nonzero exit) leaves the
 		// worktree's contents untrustworthy — discard it rather than
 		// capture/apply a possibly-garbage partial edit. (Found by the same
@@ -379,7 +403,7 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 		// to see, rather than vanishing from view while the outcome recorded
 		// as uncertain.
 		note := fmt.Sprintf("decision did not match schema: %v (raw: %s)", parseErr, truncateForError(output))
-		if err := store.FinishMemberTurn(teamID, name, lease, "active", capturedToken, note, costUSD); err != nil {
+		if err := store.FinishMemberTurnResult(teamID, name, lease, "active", capturedToken, "", note, costUSD); err != nil {
 			return true, err
 		}
 		// A schema-failed decision must never be a SILENT no-op: the lead
@@ -432,6 +456,19 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 	// read further down.
 	planPending := member.PlanRequired && member.PlanStatus == "pending"
 	rescheduleAfterIdleRejection := false
+	coordinationRecoveryTaskID := ""
+	var ownedUnfinished []TeamTask
+	for _, task := range tasks {
+		if task.Status == "in_progress" && task.Owner == name {
+			ownedUnfinished = append(ownedUnfinished, task)
+		}
+	}
+	if (status == "idle" || status == "blocked") && strings.TrimSpace(decision.CompleteTaskID) == "" && len(ownedUnfinished) > 0 {
+		status = "active"
+		statusNote = fmt.Sprintf("%s [coordination recovery: task %s is still in_progress and owned by this member; complete it with complete_task_id or explicitly coordinate reassignment]", statusNote, ownedUnfinished[0].ID)
+		rescheduleAfterIdleRejection = true
+		coordinationRecoveryTaskID = ownedUnfinished[0].ID
+	}
 	if status == "idle" && teamGateHasHook(team, "teammate_idle") {
 		situation := fmt.Sprintf("Teammate %q wants to go idle. Its own summary: %s\n%s", name, decision.Summary, describeClaimableWork(tasks, name))
 		approved, reason, gateCostUSD, gerr := r.runTeamGate(turnCtx, team, situation)
@@ -537,7 +574,7 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 	// still in flight) had already mutated the board. Now: if the lease is
 	// gone, FinishMemberTurn errors and we return BEFORE any side effect
 	// below ever runs — a stale-takeover zombie's decision mutates nothing.
-	if err := store.FinishMemberTurn(teamID, name, lease, status, capturedToken, statusNote, costUSD); err != nil {
+	if err := store.FinishMemberTurnResult(teamID, name, lease, status, capturedToken, statusNote, "", costUSD); err != nil {
 		return true, err
 	}
 	if rescheduleAfterIdleRejection {
@@ -555,6 +592,10 @@ func (r *Runner) RunTeamTurn(ctx context.Context, store *Store, teamID, name str
 		}
 	}
 	deliverInjectedMessages()
+	if coordinationRecoveryTaskID != "" {
+		_, _ = store.SendTeamMessage(teamID, "coordinator", name, fmt.Sprintf("Task %s is still assigned to you. Pallium kept you active because idle/blocked prose cannot complete owned work. Return complete_task_id when it is done, or message lead to coordinate reassignment.", coordinationRecoveryTaskID))
+		_ = store.NudgeMember(teamID, name)
+	}
 
 	for _, m := range decision.Messages {
 		to := strings.TrimSpace(m.To)
@@ -1197,11 +1238,47 @@ func (r *Runner) runConfiguredProviderTeamTurn(ctx context.Context, teamID strin
 
 // TeamRunSummary reports what one `pallium team run` invocation did.
 type TeamRunSummary struct {
-	Rounds       int      `json:"rounds"`
-	TurnsTaken   int      `json:"turns_taken"`
-	Interrupted  []string `json:"reconciled_interrupted,omitempty"`
-	StoppedAtEnd bool     `json:"stopped"`
-	ParkedAtEnd  bool     `json:"parked"`
+	Rounds               int        `json:"rounds"`
+	TurnsTaken           int        `json:"turns_taken"`
+	Interrupted          []string   `json:"reconciled_interrupted,omitempty"`
+	StoppedAtEnd         bool       `json:"stopped"`
+	ParkedAtEnd          bool       `json:"parked"`
+	OpenTasks            []TeamTask `json:"open_tasks,omitempty"`
+	IncompleteStopReason string     `json:"incomplete_stop_reason,omitempty"`
+	Recovery             string     `json:"recovery,omitempty"`
+}
+
+func memberHasClaimableWork(tasks []TeamTask, member TeamMember) bool {
+	completed := make(map[string]bool, len(tasks))
+	for _, task := range tasks {
+		completed[task.ID] = task.Status == "completed"
+	}
+	roleText := strings.ToLower(member.Name + " " + member.Role)
+	specialty := ""
+	if strings.Contains(roleText, "review") {
+		specialty = "review"
+	} else if strings.Contains(roleText, "verif") {
+		specialty = "verif"
+	}
+	for _, task := range tasks {
+		if task.Status != "pending" {
+			continue
+		}
+		if specialty != "" && !strings.Contains(strings.ToLower(task.Title+" "+task.Description), specialty) {
+			continue
+		}
+		ready := true
+		for _, dependency := range task.DependsOn {
+			if !completed[dependency] {
+				ready = false
+				break
+			}
+		}
+		if ready {
+			return true
+		}
+	}
+	return false
 }
 
 // RunTeam drives a team's turn-taking until it converges (no member has
@@ -1246,7 +1323,7 @@ func (r *Runner) RunTeam(ctx context.Context, store *Store, teamID string, opts 
 		if err != nil {
 			return summary, err
 		}
-		claimable, err := store.HasClaimableWork(teamID)
+		tasks, err := store.ListTeamTasks(teamID)
 		if err != nil {
 			return summary, err
 		}
@@ -1286,7 +1363,7 @@ func (r *Runner) RunTeam(ctx context.Context, store *Store, teamID string, opts 
 			// has by definition never seen the current board, so it stays
 			// eligible for its first look regardless of the watermark.
 			boardIsNewToMember := m.LastTurnAt == "" || team.TasksUpdatedAt > m.LastTurnAt
-			if len(undelivered) > 0 || m.NudgedAt != "" || (claimable && boardIsNewToMember) {
+			if len(undelivered) > 0 || m.NudgedAt != "" || (memberHasClaimableWork(tasks, m) && boardIsNewToMember) {
 				eligible = append(eligible, m.Name)
 				preTurnNudgedAt[m.Name] = m.NudgedAt
 			}
@@ -1350,6 +1427,28 @@ func (r *Runner) RunTeam(ctx context.Context, store *Store, teamID string, opts 
 			summary.ParkedAtEnd = true
 			break
 		}
+	}
+	tasks, err := store.ListTeamTasks(teamID)
+	if err != nil {
+		return summary, err
+	}
+	for _, task := range tasks {
+		if task.Status != "completed" {
+			summary.OpenTasks = append(summary.OpenTasks, task)
+		}
+	}
+	if len(summary.OpenTasks) > 0 {
+		switch {
+		case summary.ParkedAtEnd:
+			summary.IncompleteStopReason = "team parked before task board completed"
+		case summary.StoppedAtEnd:
+			summary.IncompleteStopReason = "team stopped before task board completed"
+		case summary.Rounds >= maxRounds:
+			summary.IncompleteStopReason = "maximum rounds reached before task board completed"
+		default:
+			summary.IncompleteStopReason = "team converged before task board completed"
+		}
+		summary.Recovery = fmt.Sprintf("Inspect the %d open task(s), then send or nudge the responsible member and run `pallium team run %s` again.", len(summary.OpenTasks), teamID)
 	}
 	return summary, nil
 }

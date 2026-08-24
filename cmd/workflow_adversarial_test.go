@@ -35,7 +35,7 @@ func TestWorkflowAdversarialInvalidMaxBudgetUSD(t *testing.T) {
 }
 
 func TestWorkflowAdversarialManualGateApproveCommandIsUnavailable(t *testing.T) {
-	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"approved":true,"reason":"ok"}`)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"approved":true,"reason":"ok","evidence":[]}`)
 	t.Setenv("HOME", t.TempDir())
 	tmp := t.TempDir()
 	dbPath := filepath.Join(tmp, "sessions.sqlite")

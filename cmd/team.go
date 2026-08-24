@@ -20,6 +20,9 @@ func runTeam(out io.Writer, args []string, jsonOutput bool) error {
 		return fmt.Errorf("usage: pallium team <start|spawn|join|member|tasks|send|inbox|nudge|status|run|approve|reject|gate|stop|attach|template> [--json]")
 	}
 	switch args[0] {
+	case "help", "-h", "--help":
+		printTeamHelp(out)
+		return nil
 	case "start":
 		return runTeamStart(out, args[1:], jsonOutput)
 	case "template":
@@ -55,6 +58,26 @@ func runTeam(out io.Writer, args []string, jsonOutput bool) error {
 	default:
 		return fmt.Errorf("unknown team subcommand: %s", args[0])
 	}
+}
+
+func printTeamHelp(out io.Writer) {
+	fmt.Fprintln(out, `pallium team
+
+Usage:
+  pallium team start <goal> [--cwd path] [--budget-usd N] [--template name] [--json]
+  pallium team spawn <team-id> <name> [--provider p] [--model m] [--role r] [--mode read-only|edit] [--plan-required] [--json]
+  pallium team join <team-id> --as <name> [--json]
+  pallium team tasks <add|list|claim|complete> ...
+  pallium team send <team-id> --to <name> [--from lead] <message> [--json]
+  pallium team inbox <team-id> --for <name> [--json]
+  pallium team nudge <team-id> <member-name> [--json]
+  pallium team status <team-id> [--json]
+  pallium team run <team-id> [--agent-timeout 600] [--json]
+  pallium team approve|reject <team-id> <member-name> ... [--json]
+  pallium team gate set <team-id> --hooks <hooks> <prompt> [--json]
+  pallium team member <stop|restart|steer> <team-id> <member-name> ... [--json]
+  pallium team stop|attach <team-id> [--json]
+  pallium team template <list|show> [name]`)
 }
 
 func runTeamStart(out io.Writer, args []string, jsonOutput bool) error {
@@ -732,6 +755,9 @@ func runTeamStatus(out io.Writer, args []string, jsonOutput bool) error {
 			if m.LastTurnError != "" {
 				fmt.Fprintf(&b, " last_error=%q", m.LastTurnError)
 			}
+			if m.LastTurnSummary != "" {
+				fmt.Fprintf(&b, " last_summary=%q", m.LastTurnSummary)
+			}
 			b.WriteString("\n")
 		}
 		pending, inProgress, completed := 0, 0, 0
@@ -783,8 +809,12 @@ func runTeamRun(out io.Writer, args []string, jsonOutput bool) error {
 		return err
 	}
 	return output.Write(out, summary, jsonOutput, func() string {
-		return fmt.Sprintf("Team %s: %d round(s), %d turn(s) taken, reconciled %d interrupted member(s), stopped=%v parked=%v",
-			teamID, summary.Rounds, summary.TurnsTaken, len(summary.Interrupted), summary.StoppedAtEnd, summary.ParkedAtEnd)
+		line := fmt.Sprintf("Team %s: %d round(s), %d turn(s) taken, reconciled %d interrupted member(s), stopped=%v parked=%v, open_tasks=%d",
+			teamID, summary.Rounds, summary.TurnsTaken, len(summary.Interrupted), summary.StoppedAtEnd, summary.ParkedAtEnd, len(summary.OpenTasks))
+		if summary.IncompleteStopReason != "" {
+			line += ". Incomplete: " + summary.IncompleteStopReason + ". Recovery: " + summary.Recovery
+		}
+		return line
 	})
 }
 

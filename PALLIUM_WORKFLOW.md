@@ -19,6 +19,10 @@ pallium workflow report <run-id> --json
 pallium workflow gc --older-than 7 --dry-run
 ```
 
+`<run-id>` is optional on `inspect`, `report`, and `stop`: omit it and inspect/report
+fall back to the most recent run (preferring one still running), and `stop` falls
+back only when exactly one run is currently running.
+
 Discover primitives first:
 
 ```bash
@@ -90,6 +94,7 @@ const finding = await agent("Review auth middleware", {
 | `schema` | StructuredOutput | Codex `--output-schema`; providers get schema file, Pallium validates returned JSON locally and, for read-only agents only, retries once with a corrective prompt before failing the agent (the read-only structured output IS the deliverable). Edit/test/check agents do NOT retry (the retry re-runs the full provider command, which could apply side effects twice); instead, when an edit agent's structured output fails schema validation its completed patch is PRESERVED and applied and the schema failure is reported in the run's failures list — a malformed output never discards completed edit work |
 | `timeout_seconds` | - | per-call wall-clock cap; overrides `--agent-timeout` (`0` disables) |
 | `network` | - | opt into network egress (default `false`); honored only when the run was started with `--allow-network`. See [Network access](#network-access) |
+| `on_error` | `agent()` returns `null` on failure | Pallium defaults to `"throw"` (raises into the script) for a direct `agent()` call. Set `on_error: "null"` for Ultracode parity — the failure becomes `null` instead (recorded in the run's `failures` list, same as a dropped `parallel`/`pipeline` item) and the script keeps running. Run-fatal causes (budget exhausted, max agents, repo lock contention, a stop/pause interrupt) always throw regardless, since those end the run itself, not just this one call. |
 
 Edit and worktree-isolated agents run in a detached git worktree under
 `~/.pallium/workflow-runs/<run-id>/worktrees/`. The worktree is removed as soon
@@ -298,7 +303,7 @@ happens only when its own turn actually runs.
 | Items per `parallel`/`pipeline` | 4096 |
 | Nested `workflow()` | 1 level |
 
-A timed-out agent fails with `workflow agent timed out after Ns`: it becomes `null` inside `parallel`/`pipeline` (recorded in the run `failures` list) and throws for a direct `agent()` call, so a hung worker can never stall the run.
+A timed-out agent fails with `workflow agent timed out after Ns`: it becomes `null` inside `parallel`/`pipeline` (recorded in the run `failures` list) and, for a direct `agent()` call, throws by default — or becomes `null` too when that call passed `on_error: "null"` (see the `agent()` options table above) — so a hung worker can never stall the run. A timed-out edit agent's in-progress worktree is never discarded silently: its changes are captured as a patch file (clearly marked as a recovery patch, never auto-applied) named in the error alongside a `pallium workflow resume ... --agent-timeout N` command, so the partial work is inspectable instead of lost.
 
 ## Network access
 

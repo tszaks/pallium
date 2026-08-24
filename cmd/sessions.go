@@ -49,6 +49,8 @@ func runSessions(out io.Writer, args []string, jsonOutput bool) error {
 		return runSessionsOpen(out, args[1:], jsonOutput)
 	case "recall":
 		return runSessionsRecall(out, args[1:], jsonOutput)
+	case "goal":
+		return runSessionsGoal(out, args[1:], jsonOutput)
 	case "embed":
 		return runSessionsEmbed(out, args[1:], jsonOutput)
 	case "embedding":
@@ -1117,6 +1119,7 @@ Usage:
   pallium sessions related [repo-path] [--file path] [--limit 10] [--json]
   pallium sessions grep <query> [--limit 20] [--json]
   pallium sessions show <session-id> [--db path] [--transcript] [--json]
+  pallium sessions goal <session-id> [--path-only] [--json]
   pallium sessions read <session-id> [--db path] [--from-line n] [--limit 50] [--json]
   pallium sessions open <session-id> [--db path] [--launch] [--json]
   pallium sessions embedding <status|configure|check> [--provider name] [--model name] [--base-url URL] [--credential-store keychain] [--json]

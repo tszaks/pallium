@@ -68,6 +68,34 @@ func TestTeamCRUDRoundTrip(t *testing.T) {
 	}
 }
 
+func TestTeamSummaryMigrationIsIdempotent(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "sessions.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	team, _ := store.CreateTeam("goal", t.TempDir(), 0)
+	_, _ = store.SpawnMember(team.ID, "worker", "claude", "", "", "read-only")
+	if _, err := store.db.Exec(`UPDATE team_members SET last_turn_status='idle', last_turn_error='done cleanly', last_turn_summary=NULL WHERE team_id=?`, team.ID); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	for i := 0; i < 2; i++ {
+		store, err = Open(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		member, err := store.GetMember(team.ID, "worker")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if member.LastTurnSummary != "done cleanly" || member.LastTurnError != "" {
+			t.Fatalf("expected migrated summary and empty error, got %+v", member)
+		}
+		store.Close()
+	}
+}
+
 func TestClaimTaskRespectsDependencies(t *testing.T) {
 	tmp := t.TempDir()
 	store, err := Open(filepath.Join(tmp, "sessions.sqlite"))
@@ -406,14 +434,31 @@ func TestRestartMemberClearsStopAndReconcilesStaleTurn(t *testing.T) {
 	if final.TurnStartedAt != "" {
 		t.Fatalf("expected the stale in-flight turn reconciled (lease released) as part of restart, got %+v", final)
 	}
-	if final.SessionToken != "sess-1" {
-		t.Fatalf("expected the session token preserved across reconciliation, got %+v", final)
+	if final.SessionToken == "sess-1" || final.SessionToken == "" {
+		t.Fatalf("expected the unestablished claude session token rotated on restart, got %+v", final)
 	}
 	if final.Status != "interrupted" {
 		t.Fatalf("expected the reconciled member's status to reflect the interrupted turn (ReconcileInterruptedMembers' own status, unmodified by restart), got %q", final.Status)
 	}
 	if final.NudgedAt == "" {
 		t.Fatalf("expected restart to nudge the member so RunTeam actually schedules it again — clearing stop_requested and reconciling a stale lease do not by themselves create a scheduling signal, got %+v", final)
+	}
+}
+
+func TestRestartMemberPreservesEstablishedClaudeSession(t *testing.T) {
+	store, tmp := newTeamTestStore(t)
+	team, _ := store.CreateTeam("goal", tmp, 0)
+	_, _ = store.SpawnMember(team.ID, "worker", "claude", "", "", "read-only")
+	_ = store.PersistMemberSession(team.ID, "worker", "established-session")
+	if _, err := store.db.Exec(`UPDATE team_members SET session_established=1 WHERE team_id=? AND name='worker'`, team.ID); err != nil {
+		t.Fatal(err)
+	}
+	member, err := store.RestartMember(team.ID, "worker", nowString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if member.SessionToken != "established-session" || !member.SessionEstablished {
+		t.Fatalf("expected established resumable session preserved, got %+v", member)
 	}
 }
 

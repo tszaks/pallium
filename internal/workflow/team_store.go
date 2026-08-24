@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 // Team is a lead + independent peer agents that coordinate over a shared
@@ -92,17 +94,18 @@ type TeamMember struct {
 	// calls the CLI it drives itself with (`team inbox`, `team send`, `team
 	// tasks claim/complete`) or re-runs `team join`, so `team status` can
 	// show real staleness instead of guessing.
-	LastActiveAt   string  `json:"last_active_at,omitempty"`
-	Worktree       string  `json:"worktree,omitempty"`
-	TurnCount      int     `json:"turn_count"`
-	TurnStartedAt  string  `json:"turn_started_at,omitempty"`
-	LastTurnAt     string  `json:"last_turn_at,omitempty"`
-	LastTurnStatus string  `json:"last_turn_status,omitempty"`
-	LastTurnError  string  `json:"last_turn_error,omitempty"`
-	NudgedAt       string  `json:"nudged_at,omitempty"`
-	SpendUSD       float64 `json:"spend_usd"`
-	CreatedAt      string  `json:"created_at"`
-	UpdatedAt      string  `json:"updated_at"`
+	LastActiveAt    string  `json:"last_active_at,omitempty"`
+	Worktree        string  `json:"worktree,omitempty"`
+	TurnCount       int     `json:"turn_count"`
+	TurnStartedAt   string  `json:"turn_started_at,omitempty"`
+	LastTurnAt      string  `json:"last_turn_at,omitempty"`
+	LastTurnStatus  string  `json:"last_turn_status,omitempty"`
+	LastTurnSummary string  `json:"last_turn_summary,omitempty"`
+	LastTurnError   string  `json:"last_turn_error,omitempty"`
+	NudgedAt        string  `json:"nudged_at,omitempty"`
+	SpendUSD        float64 `json:"spend_usd"`
+	CreatedAt       string  `json:"created_at"`
+	UpdatedAt       string  `json:"updated_at"`
 }
 
 // TeamTask is one item on the shared task board. DependsOn holds task ids
@@ -169,6 +172,7 @@ CREATE TABLE IF NOT EXISTS team_members (
   turn_started_at TEXT,
   last_turn_at TEXT,
   last_turn_status TEXT,
+  last_turn_summary TEXT,
   last_turn_error TEXT,
   nudged_at TEXT,
   spend_usd REAL DEFAULT 0,
@@ -235,8 +239,21 @@ func (s *Store) initTeams() error {
 		"ALTER TABLE team_members ADD COLUMN stop_requested INTEGER DEFAULT 0",
 		// M3: external-session attach (see TeamMember.LastActiveAt).
 		"ALTER TABLE team_members ADD COLUMN last_active_at TEXT",
+		"ALTER TABLE team_members ADD COLUMN last_turn_summary TEXT",
 	} {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return err
+		}
+	}
+	// Older versions stored a successful turn's summary in last_turn_error.
+	// Move only non-error outcomes; malformed-decision diagnostics used an
+	// active status and retain their explicit error prefix.
+	if _, err := s.db.Exec(`UPDATE team_members
+		SET last_turn_summary=last_turn_error, last_turn_error=NULL
+		WHERE COALESCE(last_turn_summary,'')='' AND COALESCE(last_turn_error,'')<>''
+		AND COALESCE(last_turn_status,'') NOT IN ('error','timed_out')
+		AND last_turn_error NOT LIKE 'decision did not match schema:%'`); err != nil {
+		if !strings.Contains(err.Error(), "no such column") {
 			return err
 		}
 	}
@@ -602,6 +619,15 @@ func (s *Store) RestartMember(teamID, name, staleAfter string) (TeamMember, erro
 	if _, err := s.ReconcileInterruptedMember(teamID, name, staleAfter); err != nil {
 		return TeamMember{}, err
 	}
+	member, err := s.GetMember(teamID, name)
+	if err != nil {
+		return TeamMember{}, err
+	}
+	if member.Provider == "claude" && !member.SessionEstablished && member.TurnStartedAt == "" {
+		if err := s.PersistMemberSession(teamID, name, uuid.NewString()); err != nil {
+			return TeamMember{}, err
+		}
+	}
 	// NudgeMember: clearing stop_requested and reconciling a stale lease
 	// do NOT by themselves make RunTeam schedule this member again — the
 	// scheduler only offers a turn for undelivered mail, a nudge, or
@@ -618,17 +644,34 @@ func (s *Store) RestartMember(teamID, name, staleAfter string) (TeamMember, erro
 	return s.GetMember(teamID, name)
 }
 
+// RotateUnestablishedClaudeSession replaces a preallocated session UUID after
+// an abnormal first attempt. Established sessions are deliberately preserved
+// because they remain resumable with --resume.
+func (s *Store) RotateUnestablishedClaudeSession(teamID, name string) (TeamMember, error) {
+	member, err := s.GetMember(teamID, name)
+	if err != nil {
+		return TeamMember{}, err
+	}
+	if member.Provider != "claude" || member.SessionEstablished || member.TurnCount == 0 {
+		return member, nil
+	}
+	if err := s.PersistMemberSession(teamID, name, uuid.NewString()); err != nil {
+		return TeamMember{}, err
+	}
+	return s.GetMember(teamID, name)
+}
+
 func scanMember(row *sql.Row) (TeamMember, error) {
 	var m TeamMember
-	var model, role, session, worktree, turnStarted, lastAt, lastStatus, lastErr, nudged, planStatus, lastActive sql.NullString
+	var model, role, session, worktree, turnStarted, lastAt, lastStatus, lastSummary, lastErr, nudged, planStatus, lastActive sql.NullString
 	var planRequired, stopRequested int
 	err := row.Scan(&m.ID, &m.TeamID, &m.Name, &m.Provider, &model, &role, &m.Mode, &m.Status, &session, &m.SessionEstablished, &planRequired, &planStatus, &stopRequested, &worktree,
-		&m.TurnCount, &turnStarted, &lastAt, &lastStatus, &lastErr, &nudged, &lastActive, &m.SpendUSD, &m.CreatedAt, &m.UpdatedAt)
+		&m.TurnCount, &turnStarted, &lastAt, &lastStatus, &lastSummary, &lastErr, &nudged, &lastActive, &m.SpendUSD, &m.CreatedAt, &m.UpdatedAt)
 	if err != nil {
 		return TeamMember{}, err
 	}
 	m.Model, m.Role, m.SessionToken, m.Worktree = model.String, role.String, session.String, worktree.String
-	m.TurnStartedAt, m.LastTurnAt, m.LastTurnStatus, m.LastTurnError, m.NudgedAt = turnStarted.String, lastAt.String, lastStatus.String, lastErr.String, nudged.String
+	m.TurnStartedAt, m.LastTurnAt, m.LastTurnStatus, m.LastTurnSummary, m.LastTurnError, m.NudgedAt = turnStarted.String, lastAt.String, lastStatus.String, lastSummary.String, lastErr.String, nudged.String
 	m.LastActiveAt = lastActive.String
 	m.PlanRequired = planRequired != 0
 	m.PlanStatus = planStatus.String
@@ -636,7 +679,7 @@ func scanMember(row *sql.Row) (TeamMember, error) {
 	return m, nil
 }
 
-const memberSelectCols = `id,team_id,name,provider,model,role,mode,status,session_token,session_established,COALESCE(plan_required,0),COALESCE(plan_status,''),COALESCE(stop_requested,0),worktree,turn_count,turn_started_at,last_turn_at,last_turn_status,last_turn_error,nudged_at,COALESCE(last_active_at,''),spend_usd,created_at,updated_at`
+const memberSelectCols = `id,team_id,name,provider,model,role,mode,status,session_token,session_established,COALESCE(plan_required,0),COALESCE(plan_status,''),COALESCE(stop_requested,0),worktree,turn_count,turn_started_at,last_turn_at,last_turn_status,COALESCE(last_turn_summary,''),last_turn_error,nudged_at,COALESCE(last_active_at,''),spend_usd,created_at,updated_at`
 
 func (s *Store) GetMember(teamID, name string) (TeamMember, error) {
 	m, err := scanMember(s.db.QueryRow(`SELECT `+memberSelectCols+` FROM team_members WHERE team_id=? AND name=?`, teamID, name))
@@ -655,14 +698,14 @@ func (s *Store) ListMembers(teamID string) ([]TeamMember, error) {
 	var members []TeamMember
 	for rows.Next() {
 		var m TeamMember
-		var model, role, session, worktree, turnStarted, lastAt, lastStatus, lastErr, nudged, planStatus, lastActive sql.NullString
+		var model, role, session, worktree, turnStarted, lastAt, lastStatus, lastSummary, lastErr, nudged, planStatus, lastActive sql.NullString
 		var planRequired, stopRequested int
 		if err := rows.Scan(&m.ID, &m.TeamID, &m.Name, &m.Provider, &model, &role, &m.Mode, &m.Status, &session, &m.SessionEstablished, &planRequired, &planStatus, &stopRequested, &worktree,
-			&m.TurnCount, &turnStarted, &lastAt, &lastStatus, &lastErr, &nudged, &lastActive, &m.SpendUSD, &m.CreatedAt, &m.UpdatedAt); err != nil {
+			&m.TurnCount, &turnStarted, &lastAt, &lastStatus, &lastSummary, &lastErr, &nudged, &lastActive, &m.SpendUSD, &m.CreatedAt, &m.UpdatedAt); err != nil {
 			return nil, err
 		}
 		m.Model, m.Role, m.SessionToken, m.Worktree = model.String, role.String, session.String, worktree.String
-		m.TurnStartedAt, m.LastTurnAt, m.LastTurnStatus, m.LastTurnError, m.NudgedAt = turnStarted.String, lastAt.String, lastStatus.String, lastErr.String, nudged.String
+		m.TurnStartedAt, m.LastTurnAt, m.LastTurnStatus, m.LastTurnSummary, m.LastTurnError, m.NudgedAt = turnStarted.String, lastAt.String, lastStatus.String, lastSummary.String, lastErr.String, nudged.String
 		m.LastActiveAt = lastActive.String
 		m.PlanRequired = planRequired != 0
 		m.PlanStatus = planStatus.String
@@ -748,6 +791,12 @@ func (s *Store) BeginMemberTurn(teamID, name string, staleAfter string) (lease s
 // never established anything for `--resume` to find. dispatchTeamTurn must
 // key `--session-id` vs `--resume` off SessionEstablished, not TurnCount==0.
 func (s *Store) FinishMemberTurn(teamID, name, lease, status, sessionToken, turnError string, spendDelta float64) error {
+	return s.FinishMemberTurnResult(teamID, name, lease, status, sessionToken, "", turnError, spendDelta)
+}
+
+// FinishMemberTurnResult keeps successful status text separate from errors.
+// FinishMemberTurn remains as a compatibility wrapper for existing callers.
+func (s *Store) FinishMemberTurnResult(teamID, name, lease, status, sessionToken, turnSummary, turnError string, spendDelta float64) error {
 	now := nowString()
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -780,10 +829,10 @@ func (s *Store) FinishMemberTurn(teamID, name, lease, status, sessionToken, turn
 	}
 	res, err := tx.Exec(
 		`UPDATE team_members SET turn_started_at=NULL, status=?, session_token=?, turn_count=turn_count+1,
-		 last_turn_at=?, last_turn_status=?, last_turn_error=?, spend_usd=spend_usd+?, updated_at=?,
-		 session_established = session_established OR (? <> 'error')
+		 last_turn_at=?, last_turn_status=?, last_turn_summary=?, last_turn_error=?, spend_usd=spend_usd+?, updated_at=?,
+		 session_established = session_established OR (? NOT IN ('error','timed_out'))
 		 WHERE team_id=? AND name=? AND turn_started_at=?`,
-		effectiveStatus, token, now, status, turnError, spendDelta, now, status, teamID, name, lease)
+		effectiveStatus, token, now, status, turnSummary, turnError, spendDelta, now, status, teamID, name, lease)
 	if err != nil {
 		return err
 	}
