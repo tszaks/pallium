@@ -59,11 +59,25 @@ jobs:
 
       - name: Workflow acceptance
         run: |
-          go build -o pallium-test-bin .
-          PALLIUM_BIN="$PWD/pallium-test-bin" bash scripts/workflow-acceptance.sh
+          go build -o "$RUNNER_TEMP/pallium-test-bin" .
+          PALLIUM_BIN="$RUNNER_TEMP/pallium-test-bin" bash scripts/workflow-acceptance.sh
 
       - name: Build release assets
         run: scripts/build-release-assets.sh "${{ steps.tag.outputs.tag }}"
+
+      - name: Verify release metadata
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          verify_dir="$RUNNER_TEMP/pallium-release-verify"
+          mkdir -p "$verify_dir"
+          tar -xzf "dist/pallium_${version}_linux_amd64.tar.gz" -C "$verify_dir"
+          metadata="$("$verify_dir/pallium_${version}_linux_amd64/pallium" version --json)"
+          revision="$(git rev-parse HEAD)"
+          jq -e --arg version "v$version" --arg revision "$revision" \
+            '.version == $version and .vcs_revision == $revision and .vcs_modified == "false"' \
+            <<<"$metadata"
 
       - name: Upload release assets
         env:
