@@ -267,7 +267,7 @@ phase("gate");
 const verdict = gate("approve", "acceptance gate");
 return { verdict };
 JS
-PALLIUM_WORKFLOW_AGENT_STUB='{"approved":true,"reason":"acceptance approved"}' \
+PALLIUM_WORKFLOW_AGENT_STUB='{"approved":true,"reason":"acceptance approved","evidence":[]}' \
   "$PALLIUM_BIN" workflow run --id wf-accept-gate --db "$db" --cwd "$repo" --script "$ROOT/gate.js" "gate acceptance" --json >"$ROOT/gate-run.json"
 "$PALLIUM_BIN" workflow gate list wf-accept-gate --db "$db" --json >"$ROOT/gate-list.json"
 assert_grep "$ROOT/gate-run.json" 'acceptance approved'
