@@ -201,50 +201,15 @@ func runWorkflowMCPCommand(args []string) (string, error) {
 }
 
 func readMCPMessage(reader *bufio.Reader) ([]byte, error) {
-	line, err := reader.ReadString('\n')
+	raw, err := reader.ReadBytes('\n')
 	if err != nil {
 		return nil, err
 	}
-	trimmed := strings.TrimSpace(line)
-	if strings.HasPrefix(trimmed, "{") {
-		return []byte(trimmed), nil
-	}
-	contentLength := 0
-	for {
-		if key, value, ok := strings.Cut(trimmed, ":"); ok && strings.EqualFold(strings.TrimSpace(key), "Content-Length") {
-			value = strings.TrimSpace(value)
-			parsed, err := strconv.Atoi(value)
-			if err != nil {
-				return nil, err
-			}
-			contentLength = parsed
-		}
-		if trimmed == "" {
-			break
-		}
-		line, err = reader.ReadString('\n')
-		if err != nil {
-			return nil, err
-		}
-		trimmed = strings.TrimSpace(line)
-	}
-	if contentLength <= 0 {
-		return nil, fmt.Errorf("missing Content-Length")
-	}
-	raw := make([]byte, contentLength)
-	if _, err := io.ReadFull(reader, raw); err != nil {
-		return nil, err
-	}
-	return raw, nil
+	return bytes.TrimSpace(raw), nil
 }
 
 func writeMCPMessage(writer io.Writer, resp mcpResponse) error {
-	raw, err := json.Marshal(resp)
-	if err != nil {
-		return err
-	}
-	_, err = fmt.Fprintf(writer, "Content-Length: %d\r\n\r\n%s", len(raw), raw)
-	return err
+	return json.NewEncoder(writer).Encode(resp)
 }
 
 func objectSchema(properties map[string]any) map[string]any {

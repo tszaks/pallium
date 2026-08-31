@@ -86,25 +86,39 @@ func TestWorkflowMCPRunAllowNetwork(t *testing.T) {
 	assertNetworkRun(t, dbPath, "wf-mcp-net-off", false, "0")
 }
 
-func TestWorkflowMCPFramedIO(t *testing.T) {
-	request := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`)
-	var input bytes.Buffer
-	input.WriteString("Content-Length: ")
-	input.WriteString("58")
-	input.WriteString("\r\n\r\n")
-	input.Write(request)
-	raw, err := readMCPMessage(bufio.NewReader(&input))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(raw) != string(request) {
-		t.Fatalf("raw=%s", string(raw))
-	}
+func TestWorkflowMCPStdioJSONLines(t *testing.T) {
+	input := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`,
+		`{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`,
+	}, "\n") + "\n"
+
 	var output bytes.Buffer
-	if err := writeMCPMessage(&output, mcpResponse{JSONRPC: "2.0", ID: float64(1), Result: map[string]any{"ok": true}}); err != nil {
+	server := &mcpServer{dbPath: filepath.Join(t.TempDir(), "sessions.sqlite")}
+	if err := server.serveStdio(bufio.NewReader(strings.NewReader(input)), &output); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(output.String(), "Content-Length: ") || !strings.Contains(output.String(), `"ok":true`) {
-		t.Fatalf("unexpected framed output: %q", output.String())
+	if strings.Contains(output.String(), "Content-Length:") {
+		t.Fatalf("stdio output must use newline-delimited JSON, got %q", output.String())
+	}
+	if !strings.HasSuffix(output.String(), "\n") {
+		t.Fatalf("stdio output must end with a newline, got %q", output.String())
+	}
+
+	lines := strings.Split(strings.TrimSuffix(output.String(), "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected initialize and tools/list responses, got %d lines: %q", len(lines), output.String())
+	}
+	for i, line := range lines {
+		var response mcpResponse
+		if err := json.Unmarshal([]byte(line), &response); err != nil {
+			t.Fatalf("response line %d is not valid JSON: %v", i+1, err)
+		}
+		if response.Error != nil {
+			t.Fatalf("response line %d returned error: %+v", i+1, response.Error)
+		}
+	}
+	if !strings.Contains(lines[1], "pallium_workflow_run") {
+		t.Fatalf("tools/list response missing workflow tools: %s", lines[1])
 	}
 }
