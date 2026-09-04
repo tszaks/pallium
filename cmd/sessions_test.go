@@ -11,6 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/tszaks/pallium/internal/codexsessions"
 	"github.com/tszaks/pallium/internal/sessionmemory"
 )
 
@@ -21,6 +22,26 @@ func TestSessionsIndexHelpDoesNotStartIndex(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "pallium sessions") {
 		t.Fatalf("expected sessions help, got %q", out.String())
+	}
+}
+
+func TestRunningSessionSummariesExcludeFinishedAndInactive(t *testing.T) {
+	sessions := []codexsessions.SessionSummary{
+		{ThreadID: "active", Status: "active"},
+		{ThreadID: "waiting", Status: "waiting"},
+		{ThreadID: "blocked", Status: "blocked"},
+		{ThreadID: "idle", Status: "idle"},
+		{ThreadID: "finished", Status: "finished"},
+		{ThreadID: "inactive", Status: "inactive"},
+	}
+	got := runningSessionSummaries(sessions)
+	if len(got) != 4 {
+		t.Fatalf("running sessions=%v", got)
+	}
+	for _, session := range got {
+		if session.Status == "finished" || session.Status == "inactive" {
+			t.Fatalf("non-running session leaked into result: %+v", session)
+		}
 	}
 }
 

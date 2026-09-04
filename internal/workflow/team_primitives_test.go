@@ -281,11 +281,10 @@ func TestTeamWaitPrimitiveHonorsWorkflowStop(t *testing.T) {
 		done <- outcome{execErr, time.Since(start)}
 	}()
 
-	// Long enough for Execute to reach team.wait and start the (sleeping)
-	// teammate turn, short enough to land well before the 5s fake sleep or
-	// the very first 250ms contextWithStoredStop poll tick would resolve it
-	// on its own without this explicit stop.
-	time.Sleep(100 * time.Millisecond)
+	// Synchronize on the provider actually starting. A fixed sleep made this
+	// test race startup under a loaded suite and sometimes stopped the run
+	// before there was an in-flight process to cancel.
+	waitForMarkerFile(t, startedMarker, 5*time.Second)
 	if err := store.SetRunStatus(run.ID, "stopped", "", "test-triggered-stop"); err != nil {
 		t.Fatal(err)
 	}
@@ -307,9 +306,6 @@ func TestTeamWaitPrimitiveHonorsWorkflowStop(t *testing.T) {
 	// toward its own natural completion" (a mistake this test's own first
 	// draft made, caught by the revert-proof below).
 	time.Sleep(6 * time.Second)
-	if _, err := os.Stat(startedMarker); err != nil {
-		t.Fatalf("expected the fake provider to have started before the stop landed: %v", err)
-	}
 	if _, err := os.Stat(finishedMarker); err == nil {
 		t.Fatal("expected the fake provider's process to have been killed mid-sleep once the run was marked stopped, but it ran to natural completion — contextWithStoredStop's cancellation did not take effect")
 	}
@@ -371,7 +367,7 @@ func TestTeamTasksCreatePrimitiveHonorsWorkflowStop(t *testing.T) {
 		done <- execErr
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	waitForMarkerFile(t, startedMarker, 5*time.Second)
 	if err := store.SetRunStatus(run.ID, "stopped", "", "test-triggered-stop"); err != nil {
 		t.Fatal(err)
 	}
@@ -381,9 +377,6 @@ func TestTeamTasksCreatePrimitiveHonorsWorkflowStop(t *testing.T) {
 	// naturally elapsed, not before — checking earlier can't distinguish
 	// "killed early" from "just hasn't gotten there yet" either way.
 	time.Sleep(6 * time.Second)
-	if _, err := os.Stat(startedMarker); err != nil {
-		t.Fatalf("expected the fake gate verifier to have started before the stop landed: %v", err)
-	}
 	if _, err := os.Stat(finishedMarker); err == nil {
 		t.Fatal("expected the fake gate verifier's process to have been killed mid-sleep once the run was marked stopped, but it ran to natural completion — contextWithStoredStop's cancellation did not take effect")
 	}
@@ -396,6 +389,20 @@ func TestTeamTasksCreatePrimitiveHonorsWorkflowStop(t *testing.T) {
 	case <-time.After(8 * time.Second):
 		t.Fatal("team.tasks.create did not return at all within 8s of the run being marked stopped")
 	}
+}
+
+func waitForMarkerFile(t *testing.T, path string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("inspect startup marker %s: %v", path, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("provider did not create startup marker %s within %s", path, timeout)
 }
 
 // TestTeamCreatePrimitiveIsIdempotentAcrossResume is the regression test

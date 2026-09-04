@@ -39,6 +39,14 @@ func TestAgentsBlockMentionsEveryService(t *testing.T) {
 	}
 }
 
+func TestAgentsBlockDelegatesToolChoiceWithoutDelegatingAuthority(t *testing.T) {
+	for _, required := range []string{"pallium route", "choose the service yourself", "never widens authority", "`allowed` is true"} {
+		if !strings.Contains(agentsBlock, required) {
+			t.Fatalf("adoption block must encode agent choice and human authority; missing %q", required)
+		}
+	}
+}
+
 func TestAgentsGuidePrintsGuide(t *testing.T) {
 	var out bytes.Buffer
 	if err := runAgents(&out, []string{"guide"}, false); err != nil {

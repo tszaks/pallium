@@ -43,6 +43,122 @@ func TestLiveSessionStatusUsesIdleForInactivity(t *testing.T) {
 	}
 }
 
+func TestLooksLikeCodexCommandRejectsHelperProcesses(t *testing.T) {
+	for _, command := range []string{"codex", "/opt/homebrew/bin/codex", "C:\\tools\\codex.exe"} {
+		if !looksLikeCodexCommand(command) {
+			t.Fatalf("expected %q to be recognized as Codex", command)
+		}
+	}
+	for _, command := range []string{
+		"/Applications/Codex.app/Contents/Resources/codex-code-mode-host",
+		"/tmp/codex/helper",
+		"codex-helper",
+	} {
+		if looksLikeCodexCommand(command) {
+			t.Fatalf("helper process %q must not become a separate session", command)
+		}
+	}
+}
+
+func TestParseLiveAgentProcessesCapturesIdentityAndState(t *testing.T) {
+	output := []byte("  101   1 S+   ttys001 01:02 /opt/homebrew/bin/codex\n  102 101 S+ ttys001 00:30 /Applications/Codex.app/Contents/Resources/codex-code-mode-host\n")
+	processes, err := parseLiveAgentProcesses(output, providerCodex, looksLikeCodexCommand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(processes) != 1 {
+		t.Fatalf("expected exactly one real Codex process, got %+v", processes)
+	}
+	if processes[0].PID != 101 || processes[0].PPID != 1 || processes[0].State != "S+" || processes[0].TTY != "ttys001" || processes[0].AgeSeconds != 62 {
+		t.Fatalf("unexpected process parse: %+v", processes[0])
+	}
+}
+
+func TestApplySessionStateUsesStrongEvidenceAndSafePrecedence(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name    string
+		session SessionSummary
+		signals sessionSignals
+		want    string
+	}{
+		{name: "blocked", session: SessionSummary{PID: 1}, signals: sessionSignals{Source: "test", PendingTool: "request_user_input", PendingSince: now.Add(-time.Minute)}, want: blockedSessionStatus},
+		{name: "waiting", session: SessionSummary{PID: 1}, signals: sessionSignals{Source: "test", PendingTool: "wait_threads", PendingSince: now.Add(-time.Minute)}, want: waitingSessionStatus},
+		{name: "pending tool is active", session: SessionSummary{PID: 1}, signals: sessionSignals{Source: "test", PendingTool: "exec_command", PendingSince: now.Add(-time.Minute)}, want: activeSessionStatus},
+		{name: "stuck requires process evidence", session: SessionSummary{PID: 1, ProcessState: "D", LastActiveAt: now.Add(-20 * time.Minute)}, want: stuckSessionStatus},
+		{name: "silence alone is idle", session: SessionSummary{PID: 1, ProcessState: "S", LastActiveAt: now.Add(-20 * time.Minute)}, want: idleSessionStatus},
+		{name: "finished lifecycle wins", session: SessionSummary{PID: 1, ProcessState: "D", LastActiveAt: now.Add(-20 * time.Minute)}, signals: sessionSignals{Source: "test", Lifecycle: lifecycleFinished, LifecycleAt: now.Add(-time.Minute)}, want: finishedSessionStatus},
+		{name: "no process is inactive", session: SessionSummary{}, signals: sessionSignals{Source: "test", Lifecycle: lifecycleFinished}, want: inactiveSessionStatus},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			applySessionState(&test.session, test.signals, now)
+			if test.session.Status != test.want {
+				t.Fatalf("status=%q, want %q; session=%+v", test.session.Status, test.want, test.session)
+			}
+			if test.session.StatusReason == "" || test.session.StatusSource == "" || test.session.StatusConfidence == "" {
+				t.Fatalf("classification must be explainable: %+v", test.session)
+			}
+			if test.signals.Lifecycle == lifecycleFinished && test.session.CompletionStatus != CompletionFinished {
+				t.Fatalf("finished lifecycle must be independently queryable: %+v", test.session)
+			}
+		})
+	}
+}
+
+func TestReadCodexRolloutDetailsTracksLifecycleAndPendingCalls(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	contents := strings.Join([]string{
+		`{"timestamp":"2026-09-04T12:00:00Z","type":"event_msg","payload":{"type":"task_started"}}`,
+		`{"timestamp":"2026-09-04T12:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"go test ./...\",\"workdir\":\"/repo\"}","call_id":"call-1"}}`,
+		`{"timestamp":"2026-09-04T12:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1"}}`,
+		`{"timestamp":"2026-09-04T12:00:03Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"await tools.request_user_input({questions: []})","call_id":"call-2"}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	details, err := readCodexRolloutDetails(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if details.Workdir != "/repo" || details.RecentAction == "" || details.Signals.Lifecycle != lifecycleRunning || details.Signals.PendingTool != "request_user_input" {
+		t.Fatalf("unexpected rollout details: %+v", details)
+	}
+
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := file.WriteString(`{"timestamp":"2026-09-04T12:00:04Z","type":"event_msg","payload":{"type":"task_complete"}}` + "\n")
+	closeErr := file.Close()
+	if writeErr != nil || closeErr != nil {
+		t.Fatalf("append task completion: write=%v close=%v", writeErr, closeErr)
+	}
+	details, err = readCodexRolloutDetails(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if details.Signals.Lifecycle != lifecycleFinished || details.Signals.PendingTool != "" {
+		t.Fatalf("task completion must clear pending state: %+v", details.Signals)
+	}
+}
+
+func TestEnrichClaudeSessionFromTailClassifiesPendingTool(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "claude.jsonl")
+	contents := strings.Join([]string{
+		`{"type":"user","timestamp":"2026-09-04T12:00:00Z","message":{"role":"user","content":"run tests"}}`,
+		`{"type":"assistant","timestamp":"2026-09-04T12:00:01Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"AskUserQuestion","input":{}}],"stop_reason":"tool_use"}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session := SessionSummary{PID: 42, Provider: providerClaude}
+	enrichClaudeSessionFromTail(&session, path, true, time.Date(2026, 9, 4, 12, 1, 0, 0, time.UTC))
+	if session.Status != blockedSessionStatus || session.StatusSource != "claude-transcript" {
+		t.Fatalf("unexpected Claude state: %+v", session)
+	}
+}
+
 func TestCollectClaudeSessionsUsesHistoryWithoutScanningTranscript(t *testing.T) {
 	tmp := t.TempDir()
 	projects := filepath.Join(tmp, "projects", "-repo")
@@ -192,5 +308,8 @@ func TestCollectSessionsPreservesOtherProviderWhenOneFails(t *testing.T) {
 	}
 	if len(snapshot.Warnings) != 1 || !strings.Contains(snapshot.Warnings[0], "codex") {
 		t.Fatalf("unexpected warnings: %+v", snapshot.Warnings)
+	}
+	if snapshot.Coverage.Scope != "local-agent-sessions" || len(snapshot.Coverage.Excludes) == 0 || len(snapshot.Coverage.Providers) != 2 {
+		t.Fatalf("coverage must disclose discovery scope: %+v", snapshot.Coverage)
 	}
 }

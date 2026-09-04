@@ -40,6 +40,8 @@ func (a *App) Run(args []string) error {
 		return runVersion(a.stdout, jsonOutput)
 	case "start":
 		return runStart(a.stdout, filtered[1:], jsonOutput)
+	case "route":
+		return runRoute(a.stdout, filtered[1:], jsonOutput)
 	case "team":
 		return runTeam(a.stdout, filtered[1:], jsonOutput)
 	case "loop":
@@ -88,6 +90,8 @@ func (a *App) printHelp() {
 	fmt.Fprintln(a.stdout, `pallium
 
 Usage:
+  pallium route <task> [--cwd path] [--authority observe|execute|edit|external] [--execute] [--json]
+  pallium route capabilities [--json]
   pallium start <task> [--workflow name] [--style auto|review|test-fix|research] [--cwd repo-path] [--dry-run] [--json]
   pallium team <start|spawn|tasks|send|inbox|nudge|status|run|approve|stop|attach> [--json]
   pallium loop <start|tick|status|list|stop|reset> [--json]
@@ -107,7 +111,7 @@ Usage:
   pallium task start <goal> [scope-paths...] [--json]
   pallium task show [--json]
   pallium task clear [--json]
-	  pallium sessions <live|watch|sync|recall|search|show|read|open|doctor|forget|prune|index|list|related|grep|embedding|embed|semantic|stats> [--json]
+	  pallium sessions <live|watch|find|sync|recall|search|show|read|open|doctor|forget|prune|index|list|related|grep|embedding|embed|semantic|stats> [--json]
 	  pallium console <ls|watch|show|manifest|handoff|claim|action|authority|gate|review> [--json]
 	  pallium workflow <preflight|generate|validate|tools|template|trigger|fleet|run|list|status|inspect|show|read|report|watch|pause|resume|stop|save|apply> [--json]
 	  pallium agents <guide|block|install> [--dir path] [--json]`)

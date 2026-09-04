@@ -29,6 +29,8 @@ func runSessions(out io.Writer, args []string, jsonOutput bool) error {
 		return runSessionsLive(out, args[1:], jsonOutput, false)
 	case "watch":
 		return runSessionsLive(out, args[1:], jsonOutput, true)
+	case "find":
+		return runSessionsFind(out, args[1:], jsonOutput)
 	case "index":
 		return runSessionsIndex(out, args[1:], jsonOutput)
 	case "sync":
@@ -71,6 +73,137 @@ func runSessions(out io.Writer, args []string, jsonOutput bool) error {
 	}
 }
 
+func runSessionsFind(out io.Writer, args []string, jsonOutput bool) error {
+	if hasHelpArg(args) {
+		printSessionsHelp(out)
+		return nil
+	}
+	var states []string
+	fs := newSessionFlagSet("sessions find")
+	fs.Var((*multiStringFlag)(&states), "state", "")
+	completion := fs.String("completion", "", "")
+	updatedWithin := fs.String("updated-within", "", "")
+	inactiveFor := fs.String("inactive-for", "", "")
+	finishedWithin := fs.String("finished-within", "", "")
+	sortOrder := fs.String("sort", "", "")
+	limit := fs.Int("limit", 20, "")
+	details := fs.Bool("details", false, "")
+	if err := parseSessionFlags(fs, args,
+		map[string]struct{}{"state": {}, "completion": {}, "updated-within": {}, "inactive-for": {}, "finished-within": {}, "sort": {}, "limit": {}},
+		map[string]struct{}{"details": {}}); err != nil {
+		return err
+	}
+	if *limit <= 0 {
+		return fmt.Errorf("--limit must be greater than zero")
+	}
+	parseDuration := func(name, raw string) (time.Duration, error) {
+		if strings.TrimSpace(raw) == "" {
+			return 0, nil
+		}
+		duration, err := parseSessionRetentionAge(raw)
+		if err != nil {
+			return 0, fmt.Errorf("invalid --%s duration %q: %w", name, raw, err)
+		}
+		return duration, nil
+	}
+	updatedDuration, err := parseDuration("updated-within", *updatedWithin)
+	if err != nil {
+		return err
+	}
+	inactiveDuration, err := parseDuration("inactive-for", *inactiveFor)
+	if err != nil {
+		return err
+	}
+	finishedDuration, err := parseDuration("finished-within", *finishedWithin)
+	if err != nil {
+		return err
+	}
+
+	query := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	lowerQuery := strings.ToLower(query)
+	needsCompletion := strings.TrimSpace(*completion) != "" || strings.TrimSpace(*finishedWithin) != "" ||
+		strings.Contains(lowerQuery, "wrapped") || strings.Contains(lowerQuery, "finished") || strings.Contains(lowerQuery, "completed")
+	snapshot, err := codexsessions.CollectSessions(context.Background(), codexsessions.SessionCollectOptions{
+		IncludeAll:        true,
+		IncludeDetails:    *details,
+		IncludeCompletion: needsCompletion,
+	})
+	if err != nil {
+		return err
+	}
+	report, err := codexsessions.FindSessions(snapshot, codexsessions.SessionFindOptions{
+		Query:          query,
+		States:         states,
+		Completion:     *completion,
+		UpdatedWithin:  updatedDuration,
+		InactiveFor:    inactiveDuration,
+		FinishedWithin: finishedDuration,
+		Sort:           *sortOrder,
+		Limit:          *limit,
+	})
+	if err != nil {
+		return err
+	}
+	if jsonOutput {
+		encoder := json.NewEncoder(out)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(report)
+	}
+	renderFoundSessions(out, report, *details)
+	return nil
+}
+
+func renderFoundSessions(out io.Writer, report *codexsessions.SessionFindReport, details bool) {
+	fmt.Fprintf(out, "%d matching sessions (showing %d)\n", report.TotalMatches, len(report.Matches))
+	fmt.Fprintf(out, "interpreted as: %s\n", report.Interpretation)
+	fmt.Fprintf(out, "ordered by: %s\n", report.Sort)
+	fmt.Fprintf(out, "scope: %s (%s)\n\n", report.Coverage.Scope, report.Coverage.Completeness)
+	for _, warning := range report.Warnings {
+		fmt.Fprintf(out, "warning: %s\n", warning)
+	}
+	if len(report.Warnings) > 0 {
+		fmt.Fprintln(out)
+	}
+	if len(report.Matches) == 0 {
+		fmt.Fprintln(out, "No sessions matched.")
+		return
+	}
+	for _, session := range report.Matches {
+		fmt.Fprintf(out, "%s %s %s completion=%s %s\n",
+			firstNonEmpty(session.Provider, "agent"), shortID(session.ThreadID), session.Status,
+			firstNonEmpty(session.CompletionStatus, "unknown"), trimText(session.Title, 90))
+		if !session.LastActiveAt.IsZero() {
+			fmt.Fprintf(out, "  updated: %s (%s)\n", session.LastActiveAt.Local().Format(time.RFC3339), relativeSessionAge(report.GeneratedAt, session.LastActiveAt))
+		}
+		if session.CompletedAt != nil {
+			fmt.Fprintf(out, "  finished: %s (%s)\n", session.CompletedAt.Local().Format(time.RFC3339), relativeSessionAge(report.GeneratedAt, *session.CompletedAt))
+		}
+		if details && session.StatusReason != "" {
+			fmt.Fprintf(out, "  state: %s (source=%s confidence=%s)\n", session.StatusReason, session.StatusSource, session.StatusConfidence)
+		}
+		if details && session.RecentAction != "" {
+			fmt.Fprintf(out, "  recent: %s\n", session.RecentAction)
+		}
+	}
+}
+
+func relativeSessionAge(now, timestamp time.Time) string {
+	if timestamp.After(now) {
+		return "just now"
+	}
+	age := now.Sub(timestamp)
+	switch {
+	case age < time.Minute:
+		return fmt.Sprintf("%ds ago", int(age.Seconds()))
+	case age < time.Hour:
+		return fmt.Sprintf("%dm ago", int(age.Minutes()))
+	case age < 24*time.Hour:
+		return fmt.Sprintf("%.1fh ago", age.Hours())
+	default:
+		return fmt.Sprintf("%.1fd ago", age.Hours()/24)
+	}
+}
+
 func runSessionsLive(out io.Writer, args []string, jsonOutput bool, watch bool) error {
 	if hasHelpArg(args) {
 		printSessionsHelp(out)
@@ -79,7 +212,8 @@ func runSessionsLive(out io.Writer, args []string, jsonOutput bool, watch bool) 
 	fs := newSessionFlagSet("sessions live")
 	includeAll := fs.Bool("all", false, "")
 	details := fs.Bool("details", false, "")
-	if err := parseSessionFlags(fs, args, nil, map[string]struct{}{"all": {}, "details": {}}); err != nil {
+	runningOnly := fs.Bool("running-only", false, "")
+	if err := parseSessionFlags(fs, args, nil, map[string]struct{}{"all": {}, "details": {}, "running-only": {}}); err != nil {
 		return err
 	}
 	if fs.NArg() > 0 {
@@ -92,6 +226,9 @@ func runSessionsLive(out io.Writer, args []string, jsonOutput bool, watch bool) 
 		snapshot, err := codexsessions.CollectSessions(context.Background(), codexsessions.SessionCollectOptions{IncludeAll: *includeAll, IncludeDetails: *details})
 		if err != nil {
 			return err
+		}
+		if *runningOnly {
+			snapshot.Sessions = runningSessionSummaries(snapshot.Sessions)
 		}
 		if jsonOutput {
 			enc := json.NewEncoder(out)
@@ -115,24 +252,39 @@ func runSessionsLive(out io.Writer, args []string, jsonOutput bool, watch bool) 
 	}
 }
 
+func runningSessionSummaries(sessions []codexsessions.SessionSummary) []codexsessions.SessionSummary {
+	filtered := make([]codexsessions.SessionSummary, 0, len(sessions))
+	for _, session := range sessions {
+		if session.Status == "finished" || session.Status == "inactive" {
+			continue
+		}
+		filtered = append(filtered, session)
+	}
+	return filtered
+}
+
 func renderLiveSessions(out io.Writer, snapshot *codexsessions.SessionSnapshot, includeAll, details bool) {
-	active, idle, inactive := 0, 0, 0
+	counts := map[string]int{}
 	for _, s := range snapshot.Sessions {
-		switch s.Status {
-		case "active":
-			active++
-		case "idle":
-			idle++
-		default:
-			inactive++
+		counts[s.Status]++
+	}
+	parts := []string{}
+	for _, status := range []string{"blocked", "stuck", "waiting", "active", "idle", "finished", "inactive"} {
+		if counts[status] > 0 || (includeAll && status == "inactive") {
+			parts = append(parts, fmt.Sprintf("%d %s", counts[status], status))
 		}
 	}
-	if includeAll {
-		fmt.Fprintf(out, "%d active, %d idle, %d inactive agent sessions\n", active, idle, inactive)
-	} else {
-		fmt.Fprintf(out, "%d active, %d idle agent sessions\n", active, idle)
+	if len(parts) == 0 {
+		parts = append(parts, "0 live")
 	}
+	fmt.Fprintf(out, "%s agent sessions\n", strings.Join(parts, ", "))
+	fmt.Fprintf(out, "scope: %s (%s)\n", firstNonEmpty(snapshot.Coverage.Scope, "local-agent-sessions"), firstNonEmpty(snapshot.Coverage.Completeness, "best-effort"))
 	fmt.Fprintf(out, "updated %s\n\n", snapshot.GeneratedAt.Local().Format(time.Kitchen))
+	for _, provider := range snapshot.Coverage.Providers {
+		if provider.Status != "available" {
+			fmt.Fprintf(out, "coverage: %s is %s (%s)\n", provider.Provider, provider.Status, provider.Evidence)
+		}
+	}
 	for _, warning := range snapshot.Warnings {
 		fmt.Fprintf(out, "warning: %s\n", warning)
 	}
@@ -149,6 +301,9 @@ func renderLiveSessions(out io.Writer, snapshot *codexsessions.SessionSnapshot, 
 			pid = strconv.Itoa(s.PID)
 		}
 		fmt.Fprintf(out, "%s %s %s %s %s %s %s\n", firstNonEmpty(s.Provider, "agent"), pid, firstNonEmpty(s.TTY, "-"), s.Status, shortID(s.ThreadID), compactPath(s.EffectiveWorkdir), trimText(s.Title, 90))
+		if details && s.StatusReason != "" {
+			fmt.Fprintf(out, "  state: %s (source=%s confidence=%s)\n", s.StatusReason, firstNonEmpty(s.StatusSource, "unknown"), firstNonEmpty(s.StatusConfidence, "unknown"))
+		}
 		if details && s.RecentAction != "" {
 			fmt.Fprintf(out, "  recent: %s\n", s.RecentAction)
 		}
@@ -1108,9 +1263,13 @@ func parseSessionRetentionAge(value string) (time.Duration, error) {
 func printSessionsHelp(out io.Writer) {
 	fmt.Fprintln(out, `pallium sessions
 
+Live discovery covers local Codex CLI/Desktop and Claude Code sessions. It is
+best-effort and reports provider coverage plus explicit exclusions in JSON.
+
 Usage:
-  pallium sessions live [--all] [--details] [--json]
-  pallium sessions watch [--all] [--details]
+  pallium sessions live [--all] [--running-only] [--details] [--json]
+  pallium sessions watch [--all] [--running-only] [--details]
+  pallium sessions find [query] [--state active|waiting|blocked|stuck|finished|idle|inactive] [--completion finished|not_finished|unknown] [--updated-within 2h] [--inactive-for 3h] [--finished-within 10m] [--sort updated|finished|status] [--limit 20] [--details] [--json]
   pallium sessions index [--provider all|codex|claude] [--codex-home ~/.codex] [--claude-home ~/.claude] [--include path] [--machine name] [--model text-embedding-3-small] [--safety-buffer 30m] [--since 24h] [--force] [--raw-events] [--json]
   pallium sessions sync [--provider all|codex|claude] [--include path] [--model name] [--force] [--no-embed] [--json]
   pallium sessions list [--limit 20] [--json]

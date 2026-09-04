@@ -24,9 +24,11 @@ const agentsBlock = agentsBlockBegin + "\n" +
 	"\n" +
 	"This machine has Pallium: a local control plane for coding agents (workflows, loops, agent teams, repo memory, verification, session state — kept outside your context window).\n" +
 	"\n" +
-	"Reach for it when a task is multi-step, needs tests objectively green, wants parallel workers, must survive the session, needs isolated reviewable edits, needs peers coordinating and messaging each other, or needs to keep retrying across separate future invocations. Skip it for one-shot edits.\n" +
+	"For every nontrivial task where Pallium may help, choose the service yourself instead of asking the user which Pallium command to run. Start with `pallium route \"<task>\" --authority <observe|execute|edit|external> --execute --json`. Supply only the authority ceiling already granted by the user or environment. Routing may recommend a stronger action, but it never widens authority or executes a blocked action. Without `--execute`, follow the returned command only when `allowed` is true. Use `pallium route capabilities --json` when you need the full selection and success-evidence contract.\n" +
 	"\n" +
-	"- Scope first: `pallium workflow preflight \"<task>\"` (files to inspect, risk, test commands)\n" +
+	"The router considers repo intelligence, session awareness, workflows, loops, agent teams, verification, and plain agent work. Skip Pallium for one-shot work when the route says its overhead is not justified.\n" +
+	"\n" +
+	"- Scope a complex task: `pallium workflow preflight \"<task>\"`\n" +
 	"- Orchestrate: write an async-JS workflow, then `pallium workflow validate f.js && pallium workflow run --script f.js \"<task>\" --json`\n" +
 	"- Primitives: `agent()` (schema-validated workers), `pipeline()` (streaming stages), `parallel()` (barrier), `verify.untilGreen()`, `gate()` — discover all with `pallium workflow tools list --json`\n" +
 	"- Peers messaging/disagreeing with each other: `pallium team start|spawn|send|run` (or `team start --template parallel-review|adversarial-debate` for a known-good shape)\n" +
