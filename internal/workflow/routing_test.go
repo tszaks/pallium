@@ -154,3 +154,79 @@ func TestTeamAutoRoutingCanSelectProviderWhenCallerOmitsIt(t *testing.T) {
 		t.Fatalf("auto routing was pinned to the default provider: %+v", m)
 	}
 }
+
+func TestTeamRoutingUsesTaskClass(t *testing.T) {
+	clearProviderEnv(t)
+	dir := t.TempDir()
+	c := routing.Starter()
+	c.Mode = "auto"
+	c.Rules["bounded-edit"] = "luna-xhigh"
+	raw, _ := json.Marshal(c)
+	config := filepath.Join(dir, "routing.json")
+	if err := os.WriteFile(config, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_ROUTING_CONFIG", config)
+	s, err := Open(filepath.Join(dir, "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	team, _ := s.CreateTeam("test", dir, 0)
+	m, err := s.SpawnMemberWithRouting(team.ID, "worker", "", "", "test", "edit", TeamRoutingOptions{TaskClass: "bounded-edit"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Model != "gpt-5.6-luna" || m.ReasoningEffort != "xhigh" {
+		t.Fatalf("team task class did not select its rule: %+v", m)
+	}
+}
+
+func TestTeamSpawnDefersCodexBinaryAvailabilityToRunner(t *testing.T) {
+	clearProviderEnv(t)
+	dir := t.TempDir()
+	t.Setenv("PATH", dir)
+	c := routing.Starter()
+	c.Mode = "auto"
+	raw, _ := json.Marshal(c)
+	config := filepath.Join(dir, "routing.json")
+	if err := os.WriteFile(config, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_ROUTING_CONFIG", config)
+	s, err := Open(filepath.Join(dir, "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	team, _ := s.CreateTeam("test", dir, 0)
+	m, err := s.SpawnMember(team.ID, "worker", "", "", "test", "read-only")
+	if err != nil || m.Provider != "codex" {
+		t.Fatalf("spawn should defer Codex executable validation until team run: %+v %v", m, err)
+	}
+}
+
+func TestPlanRequiredRoutingRequiresEditEligibleCandidate(t *testing.T) {
+	clearProviderEnv(t)
+	dir := t.TempDir()
+	c := routing.Starter()
+	c.Mode = "auto"
+	for i := range c.Candidates {
+		c.Candidates[i].Modes = []string{"read-only"}
+	}
+	raw, _ := json.Marshal(c)
+	config := filepath.Join(dir, "routing.json")
+	if err := os.WriteFile(config, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_ROUTING_CONFIG", config)
+	s, err := Open(filepath.Join(dir, "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	team, _ := s.CreateTeam("test", dir, 0)
+	if _, err := s.SpawnPlanRequiredMember(team.ID, "planner", "", "", "test"); err == nil {
+		t.Fatal("plan-required member accepted a route that cannot run after edit approval")
+	}
+}

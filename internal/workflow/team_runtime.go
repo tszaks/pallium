@@ -779,13 +779,18 @@ func (r *Runner) dispatchTeamTurn(ctx context.Context, store *Store, teamID, lea
 	// --session-id again, not switch to --resume against a session claude
 	// may never have actually created — see Store.FinishMemberTurn's doc
 	// comment for the full incident this fixes.
-	if e := enforceTeamProviderPolicy(cwd, member.Provider); e != nil {
+	team, teamErr := store.GetTeam(teamID)
+	if teamErr != nil {
+		return "", "", 0, teamErr
+	}
+	if e := enforceTeamProviderPolicy(team.CWD, member.Provider); e != nil {
 		return "", "", 0, e
 	}
 	started := time.Now()
 	var observedUsage map[string]any
+	dispatched := false
 	defer func() {
-		if e := store.recordInvocation(teamID, member.ID, member.Provider, member.Model, member.ReasoningEffort, started, observedUsage, err); e != nil {
+		if e := store.recordInvocation(teamID, member.ID, member.Provider, member.Model, member.ReasoningEffort, started, observedUsage, err, dispatched); e != nil {
 			err = fmt.Errorf("record team invocation: %w", e)
 		}
 	}()
@@ -801,6 +806,7 @@ func (r *Runner) dispatchTeamTurn(ctx context.Context, store *Store, teamID, lea
 		}
 		defer os.RemoveAll(tmpDir)
 		outFile := tmpDir + "/last-message.txt"
+		dispatched = true
 		out, cerr := r.runCodexTeamTurn(ctx, tmpDir, outFile, cwd, member.Model, member.SessionToken, member.Mode, false, prompt, teamDecisionSchema, func(threadID string) {
 			// Lease-guarded: an orphaned codex subprocess from an earlier,
 			// already-reassigned turn (its owning `team run` process was
@@ -814,9 +820,11 @@ func (r *Runner) dispatchTeamTurn(ctx context.Context, store *Store, teamID, lea
 		observedUsage = usageFromFile(filepath.Join(tmpDir, "usage.json"))
 		return out, member.SessionToken, 0, cerr
 	case strings.TrimSpace(os.Getenv(providerCommandEnvName(member.Provider))) != "":
+		dispatched = true
 		out, token, cost, werr := r.runConfiguredProviderTeamTurn(ctx, teamID, member, cwd, prompt, func(u map[string]any) { observedUsage = u })
 		return out, token, cost, werr
 	case member.Provider == "claude":
+		dispatched = true
 		out, usage, cerr := r.runClaudeTeamTurn(ctx, member.Mode, member.Model, member.SessionToken, isFirstTurn, cwd, prompt, teamDecisionSchema, member.ReasoningEffort)
 		observedUsage = usage
 		cost, _ := usage["cost_usd"].(float64)

@@ -2,6 +2,8 @@ package workflow
 
 import (
 	"context"
+	"encoding/json"
+	"github.com/tszaks/pallium/internal/routing"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -9,6 +11,60 @@ import (
 	"testing"
 	"time"
 )
+
+func TestDispatchTeamTurnConfigurationFailureIsNotDispatched(t *testing.T) {
+	clearProviderEnv(t)
+	dir := t.TempDir()
+	store, err := Open(filepath.Join(dir, "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	team, _ := store.CreateTeam("test", dir, 0)
+	member, err := store.SpawnMember(team.ID, "worker", "grok", "", "", "read-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &Runner{}
+	_, _, _, err = runner.dispatchTeamTurn(context.Background(), store, team.ID, "lease", &member, dir, "hello")
+	if err == nil {
+		t.Fatal("expected missing provider wrapper error")
+	}
+	invocations, err := store.ListInvocations(team.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(invocations) != 1 || invocations[0].ConfigurationStatus != "not_dispatched" {
+		t.Fatalf("team configuration failure was recorded as dispatched: %+v", invocations)
+	}
+}
+
+func TestDispatchTeamTurnReadsPolicyFromTeamRoot(t *testing.T) {
+	clearProviderEnv(t)
+	root := t.TempDir()
+	store, err := Open(filepath.Join(root, "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	team, _ := store.CreateTeam("test", root, 0)
+	member, err := store.SpawnMember(team.ID, "editor", "claude", "", "", "edit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := routing.Starter()
+	raw, _ := json.Marshal(policy)
+	if err := os.MkdirAll(filepath.Join(root, ".pallium"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".pallium", "routing.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, err = (&Runner{}).dispatchTeamTurn(context.Background(), store, team.ID, "lease", &member, t.TempDir(), "hello")
+	if err == nil || !strings.Contains(err.Error(), "not allowed") {
+		t.Fatalf("edit worktree bypassed the live team-root policy: %v", err)
+	}
+}
 
 func TestBuildClaudeTeamArgsFirstTurnUsesSessionID(t *testing.T) {
 	got := buildClaudeTeamArgs("read-only", "", "abc-123", true)

@@ -27,7 +27,9 @@ func (r *Runner) resolveRouting(opts AgentOptions, mode string) (AgentOptions, s
 	if provider == "" {
 		provider = normalizeProvider(os.Getenv("PALLIUM_WORKFLOW_PROVIDER"))
 	}
-	d, err := c.Choose(routing.Request{VerificationRetry: opts.verificationRetry, Provider: provider, Model: opts.Model, Effort: opts.ReasoningEffort, TaskClass: opts.TaskClass, Mode: mode, Network: opts.Network && r.Run.AllowNetwork}, func(provider string) bool { return ProviderAvailable(provider, r.CodexBinary) })
+	d, err := c.Choose(routing.Request{VerificationRetry: opts.verificationRetry, Provider: provider, Model: opts.Model, Effort: opts.ReasoningEffort, TaskClass: opts.TaskClass, Mode: mode, Network: opts.Network && r.Run.AllowNetwork}, func(provider string) bool {
+		return provider == "codex" && r.AssumeCodexAvailable || ProviderAvailable(provider, r.CodexBinary)
+	})
 	if err != nil {
 		return opts, "", err
 	}

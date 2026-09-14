@@ -51,6 +51,12 @@ class AccountingTests(unittest.TestCase):
         changed = dict(base, model="gpt-5.6-luna")
         self.assertNotEqual(runner.execution_signature(base), runner.execution_signature(changed))
 
+    def test_non_simulation_trials_require_isolated_codex_config(self):
+        with self.assertRaises(ValueError):
+            runner.require_isolated_trial(False, False)
+        runner.require_isolated_trial(False, True)
+        runner.require_isolated_trial(True, False)
+
 
 if __name__ == "__main__":
     unittest.main()

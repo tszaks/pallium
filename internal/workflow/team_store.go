@@ -426,14 +426,29 @@ func (s *Store) SpawnMember(teamID, name, provider, model, role, mode string, ef
 	if len(efforts) > 0 {
 		effort = efforts[0]
 	}
+	return s.spawnMember(teamID, name, provider, model, role, mode, mode, TeamRoutingOptions{ReasoningEffort: effort})
+}
+
+type TeamRoutingOptions struct {
+	ReasoningEffort string
+	TaskClass       string
+	CodexBinary     string
+}
+
+func (s *Store) SpawnMemberWithRouting(teamID, name, provider, model, role, mode string, opts TeamRoutingOptions) (TeamMember, error) {
+	return s.spawnMember(teamID, name, provider, model, role, mode, mode, opts)
+}
+
+func (s *Store) spawnMember(teamID, name, provider, model, role, storedMode, routingMode string, routingOpts TeamRoutingOptions) (TeamMember, error) {
+	effort := routingOpts.ReasoningEffort
 	routingJSON := ""
 	if provider != "external" {
 		team, err := s.GetTeam(teamID)
 		if err != nil {
 			return TeamMember{}, err
 		}
-		r := Runner{Run: Run{CWD: team.CWD}}
-		opts, decision, err := r.resolveRouting(AgentOptions{Provider: provider, Model: model, ReasoningEffort: effort}, mode)
+		r := Runner{Run: Run{CWD: team.CWD}, CodexBinary: routingOpts.CodexBinary, AssumeCodexAvailable: true}
+		opts, decision, err := r.resolveRouting(AgentOptions{Provider: provider, Model: model, ReasoningEffort: effort, TaskClass: routingOpts.TaskClass}, routingMode)
 		if err != nil {
 			return TeamMember{}, err
 		}
@@ -449,11 +464,11 @@ func (s *Store) SpawnMember(teamID, name, provider, model, role, mode string, ef
 	if name == "" {
 		return TeamMember{}, fmt.Errorf("team member requires a name")
 	}
-	if mode != "read-only" && mode != "edit" {
-		return TeamMember{}, fmt.Errorf("team member mode must be \"read-only\" or \"edit\", got %q", mode)
+	if storedMode != "read-only" && storedMode != "edit" {
+		return TeamMember{}, fmt.Errorf("team member mode must be \"read-only\" or \"edit\", got %q", storedMode)
 	}
 	now := nowString()
-	m := TeamMember{ID: NewID("tm"), TeamID: teamID, Name: name, Provider: provider, Model: model, ReasoningEffort: effort, RoutingJSON: routingJSON, Role: role, Mode: mode, Status: "idle", CreatedAt: now, UpdatedAt: now}
+	m := TeamMember{ID: NewID("tm"), TeamID: teamID, Name: name, Provider: provider, Model: model, ReasoningEffort: effort, RoutingJSON: routingJSON, Role: role, Mode: storedMode, Status: "idle", CreatedAt: now, UpdatedAt: now}
 	_, err := s.db.Exec(`INSERT INTO team_members(id,team_id,name,provider,model,reasoning_effort,routing_json,role,mode,status,turn_count,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,0,?,?)`,
 		m.ID, m.TeamID, m.Name, m.Provider, m.Model, m.ReasoningEffort, m.RoutingJSON, m.Role, m.Mode, m.Status, m.CreatedAt, m.UpdatedAt)
 	if err != nil {
@@ -471,7 +486,15 @@ func (s *Store) SpawnMember(teamID, name, provider, model, role, mode string, ef
 // ApproveMemberPlan/RejectMemberPlan and buildTeamTurnPrompt's plan-mode
 // framing.
 func (s *Store) SpawnPlanRequiredMember(teamID, name, provider, model, role string, efforts ...string) (TeamMember, error) {
-	if _, err := s.SpawnMember(teamID, name, provider, model, role, "read-only", efforts...); err != nil {
+	effort := ""
+	if len(efforts) > 0 {
+		effort = efforts[0]
+	}
+	return s.SpawnPlanRequiredMemberWithRouting(teamID, name, provider, model, role, TeamRoutingOptions{ReasoningEffort: effort})
+}
+
+func (s *Store) SpawnPlanRequiredMemberWithRouting(teamID, name, provider, model, role string, opts TeamRoutingOptions) (TeamMember, error) {
+	if _, err := s.spawnMember(teamID, name, provider, model, role, "read-only", "edit", opts); err != nil {
 		return TeamMember{}, err
 	}
 	if _, err := s.db.Exec(`UPDATE team_members SET plan_required=1, plan_status='pending', updated_at=? WHERE team_id=? AND name=?`, nowString(), teamID, name); err != nil {

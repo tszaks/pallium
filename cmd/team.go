@@ -131,7 +131,7 @@ func runTeamStart(out io.Writer, args []string, jsonOutput bool) error {
 	}
 	var spawned []workflow.TeamMember
 	for _, m := range tmpl.Members {
-		member, err := spawnTeamMember(store, team.ID, m.Name, "", "", m.Role, m.Mode, false)
+		member, err := spawnTeamMember(store, team.ID, m.Name, "", "", m.Role, m.Mode, false, workflow.TeamRoutingOptions{})
 		if err != nil {
 			return fmt.Errorf("template %q: spawning %q: %w", tmpl.Name, m.Name, err)
 		}
@@ -297,15 +297,16 @@ func runTeamSpawn(out io.Writer, args []string, jsonOutput bool) error {
 	provider := fs.String("provider", "", "")
 	model := fs.String("model", "", "")
 	effort := fs.String("reasoning-effort", "", "Worker reasoning effort")
+	taskClass := fs.String("task-class", "", "Routing task class")
 	role := fs.String("role", "", "")
 	mode := fs.String("mode", "read-only", "")
 	planRequired := fs.Bool("plan-required", false, "")
-	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "provider": {}, "model": {}, "reasoning-effort": {}, "role": {}, "mode": {}}, map[string]struct{}{"plan-required": {}}); err != nil {
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"db": {}, "provider": {}, "model": {}, "reasoning-effort": {}, "task-class": {}, "role": {}, "mode": {}}, map[string]struct{}{"plan-required": {}}); err != nil {
 		return err
 	}
 	positionals := fs.Args()
 	if len(positionals) < 2 {
-		return fmt.Errorf("usage: pallium team spawn <team-id> <name> [--provider p] [--model m] [--role r] [--mode read-only|edit] [--plan-required] [--json]")
+		return fmt.Errorf("usage: pallium team spawn <team-id> <name> [--provider p] [--model m] [--reasoning-effort e] [--task-class c] [--role r] [--mode read-only|edit] [--plan-required] [--json]")
 	}
 	teamID, name := positionals[0], positionals[1]
 	store, err := openPalliumStore(*dbPath)
@@ -313,7 +314,7 @@ func runTeamSpawn(out io.Writer, args []string, jsonOutput bool) error {
 		return err
 	}
 	defer store.Close()
-	member, err := spawnTeamMember(store, teamID, name, *provider, *model, *role, *mode, *planRequired, *effort)
+	member, err := spawnTeamMember(store, teamID, name, *provider, *model, *role, *mode, *planRequired, workflow.TeamRoutingOptions{ReasoningEffort: *effort, TaskClass: *taskClass})
 	if err != nil {
 		return err
 	}
@@ -329,16 +330,16 @@ func runTeamSpawn(out io.Writer, args []string, jsonOutput bool) error {
 // final member row. Kept as one function so a template-spawned member is
 // indistinguishable from one spawned by hand — no second, drifting copy of
 // the claude-session-minting step.
-func spawnTeamMember(store *workflow.Store, teamID, name, provider, model, role, mode string, planRequired bool, effort ...string) (workflow.TeamMember, error) {
+func spawnTeamMember(store *workflow.Store, teamID, name, provider, model, role, mode string, planRequired bool, routing workflow.TeamRoutingOptions) (workflow.TeamMember, error) {
 	var member workflow.TeamMember
 	var err error
 	if planRequired {
 		// A plan-required member is always spawned read-only regardless of
 		// mode: it cannot edit anything until `team approve` flips it, so
 		// mode is enforced here, not merely defaulted.
-		member, err = store.SpawnPlanRequiredMember(teamID, name, provider, model, role, effort...)
+		member, err = store.SpawnPlanRequiredMemberWithRouting(teamID, name, provider, model, role, routing)
 	} else {
-		member, err = store.SpawnMember(teamID, name, provider, model, role, mode, effort...)
+		member, err = store.SpawnMemberWithRouting(teamID, name, provider, model, role, mode, routing)
 	}
 	if err != nil {
 		return workflow.TeamMember{}, err

@@ -39,14 +39,15 @@ var (
 )
 
 type Runner struct {
-	Store               *Store
-	Run                 Run
-	MaxAgents           int
-	MaxBudgetUSD        string
-	CodexBinary         string
-	MaxConcurrentAgents int
-	PalliumBinary       string
-	AgentTimeoutSeconds int
+	Store                *Store
+	Run                  Run
+	MaxAgents            int
+	MaxBudgetUSD         string
+	CodexBinary          string
+	AssumeCodexAvailable bool
+	MaxConcurrentAgents  int
+	PalliumBinary        string
+	AgentTimeoutSeconds  int
 
 	mu         sync.Mutex
 	failuresMu sync.Mutex
@@ -764,6 +765,7 @@ func (r *Runner) jsTeam(ctx context.Context, vm *goja.Runtime) map[string]any {
 				Provider        string `json:"provider"`
 				Model           string `json:"model"`
 				ReasoningEffort string `json:"reasoning_effort"`
+				TaskClass       string `json:"task_class"`
 				Role            string `json:"role"`
 				Mode            string `json:"mode"`
 				PlanRequired    bool   `json:"planRequired"`
@@ -772,10 +774,11 @@ func (r *Runner) jsTeam(ctx context.Context, vm *goja.Runtime) map[string]any {
 				decodeOpts(rawOpts[0], &opts)
 			}
 			var err error
+			routingOpts := TeamRoutingOptions{ReasoningEffort: opts.ReasoningEffort, TaskClass: opts.TaskClass, CodexBinary: r.CodexBinary}
 			if opts.PlanRequired {
-				_, err = r.Store.SpawnPlanRequiredMember(teamID, name, opts.Provider, opts.Model, opts.Role, opts.ReasoningEffort)
+				_, err = r.Store.SpawnPlanRequiredMemberWithRouting(teamID, name, opts.Provider, opts.Model, opts.Role, routingOpts)
 			} else {
-				_, err = r.Store.SpawnMember(teamID, name, opts.Provider, opts.Model, opts.Role, opts.Mode, opts.ReasoningEffort)
+				_, err = r.Store.SpawnMemberWithRouting(teamID, name, opts.Provider, opts.Model, opts.Role, opts.Mode, routingOpts)
 			}
 			if err != nil {
 				panic(vm.ToValue(err.Error()))

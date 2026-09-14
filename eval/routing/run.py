@@ -48,6 +48,11 @@ def comparison_signature(record):
             record.get("worker_binary_hash"), record.get("isolated_codex_config"))
 
 
+def require_isolated_trial(simulation, isolated_codex_config):
+    if not simulation and not isolated_codex_config:
+        raise ValueError("non-simulation trials require --isolated-codex-config so ambient Codex settings cannot mix execution identities")
+
+
 def write(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
 
@@ -193,6 +198,8 @@ def run(args):
     if args.candidate not in candidates:
         raise ValueError("candidate not enabled")
     candidate = candidates[args.candidate]
+
+    require_isolated_trial(args.simulation, args.isolated_codex_config)
 
     if candidate["provider"] != "codex" or candidate["provider"] not in config["allowed_providers"]:
         raise ValueError("initial evaluation harness supports permitted Codex candidates only")
