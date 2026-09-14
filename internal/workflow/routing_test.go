@@ -93,6 +93,35 @@ func TestRoutingShadowPreservesExplicitAndProviderBoundary(t *testing.T) {
 	}
 }
 
+func TestRoutingRejectsNetworklessBuiltinClaude(t *testing.T) {
+	clearProviderEnv(t)
+	dir := t.TempDir()
+	claude := filepath.Join(dir, "claude")
+	if err := os.WriteFile(claude, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	c := routing.Config{
+		Version: 1, Mode: "auto", AllowedProviders: []string{"claude"}, Default: "claude-network",
+		Candidates: []routing.Candidate{{ID: "claude-network", Provider: "claude", Model: "claude-opus-5", Effort: "high", Enabled: true, Network: true, Modes: []string{"read-only"}}},
+		Rules:      map[string]string{},
+	}
+	raw, _ := json.Marshal(c)
+	config := filepath.Join(dir, "routing.json")
+	if err := os.WriteFile(config, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_ROUTING_CONFIG", config)
+	r := Runner{Run: Run{CWD: dir, AllowNetwork: true}}
+	if _, _, err := r.resolveRouting(AgentOptions{Network: true}, "read-only"); err == nil {
+		t.Fatal("selected networkless built-in Claude for a network-required call")
+	}
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_CLAUDE_COMMAND", "wrapper")
+	if opts, _, err := r.resolveRouting(AgentOptions{Network: true}, "read-only"); err != nil || opts.Provider != "claude" {
+		t.Fatalf("configured Claude wrapper should satisfy network routing: %+v %v", opts, err)
+	}
+}
+
 func TestTeamEffortSurvivesStoreRoundTrip(t *testing.T) {
 	clearProviderEnv(t)
 	t.Setenv("PALLIUM_ROUTING_CONFIG", "")

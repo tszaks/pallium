@@ -6,6 +6,7 @@ import (
 	"github.com/tszaks/pallium/internal/routing"
 	"os"
 	"os/exec"
+	"strings"
 )
 
 // resolveRouting applies only an operator-provided policy. A missing default
@@ -27,8 +28,9 @@ func (r *Runner) resolveRouting(opts AgentOptions, mode string) (AgentOptions, s
 	if provider == "" {
 		provider = normalizeProvider(os.Getenv("PALLIUM_WORKFLOW_PROVIDER"))
 	}
-	d, err := c.Choose(routing.Request{VerificationRetry: opts.verificationRetry, Provider: provider, Model: opts.Model, Effort: opts.ReasoningEffort, TaskClass: opts.TaskClass, Mode: mode, Network: opts.Network && r.Run.AllowNetwork}, func(provider string) bool {
-		return provider == "codex" && r.AssumeCodexAvailable || ProviderAvailable(provider, r.CodexBinary)
+	networkRequired := opts.Network && r.Run.AllowNetwork
+	d, err := c.Choose(routing.Request{VerificationRetry: opts.verificationRetry, Provider: provider, Model: opts.Model, Effort: opts.ReasoningEffort, TaskClass: opts.TaskClass, Mode: mode, Network: networkRequired}, func(provider string) bool {
+		return provider == "codex" && r.AssumeCodexAvailable || ProviderAvailableWithNetwork(provider, r.CodexBinary, networkRequired)
 	})
 	if err != nil {
 		return opts, "", err
@@ -50,6 +52,9 @@ func (r *Runner) resolveRouting(opts AgentOptions, mode string) (AgentOptions, s
 		if !allowed {
 			return opts, "", fmt.Errorf("effective provider %q is not allowed by routing policy", effectiveProvider)
 		}
+		if networkRequired && effectiveProvider == "claude" && strings.TrimSpace(os.Getenv(providerCommandEnvName("claude"))) == "" {
+			return opts, "", fmt.Errorf("built-in claude provider cannot satisfy required network access; configure %s", providerCommandEnvName("claude"))
+		}
 	}
 	opts.Provider = d.Selected.Provider
 	opts.Model = d.Selected.Model
@@ -61,8 +66,15 @@ func (r *Runner) resolveRouting(opts AgentOptions, mode string) (AgentOptions, s
 // ProviderAvailable checks executable wiring only; authentication remains an
 // operator declaration until an actual invocation succeeds.
 func ProviderAvailable(provider, codexBinary string) bool {
+	return ProviderAvailableWithNetwork(provider, codexBinary, false)
+}
+
+func ProviderAvailableWithNetwork(provider, codexBinary string, networkRequired bool) bool {
 	if provider != "codex" && os.Getenv(providerCommandEnvName(provider)) != "" {
 		return true
+	}
+	if provider == "claude" && networkRequired {
+		return false
 	}
 	binary := provider
 	if provider == "codex" && codexBinary != "" {

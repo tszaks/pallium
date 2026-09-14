@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"fmt"
+	"os"
 	"strings"
 )
 
@@ -29,7 +30,13 @@ func ValidateReasoningEffort(provider, model, effort string) error {
 			allowed = append(allowed, "max")
 		}
 	default:
-		return fmt.Errorf("provider %q has no verified reasoning-effort adapter", provider)
+		if strings.TrimSpace(os.Getenv(providerCommandEnvName(provider))) == "" {
+			return fmt.Errorf("provider %q has no verified reasoning-effort adapter", provider)
+		}
+		if strings.TrimSpace(effort) != effort || strings.ContainsAny(effort, " \t\r\n") {
+			return fmt.Errorf("configured provider %q reasoning effort must be one non-whitespace token", provider)
+		}
+		return nil
 	}
 	for _, value := range allowed {
 		if effort == value {

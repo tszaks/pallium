@@ -26,6 +26,17 @@ func TestReasoningValidation(t *testing.T) {
 	}
 }
 
+func TestConfiguredWrapperOwnsReasoningEffortValidation(t *testing.T) {
+	clearProviderEnv(t)
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_GEMINI_COMMAND", "wrapper")
+	if err := ValidateReasoningEffort("gemini", "gemini-3.5-flash", "provider-defined"); err != nil {
+		t.Fatalf("configured wrapper effort was rejected: %v", err)
+	}
+	if err := ValidateReasoningEffort("gemini", "gemini-3.5-flash", "bad value"); err == nil {
+		t.Fatal("accepted whitespace-bearing wrapper effort")
+	}
+}
+
 func TestWorkflowReasoningValidationFailureIsRecordedNotDispatched(t *testing.T) {
 	clearProviderEnv(t)
 	dir := t.TempDir()
