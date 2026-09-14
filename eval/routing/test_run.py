@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 import unittest
 
@@ -56,6 +57,23 @@ class AccountingTests(unittest.TestCase):
             runner.require_isolated_trial(False, False)
         runner.require_isolated_trial(False, True)
         runner.require_isolated_trial(True, False)
+
+    def test_invocation_snapshot_must_be_successful_and_observable(self):
+        with self.assertRaises(ValueError):
+            runner.parse_invocation_snapshot({"exit_code": 1, "timed_out": False, "stdout": "{}"})
+        with self.assertRaises(ValueError):
+            runner.parse_invocation_snapshot({"exit_code": 0, "timed_out": False, "stdout": "not-json"})
+        with self.assertRaises(ValueError):
+            runner.parse_invocation_snapshot({"exit_code": 0, "timed_out": False, "stdout": "{}"})
+        snapshot, invocations = runner.parse_invocation_snapshot({
+            "exit_code": 0, "timed_out": False,
+            "stdout": json.dumps({"invocations": [{"provider": "codex"}]})})
+        self.assertEqual(snapshot["invocations"], invocations)
+
+    def test_routing_config_hash_changes_with_candidate_mapping(self):
+        first = {"candidates": [{"id": "fast", "model": "a"}]}
+        second = {"candidates": [{"id": "fast", "model": "b"}]}
+        self.assertNotEqual(runner.routing_config_hash(first), runner.routing_config_hash(second))
 
 
 if __name__ == "__main__":

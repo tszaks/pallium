@@ -4,9 +4,25 @@ import (
 	"bytes"
 	"encoding/json"
 	"github.com/tszaks/pallium/internal/routing"
+	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestRouteHistoryHonorsTestDatabaseRedirect(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "redirected.sqlite")
+	t.Setenv("PALLIUM_TEST_DB", dbPath)
+	t.Setenv("HOME", filepath.Join(tmp, "home"))
+	var out bytes.Buffer
+	app := NewApp(&out, &out)
+	if err := app.Run([]string{"route", "models", "history", "--run", "missing", "--json"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dbPath); err != nil {
+		t.Fatalf("route history ignored PALLIUM_TEST_DB: %v", err)
+	}
+}
 
 func TestRouteInitPreservesExistingPolicy(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "routing.json")

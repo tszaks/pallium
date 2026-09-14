@@ -688,7 +688,7 @@ func (r *Runner) jsTeam(ctx context.Context, vm *goja.Runtime) map[string]any {
 	// from these two primitives' gate calls even after the CLI's own
 	// one-off gate calls got the identical fix.
 	teamRunner := func(teamID string) *Runner {
-		return &Runner{CodexBinary: r.CodexBinary, PalliumBinary: r.PalliumBinary, Run: Run{ID: teamID}}
+		return &Runner{Store: r.Store, CodexBinary: r.CodexBinary, PalliumBinary: r.PalliumBinary, Run: Run{ID: teamID}}
 	}
 	decodeOpts := func(raw any, out any) {
 		if raw == nil {

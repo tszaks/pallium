@@ -53,6 +53,23 @@ def require_isolated_trial(simulation, isolated_codex_config):
         raise ValueError("non-simulation trials require --isolated-codex-config so ambient Codex settings cannot mix execution identities")
 
 
+def routing_config_hash(config):
+    return digest(json.dumps(config, sort_keys=True, separators=(",", ":")).encode())
+
+
+def parse_invocation_snapshot(report):
+    if report["exit_code"] != 0 or report["timed_out"]:
+        raise ValueError("workflow invocation snapshot could not be inspected")
+    try:
+        snapshot = json.loads(report["stdout"])
+    except json.JSONDecodeError as error:
+        raise ValueError("workflow invocation snapshot was not valid JSON") from error
+    invocations = snapshot.get("invocations")
+    if not isinstance(invocations, list) or not invocations:
+        raise ValueError("workflow invocation snapshot contained no provider invocation")
+    return snapshot, invocations
+
+
 def write(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
 
@@ -249,11 +266,7 @@ def run(args):
     write(run_dir / "process.json", result)
     report = command([binary, "workflow", "inspect", run_id, "--db", str(db), "--json"], work, 30, env)
     (run_dir / "snapshot.json").write_text(report["stdout"])
-    try:
-        snapshot = json.loads(report["stdout"])
-    except json.JSONDecodeError:
-        snapshot = {}
-    invocations = snapshot.get("invocations", [])
+    snapshot, invocations = parse_invocation_snapshot(report)
     costs = [v.get("cost_usd") for v in invocations]
     total_cost = sum(costs) if costs and all(c is not None for c in costs) else None
     objective = None
@@ -266,7 +279,7 @@ def run(args):
         objective = {"passed": checks["exit_code"] == 0 and not test_changes,
                      "test_changes": test_changes, "duration_ms": checks["duration_ms"]}
     worker_identity = resolved_executable(args.codex)
-    record = {"harness_hash": harness_hash, "pallium_binary_hash": digest(Path(binary).read_bytes()), "routing_config_hash": digest(json.dumps(config, sort_keys=True, separators=(",", ":")).encode()), "isolated_codex_config": args.isolated_codex_config, "simulation": args.simulation, "worker_binary": args.codex, "worker_binary_path": worker_identity["path"], "worker_binary_hash": worker_identity["hash"], "objective_checks": objective, "run_id": run_id, "task_id": task["id"], "family": task["family"],
+    record = {"harness_hash": harness_hash, "pallium_binary_hash": digest(Path(binary).read_bytes()), "routing_config_hash": routing_config_hash(config), "isolated_codex_config": args.isolated_codex_config, "simulation": args.simulation, "worker_binary": args.codex, "worker_binary_path": worker_identity["path"], "worker_binary_hash": worker_identity["hash"], "objective_checks": objective, "run_id": run_id, "task_id": task["id"], "family": task["family"],
               "split": task["proposed_split"], "split_group": task.get("split_group",task["id"]), "candidate": args.candidate,
               "provider": candidate["provider"], "model": candidate["model"], "reasoning_effort": candidate["reasoning_effort"],
               "fixture_hash": task["fixture_hash"], "prompt_hash": task["prompt_hash"],
@@ -347,6 +360,8 @@ def suggest(args):
             any(len(signatures) != 1 or any(None in signature for signature in signatures)
                 for signatures in candidate_signatures.values())):
         raise ValueError("suggest requires one pinned harness/binary/config group and one execution identity per candidate")
+    if next(iter(comparison_signatures))[2] != routing_config_hash(config):
+        raise ValueError("suggest config does not match the routing configuration recorded by the trials")
     if any(r["outcome"] == "pending_review" for r in records):
         raise ValueError("grade calibration outcomes before suggesting rules")
     enabled = {c["id"] for c in config["candidates"] if c["enabled"] and c["provider"] in config["allowed_providers"]}

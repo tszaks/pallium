@@ -64,6 +64,10 @@ func TestDispatchTeamTurnReadsPolicyFromTeamRoot(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "not allowed") {
 		t.Fatalf("edit worktree bypassed the live team-root policy: %v", err)
 	}
+	invocations, err := store.ListInvocations(team.ID)
+	if err != nil || len(invocations) != 1 || invocations[0].ConfigurationStatus != "not_dispatched" {
+		t.Fatalf("live-policy rejection was not recorded as not dispatched: %+v %v", invocations, err)
+	}
 }
 
 func TestBuildClaudeTeamArgsFirstTurnUsesSessionID(t *testing.T) {

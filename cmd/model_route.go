@@ -38,7 +38,7 @@ func runModelRoute(out io.Writer, args []string, jsonOutput bool) error {
 		if *runID == "" {
 			return fmt.Errorf("route models history requires --run")
 		}
-		store, err := workflow.Open(*db)
+		store, err := openPalliumStore(*db)
 		if err != nil {
 			return err
 		}

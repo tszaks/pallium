@@ -779,13 +779,6 @@ func (r *Runner) dispatchTeamTurn(ctx context.Context, store *Store, teamID, lea
 	// --session-id again, not switch to --resume against a session claude
 	// may never have actually created — see Store.FinishMemberTurn's doc
 	// comment for the full incident this fixes.
-	team, teamErr := store.GetTeam(teamID)
-	if teamErr != nil {
-		return "", "", 0, teamErr
-	}
-	if e := enforceTeamProviderPolicy(team.CWD, member.Provider); e != nil {
-		return "", "", 0, e
-	}
 	started := time.Now()
 	var observedUsage map[string]any
 	dispatched := false
@@ -794,6 +787,13 @@ func (r *Runner) dispatchTeamTurn(ctx context.Context, store *Store, teamID, lea
 			err = fmt.Errorf("record team invocation: %w", e)
 		}
 	}()
+	team, teamErr := store.GetTeam(teamID)
+	if teamErr != nil {
+		return "", "", 0, teamErr
+	}
+	if e := enforceTeamProviderPolicy(team.CWD, member.Provider); e != nil {
+		return "", "", 0, e
+	}
 	if e := ValidateReasoningEffort(member.Provider, member.Model, member.ReasoningEffort); e != nil {
 		return "", "", 0, e
 	}
