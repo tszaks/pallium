@@ -7,9 +7,10 @@ import (
 )
 
 type Report struct {
-	ID     string `json:"id"`
-	Task   string `json:"task"`
-	Status string `json:"status"`
+	Invocations []Invocation `json:"invocations,omitempty"`
+	ID          string       `json:"id"`
+	Task        string       `json:"task"`
+	Status      string       `json:"status"`
 	// Verdict is a blunt, unmissable one-liner ("VERDICT: NOT FINISHED — ...")
 	// stating whether the run actually finished and how many agents actually
 	// completed. Exists because a skimming reader (human or model) can
@@ -55,6 +56,10 @@ func Verdict(status string, agentsCompleted, agentsTotal int) string {
 }
 
 type AgentReport struct {
+	Model            string   `json:"model,omitempty"`
+	ReasoningEffort  string   `json:"reasoning_effort,omitempty"`
+	RoutingJSON      string   `json:"routing_json,omitempty"`
+	UsageJSON        string   `json:"usage_json,omitempty"`
 	Label            string   `json:"label"`
 	Phase            string   `json:"phase,omitempty"`
 	Provider         string   `json:"provider,omitempty"`
@@ -69,13 +74,14 @@ type AgentReport struct {
 
 func BuildReport(snapshot Snapshot) Report {
 	report := Report{
-		ID:       snapshot.Run.ID,
-		Task:     snapshot.Run.Task,
-		Status:   snapshot.Run.Status,
-		OwnedID:  snapshot.Run.OwnedID,
-		Failures: snapshot.Run.Failures,
-		Error:    snapshot.Run.Error,
-		Summary:  defaultReportSummary(snapshot),
+		Invocations: snapshot.Invocations,
+		ID:          snapshot.Run.ID,
+		Task:        snapshot.Run.Task,
+		Status:      snapshot.Run.Status,
+		OwnedID:     snapshot.Run.OwnedID,
+		Failures:    snapshot.Run.Failures,
+		Error:       snapshot.Run.Error,
+		Summary:     defaultReportSummary(snapshot),
 	}
 	agentsCompleted := 0
 	for _, agent := range snapshot.Agents {
@@ -90,6 +96,7 @@ func BuildReport(snapshot Snapshot) Report {
 		}
 		parsed := parseJSONish(agent.Output)
 		agentReport := AgentReport{
+			Model: agent.Model, ReasoningEffort: agent.ReasoningEffort, RoutingJSON: agent.RoutingJSON, UsageJSON: agent.UsageJSON,
 			Label:            firstNonEmpty(agent.Label, agent.ID),
 			Phase:            agent.Phase,
 			Provider:         agent.Provider,

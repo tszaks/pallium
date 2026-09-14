@@ -52,6 +52,14 @@ func TestMeaningfulProviderErrorLine(t *testing.T) {
 	}
 }
 
+func TestProviderErrorDoesNotPromoteToolSourceCode(t *testing.T) {
+	stream := `{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"return fmt.Errorf(\"error: failed\")"}}` + "\n" + `{"type":"turn.failed","error":{"message":"Model is unavailable"}}`
+	got, ok := meaningfulProviderErrorLine(stream)
+	if !ok || got != "Model is unavailable" {
+		t.Fatalf("got %q %v", got, ok)
+	}
+}
+
 // TestRunConfiguredProviderCommandSurfacesMeaningfulErrorLine proves a
 // configured provider wrapper that dies with a generic kill signal after
 // printing its real failure reason (a quota wall) surfaces that reason as

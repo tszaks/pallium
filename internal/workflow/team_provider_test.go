@@ -2,6 +2,8 @@ package workflow
 
 import (
 	"context"
+	"encoding/json"
+	"github.com/tszaks/pallium/internal/routing"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -9,6 +11,64 @@ import (
 	"testing"
 	"time"
 )
+
+func TestDispatchTeamTurnConfigurationFailureIsNotDispatched(t *testing.T) {
+	clearProviderEnv(t)
+	dir := t.TempDir()
+	store, err := Open(filepath.Join(dir, "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	team, _ := store.CreateTeam("test", dir, 0)
+	member, err := store.SpawnMember(team.ID, "worker", "grok", "", "", "read-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &Runner{}
+	_, _, _, err = runner.dispatchTeamTurn(context.Background(), store, team.ID, "lease", &member, dir, "hello")
+	if err == nil {
+		t.Fatal("expected missing provider wrapper error")
+	}
+	invocations, err := store.ListInvocations(team.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(invocations) != 1 || invocations[0].ConfigurationStatus != "not_dispatched" {
+		t.Fatalf("team configuration failure was recorded as dispatched: %+v", invocations)
+	}
+}
+
+func TestDispatchTeamTurnReadsPolicyFromTeamRoot(t *testing.T) {
+	clearProviderEnv(t)
+	root := t.TempDir()
+	store, err := Open(filepath.Join(root, "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	team, _ := store.CreateTeam("test", root, 0)
+	member, err := store.SpawnMember(team.ID, "editor", "claude", "", "", "edit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := routing.Starter()
+	raw, _ := json.Marshal(policy)
+	if err := os.MkdirAll(filepath.Join(root, ".pallium"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".pallium", "routing.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, err = (&Runner{}).dispatchTeamTurn(context.Background(), store, team.ID, "lease", &member, t.TempDir(), "hello")
+	if err == nil || !strings.Contains(err.Error(), "not allowed") {
+		t.Fatalf("edit worktree bypassed the live team-root policy: %v", err)
+	}
+	invocations, err := store.ListInvocations(team.ID)
+	if err != nil || len(invocations) != 1 || invocations[0].ConfigurationStatus != "not_dispatched" {
+		t.Fatalf("live-policy rejection was not recorded as not dispatched: %+v %v", invocations, err)
+	}
+}
 
 func TestBuildClaudeTeamArgsFirstTurnUsesSessionID(t *testing.T) {
 	got := buildClaudeTeamArgs("read-only", "", "abc-123", true)
@@ -139,37 +199,32 @@ func TestRunCodexTeamTurnPropagatesMeaningfulError(t *testing.T) {
 	}
 }
 
-// TestRunCodexTeamTurnSurfacesScanTooLongError is the regression test for a
-// P3 found by review: scanner.Err() was never checked after the scan loop.
-// A single unterminated line over the scanner's 4MB cap makes Scan() return
-// false the same way a clean EOF does — without this check, a truncated/
-// corrupted stream with a zero exit code would silently fall through to
-// "success" on whatever partial last-message file happened to exist.
-func TestRunCodexTeamTurnSurfacesScanTooLongError(t *testing.T) {
+// Oversized non-accounting events must be drained without unbounded memory or
+// turning an otherwise successful provider execution into a failure.
+func TestRunCodexTeamTurnDrainsOversizedEvent(t *testing.T) {
 	tmp := t.TempDir()
-	// One unterminated line just over the 4MB scanner cap (4*1024*1024).
-	// The scanner drains roughly this many bytes before giving up, so the
-	// single producing pipeline (head|tr) finishes and the script exits
-	// normally — no second write is attempted afterward, so there's no risk
-	// of the child blocking on a pipe nobody's draining anymore.
-	script := "#!/bin/sh\nhead -c 4300000 /dev/zero | tr '\\0' 'a'\n"
+	script := `#!/bin/sh
+OUT=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output-last-message) OUT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '{"ok":true}' > "$OUT"
+printf '{"type":"item.completed","output":"'
+head -c 4300000 /dev/zero | tr '\0' 'a'
+printf '"}\n{"type":"turn.completed","usage":{"output_tokens":7}}\n'
+`
 	path := filepath.Join(tmp, "fake-codex-oversized.sh")
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	r := &Runner{CodexBinary: path}
-	// scanner.Err() fires almost immediately once ~4MB has been read (well
-	// under a second); the bound below is only a safety net in case the
-	// remaining unread tail leaves the child blocked on a pipe nobody's
-	// draining anymore (see the comment above) — it should never actually
-	// need to fire, but keeps the test from hanging if it does.
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_, err := r.runCodexTeamTurn(ctx, tmp, filepath.Join(tmp, "last.txt"), t.TempDir(), "", "", "read-only", false, "hi", nil, nil)
-	if err == nil {
-		t.Fatal("expected an error for an oversized unterminated line, got nil")
-	}
-	if !strings.Contains(err.Error(), "reading output") {
-		t.Fatalf("expected the scan error surfaced (not silently ignored), got: %v", err)
+	output, err := r.runCodexTeamTurn(ctx, tmp, filepath.Join(tmp, "last.txt"), t.TempDir(), "", "", "read-only", false, "hi", nil, nil)
+	if err != nil || output != `{"ok":true}` {
+		t.Fatalf("oversized event broke successful turn: output=%q err=%v", output, err)
 	}
 }

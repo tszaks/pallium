@@ -1,7 +1,6 @@
 package workflow
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -20,10 +19,13 @@ import (
 // flag) lives here too, mirroring runBuiltinClaudeCommand's role as the sole
 // claude invocation site.
 func (r *Runner) runCodexCommand(ctx context.Context, tmpDir, outFile, cwd, prompt string, agent *Agent, opts AgentOptions, networkAllowed bool) (string, error) {
-	cmdArgs := []string{"exec", "--cd", cwd, "--output-last-message", outFile}
+	cmdArgs := []string{"exec", "--json", "--cd", cwd, "--output-last-message", outFile}
 	cmdArgs = append(cmdArgs, codexSandboxArgs(agent.Mode, networkAllowed)...)
 	if opts.Model != "" {
 		cmdArgs = append(cmdArgs, "--model", opts.Model)
+	}
+	if opts.ReasoningEffort != "" {
+		cmdArgs = append(cmdArgs, "-c", "model_reasoning_effort="+opts.ReasoningEffort)
 	}
 	if len(opts.Schema) > 0 {
 		schemaPath := filepath.Join(tmpDir, "schema.json")
@@ -41,12 +43,29 @@ func (r *Runner) runCodexCommand(ctx context.Context, tmpDir, outFile, cwd, prom
 	cmd := exec.CommandContext(ctx, r.CodexBinary, cmdArgs...)
 	cmd.Dir = cwd
 	cmd.WaitDelay = 5 * time.Second
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", err
+	}
+	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if err := cmd.Start(); err != nil {
+		return "", err
+	}
+	markProviderStarted(ctx)
+	stdoutTail, usage, scanErr := consumeCodexEvents(stdoutPipe, nil)
+	if scanErr != nil {
+		_ = stdoutPipe.Close()
+	}
+	waitErr := cmd.Wait()
+	writeCodexUsageMap(filepath.Join(tmpDir, "usage.json"), usage)
+	if scanErr != nil {
+		baseErr := fmt.Errorf("codex agent failed reading output: %w", scanErr)
+		return "", wrapProviderCommandError(baseErr, stdoutTail+stderr.String())
+	}
+	if err := waitErr; err != nil {
 		baseErr := formatProviderFailure("codex agent", err, truncateForError(strings.TrimSpace(stderr.String())))
-		return "", wrapProviderCommandError(baseErr, stdout.String()+stderr.String())
+		return "", wrapProviderCommandError(baseErr, stdoutTail+stderr.String())
 	}
 	raw, err := os.ReadFile(outFile)
 	if err != nil {
@@ -76,7 +95,7 @@ type codexThreadStartedEvent struct {
 // outFile via --output-last-message, exactly like the regular worker path;
 // --json is layered on top purely to observe thread.started, not to parse
 // the final answer.
-func (r *Runner) runCodexTeamTurn(ctx context.Context, tmpDir, outFile, cwd, model, sessionToken string, mode string, networkAllowed bool, prompt string, schema map[string]any, onSessionCaptured func(threadID string)) (string, error) {
+func (r *Runner) runCodexTeamTurn(ctx context.Context, tmpDir, outFile, cwd, model, sessionToken string, mode string, networkAllowed bool, prompt string, schema map[string]any, onSessionCaptured func(threadID string), effort ...string) (string, error) {
 	var cmdArgs []string
 	if sessionToken == "" {
 		cmdArgs = []string{"exec", "--cd", cwd, "--json", "--output-last-message", outFile}
@@ -86,6 +105,9 @@ func (r *Runner) runCodexTeamTurn(ctx context.Context, tmpDir, outFile, cwd, mod
 	cmdArgs = append(cmdArgs, codexSandboxArgs(mode, networkAllowed)...)
 	if model != "" {
 		cmdArgs = append(cmdArgs, "--model", model)
+	}
+	if len(effort) > 0 && effort[0] != "" {
+		cmdArgs = append(cmdArgs, "-c", "model_reasoning_effort="+effort[0])
 	}
 	if len(schema) > 0 {
 		schemaPath := filepath.Join(tmpDir, "team-decision-schema.json")
@@ -111,19 +133,14 @@ func (r *Runner) runCodexTeamTurn(ctx context.Context, tmpDir, outFile, cwd, mod
 	if err := cmd.Start(); err != nil {
 		return "", err
 	}
+	markProviderStarted(ctx)
 
 	// The pipe MUST be fully drained before Wait — calling Wait while the
 	// pipe still has unread data races the pipe's own close (a documented
 	// os/exec pitfall). The scan loop below always runs to EOF (or the
 	// process's own exit closes the write end) before we call cmd.Wait().
-	var stdout bytes.Buffer
-	scanner := bufio.NewScanner(stdoutPipe)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	captured := false
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		stdout.Write(line)
-		stdout.WriteByte('\n')
+	stdoutTail, usage, scanErr := consumeCodexEvents(stdoutPipe, func(line []byte) {
 		if sessionToken == "" && !captured {
 			var event codexThreadStartedEvent
 			if json.Unmarshal(line, &event) == nil && event.Type == "thread.started" && event.ThreadID != "" {
@@ -133,20 +150,25 @@ func (r *Runner) runCodexTeamTurn(ctx context.Context, tmpDir, outFile, cwd, mod
 				}
 			}
 		}
+	})
+	if scanErr != nil {
+		// Stop a producer that may still be writing after the scanner limit.
+		_ = stdoutPipe.Close()
 	}
 	waitErr := cmd.Wait()
+	writeCodexUsageMap(filepath.Join(tmpDir, "usage.json"), usage)
 	// A scan error (a line over the 4MB cap, or the pipe itself erroring)
 	// stops the loop the same way a clean EOF does — Scan() just returns
 	// false either way — so without this check a truncated/corrupted
 	// stream with waitErr==nil would silently fall through to "success"
 	// on whatever partial last-message file happened to exist.
-	if scanErr := scanner.Err(); scanErr != nil {
+	if scanErr != nil {
 		baseErr := fmt.Errorf("team turn (codex) failed reading output: %w", scanErr)
-		return "", wrapProviderCommandError(baseErr, stdout.String()+stderr.String())
+		return "", wrapProviderCommandError(baseErr, stdoutTail+stderr.String())
 	}
 	if waitErr != nil {
 		baseErr := formatProviderFailure("team turn (codex)", waitErr, truncateForError(strings.TrimSpace(stderr.String())))
-		return "", wrapProviderCommandError(baseErr, stdout.String()+stderr.String())
+		return "", wrapProviderCommandError(baseErr, stdoutTail+stderr.String())
 	}
 	raw, err := os.ReadFile(outFile)
 	if err != nil {

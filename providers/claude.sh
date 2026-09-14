@@ -27,8 +27,11 @@ $SCHEMA"
 fi
 
 MODEL_ARGS=()
+if [ -n "${PALLIUM_WORKFLOW_REASONING_EFFORT:-}" ]; then
+  MODEL_ARGS+=(--effort "$PALLIUM_WORKFLOW_REASONING_EFFORT")
+fi
 if [ -n "${PALLIUM_WORKFLOW_MODEL:-}" ]; then
-  MODEL_ARGS=(--model "$PALLIUM_WORKFLOW_MODEL")
+  MODEL_ARGS+=(--model "$PALLIUM_WORKFLOW_MODEL")
 fi
 
 # Mode mapping. Only "edit" agents run in an isolated worktree (per Pallium's

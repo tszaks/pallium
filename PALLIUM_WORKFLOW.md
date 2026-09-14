@@ -480,3 +480,7 @@ return await agent(`Synthesize confirmed findings into next steps.\n${JSON.strin
   mode: "read-only",
 });
 ```
+
+## Model and reasoning selection
+
+Use `pallium route models init` to create a shadow policy, and `pallium route models explain --task-class CLASS` to inspect a recommendation. Workers accept `task_class` and `reasoning_effort`; explicit model or effort pins override automatic selection. Set policy mode to `auto` to execute eligible recommendations. `pallium route models history --run ID` reports invocation usage, including unknown dollar costs. See [model routing](docs/model-routing/README.md) for policy, provider boundaries, and evaluation instructions.

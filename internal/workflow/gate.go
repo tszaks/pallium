@@ -7,43 +7,55 @@ import (
 )
 
 type Gate struct {
-	ID         string `json:"id"`
-	RunID      string `json:"run_id"`
-	Name       string `json:"name"`
-	Message    string `json:"message,omitempty"`
-	Status     string `json:"status"`
-	OpenedAt   string `json:"opened_at"`
-	ApprovedAt string `json:"approved_at,omitempty"`
+	EvaluationKey string `json:"evaluation_key,omitempty"`
+	ID            string `json:"id"`
+	RunID         string `json:"run_id"`
+	Name          string `json:"name"`
+	Message       string `json:"message,omitempty"`
+	Status        string `json:"status"`
+	OpenedAt      string `json:"opened_at"`
+	ApprovedAt    string `json:"approved_at,omitempty"`
 }
 
-func (s *Store) EnsureGate(runID, name, message string) (Gate, error) {
+func (s *Store) EnsureGate(runID, name, message string, evaluationKeys ...string) (Gate, error) {
 	runID = strings.TrimSpace(runID)
 	name = strings.TrimSpace(name)
 	if runID == "" || name == "" {
 		return Gate{}, fmt.Errorf("workflow gate requires run id and name")
 	}
+	key := ""
+	if len(evaluationKeys) > 0 {
+		key = evaluationKeys[0]
+	}
 	existing, err := s.Gate(runID, name)
 	if err == nil {
+		if key != "" && key != existing.EvaluationKey {
+			_, err = s.db.Exec(`UPDATE workflow_gates SET status='open',approved_at='',evaluation_key=?,message=? WHERE id=?`, key, message, existing.ID)
+			if err != nil {
+				return Gate{}, err
+			}
+			return s.Gate(runID, name)
+		}
 		return existing, nil
 	}
 	if err != sql.ErrNoRows {
 		return Gate{}, err
 	}
-	gate := Gate{ID: NewID("gate"), RunID: runID, Name: name, Message: strings.TrimSpace(message), Status: "open", OpenedAt: nowString()}
-	_, err = s.db.Exec(`INSERT INTO workflow_gates(id,run_id,name,message,status,opened_at,approved_at) VALUES(?,?,?,?,?,?,?)`,
-		gate.ID, gate.RunID, gate.Name, gate.Message, gate.Status, gate.OpenedAt, gate.ApprovedAt)
+	gate := Gate{EvaluationKey: key, ID: NewID("gate"), RunID: runID, Name: name, Message: strings.TrimSpace(message), Status: "open", OpenedAt: nowString()}
+	_, err = s.db.Exec(`INSERT INTO workflow_gates(id,run_id,name,message,status,opened_at,approved_at,evaluation_key) VALUES(?,?,?,?,?,?,?,?)`,
+		gate.ID, gate.RunID, gate.Name, gate.Message, gate.Status, gate.OpenedAt, gate.ApprovedAt, gate.EvaluationKey)
 	return gate, err
 }
 
 func (s *Store) Gate(runID, name string) (Gate, error) {
-	row := s.db.QueryRow(`SELECT id,run_id,name,COALESCE(message,''),status,opened_at,COALESCE(approved_at,'') FROM workflow_gates WHERE run_id=? AND name=?`, runID, name)
+	row := s.db.QueryRow(`SELECT id,run_id,name,COALESCE(message,''),status,opened_at,COALESCE(approved_at,''),COALESCE(evaluation_key,'') FROM workflow_gates WHERE run_id=? AND name=?`, runID, name)
 	var gate Gate
-	err := row.Scan(&gate.ID, &gate.RunID, &gate.Name, &gate.Message, &gate.Status, &gate.OpenedAt, &gate.ApprovedAt)
+	err := row.Scan(&gate.ID, &gate.RunID, &gate.Name, &gate.Message, &gate.Status, &gate.OpenedAt, &gate.ApprovedAt, &gate.EvaluationKey)
 	return gate, err
 }
 
 func (s *Store) ListGates(runID string) ([]Gate, error) {
-	rows, err := s.db.Query(`SELECT id,run_id,name,COALESCE(message,''),status,opened_at,COALESCE(approved_at,'') FROM workflow_gates WHERE run_id=? ORDER BY opened_at DESC`, runID)
+	rows, err := s.db.Query(`SELECT id,run_id,name,COALESCE(message,''),status,opened_at,COALESCE(approved_at,''),COALESCE(evaluation_key,'') FROM workflow_gates WHERE run_id=? ORDER BY opened_at DESC`, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -51,7 +63,7 @@ func (s *Store) ListGates(runID string) ([]Gate, error) {
 	var gates []Gate
 	for rows.Next() {
 		var gate Gate
-		if err := rows.Scan(&gate.ID, &gate.RunID, &gate.Name, &gate.Message, &gate.Status, &gate.OpenedAt, &gate.ApprovedAt); err != nil {
+		if err := rows.Scan(&gate.ID, &gate.RunID, &gate.Name, &gate.Message, &gate.Status, &gate.OpenedAt, &gate.ApprovedAt, &gate.EvaluationKey); err != nil {
 			return nil, err
 		}
 		gates = append(gates, gate)

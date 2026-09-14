@@ -88,6 +88,7 @@ type Phase struct {
 }
 
 type Agent struct {
+	RoutingJSON      string  `json:"routing_json,omitempty"`
 	ID               string  `json:"id"`
 	RunID            string  `json:"run_id"`
 	CallIndex        int     `json:"call_index,omitempty"`
@@ -99,6 +100,7 @@ type Agent struct {
 	Mode             string  `json:"mode"`
 	Isolation        string  `json:"isolation,omitempty"`
 	Model            string  `json:"model,omitempty"`
+	ReasoningEffort  string  `json:"reasoning_effort,omitempty"`
 	SchemaHash       string  `json:"schema_hash,omitempty"`
 	ScriptHash       string  `json:"script_hash,omitempty"`
 	ArgsHash         string  `json:"args_hash,omitempty"`
@@ -120,9 +122,10 @@ type Agent struct {
 }
 
 type Snapshot struct {
-	Run    Run     `json:"run"`
-	Phases []Phase `json:"phases"`
-	Agents []Agent `json:"agents"`
+	Invocations []Invocation `json:"invocations,omitempty"`
+	Run         Run          `json:"run"`
+	Phases      []Phase      `json:"phases"`
+	Agents      []Agent      `json:"agents"`
 }
 
 func Open(path string) (*Store, error) {
@@ -149,6 +152,8 @@ func Open(path string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 const workflowSchema = `
+CREATE TABLE IF NOT EXISTS provider_invocations (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, agent_id TEXT, record_json TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS provider_invocations_run ON provider_invocations(run_id);
 CREATE TABLE IF NOT EXISTS workflow_runs (
   id TEXT PRIMARY KEY,
   task TEXT NOT NULL,
@@ -195,6 +200,8 @@ CREATE TABLE IF NOT EXISTS workflow_agents (
   mode TEXT NOT NULL,
   isolation TEXT,
   model TEXT,
+  reasoning_effort TEXT,
+  routing_json TEXT,
   schema_hash TEXT,
   script_hash TEXT,
   args_hash TEXT,
@@ -245,6 +252,7 @@ CREATE TABLE IF NOT EXISTS workflow_gates (
   status TEXT NOT NULL,
   opened_at TEXT NOT NULL,
   approved_at TEXT,
+  evaluation_key TEXT,
   UNIQUE(run_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_workflow_gates_run ON workflow_gates(run_id, opened_at DESC);
@@ -267,7 +275,10 @@ func (s *Store) init() error {
 		return err
 	}
 	for _, stmt := range []string{
+		"ALTER TABLE workflow_gates ADD COLUMN evaluation_key TEXT",
 		"ALTER TABLE workflow_agents ADD COLUMN model TEXT",
+		"ALTER TABLE workflow_agents ADD COLUMN reasoning_effort TEXT",
+		"ALTER TABLE workflow_agents ADD COLUMN routing_json TEXT",
 		"ALTER TABLE workflow_agents ADD COLUMN provider TEXT",
 		"ALTER TABLE workflow_agents ADD COLUMN repo TEXT",
 		"ALTER TABLE workflow_agents ADD COLUMN call_index INTEGER DEFAULT 0",
@@ -555,7 +566,11 @@ func (s *Store) Snapshot(id string) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, err
 	}
-	return Snapshot{Run: run, Phases: phases, Agents: agents}, nil
+	invocations, err := s.ListInvocations(id)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	return Snapshot{Run: run, Phases: phases, Agents: agents, Invocations: invocations}, nil
 }
 
 func (s *Store) StartPhase(runID, name string) (Phase, error) {
@@ -631,8 +646,8 @@ func (s *Store) CreateAgent(agent Agent) (Agent, error) {
 	if agent.UpdatedAt == "" {
 		agent.UpdatedAt = agent.CreatedAt
 	}
-	_, err := s.db.Exec(`INSERT INTO workflow_agents(id,run_id,call_index,phase,label,prompt,provider,repo,mode,isolation,model,schema_hash,script_hash,args_hash,estimated_cost_usd,usage_json,status,output,error,patch_path,worktree,networked,created_at,updated_at,completed_at)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, agent.ID, agent.RunID, agent.CallIndex, agent.Phase, agent.Label, agent.Prompt, agent.Provider, agent.Repo, agent.Mode, agent.Isolation, agent.Model, agent.SchemaHash, agent.ScriptHash, agent.ArgsHash, agent.EstimatedCostUSD, agent.UsageJSON, agent.Status, agent.Output, agent.Error, agent.PatchPath, agent.Worktree, agent.Networked, agent.CreatedAt, agent.UpdatedAt, agent.CompletedAt)
+	_, err := s.db.Exec(`INSERT INTO workflow_agents(id,run_id,call_index,phase,label,prompt,provider,repo,mode,isolation,model,reasoning_effort,routing_json,schema_hash,script_hash,args_hash,estimated_cost_usd,usage_json,status,output,error,patch_path,worktree,networked,created_at,updated_at,completed_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, agent.ID, agent.RunID, agent.CallIndex, agent.Phase, agent.Label, agent.Prompt, agent.Provider, agent.Repo, agent.Mode, agent.Isolation, agent.Model, agent.ReasoningEffort, agent.RoutingJSON, agent.SchemaHash, agent.ScriptHash, agent.ArgsHash, agent.EstimatedCostUSD, agent.UsageJSON, agent.Status, agent.Output, agent.Error, agent.PatchPath, agent.Worktree, agent.Networked, agent.CreatedAt, agent.UpdatedAt, agent.CompletedAt)
 	if err != nil {
 		return agent, err
 	}
@@ -675,11 +690,11 @@ func (s *Store) FinishAgentStatus(agent Agent, status, outputText, errorText str
 }
 
 func (s *Store) CompletedAgent(runID string, callIndex int, phase, label, prompt, provider, repo, mode, isolation, model, schemaHash, argsHash string, networked bool) (Agent, bool, error) {
-	row := s.db.QueryRow(`SELECT id,run_id,COALESCE(call_index,0),COALESCE(phase,''),COALESCE(label,''),prompt,COALESCE(provider,''),COALESCE(repo,''),mode,COALESCE(isolation,''),COALESCE(model,''),COALESCE(schema_hash,''),COALESCE(script_hash,''),COALESCE(args_hash,''),COALESCE(estimated_cost_usd,0),COALESCE(usage_json,''),status,COALESCE(output,''),COALESCE(error,''),COALESCE(patch_path,''),COALESCE(worktree,''),COALESCE(networked,0),created_at,updated_at,COALESCE(completed_at,'') FROM workflow_agents WHERE run_id=? AND COALESCE(call_index,0)=? AND COALESCE(phase,'')=? AND COALESCE(label,'')=? AND prompt=? AND COALESCE(provider,'')=? AND COALESCE(repo,'')=? AND mode=? AND COALESCE(isolation,'')=? AND COALESCE(model,'')=? AND COALESCE(schema_hash,'')=? AND COALESCE(args_hash,'')=? AND COALESCE(networked,0)=? AND status='completed' ORDER BY completed_at DESC, updated_at DESC LIMIT 1`,
+	row := s.db.QueryRow(`SELECT id,run_id,COALESCE(call_index,0),COALESCE(phase,''),COALESCE(label,''),prompt,COALESCE(provider,''),COALESCE(repo,''),mode,COALESCE(isolation,''),COALESCE(model,''),COALESCE(reasoning_effort,''),COALESCE(routing_json,''),COALESCE(schema_hash,''),COALESCE(script_hash,''),COALESCE(args_hash,''),COALESCE(estimated_cost_usd,0),COALESCE(usage_json,''),status,COALESCE(output,''),COALESCE(error,''),COALESCE(patch_path,''),COALESCE(worktree,''),COALESCE(networked,0),created_at,updated_at,COALESCE(completed_at,'') FROM workflow_agents WHERE run_id=? AND COALESCE(call_index,0)=? AND COALESCE(phase,'')=? AND COALESCE(label,'')=? AND prompt=? AND COALESCE(provider,'')=? AND COALESCE(repo,'')=? AND mode=? AND COALESCE(isolation,'')=? AND COALESCE(model,'')=? AND COALESCE(schema_hash,'')=? AND COALESCE(args_hash,'')=? AND COALESCE(networked,0)=? AND status='completed' ORDER BY completed_at DESC, updated_at DESC LIMIT 1`,
 		runID, callIndex, phase, label, prompt, provider, repo, mode, isolation, model, schemaHash, argsHash, networked)
 	var agent Agent
 	var networkedInt int
-	err := row.Scan(&agent.ID, &agent.RunID, &agent.CallIndex, &agent.Phase, &agent.Label, &agent.Prompt, &agent.Provider, &agent.Repo, &agent.Mode, &agent.Isolation, &agent.Model, &agent.SchemaHash, &agent.ScriptHash, &agent.ArgsHash, &agent.EstimatedCostUSD, &agent.UsageJSON, &agent.Status, &agent.Output, &agent.Error, &agent.PatchPath, &agent.Worktree, &networkedInt, &agent.CreatedAt, &agent.UpdatedAt, &agent.CompletedAt)
+	err := row.Scan(&agent.ID, &agent.RunID, &agent.CallIndex, &agent.Phase, &agent.Label, &agent.Prompt, &agent.Provider, &agent.Repo, &agent.Mode, &agent.Isolation, &agent.Model, &agent.ReasoningEffort, &agent.RoutingJSON, &agent.SchemaHash, &agent.ScriptHash, &agent.ArgsHash, &agent.EstimatedCostUSD, &agent.UsageJSON, &agent.Status, &agent.Output, &agent.Error, &agent.PatchPath, &agent.Worktree, &networkedInt, &agent.CreatedAt, &agent.UpdatedAt, &agent.CompletedAt)
 	if err == sql.ErrNoRows {
 		return Agent{}, false, nil
 	}
@@ -690,8 +705,13 @@ func (s *Store) CompletedAgent(runID string, callIndex int, phase, label, prompt
 	return agent, true, nil
 }
 
+func (s *Store) UpdateAgentRouting(agentID, routingJSON string) error {
+	_, err := s.db.Exec(`UPDATE workflow_agents SET routing_json=?, updated_at=? WHERE id=?`, routingJSON, time.Now().UTC().Format(time.RFC3339Nano), agentID)
+	return err
+}
+
 func (s *Store) ListAgents(runID string) ([]Agent, error) {
-	rows, err := s.db.Query(`SELECT id,run_id,COALESCE(call_index,0),COALESCE(phase,''),COALESCE(label,''),prompt,COALESCE(provider,''),COALESCE(repo,''),mode,COALESCE(isolation,''),COALESCE(model,''),COALESCE(schema_hash,''),COALESCE(script_hash,''),COALESCE(args_hash,''),COALESCE(estimated_cost_usd,0),COALESCE(usage_json,''),status,COALESCE(output,''),COALESCE(error,''),COALESCE(patch_path,''),COALESCE(worktree,''),COALESCE(networked,0),created_at,updated_at,COALESCE(completed_at,'') FROM workflow_agents WHERE run_id=? ORDER BY COALESCE(call_index,0), created_at`, runID)
+	rows, err := s.db.Query(`SELECT id,run_id,COALESCE(call_index,0),COALESCE(phase,''),COALESCE(label,''),prompt,COALESCE(provider,''),COALESCE(repo,''),mode,COALESCE(isolation,''),COALESCE(model,''),COALESCE(reasoning_effort,''),COALESCE(routing_json,''),COALESCE(schema_hash,''),COALESCE(script_hash,''),COALESCE(args_hash,''),COALESCE(estimated_cost_usd,0),COALESCE(usage_json,''),status,COALESCE(output,''),COALESCE(error,''),COALESCE(patch_path,''),COALESCE(worktree,''),COALESCE(networked,0),created_at,updated_at,COALESCE(completed_at,'') FROM workflow_agents WHERE run_id=? ORDER BY COALESCE(call_index,0), created_at`, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -700,7 +720,7 @@ func (s *Store) ListAgents(runID string) ([]Agent, error) {
 	for rows.Next() {
 		var agent Agent
 		var networkedInt int
-		if err := rows.Scan(&agent.ID, &agent.RunID, &agent.CallIndex, &agent.Phase, &agent.Label, &agent.Prompt, &agent.Provider, &agent.Repo, &agent.Mode, &agent.Isolation, &agent.Model, &agent.SchemaHash, &agent.ScriptHash, &agent.ArgsHash, &agent.EstimatedCostUSD, &agent.UsageJSON, &agent.Status, &agent.Output, &agent.Error, &agent.PatchPath, &agent.Worktree, &networkedInt, &agent.CreatedAt, &agent.UpdatedAt, &agent.CompletedAt); err != nil {
+		if err := rows.Scan(&agent.ID, &agent.RunID, &agent.CallIndex, &agent.Phase, &agent.Label, &agent.Prompt, &agent.Provider, &agent.Repo, &agent.Mode, &agent.Isolation, &agent.Model, &agent.ReasoningEffort, &agent.RoutingJSON, &agent.SchemaHash, &agent.ScriptHash, &agent.ArgsHash, &agent.EstimatedCostUSD, &agent.UsageJSON, &agent.Status, &agent.Output, &agent.Error, &agent.PatchPath, &agent.Worktree, &networkedInt, &agent.CreatedAt, &agent.UpdatedAt, &agent.CompletedAt); err != nil {
 			return nil, err
 		}
 		agent.Networked = networkedInt != 0
