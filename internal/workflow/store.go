@@ -705,6 +705,11 @@ func (s *Store) CompletedAgent(runID string, callIndex int, phase, label, prompt
 	return agent, true, nil
 }
 
+func (s *Store) UpdateAgentRouting(agentID, routingJSON string) error {
+	_, err := s.db.Exec(`UPDATE workflow_agents SET routing_json=?, updated_at=? WHERE id=?`, routingJSON, time.Now().UTC().Format(time.RFC3339Nano), agentID)
+	return err
+}
+
 func (s *Store) ListAgents(runID string) ([]Agent, error) {
 	rows, err := s.db.Query(`SELECT id,run_id,COALESCE(call_index,0),COALESCE(phase,''),COALESCE(label,''),prompt,COALESCE(provider,''),COALESCE(repo,''),mode,COALESCE(isolation,''),COALESCE(model,''),COALESCE(reasoning_effort,''),COALESCE(routing_json,''),COALESCE(schema_hash,''),COALESCE(script_hash,''),COALESCE(args_hash,''),COALESCE(estimated_cost_usd,0),COALESCE(usage_json,''),status,COALESCE(output,''),COALESCE(error,''),COALESCE(patch_path,''),COALESCE(worktree,''),COALESCE(networked,0),created_at,updated_at,COALESCE(completed_at,'') FROM workflow_agents WHERE run_id=? ORDER BY COALESCE(call_index,0), created_at`, runID)
 	if err != nil {

@@ -95,6 +95,8 @@ type Runner struct {
 
 type AgentOptions struct {
 	verificationRetry int
+	routingResolved   bool
+	routingJSON       string
 	TaskClass         string         `json:"task_class,omitempty"`
 	Label             string         `json:"label,omitempty"`
 	Provider          string         `json:"provider,omitempty"`
@@ -615,9 +617,9 @@ func (r *Runner) runAgentGate(ctx context.Context, name, message string, opts Ga
 		return map[string]any{"approved": false, "gate": gate, "cached": true}, fmt.Errorf("workflow gate %q was already rejected", name)
 	}
 
-	agentOpts.Provider = resolvedOpts.Provider
-	agentOpts.Model = resolvedOpts.Model
-	agentOpts.ReasoningEffort = resolvedOpts.ReasoningEffort
+	agentOpts = resolvedOpts
+	agentOpts.routingResolved = true
+	agentOpts.routingJSON = routingDecision
 	output, err := r.RunAgent(ctx, buildGatePrompt(name, message, opts.Criteria), agentOpts)
 	if err != nil {
 		return nil, err
@@ -1988,9 +1990,13 @@ func (r *Runner) runAgentAtCallIndex(ctx context.Context, prompt string, opts Ag
 	if mode == "edit" {
 		prompt = editWorkerPrompt(prompt)
 	}
-	opts, routingJSON, routeErr := r.resolveRouting(opts, mode)
-	if routeErr != nil {
-		return "", routeErr
+	routingJSON := opts.routingJSON
+	if !opts.routingResolved {
+		var routeErr error
+		opts, routingJSON, routeErr = r.resolveRouting(opts, mode)
+		if routeErr != nil {
+			return "", routeErr
+		}
 	}
 	provider := ResolveProvider("", opts.Provider)
 	if provider == "internal" {
@@ -2022,6 +2028,11 @@ func (r *Runner) runAgentAtCallIndex(ctx context.Context, prompt string, opts Ag
 	if cached, ok, err := r.Store.CompletedAgent(r.Run.ID, callIndex, phase, opts.Label, prompt, provider, absRepo, mode, opts.Isolation, opts.Model, schemaHash, argsHash, networkGranted); err != nil {
 		return "", err
 	} else if ok {
+		if cached.RoutingJSON != routingJSON {
+			if err := r.Store.UpdateAgentRouting(cached.ID, routingJSON); err != nil {
+				return "", err
+			}
+		}
 		if _, err := parseAgentOutputWithSchema(cached.Output, opts.Schema); err != nil {
 			return "", fmt.Errorf("cached agent %s failed schema validation: %w", cached.ID, err)
 		}

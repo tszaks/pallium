@@ -1,6 +1,8 @@
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
+import tempfile
 import unittest
 
 spec = importlib.util.spec_from_file_location("routing_eval", Path(__file__).with_name("run.py"))
@@ -74,6 +76,20 @@ class AccountingTests(unittest.TestCase):
         first = {"candidates": [{"id": "fast", "model": "a"}]}
         second = {"candidates": [{"id": "fast", "model": "b"}]}
         self.assertNotEqual(runner.routing_config_hash(first), runner.routing_config_hash(second))
+
+    def test_test_file_rename_reports_both_paths(self):
+        with tempfile.TemporaryDirectory() as raw:
+            work = Path(raw)
+            subprocess.run(["git", "init", "-q"], cwd=work, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=work, check=True)
+            subprocess.run(["git", "config", "user.name", "Routing Test"], cwd=work, check=True)
+            (work / "old_test.go").write_text("package sample\n")
+            subprocess.run(["git", "add", "old_test.go"], cwd=work, check=True)
+            subprocess.run(["git", "commit", "-qm", "fixture"], cwd=work, check=True)
+            subprocess.run(["git", "mv", "old_test.go", "replacement.go"], cwd=work, check=True)
+            paths = runner.working_tree_paths(work)
+            self.assertIn("old_test.go", paths)
+            self.assertIn("replacement.go", paths)
 
 
 if __name__ == "__main__":

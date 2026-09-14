@@ -74,6 +74,86 @@ func TestRoutingExecutesAndPersistsSelectedPair(t *testing.T) {
 	}
 }
 
+func TestGatePersistsOriginalAutoRoutingDecision(t *testing.T) {
+	clearProviderEnv(t)
+	dir := t.TempDir()
+	c := routing.Starter()
+	c.Mode = "auto"
+	c.Rules["bounded-edit"] = "luna-xhigh"
+	raw, _ := json.Marshal(c)
+	config := filepath.Join(dir, "routing.json")
+	if err := os.WriteFile(config, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_ROUTING_CONFIG", config)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"approved":true,"reason":"ok","evidence":[]}`)
+	store, err := Open(filepath.Join(dir, "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `return await gate("release", "verify", {task_class:"bounded-edit"});`
+	path, _ := WriteRunScript("wf-gate-routing", dir, script)
+	run, _ := store.CreateRun(Run{ID: "wf-gate-routing", Task: "gate", CWD: dir, ScriptPath: path})
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10, AssumeCodexAvailable: true}).Execute(context.Background(), script, nil); err != nil {
+		t.Fatal(err)
+	}
+	agents, _ := store.ListAgents(run.ID)
+	if len(agents) != 1 {
+		t.Fatalf("agents %+v", agents)
+	}
+	var decision routing.Decision
+	if err := json.Unmarshal([]byte(agents[0].RoutingJSON), &decision); err != nil {
+		t.Fatal(err)
+	}
+	if decision.Requested.TaskClass != "bounded-edit" || decision.Reason != "configured rule for task class bounded-edit" {
+		t.Fatalf("gate lost original auto-routing provenance: %+v", decision)
+	}
+}
+
+func TestRoutingCacheHitRefreshesShadowDecision(t *testing.T) {
+	clearProviderEnv(t)
+	dir := t.TempDir()
+	c := routing.Starter()
+	raw, _ := json.Marshal(c)
+	config := filepath.Join(dir, "routing.json")
+	if err := os.WriteFile(config, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_ROUTING_CONFIG", config)
+	t.Setenv("PALLIUM_WORKFLOW_AGENT_STUB", `{"ok":true}`)
+	store, err := Open(filepath.Join(dir, "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `return await agent("inspect", {label:"stable"});`
+	path, _ := WriteRunScript("wf-shadow-refresh", dir, script)
+	run, _ := store.CreateRun(Run{ID: "wf-shadow-refresh", Task: "shadow", CWD: dir, ScriptPath: path})
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10, AssumeCodexAvailable: true}).Execute(context.Background(), script, nil); err != nil {
+		t.Fatal(err)
+	}
+	c.Default = "luna-medium"
+	raw, _ = json.Marshal(c)
+	if err := os.WriteFile(config, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10, AssumeCodexAvailable: true}).Execute(context.Background(), script, nil); err != nil {
+		t.Fatal(err)
+	}
+	agents, _ := store.ListAgents(run.ID)
+	if len(agents) != 1 {
+		t.Fatalf("cache hit unexpectedly dispatched: %+v", agents)
+	}
+	var decision routing.Decision
+	if err := json.Unmarshal([]byte(agents[0].RoutingJSON), &decision); err != nil {
+		t.Fatal(err)
+	}
+	if decision.Recommended == nil || decision.Recommended.ID != "luna-medium" || decision.PolicyHash != c.Hash() {
+		t.Fatalf("cached routing evidence stayed stale: %+v", decision)
+	}
+}
+
 func TestRoutingShadowPreservesExplicitAndProviderBoundary(t *testing.T) {
 	clearProviderEnv(t)
 	dir := t.TempDir()

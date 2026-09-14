@@ -2,11 +2,14 @@ package workflow
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"io"
 	"os"
 	"strings"
 )
+
+const maxCodexEventBytes = 4 * 1024 * 1024
 
 type boundedTailBuffer struct {
 	data []byte
@@ -51,18 +54,37 @@ func addCodexUsage(total map[string]any, line []byte) map[string]any {
 func consumeCodexEvents(reader io.Reader, onLine func([]byte)) (string, map[string]any, error) {
 	var tail boundedTailBuffer
 	var usage map[string]any
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	for scanner.Scan() {
-		line := append([]byte(nil), scanner.Bytes()...)
-		_, _ = tail.Write(line)
-		_, _ = tail.Write([]byte{'\n'})
-		usage = addCodexUsage(usage, line)
-		if onLine != nil {
-			onLine(line)
+	buffered := bufio.NewReaderSize(reader, 64*1024)
+	line := make([]byte, 0, 64*1024)
+	oversized := false
+	for {
+		chunk, readErr := buffered.ReadSlice('\n')
+		_, _ = tail.Write(chunk)
+		if !oversized && len(line)+len(chunk) <= maxCodexEventBytes {
+			line = append(line, chunk...)
+		} else {
+			oversized = true
+		}
+		if readErr == bufio.ErrBufferFull {
+			continue
+		}
+		if !oversized && len(line) > 0 {
+			line = bytes.TrimSuffix(line, []byte{'\n'})
+			line = bytes.TrimSuffix(line, []byte{'\r'})
+			usage = addCodexUsage(usage, line)
+			if onLine != nil {
+				onLine(line)
+			}
+		}
+		line = line[:0]
+		oversized = false
+		if readErr == io.EOF {
+			return tail.String(), usage, nil
+		}
+		if readErr != nil {
+			return tail.String(), usage, readErr
 		}
 	}
-	return tail.String(), usage, scanner.Err()
 }
 
 // codexUsage reads only completed-turn accounting events, never tool output.

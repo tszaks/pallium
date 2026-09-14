@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -107,6 +108,22 @@ func TestCodexUsageIgnoresToolOutputAndSumsTurns(t *testing.T) {
 	}
 	if codexUsage("bad data") != nil {
 		t.Fatal("invented usage")
+	}
+}
+
+func TestConsumeCodexEventsDrainsOversizedLines(t *testing.T) {
+	oversized := append([]byte(`{"type":"item.completed","output":"`), bytes.Repeat([]byte("x"), maxCodexEventBytes+1)...)
+	oversized = append(oversized, []byte(`"}`+"\n"+`{"type":"turn.completed","usage":{"output_tokens":7}}`+"\n")...)
+	seen := 0
+	tail, usage, err := consumeCodexEvents(bytes.NewReader(oversized), func([]byte) { seen++ })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage["output_tokens"] != float64(7) || seen != 1 {
+		t.Fatalf("oversized event prevented later accounting: usage=%+v seen=%d", usage, seen)
+	}
+	if len(tail) > maxErrorOutputBytes {
+		t.Fatalf("tail grew beyond bound: %d", len(tail))
 	}
 }
 

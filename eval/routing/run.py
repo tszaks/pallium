@@ -48,6 +48,15 @@ def comparison_signature(record):
             record.get("worker_binary_hash"), record.get("isolated_codex_config"))
 
 
+def working_tree_paths(work):
+    # Treat renames as a deletion plus an addition so policy checks see both
+    # paths, including a test file renamed to a non-test filename.
+    status = subprocess.check_output(
+        ["git", "status", "--porcelain=v1", "--no-renames", "--untracked-files=all"],
+        cwd=work).decode().splitlines()
+    return [line[3:] for line in status if len(line) >= 4]
+
+
 def require_isolated_trial(simulation, isolated_codex_config):
     if not simulation and not isolated_codex_config:
         raise ValueError("non-simulation trials require --isolated-codex-config so ambient Codex settings cannot mix execution identities")
@@ -273,8 +282,7 @@ def run(args):
     if result["exit_code"] == 0 and task["mode"] == "edit":
         checks = command(["go", "test", "./internal/workflow"], work, args.check_timeout, env)
         write(run_dir / "checks.json", checks)
-        status = subprocess.check_output(["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=work).decode().splitlines()
-        changed = [line[3:] for line in status if len(line) >= 4]
+        changed = working_tree_paths(work)
         test_changes = [p for p in changed if p.endswith("_test.go") or p.startswith("eval/")]
         objective = {"passed": checks["exit_code"] == 0 and not test_changes,
                      "test_changes": test_changes, "duration_ms": checks["duration_ms"]}
