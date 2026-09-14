@@ -1993,9 +1993,6 @@ func (r *Runner) runAgentAtCallIndex(ctx context.Context, prompt string, opts Ag
 		return "", routeErr
 	}
 	provider := ResolveProvider("", opts.Provider)
-	if err := ValidateReasoningEffort(provider, opts.Model, opts.ReasoningEffort); err != nil {
-		return "", err
-	}
 	if provider == "internal" {
 		// "internal" is reserved for registerUntilGreenPatch's own
 		// bookkeeping rows, which Store.AgentUsage excludes from the
@@ -3289,7 +3286,12 @@ func (r *Runner) runConfiguredProviderCommand(ctx context.Context, command, tmpD
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if err := cmd.Start(); err != nil {
+		baseErr := formatProviderFailure(fmt.Sprintf("workflow provider %q", agent.Provider), err, truncateForError(strings.TrimSpace(stderr.String())))
+		return strings.TrimSpace(stdout.String()), wrapProviderCommandError(baseErr, stdout.String()+stderr.String())
+	}
+	markProviderStarted(ctx)
+	if err := cmd.Wait(); err != nil {
 		baseErr := formatProviderFailure(fmt.Sprintf("workflow provider %q", agent.Provider), err, truncateForError(strings.TrimSpace(stderr.String())))
 		return strings.TrimSpace(stdout.String()), wrapProviderCommandError(baseErr, stdout.String()+stderr.String())
 	}

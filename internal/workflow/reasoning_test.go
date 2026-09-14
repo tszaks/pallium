@@ -26,6 +26,33 @@ func TestReasoningValidation(t *testing.T) {
 	}
 }
 
+func TestWorkflowReasoningValidationFailureIsRecordedNotDispatched(t *testing.T) {
+	clearProviderEnv(t)
+	dir := t.TempDir()
+	store, err := Open(filepath.Join(dir, "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `return await agent("invalid effort", {model:"gpt-5.5", reasoning_effort:"max"});`
+	path, err := WriteRunScript("wf-invalid-effort", dir, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(Run{ID: "wf-invalid-effort", Task: "invalid", CWD: dir, ScriptPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &Runner{Store: store, Run: run, CodexBinary: filepath.Join(dir, "must-not-run"), MaxAgents: 10}
+	if _, err := runner.Execute(context.Background(), script, nil); err == nil {
+		t.Fatal("expected invalid reasoning effort error")
+	}
+	invocations, err := store.ListInvocations(run.ID)
+	if err != nil || len(invocations) != 1 || invocations[0].ConfigurationStatus != "not_dispatched" {
+		t.Fatalf("public workflow validation failure was not recorded: %+v %v", invocations, err)
+	}
+}
+
 func TestCodexEffortAndUsage(t *testing.T) {
 	dir := t.TempDir()
 	log := filepath.Join(dir, "argv")

@@ -98,6 +98,30 @@ func TestRunProviderCommandRecordsConfigurationFailureAsNotDispatched(t *testing
 	}
 }
 
+func TestRunProviderCommandRecordsProcessStartFailureAsNotDispatched(t *testing.T) {
+	clearProviderEnv(t)
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run, err := store.CreateRun(Run{ID: "wf-start-failure", Task: "start", CWD: tmp, ScriptPath: "workflow.js"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent := &Agent{ID: "agent-start", Mode: "read-only", Prompt: "hello"}
+	r := &Runner{Store: store, Run: run, CodexBinary: filepath.Join(tmp, "missing-codex")}
+	_, err = r.runProviderCommand(context.Background(), "codex", tmp, filepath.Join(tmp, "out.txt"), filepath.Join(tmp, "usage.json"), tmp, agent.Prompt, agent, AgentOptions{}, false)
+	if err == nil {
+		t.Fatal("expected process start error")
+	}
+	invocations, err := store.ListInvocations(run.ID)
+	if err != nil || len(invocations) != 1 || invocations[0].ConfigurationStatus != "not_dispatched" {
+		t.Fatalf("process start failure was recorded as dispatched: %+v %v", invocations, err)
+	}
+}
+
 // TestRunProviderTextDispatchesLikeALiveAgent proves the one-off text path
 // used by workflow generation goes through the same dispatch as a live
 // agent call — a configured wrapper answers it exactly like it would answer

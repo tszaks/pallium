@@ -145,7 +145,11 @@ func (r *Runner) runBuiltinClaudeCommand(ctx context.Context, usageFile, cwd, pr
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	runErr := cmd.Run()
+	runErr := cmd.Start()
+	if runErr == nil {
+		markProviderStarted(ctx)
+		runErr = cmd.Wait()
+	}
 	text, usage, parseErr := extractClaudeOutput(stdout.String(), len(opts.Schema) > 0)
 	if usage != nil {
 		if raw, err := json.Marshal(usage); err == nil {
@@ -210,7 +214,11 @@ func (r *Runner) runClaudeTeamTurn(ctx context.Context, mode, model, sessionToke
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	runErr := cmd.Run()
+	runErr := cmd.Start()
+	if runErr == nil {
+		markProviderStarted(ctx)
+		runErr = cmd.Wait()
+	}
 	text, usage, parseErr := extractClaudeOutput(stdout.String(), len(schema) > 0)
 	if runErr != nil {
 		baseErr := formatProviderFailure("team turn (claude)", runErr, truncateForError(strings.TrimSpace(stderr.String())))

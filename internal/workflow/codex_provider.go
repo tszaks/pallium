@@ -52,6 +52,7 @@ func (r *Runner) runCodexCommand(ctx context.Context, tmpDir, outFile, cwd, prom
 	if err := cmd.Start(); err != nil {
 		return "", err
 	}
+	markProviderStarted(ctx)
 	stdoutTail, usage, scanErr := consumeCodexEvents(stdoutPipe, nil)
 	if scanErr != nil {
 		_ = stdoutPipe.Close()
@@ -132,6 +133,7 @@ func (r *Runner) runCodexTeamTurn(ctx context.Context, tmpDir, outFile, cwd, mod
 	if err := cmd.Start(); err != nil {
 		return "", err
 	}
+	markProviderStarted(ctx)
 
 	// The pipe MUST be fully drained before Wait — calling Wait while the
 	// pipe still has unread data races the pipe's own close (a documented

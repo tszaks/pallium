@@ -782,6 +782,7 @@ func (r *Runner) dispatchTeamTurn(ctx context.Context, store *Store, teamID, lea
 	started := time.Now()
 	var observedUsage map[string]any
 	dispatched := false
+	ctx = withProviderStartTracking(ctx, &dispatched)
 	defer func() {
 		if e := store.recordInvocation(teamID, member.ID, member.Provider, member.Model, member.ReasoningEffort, started, observedUsage, err, dispatched); e != nil {
 			err = fmt.Errorf("record team invocation: %w", e)
@@ -806,7 +807,6 @@ func (r *Runner) dispatchTeamTurn(ctx context.Context, store *Store, teamID, lea
 		}
 		defer os.RemoveAll(tmpDir)
 		outFile := tmpDir + "/last-message.txt"
-		dispatched = true
 		out, cerr := r.runCodexTeamTurn(ctx, tmpDir, outFile, cwd, member.Model, member.SessionToken, member.Mode, false, prompt, teamDecisionSchema, func(threadID string) {
 			// Lease-guarded: an orphaned codex subprocess from an earlier,
 			// already-reassigned turn (its owning `team run` process was
@@ -820,11 +820,9 @@ func (r *Runner) dispatchTeamTurn(ctx context.Context, store *Store, teamID, lea
 		observedUsage = usageFromFile(filepath.Join(tmpDir, "usage.json"))
 		return out, member.SessionToken, 0, cerr
 	case strings.TrimSpace(os.Getenv(providerCommandEnvName(member.Provider))) != "":
-		dispatched = true
 		out, token, cost, werr := r.runConfiguredProviderTeamTurn(ctx, teamID, member, cwd, prompt, func(u map[string]any) { observedUsage = u })
 		return out, token, cost, werr
 	case member.Provider == "claude":
-		dispatched = true
 		out, usage, cerr := r.runClaudeTeamTurn(ctx, member.Mode, member.Model, member.SessionToken, isFirstTurn, cwd, prompt, teamDecisionSchema, member.ReasoningEffort)
 		observedUsage = usage
 		cost, _ := usage["cost_usd"].(float64)
@@ -1238,7 +1236,11 @@ func (r *Runner) runConfiguredProviderTeamTurn(ctx context.Context, teamID strin
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	runErr := cmd.Run()
+	runErr := cmd.Start()
+	if runErr == nil {
+		markProviderStarted(ctx)
+		runErr = cmd.Wait()
+	}
 	newToken := member.SessionToken
 	if tokenRaw, terr := os.ReadFile(sessionFile); terr == nil {
 		if t := strings.TrimSpace(string(tokenRaw)); t != "" {
