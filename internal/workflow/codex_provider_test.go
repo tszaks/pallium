@@ -128,6 +128,34 @@ func TestRunCodexCommandSurfacesMeaningfulErrorLineFromStdout(t *testing.T) {
 	}
 }
 
+func TestRunCodexCommandBoundsStdoutWhileKeepingUsage(t *testing.T) {
+	tmp := t.TempDir()
+	failing := filepath.Join(tmp, "fake-codex-large-stdout.sh")
+	script := `#!/bin/sh
+printf 'HEAD_MARKER_NEVER_SHOULD_SURVIVE '
+yes filler | head -c 65536
+printf '\n{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":3}}\n'
+echo "ERROR: bounded tail marker"
+exit 1
+`
+	if err := os.WriteFile(failing, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := &Runner{CodexBinary: failing}
+	agent := &Agent{Mode: "read-only", Prompt: "hi"}
+	_, err := r.runCodexCommand(context.Background(), tmp, filepath.Join(tmp, "last-message.txt"), t.TempDir(), agent.Prompt, agent, AgentOptions{}, false)
+	if err == nil || !strings.Contains(err.Error(), "bounded tail marker") {
+		t.Fatalf("expected bounded stdout tail in error, got %v", err)
+	}
+	if strings.Contains(err.Error(), "HEAD_MARKER_NEVER_SHOULD_SURVIVE") {
+		t.Fatalf("unbounded stdout head survived in error: %v", err)
+	}
+	raw, readErr := os.ReadFile(filepath.Join(tmp, "usage.json"))
+	if readErr != nil || !strings.Contains(string(raw), `"input_tokens":12`) || !strings.Contains(string(raw), `"output_tokens":3`) {
+		t.Fatalf("usage was not retained after bounded streaming: %s, %v", raw, readErr)
+	}
+}
+
 func TestRunnerDispatchesToRealCodexBinary(t *testing.T) {
 	clearProviderEnv(t)
 	tmp := t.TempDir()

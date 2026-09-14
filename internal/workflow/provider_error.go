@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -28,6 +29,25 @@ func meaningfulProviderErrorLine(combinedOutput string) (string, bool) {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
+		}
+		if strings.HasPrefix(line, "{") {
+			var event struct {
+				Type    string `json:"type"`
+				Message string `json:"message"`
+				Error   struct {
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if json.Unmarshal([]byte(line), &event) == nil && event.Type != "" {
+				if event.Type != "error" && event.Type != "turn.failed" {
+					continue
+				}
+				message := strings.TrimSpace(firstNonEmpty(event.Message, event.Error.Message))
+				if message != "" {
+					return truncateForError(message), true
+				}
+				continue
+			}
 		}
 		lower := strings.ToLower(line)
 		for _, pattern := range providerErrorPatterns {

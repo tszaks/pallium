@@ -779,6 +779,25 @@ func (r *Runner) dispatchTeamTurn(ctx context.Context, store *Store, teamID, lea
 	// --session-id again, not switch to --resume against a session claude
 	// may never have actually created — see Store.FinishMemberTurn's doc
 	// comment for the full incident this fixes.
+	started := time.Now()
+	var observedUsage map[string]any
+	dispatched := false
+	ctx = withProviderStartTracking(ctx, &dispatched)
+	defer func() {
+		if e := store.recordInvocation(teamID, member.ID, member.Provider, member.Model, member.ReasoningEffort, started, observedUsage, err, dispatched); e != nil {
+			err = fmt.Errorf("record team invocation: %w", e)
+		}
+	}()
+	team, teamErr := store.GetTeam(teamID)
+	if teamErr != nil {
+		return "", "", 0, teamErr
+	}
+	if e := enforceTeamProviderPolicy(team.CWD, member.Provider); e != nil {
+		return "", "", 0, e
+	}
+	if e := ValidateReasoningEffort(member.Provider, member.Model, member.ReasoningEffort); e != nil {
+		return "", "", 0, e
+	}
 	isFirstTurn := !member.SessionEstablished
 	switch {
 	case member.Provider == "codex":
@@ -797,13 +816,15 @@ func (r *Runner) dispatchTeamTurn(ctx context.Context, store *Store, teamID, lea
 			if perr := store.PersistMemberSessionForLease(teamID, member.Name, lease, threadID); perr != nil {
 				fmt.Fprintf(os.Stderr, "[team:%s] %v\n", teamID, perr)
 			}
-		})
+		}, member.ReasoningEffort)
+		observedUsage = usageFromFile(filepath.Join(tmpDir, "usage.json"))
 		return out, member.SessionToken, 0, cerr
 	case strings.TrimSpace(os.Getenv(providerCommandEnvName(member.Provider))) != "":
-		out, token, cost, werr := r.runConfiguredProviderTeamTurn(ctx, teamID, member, cwd, prompt)
+		out, token, cost, werr := r.runConfiguredProviderTeamTurn(ctx, teamID, member, cwd, prompt, func(u map[string]any) { observedUsage = u })
 		return out, token, cost, werr
 	case member.Provider == "claude":
-		out, usage, cerr := r.runClaudeTeamTurn(ctx, member.Mode, member.Model, member.SessionToken, isFirstTurn, cwd, prompt, teamDecisionSchema)
+		out, usage, cerr := r.runClaudeTeamTurn(ctx, member.Mode, member.Model, member.SessionToken, isFirstTurn, cwd, prompt, teamDecisionSchema, member.ReasoningEffort)
+		observedUsage = usage
 		cost, _ := usage["cost_usd"].(float64)
 		return out, member.SessionToken, cost, cerr
 	default:
@@ -1027,7 +1048,7 @@ func (r *Runner) runTeamGate(ctx context.Context, team Team, situation string) (
 	if codexBinary == "" {
 		codexBinary = "codex"
 	}
-	gateRunner := &Runner{CodexBinary: codexBinary, PalliumBinary: r.PalliumBinary, Run: Run{ID: r.Run.ID}}
+	gateRunner := &Runner{Store: r.Store, CodexBinary: codexBinary, PalliumBinary: r.PalliumBinary, Run: Run{ID: r.Run.ID}}
 	cwd := strings.TrimSpace(team.CWD)
 	if cwd == "" {
 		cwd, err = os.Getwd()
@@ -1042,7 +1063,17 @@ func (r *Runner) runTeamGate(ctx context.Context, team Team, situation string) (
 	defer os.RemoveAll(tmpDir)
 	outFile := filepath.Join(tmpDir, "last-message.txt")
 	usageFile := filepath.Join(tmpDir, "usage.json")
-	provider := ResolveProvider("", "")
+	gateRunner.Run.CWD = cwd
+	routingStarted := time.Now()
+	gateOpts, routingDecision, routeErr := gateRunner.resolveRouting(AgentOptions{Schema: defaultGateSchema(), TaskClass: "verification"}, "read-only")
+	if routeErr != nil {
+		provider := ResolveProvider("", "")
+		if recordErr := gateRunner.Store.recordInvocation(gateRunner.Run.ID, "", provider, "", "", routingStarted, nil, routeErr, false); recordErr != nil {
+			return false, "", 0, fmt.Errorf("%v; record team gate routing rejection: %w", routeErr, recordErr)
+		}
+		return false, "", 0, routeErr
+	}
+	provider := ResolveProvider("", gateOpts.Provider)
 	// The team's Goal is prepended to situation, not folded into
 	// team.GatePrompt (the operator's own approval criteria, shared
 	// verbatim with buildGatePrompt's non-team gate() primitive callers,
@@ -1051,8 +1082,8 @@ func (r *Runner) runTeamGate(ctx context.Context, team Team, situation string) (
 	// itself being a stated fact. Found by review.
 	situationWithGoal := fmt.Sprintf("Team goal: %s\n\n%s", team.Goal, situation)
 	prompt := buildGatePrompt("team-quality-gate", situationWithGoal, team.GatePrompt)
-	agent := &Agent{Mode: "read-only", Prompt: prompt, Provider: provider}
-	output, derr := gateRunner.runProviderCommand(ctx, provider, tmpDir, outFile, usageFile, cwd, prompt, agent, AgentOptions{Schema: defaultGateSchema()}, false)
+	agent := &Agent{Mode: "read-only", Prompt: prompt, Provider: provider, Model: gateOpts.Model, ReasoningEffort: gateOpts.ReasoningEffort, RoutingJSON: routingDecision}
+	output, derr := gateRunner.runProviderCommand(ctx, provider, tmpDir, outFile, usageFile, cwd, prompt, agent, gateOpts, false)
 	if _, usage := readAndRemoveAgentUsage(usageFile); usage != nil {
 		if cost, ok := usage["cost_usd"].(float64); ok && cost > 0 {
 			costUSD = cost
@@ -1156,7 +1187,7 @@ func (r *Runner) CreateTeamTaskWithGate(ctx context.Context, store *Store, teamI
 // untracked — the regular (non-team) worker path already reads it via
 // readAndRemoveAgentUsage; this reuses the same helper so a wrapper only
 // has to implement the contract once for both paths.
-func (r *Runner) runConfiguredProviderTeamTurn(ctx context.Context, teamID string, member *TeamMember, cwd, prompt string) (string, string, float64, error) {
+func (r *Runner) runConfiguredProviderTeamTurn(ctx context.Context, teamID string, member *TeamMember, cwd, prompt string, observe ...func(map[string]any)) (string, string, float64, error) {
 	command := strings.TrimSpace(os.Getenv(providerCommandEnvName(member.Provider)))
 	tmpDir, terr := os.MkdirTemp("", "pallium-team-turn-*")
 	if terr != nil {
@@ -1192,6 +1223,7 @@ func (r *Runner) runConfiguredProviderTeamTurn(ctx context.Context, teamID strin
 		"PALLIUM_WORKFLOW_LABEL="+member.Name,
 		"PALLIUM_WORKFLOW_MODE="+member.Mode,
 		"PALLIUM_WORKFLOW_MODEL="+member.Model,
+		"PALLIUM_WORKFLOW_REASONING_EFFORT="+member.ReasoningEffort,
 		"PALLIUM_WORKFLOW_CWD="+cwd,
 		"PALLIUM_WORKFLOW_PROMPT_FILE="+promptFile,
 		"PALLIUM_WORKFLOW_OUTPUT_FILE="+outFile,
@@ -1209,7 +1241,11 @@ func (r *Runner) runConfiguredProviderTeamTurn(ctx context.Context, teamID strin
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	runErr := cmd.Run()
+	runErr := cmd.Start()
+	if runErr == nil {
+		markProviderStarted(ctx)
+		runErr = cmd.Wait()
+	}
 	newToken := member.SessionToken
 	if tokenRaw, terr := os.ReadFile(sessionFile); terr == nil {
 		if t := strings.TrimSpace(string(tokenRaw)); t != "" {
@@ -1220,6 +1256,9 @@ func (r *Runner) runConfiguredProviderTeamTurn(ctx context.Context, teamID strin
 	// (e.g. after its own CLI call succeeded but before it wrote the output
 	// file) may still have reported real usage worth recording.
 	_, usage := readAndRemoveAgentUsage(usageFile)
+	if len(observe) > 0 {
+		observe[0](usage)
+	}
 	cost, _ := usage["cost_usd"].(float64)
 	if runErr != nil {
 		baseErr := formatProviderFailure(fmt.Sprintf("team turn (%s wrapper)", member.Provider), runErr, stderr.String())
