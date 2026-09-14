@@ -1,7 +1,6 @@
 package workflow
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -44,14 +43,28 @@ func (r *Runner) runCodexCommand(ctx context.Context, tmpDir, outFile, cwd, prom
 	cmd := exec.CommandContext(ctx, r.CodexBinary, cmdArgs...)
 	cmd.Dir = cwd
 	cmd.WaitDelay = 5 * time.Second
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", err
+	}
+	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	runErr := cmd.Run()
-	writeCodexUsage(filepath.Join(tmpDir, "usage.json"), stdout.String())
-	if err := runErr; err != nil {
+	if err := cmd.Start(); err != nil {
+		return "", err
+	}
+	stdoutTail, usage, scanErr := consumeCodexEvents(stdoutPipe, nil)
+	if scanErr != nil {
+		_ = stdoutPipe.Close()
+	}
+	waitErr := cmd.Wait()
+	writeCodexUsageMap(filepath.Join(tmpDir, "usage.json"), usage)
+	if scanErr != nil {
+		baseErr := fmt.Errorf("codex agent failed reading output: %w", scanErr)
+		return "", wrapProviderCommandError(baseErr, stdoutTail+stderr.String())
+	}
+	if err := waitErr; err != nil {
 		baseErr := formatProviderFailure("codex agent", err, truncateForError(strings.TrimSpace(stderr.String())))
-		return "", wrapProviderCommandError(baseErr, stdout.String()+stderr.String())
+		return "", wrapProviderCommandError(baseErr, stdoutTail+stderr.String())
 	}
 	raw, err := os.ReadFile(outFile)
 	if err != nil {
@@ -124,14 +137,8 @@ func (r *Runner) runCodexTeamTurn(ctx context.Context, tmpDir, outFile, cwd, mod
 	// pipe still has unread data races the pipe's own close (a documented
 	// os/exec pitfall). The scan loop below always runs to EOF (or the
 	// process's own exit closes the write end) before we call cmd.Wait().
-	var stdout bytes.Buffer
-	scanner := bufio.NewScanner(stdoutPipe)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	captured := false
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		stdout.Write(line)
-		stdout.WriteByte('\n')
+	stdoutTail, usage, scanErr := consumeCodexEvents(stdoutPipe, func(line []byte) {
 		if sessionToken == "" && !captured {
 			var event codexThreadStartedEvent
 			if json.Unmarshal(line, &event) == nil && event.Type == "thread.started" && event.ThreadID != "" {
@@ -141,25 +148,25 @@ func (r *Runner) runCodexTeamTurn(ctx context.Context, tmpDir, outFile, cwd, mod
 				}
 			}
 		}
-	}
-	if scanner.Err() != nil {
+	})
+	if scanErr != nil {
 		// Stop a producer that may still be writing after the scanner limit.
 		_ = stdoutPipe.Close()
 	}
 	waitErr := cmd.Wait()
-	writeCodexUsage(filepath.Join(tmpDir, "usage.json"), stdout.String())
+	writeCodexUsageMap(filepath.Join(tmpDir, "usage.json"), usage)
 	// A scan error (a line over the 4MB cap, or the pipe itself erroring)
 	// stops the loop the same way a clean EOF does — Scan() just returns
 	// false either way — so without this check a truncated/corrupted
 	// stream with waitErr==nil would silently fall through to "success"
 	// on whatever partial last-message file happened to exist.
-	if scanErr := scanner.Err(); scanErr != nil {
+	if scanErr != nil {
 		baseErr := fmt.Errorf("team turn (codex) failed reading output: %w", scanErr)
-		return "", wrapProviderCommandError(baseErr, stdout.String()+stderr.String())
+		return "", wrapProviderCommandError(baseErr, stdoutTail+stderr.String())
 	}
 	if waitErr != nil {
 		baseErr := formatProviderFailure("team turn (codex)", waitErr, truncateForError(strings.TrimSpace(stderr.String())))
-		return "", wrapProviderCommandError(baseErr, stdout.String()+stderr.String())
+		return "", wrapProviderCommandError(baseErr, stdoutTail+stderr.String())
 	}
 	raw, err := os.ReadFile(outFile)
 	if err != nil {
