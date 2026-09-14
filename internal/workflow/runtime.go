@@ -592,8 +592,13 @@ func (r *Runner) runAgentGate(ctx context.Context, name, message string, opts Ga
 		TaskClass:       opts.TaskClass,
 		Schema:          defaultGateSchema(),
 	}
+	routingStarted := time.Now()
 	resolvedOpts, routingDecision, err := r.resolveRouting(agentOpts, mode)
 	if err != nil {
+		provider := ResolveProvider("", agentOpts.Provider)
+		if recordErr := r.Store.recordInvocation(r.Run.ID, "", provider, agentOpts.Model, agentOpts.ReasoningEffort, routingStarted, nil, err, false); recordErr != nil {
+			return nil, fmt.Errorf("%v; record gate routing rejection: %w", err, recordErr)
+		}
 		return nil, err
 	}
 	keyRaw, _ := json.Marshal(struct {

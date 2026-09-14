@@ -88,6 +88,25 @@ class AccountingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             runner.require_isolated_records([{}])
 
+    def test_paired_trials_require_same_fixture_prompt_and_mode(self):
+        left = [{"task_id": "one", "fixture_hash": "f1", "prompt_hash": "p1", "mode": "edit"}]
+        self.assertTrue(runner.paired_trial_identities_match(left, list(left)))
+        for field, value in (("fixture_hash", "f2"), ("prompt_hash", "p2"), ("mode", "read-only")):
+            right = [dict(left[0], **{field: value})]
+            self.assertFalse(runner.paired_trial_identities_match(left, right))
+
+    def test_candidate_must_support_every_recorded_mode(self):
+        candidate = {"modes": ["read-only"]}
+        self.assertTrue(runner.candidate_supports_rows(candidate, [{"mode": "read-only"}]))
+        self.assertFalse(runner.candidate_supports_rows(candidate, [{"mode": "edit"}]))
+        self.assertFalse(runner.candidate_supports_rows(candidate, [{}]))
+
+    def test_suggestion_rules_normalize_missing_or_null_map(self):
+        for config in ({}, {"rules": None}):
+            runner.normalize_rules(config)
+            config["rules"].update({"edit": "fast"})
+            self.assertEqual(config["rules"], {"edit": "fast"})
+
     def test_routing_config_hash_changes_with_candidate_mapping(self):
         first = {"candidates": [{"id": "fast", "model": "a"}]}
         second = {"candidates": [{"id": "fast", "model": "b"}]}

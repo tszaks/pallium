@@ -1064,8 +1064,13 @@ func (r *Runner) runTeamGate(ctx context.Context, team Team, situation string) (
 	outFile := filepath.Join(tmpDir, "last-message.txt")
 	usageFile := filepath.Join(tmpDir, "usage.json")
 	gateRunner.Run.CWD = cwd
-	gateOpts, _, routeErr := gateRunner.resolveRouting(AgentOptions{Schema: defaultGateSchema(), TaskClass: "verification"}, "read-only")
+	routingStarted := time.Now()
+	gateOpts, routingDecision, routeErr := gateRunner.resolveRouting(AgentOptions{Schema: defaultGateSchema(), TaskClass: "verification"}, "read-only")
 	if routeErr != nil {
+		provider := ResolveProvider("", "")
+		if recordErr := gateRunner.Store.recordInvocation(gateRunner.Run.ID, "", provider, "", "", routingStarted, nil, routeErr, false); recordErr != nil {
+			return false, "", 0, fmt.Errorf("%v; record team gate routing rejection: %w", routeErr, recordErr)
+		}
 		return false, "", 0, routeErr
 	}
 	provider := ResolveProvider("", gateOpts.Provider)
@@ -1077,7 +1082,7 @@ func (r *Runner) runTeamGate(ctx context.Context, team Team, situation string) (
 	// itself being a stated fact. Found by review.
 	situationWithGoal := fmt.Sprintf("Team goal: %s\n\n%s", team.Goal, situation)
 	prompt := buildGatePrompt("team-quality-gate", situationWithGoal, team.GatePrompt)
-	agent := &Agent{Mode: "read-only", Prompt: prompt, Provider: provider, Model: gateOpts.Model, ReasoningEffort: gateOpts.ReasoningEffort}
+	agent := &Agent{Mode: "read-only", Prompt: prompt, Provider: provider, Model: gateOpts.Model, ReasoningEffort: gateOpts.ReasoningEffort, RoutingJSON: routingDecision}
 	output, derr := gateRunner.runProviderCommand(ctx, provider, tmpDir, outFile, usageFile, cwd, prompt, agent, gateOpts, false)
 	if _, usage := readAndRemoveAgentUsage(usageFile); usage != nil {
 		if cost, ok := usage["cost_usd"].(float64); ok && cost > 0 {

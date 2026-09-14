@@ -43,3 +43,13 @@ func TestModelRouteExplainRejectsInvalidExplicitEffort(t *testing.T) {
 		t.Fatal("explain accepted an unsupported explicit model/effort pair")
 	}
 }
+
+func TestModelRouteExplainAppliesAmbientProviderPin(t *testing.T) {
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER", "claude")
+	config := routing.Starter()
+	var out bytes.Buffer
+	err := runModelRoute(&out, []string{"explain", "--config", writeModelRouteConfig(t, config)}, true)
+	if err == nil {
+		t.Fatal("explain ignored ambient provider rejected by the policy")
+	}
+}

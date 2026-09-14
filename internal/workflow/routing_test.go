@@ -111,6 +111,67 @@ func TestGatePersistsOriginalAutoRoutingDecision(t *testing.T) {
 	}
 }
 
+func TestGateRoutingRejectionIsRecordedAsNotDispatched(t *testing.T) {
+	clearProviderEnv(t)
+	dir := t.TempDir()
+	c := routing.Starter()
+	c.Mode = "auto"
+	c.AllowedProviders = []string{"claude"}
+	raw, _ := json.Marshal(c)
+	config := filepath.Join(dir, "routing.json")
+	if err := os.WriteFile(config, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_ROUTING_CONFIG", config)
+	store, err := Open(filepath.Join(dir, "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `return await gate("release", "verify");`
+	path, _ := WriteRunScript("wf-gate-route-reject", dir, script)
+	run, _ := store.CreateRun(Run{ID: "wf-gate-route-reject", Task: "gate", CWD: dir, ScriptPath: path})
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10, AssumeCodexAvailable: true}).Execute(context.Background(), script, nil); err == nil {
+		t.Fatal("expected gate routing rejection")
+	}
+	invocations, err := store.ListInvocations(run.ID)
+	if err != nil || len(invocations) != 1 || invocations[0].ConfigurationStatus != "not_dispatched" {
+		t.Fatalf("gate routing rejection was not recorded: %+v %v", invocations, err)
+	}
+}
+
+func TestTeamGatePersistsShadowRoutingDecision(t *testing.T) {
+	clearProviderEnv(t)
+	dir := t.TempDir()
+	c := routing.Starter()
+	raw, _ := json.Marshal(c)
+	config := filepath.Join(dir, "routing.json")
+	if err := os.WriteFile(config, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_ROUTING_CONFIG", config)
+	store, err := Open(filepath.Join(dir, "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	team, _ := store.CreateTeam("ship", dir, 0)
+	log := filepath.Join(dir, "args")
+	runner := &Runner{Store: store, Run: Run{ID: team.ID}, CodexBinary: fakeCodexBinary(t, log, `{"approved":true,"reason":"ok","evidence":[]}`)}
+	approved, _, _, err := runner.runTeamGate(context.Background(), team, "verify")
+	if err != nil || !approved {
+		t.Fatalf("team gate failed: approved=%v err=%v", approved, err)
+	}
+	invocations, err := store.ListInvocations(team.ID)
+	if err != nil || len(invocations) != 1 || invocations[0].RoutingJSON == "" {
+		t.Fatalf("team gate lost routing evidence: %+v %v", invocations, err)
+	}
+	var decision routing.Decision
+	if err := json.Unmarshal([]byte(invocations[0].RoutingJSON), &decision); err != nil || decision.PolicyHash == "" || decision.Recommended == nil {
+		t.Fatalf("invalid team gate routing evidence: %+v %v", decision, err)
+	}
+}
+
 func TestRoutingCacheHitRefreshesShadowDecision(t *testing.T) {
 	clearProviderEnv(t)
 	dir := t.TempDir()

@@ -85,7 +85,7 @@ func (r *Runner) runProviderCommand(ctx context.Context, provider, tmpDir, outFi
 	dispatched := false
 	ctx = withProviderStartTracking(ctx, &dispatched)
 	defer func() {
-		if err := r.Store.recordInvocation(r.Run.ID, agent.ID, provider, opts.Model, opts.ReasoningEffort, started, usageFromFile(usageFile), callErr, dispatched); err != nil {
+		if err := r.Store.recordRoutedInvocation(r.Run.ID, agent.ID, provider, opts.Model, opts.ReasoningEffort, agent.RoutingJSON, started, usageFromFile(usageFile), callErr, dispatched); err != nil {
 			callErr = fmt.Errorf("record provider invocation: %w", err)
 		}
 	}()

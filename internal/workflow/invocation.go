@@ -15,6 +15,7 @@ type Invocation struct {
 	Provider            string         `json:"provider"`
 	Model               string         `json:"model,omitempty"`
 	ReasoningEffort     string         `json:"reasoning_effort,omitempty"`
+	RoutingJSON         string         `json:"routing_json,omitempty"`
 	ConfigurationStatus string         `json:"configuration_status"`
 	StartedAt           string         `json:"started_at"`
 	DurationMS          int64          `json:"duration_ms"`
@@ -24,10 +25,14 @@ type Invocation struct {
 }
 
 func (s *Store) recordInvocation(runID, agentID, provider, model, effort string, started time.Time, usage map[string]any, callErr error, dispatched ...bool) error {
+	return s.recordRoutedInvocation(runID, agentID, provider, model, effort, "", started, usage, callErr, dispatched...)
+}
+
+func (s *Store) recordRoutedInvocation(runID, agentID, provider, model, effort, routingJSON string, started time.Time, usage map[string]any, callErr error, dispatched ...bool) error {
 	if s == nil {
 		return nil
 	}
-	v := Invocation{ID: NewID("inv"), RunID: runID, AgentID: agentID, Provider: provider, Model: model, ReasoningEffort: effort, ConfigurationStatus: "sent_to_provider", StartedAt: started.UTC().Format(time.RFC3339Nano), DurationMS: time.Since(started).Milliseconds(), Status: "completed", Usage: usage}
+	v := Invocation{ID: NewID("inv"), RunID: runID, AgentID: agentID, Provider: provider, Model: model, ReasoningEffort: effort, RoutingJSON: routingJSON, ConfigurationStatus: "sent_to_provider", StartedAt: started.UTC().Format(time.RFC3339Nano), DurationMS: time.Since(started).Milliseconds(), Status: "completed", Usage: usage}
 	if len(dispatched) > 0 && !dispatched[0] {
 		v.ConfigurationStatus = "not_dispatched"
 	} else if model == "" || effort == "" {

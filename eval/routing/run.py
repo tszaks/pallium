@@ -5,6 +5,7 @@ Success requires an external rubric decision as well as any objective checks;
 a provider exit of zero is not a benchmark pass. All artifacts stay local.
 """
 import argparse
+from collections import Counter
 import hashlib
 import io
 import json
@@ -90,6 +91,21 @@ def validate_trial_invocations(invocations, candidate):
 def require_isolated_records(records):
     if any(record.get("isolated_codex_config") is not True for record in records):
         raise ValueError("suggest requires isolated Codex configuration for every trial")
+
+
+def paired_trial_identities_match(left, right):
+    identity = lambda record: (record.get("task_id"), record.get("fixture_hash"),
+                               record.get("prompt_hash"), record.get("mode"))
+    return Counter(identity(record) for record in left) == Counter(identity(record) for record in right)
+
+
+def candidate_supports_rows(candidate, rows):
+    modes = set(candidate.get("modes") or [])
+    return all(record.get("mode") in modes for record in rows)
+
+
+def normalize_rules(config):
+    config["rules"] = dict(config.get("rules") or {})
 
 
 def write(path, value):
@@ -301,7 +317,7 @@ def run(args):
         objective = {"passed": checks["exit_code"] == 0 and not test_changes,
                      "test_changes": test_changes, "duration_ms": checks["duration_ms"]}
     worker_identity = resolved_executable(args.codex)
-    record = {"harness_hash": harness_hash, "pallium_binary_hash": digest(Path(binary).read_bytes()), "routing_config_hash": routing_config_hash(config), "isolated_codex_config": args.isolated_codex_config, "simulation": args.simulation, "worker_binary": args.codex, "worker_binary_path": worker_identity["path"], "worker_binary_hash": worker_identity["hash"], "objective_checks": objective, "run_id": run_id, "task_id": task["id"], "family": task["family"],
+    record = {"harness_hash": harness_hash, "pallium_binary_hash": digest(Path(binary).read_bytes()), "routing_config_hash": routing_config_hash(config), "isolated_codex_config": args.isolated_codex_config, "simulation": args.simulation, "worker_binary": args.codex, "worker_binary_path": worker_identity["path"], "worker_binary_hash": worker_identity["hash"], "objective_checks": objective, "run_id": run_id, "task_id": task["id"], "family": task["family"], "mode": task["mode"],
               "split": task["proposed_split"], "split_group": task.get("split_group",task["id"]), "candidate": args.candidate,
               "provider": candidate["provider"], "model": candidate["model"], "reasoning_effort": candidate["reasoning_effort"],
               "fixture_hash": task["fixture_hash"], "prompt_hash": task["prompt_hash"],
@@ -388,19 +404,24 @@ def suggest(args):
     if any(r["outcome"] == "pending_review" for r in records):
         raise ValueError("grade calibration outcomes before suggesting rules")
     enabled = {c["id"] for c in config["candidates"] if c["enabled"] and c["provider"] in config["allowed_providers"]}
+    candidate_configs = {candidate["id"]: candidate for candidate in config["candidates"]}
     if args.baseline not in enabled:
         raise ValueError("baseline is not enabled in the policy")
     proposals = {}
     for family in sorted({r["family"] for r in records}):
         family_rows = [r for r in records if r["family"] == family]
         baseline = [r for r in family_rows if r["candidate"] == args.baseline]
+        if not candidate_supports_rows(candidate_configs[args.baseline], baseline):
+            continue
         baseline_tasks = {r["task_id"] for r in baseline}
         if len({r.get("split_group",r["task_id"]) for r in baseline}) < args.min_tasks:
             continue
         best = None
         for candidate in sorted(enabled - {args.baseline}):
             rows = [r for r in family_rows if r["candidate"] == candidate]
-            if {r["task_id"] for r in rows} != baseline_tasks:
+            if not candidate_supports_rows(candidate_configs[candidate], rows):
+                continue
+            if {r["task_id"] for r in rows} != baseline_tasks or not paired_trial_identities_match(baseline, rows):
                 continue
             paired = True
             for task_id in baseline_tasks:
@@ -425,6 +446,7 @@ def suggest(args):
         if best:
             proposals[family] = best[2]
     config["mode"] = "shadow"
+    normalize_rules(config)
     config["rules"].update(proposals)
     path = Path(args.output)
     with path.open("x") as f:

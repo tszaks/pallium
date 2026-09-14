@@ -75,7 +75,8 @@ func runModelRoute(out io.Writer, args []string, jsonOutput bool) error {
 		if args[0] == "catalog" {
 			return write(c)
 		}
-		d, err := c.Choose(routing.Request{Provider: *provider, Model: *model, Effort: *effort, TaskClass: *class, Mode: *mode, Network: *network}, func(provider string) bool { return workflow.ProviderAvailableWithNetwork(provider, "", *network) })
+		effectiveProvider := workflow.ResolveProvider("", *provider)
+		d, err := c.Choose(routing.Request{Provider: effectiveProvider, Model: *model, Effort: *effort, TaskClass: *class, Mode: *mode, Network: *network}, func(provider string) bool { return workflow.ProviderAvailableWithNetwork(provider, "", *network) })
 		if err != nil {
 			return err
 		}
