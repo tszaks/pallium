@@ -160,6 +160,16 @@ func TestExtractClaudeOutputPreservesUsageOnEnvelopeError(t *testing.T) {
 	}
 }
 
+func TestExtractClaudeOutputPreservesUsageOnEmptyResult(t *testing.T) {
+	_, usage, err := extractClaudeOutput(`{"type":"result","is_error":false,"result":"","total_cost_usd":0.75,"usage":{"input_tokens":8,"output_tokens":1}}`, false)
+	if err == nil {
+		t.Fatal("expected empty-result error")
+	}
+	if usage["cost_usd"] != 0.75 || usage["input_tokens"] != float64(8) || usage["output_tokens"] != float64(1) {
+		t.Fatalf("lost paid usage from empty result: %+v", usage)
+	}
+}
+
 func TestTruncateForError(t *testing.T) {
 	if got := truncateForError("short"); got != "short" {
 		t.Fatalf("short string changed: %q", got)

@@ -202,6 +202,79 @@ func TestRoutingRejectsNetworklessBuiltinClaude(t *testing.T) {
 	}
 }
 
+func TestRoutingTreatsWhitespaceWrapperAsUnavailable(t *testing.T) {
+	clearProviderEnv(t)
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_GEMINI_COMMAND", "  \t")
+	if ProviderAvailable("gemini", "") {
+		t.Fatal("whitespace-only wrapper was treated as available")
+	}
+}
+
+func TestRoutingRejectionIsRecordedAsNotDispatched(t *testing.T) {
+	clearProviderEnv(t)
+	dir := t.TempDir()
+	c := routing.Starter()
+	c.Mode = "auto"
+	c.AllowedProviders = []string{"claude"}
+	raw, _ := json.Marshal(c)
+	config := filepath.Join(dir, "routing.json")
+	if err := os.WriteFile(config, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_ROUTING_CONFIG", config)
+	store, err := Open(filepath.Join(dir, "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	script := `return await agent("inspect");`
+	path, _ := WriteRunScript("wf-route-reject", dir, script)
+	run, _ := store.CreateRun(Run{ID: "wf-route-reject", Task: "reject", CWD: dir, ScriptPath: path})
+	if _, err := (&Runner{Store: store, Run: run, MaxAgents: 10, AssumeCodexAvailable: true}).Execute(context.Background(), script, nil); err == nil {
+		t.Fatal("expected routing rejection")
+	}
+	invocations, err := store.ListInvocations(run.ID)
+	if err != nil || len(invocations) != 1 || invocations[0].ConfigurationStatus != "not_dispatched" || invocations[0].Status != "failed" {
+		t.Fatalf("routing rejection was not recorded: %+v %v", invocations, err)
+	}
+}
+
+func TestPlainAutoRoutedMemberCannotPromoteToIneligibleEditMode(t *testing.T) {
+	clearProviderEnv(t)
+	dir := t.TempDir()
+	c := routing.Starter()
+	c.Mode = "auto"
+	for i := range c.Candidates {
+		c.Candidates[i].Modes = []string{"read-only"}
+	}
+	raw, _ := json.Marshal(c)
+	config := filepath.Join(dir, "routing.json")
+	if err := os.WriteFile(config, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_ROUTING_CONFIG", config)
+	store, err := Open(filepath.Join(dir, "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	team, _ := store.CreateTeam("test", dir, 0)
+	member, err := store.SpawnMember(team.ID, "reader", "", "", "inspect", "read-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if member.Mode != "read-only" {
+		t.Fatalf("unexpected member: %+v", member)
+	}
+	if err := store.SetMemberMode(team.ID, member.Name, "edit"); err == nil {
+		t.Fatal("promoted member through an edit-ineligible auto route")
+	}
+	unchanged, _ := store.GetMember(team.ID, member.Name)
+	if unchanged.Mode != "read-only" {
+		t.Fatalf("failed promotion still changed mode: %+v", unchanged)
+	}
+}
+
 func TestTeamEffortSurvivesStoreRoundTrip(t *testing.T) {
 	clearProviderEnv(t)
 	t.Setenv("PALLIUM_ROUTING_CONFIG", "")

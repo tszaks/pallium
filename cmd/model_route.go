@@ -72,16 +72,19 @@ func runModelRoute(out io.Writer, args []string, jsonOutput bool) error {
 		if err != nil {
 			return err
 		}
-		for _, candidate := range c.Candidates {
-			if err := workflow.ValidateReasoningEffort(candidate.Provider, candidate.Model, candidate.Effort); err != nil {
-				return err
-			}
-		}
 		if args[0] == "catalog" {
 			return write(c)
 		}
 		d, err := c.Choose(routing.Request{Provider: *provider, Model: *model, Effort: *effort, TaskClass: *class, Mode: *mode, Network: *network}, func(provider string) bool { return workflow.ProviderAvailableWithNetwork(provider, "", *network) })
 		if err != nil {
+			return err
+		}
+		if d.Recommended != nil {
+			if err := workflow.ValidateReasoningEffort(d.Recommended.Provider, d.Recommended.Model, d.Recommended.Effort); err != nil {
+				return err
+			}
+		}
+		if err := workflow.ValidateReasoningEffort(workflow.ResolveProvider("", d.Selected.Provider), d.Selected.Model, d.Selected.Effort); err != nil {
 			return err
 		}
 		return write(d)

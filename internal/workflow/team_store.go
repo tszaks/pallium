@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/tszaks/pallium/internal/routing"
 )
 
 // Team is a lead + independent peer agents that coordinate over a shared
@@ -583,8 +584,11 @@ func (s *Store) ApproveMemberPlan(teamID, name string) (TeamMember, error) {
 	if !m.PlanRequired || m.PlanStatus != "pending" {
 		return TeamMember{}, fmt.Errorf("team member %q has no pending plan to approve (plan_required=%v plan_status=%q)", name, m.PlanRequired, m.PlanStatus)
 	}
+	if err := s.SetMemberMode(teamID, name, "edit"); err != nil {
+		return TeamMember{}, err
+	}
 	now := nowString()
-	if _, err := s.db.Exec(`UPDATE team_members SET mode='edit', plan_status='approved', updated_at=? WHERE team_id=? AND name=?`, now, teamID, name); err != nil {
+	if _, err := s.db.Exec(`UPDATE team_members SET plan_status='approved', updated_at=? WHERE team_id=? AND name=?`, now, teamID, name); err != nil {
 		return TeamMember{}, err
 	}
 	if _, err := s.SendTeamMessage(teamID, "lead", name, "Your plan is approved. Proceed with edits."); err != nil {
@@ -931,7 +935,40 @@ func (s *Store) SetMemberWorktree(teamID, name, worktree string) error {
 }
 
 func (s *Store) SetMemberMode(teamID, name, mode string) error {
-	_, err := s.db.Exec(`UPDATE team_members SET mode=?, updated_at=? WHERE team_id=? AND name=?`, mode, nowString(), teamID, name)
+	if mode != "read-only" && mode != "edit" {
+		return fmt.Errorf("team member mode must be \"read-only\" or \"edit\", got %q", mode)
+	}
+	member, err := s.GetMember(teamID, name)
+	if err != nil {
+		return err
+	}
+	routingJSON := member.RoutingJSON
+	if mode == "edit" && routingJSON != "" && member.Provider != "external" {
+		var prior routing.Decision
+		if err := json.Unmarshal([]byte(routingJSON), &prior); err != nil {
+			return fmt.Errorf("team member %q has invalid routing evidence: %w", name, err)
+		}
+		if prior.Mode == "auto" {
+			team, err := s.GetTeam(teamID)
+			if err != nil {
+				return err
+			}
+			runner := Runner{Run: Run{CWD: team.CWD}, AssumeCodexAvailable: true}
+			resolved, decision, err := runner.resolveRouting(AgentOptions{
+				Provider: prior.Requested.Provider, Model: prior.Requested.Model,
+				ReasoningEffort: prior.Requested.Effort, TaskClass: prior.Requested.TaskClass,
+			}, "edit")
+			if err != nil {
+				return fmt.Errorf("team member %q is not eligible for edit mode: %w", name, err)
+			}
+			provider := ResolveProvider("", resolved.Provider)
+			if provider != member.Provider || resolved.Model != member.Model || resolved.ReasoningEffort != member.ReasoningEffort {
+				return fmt.Errorf("team member %q cannot be promoted in place: edit routing selects %s/%s/%s instead of %s/%s/%s", name, provider, resolved.Model, resolved.ReasoningEffort, member.Provider, member.Model, member.ReasoningEffort)
+			}
+			routingJSON = decision
+		}
+	}
+	_, err = s.db.Exec(`UPDATE team_members SET mode=?, routing_json=?, updated_at=? WHERE team_id=? AND name=?`, mode, routingJSON, nowString(), teamID, name)
 	return err
 }
 

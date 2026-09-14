@@ -1992,9 +1992,14 @@ func (r *Runner) runAgentAtCallIndex(ctx context.Context, prompt string, opts Ag
 	}
 	routingJSON := opts.routingJSON
 	if !opts.routingResolved {
+		routingStarted := time.Now()
 		var routeErr error
 		opts, routingJSON, routeErr = r.resolveRouting(opts, mode)
 		if routeErr != nil {
+			provider := ResolveProvider("", opts.Provider)
+			if recordErr := r.Store.recordInvocation(r.Run.ID, "", provider, opts.Model, opts.ReasoningEffort, routingStarted, nil, routeErr, false); recordErr != nil {
+				return "", fmt.Errorf("%v; record routing rejection: %w", routeErr, recordErr)
+			}
 			return "", routeErr
 		}
 	}

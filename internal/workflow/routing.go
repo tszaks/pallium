@@ -70,7 +70,7 @@ func ProviderAvailable(provider, codexBinary string) bool {
 }
 
 func ProviderAvailableWithNetwork(provider, codexBinary string, networkRequired bool) bool {
-	if provider != "codex" && os.Getenv(providerCommandEnvName(provider)) != "" {
+	if provider != "codex" && strings.TrimSpace(os.Getenv(providerCommandEnvName(provider))) != "" {
 		return true
 	}
 	if provider == "claude" && networkRequired {

@@ -72,6 +72,22 @@ class AccountingTests(unittest.TestCase):
             "stdout": json.dumps({"invocations": [{"provider": "codex"}]})})
         self.assertEqual(snapshot["invocations"], invocations)
 
+    def test_trial_invocation_must_match_candidate_and_be_dispatched(self):
+        candidate = {"provider": "codex", "model": "gpt-6-astra", "reasoning_effort": "high"}
+        valid = [{**candidate, "configuration_status": "sent_to_provider"}]
+        runner.validate_trial_invocations(valid, candidate)
+        with self.assertRaises(ValueError):
+            runner.validate_trial_invocations([{**valid[0], "model": "gpt-5.6-luna"}], candidate)
+        with self.assertRaises(ValueError):
+            runner.validate_trial_invocations([{**valid[0], "configuration_status": "not_dispatched"}], candidate)
+
+    def test_suggestions_reject_legacy_nonisolated_records(self):
+        runner.require_isolated_records([{"isolated_codex_config": True}])
+        with self.assertRaises(ValueError):
+            runner.require_isolated_records([{"isolated_codex_config": False}])
+        with self.assertRaises(ValueError):
+            runner.require_isolated_records([{}])
+
     def test_routing_config_hash_changes_with_candidate_mapping(self):
         first = {"candidates": [{"id": "fast", "model": "a"}]}
         second = {"candidates": [{"id": "fast", "model": "b"}]}

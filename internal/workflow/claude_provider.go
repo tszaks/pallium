@@ -298,7 +298,7 @@ func extractClaudeOutput(raw string, hasSchema bool) (string, map[string]any, er
 		}
 	}
 	if text == "" {
-		return "", nil, fmt.Errorf("empty output")
+		return "", usage, fmt.Errorf("empty output")
 	}
 	return text, usage, nil
 }

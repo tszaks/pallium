@@ -79,6 +79,19 @@ def parse_invocation_snapshot(report):
     return snapshot, invocations
 
 
+def validate_trial_invocations(invocations, candidate):
+    expected = (candidate["provider"], candidate["model"], candidate["reasoning_effort"])
+    for invocation in invocations:
+        actual = (invocation.get("provider"), invocation.get("model"), invocation.get("reasoning_effort"))
+        if actual != expected or invocation.get("configuration_status") != "sent_to_provider":
+            raise ValueError("workflow invocation did not match the requested trial candidate")
+
+
+def require_isolated_records(records):
+    if any(record.get("isolated_codex_config") is not True for record in records):
+        raise ValueError("suggest requires isolated Codex configuration for every trial")
+
+
 def write(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
 
@@ -276,6 +289,7 @@ def run(args):
     report = command([binary, "workflow", "inspect", run_id, "--db", str(db), "--json"], work, 30, env)
     (run_dir / "snapshot.json").write_text(report["stdout"])
     snapshot, invocations = parse_invocation_snapshot(report)
+    validate_trial_invocations(invocations, candidate)
     costs = [v.get("cost_usd") for v in invocations]
     total_cost = sum(costs) if costs and all(c is not None for c in costs) else None
     objective = None
@@ -359,6 +373,7 @@ def suggest(args):
     config = json.loads(Path(args.config).read_text())
     all_records = [json.loads(p.read_text()) for p in Path(args.experiment).glob("*/runs/*/result.json")]
     records = [r for r in all_records if r.get("simulation") is False and r.get("split") == "calibration"]
+    require_isolated_records(records)
     comparison_signatures = {comparison_signature(r) for r in records}
     candidate_signatures = {}
     for r in records:
