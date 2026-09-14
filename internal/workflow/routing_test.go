@@ -118,3 +118,39 @@ func TestTeamEffortSurvivesStoreRoundTrip(t *testing.T) {
 		t.Fatalf("%+v %v", ms, err)
 	}
 }
+
+func TestTeamAutoRoutingCanSelectProviderWhenCallerOmitsIt(t *testing.T) {
+	clearProviderEnv(t)
+	dir := t.TempDir()
+	c := routing.Starter()
+	c.Mode = "auto"
+	c.AllowedProviders = []string{"codex", "claude"}
+	c.Candidates = append(c.Candidates, routing.Candidate{
+		ID: "claude-auto", Provider: "claude", Model: "claude-opus-5",
+		Effort: "xhigh", Enabled: true, Modes: []string{"read-only"},
+	})
+	c.Default = "claude-auto"
+	raw, _ := json.Marshal(c)
+	config := filepath.Join(dir, "routing.json")
+	if err := os.WriteFile(config, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PALLIUM_ROUTING_CONFIG", config)
+	t.Setenv("PALLIUM_WORKFLOW_PROVIDER_CLAUDE_COMMAND", "configured")
+	s, err := Open(filepath.Join(dir, "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	team, err := s.CreateTeam("test", dir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := s.SpawnMember(team.ID, "worker", "", "", "test", "read-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Provider != "claude" || m.Model != "claude-opus-5" || m.ReasoningEffort != "xhigh" {
+		t.Fatalf("auto routing was pinned to the default provider: %+v", m)
+	}
+}

@@ -261,6 +261,7 @@ func extractClaudeOutput(raw string, hasSchema bool) (string, map[string]any, er
 	text := raw
 	var usage map[string]any
 	if envelope := parseClaudeEnvelope(raw); envelope != nil {
+		usage = claudeUsageFromEnvelope(envelope)
 		// The CLI can exit 0 yet report a failure in the envelope (e.g.
 		// {"is_error":true,"subtype":"error_max_turns"}), often with no usable
 		// "result" string. Treat that as an error rather than returning the
@@ -273,12 +274,11 @@ func extractClaudeOutput(raw string, hasSchema bool) (string, map[string]any, er
 			if strings.TrimSpace(msg) == "" {
 				msg = "unspecified error"
 			}
-			return "", nil, fmt.Errorf("claude CLI reported an error: %s", strings.TrimSpace(msg))
+			return "", usage, fmt.Errorf("claude CLI reported an error: %s", strings.TrimSpace(msg))
 		}
 		if result, ok := envelope["result"].(string); ok {
 			text = result
 		}
-		usage = claudeUsageFromEnvelope(envelope)
 	}
 	text = strings.TrimSpace(text)
 	if hasSchema {

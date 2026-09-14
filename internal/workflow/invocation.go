@@ -23,12 +23,14 @@ type Invocation struct {
 	Usage               map[string]any `json:"usage"`
 }
 
-func (s *Store) recordInvocation(runID, agentID, provider, model, effort string, started time.Time, usage map[string]any, callErr error) error {
+func (s *Store) recordInvocation(runID, agentID, provider, model, effort string, started time.Time, usage map[string]any, callErr error, dispatched ...bool) error {
 	if s == nil {
 		return nil
 	}
 	v := Invocation{ID: NewID("inv"), RunID: runID, AgentID: agentID, Provider: provider, Model: model, ReasoningEffort: effort, ConfigurationStatus: "sent_to_provider", StartedAt: started.UTC().Format(time.RFC3339Nano), DurationMS: time.Since(started).Milliseconds(), Status: "completed", Usage: usage}
-	if model == "" || effort == "" {
+	if len(dispatched) > 0 && !dispatched[0] {
+		v.ConfigurationStatus = "not_dispatched"
+	} else if model == "" || effort == "" {
 		v.ConfigurationStatus = "provider_default_unresolved"
 	}
 	if callErr != nil {

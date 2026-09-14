@@ -150,6 +150,16 @@ func TestExtractClaudeOutputSurfacesIsError(t *testing.T) {
 	}
 }
 
+func TestExtractClaudeOutputPreservesUsageOnEnvelopeError(t *testing.T) {
+	_, usage, err := extractClaudeOutput(`{"type":"result","subtype":"error_max_turns","is_error":true,"total_cost_usd":1.25,"usage":{"input_tokens":10,"output_tokens":4}}`, false)
+	if err == nil {
+		t.Fatal("expected envelope error")
+	}
+	if usage["cost_usd"] != 1.25 || usage["input_tokens"] != float64(10) || usage["output_tokens"] != float64(4) {
+		t.Fatalf("lost paid usage from failed envelope: %+v", usage)
+	}
+}
+
 func TestTruncateForError(t *testing.T) {
 	if got := truncateForError("short"); got != "short" {
 		t.Fatalf("short string changed: %q", got)

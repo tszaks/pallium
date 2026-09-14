@@ -330,21 +330,20 @@ func runTeamSpawn(out io.Writer, args []string, jsonOutput bool) error {
 // indistinguishable from one spawned by hand — no second, drifting copy of
 // the claude-session-minting step.
 func spawnTeamMember(store *workflow.Store, teamID, name, provider, model, role, mode string, planRequired bool, effort ...string) (workflow.TeamMember, error) {
-	resolvedProvider := workflow.ResolveProvider("", provider)
 	var member workflow.TeamMember
 	var err error
 	if planRequired {
 		// A plan-required member is always spawned read-only regardless of
 		// mode: it cannot edit anything until `team approve` flips it, so
 		// mode is enforced here, not merely defaulted.
-		member, err = store.SpawnPlanRequiredMember(teamID, name, resolvedProvider, model, role, effort...)
+		member, err = store.SpawnPlanRequiredMember(teamID, name, provider, model, role, effort...)
 	} else {
-		member, err = store.SpawnMember(teamID, name, resolvedProvider, model, role, mode, effort...)
+		member, err = store.SpawnMember(teamID, name, provider, model, role, mode, effort...)
 	}
 	if err != nil {
 		return workflow.TeamMember{}, err
 	}
-	if resolvedProvider == "claude" {
+	if member.Provider == "claude" {
 		if err := store.PersistMemberSession(teamID, name, uuid.NewString()); err != nil {
 			return workflow.TeamMember{}, err
 		}

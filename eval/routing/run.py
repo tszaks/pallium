@@ -26,6 +26,28 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def resolved_executable(command):
+    resolved = shutil.which(command)
+    if not resolved:
+        return {"path": None, "hash": None}
+    path = Path(resolved).resolve()
+    return {"path": str(path), "hash": digest(path.read_bytes())}
+
+
+def execution_signature(record):
+    return (record.get("harness_hash"), record.get("pallium_binary_hash"),
+            record.get("routing_config_hash"), record.get("provider"),
+            record.get("model"), record.get("reasoning_effort"),
+            record.get("worker_binary_path"), record.get("worker_binary_hash"),
+            record.get("isolated_codex_config"))
+
+
+def comparison_signature(record):
+    return (record.get("harness_hash"), record.get("pallium_binary_hash"),
+            record.get("routing_config_hash"), record.get("worker_binary_path"),
+            record.get("worker_binary_hash"), record.get("isolated_codex_config"))
+
+
 def write(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
 
@@ -171,6 +193,7 @@ def run(args):
     if args.candidate not in candidates:
         raise ValueError("candidate not enabled")
     candidate = candidates[args.candidate]
+
     if candidate["provider"] != "codex" or candidate["provider"] not in config["allowed_providers"]:
         raise ValueError("initial evaluation harness supports permitted Codex candidates only")
     task_dir = experiment / args.task
@@ -230,13 +253,15 @@ def run(args):
     if result["exit_code"] == 0 and task["mode"] == "edit":
         checks = command(["go", "test", "./internal/workflow"], work, args.check_timeout, env)
         write(run_dir / "checks.json", checks)
-        changed = subprocess.check_output(["git", "diff", "--name-only", "HEAD"], cwd=work).decode().splitlines()
+        status = subprocess.check_output(["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=work).decode().splitlines()
+        changed = [line[3:] for line in status if len(line) >= 4]
         test_changes = [p for p in changed if p.endswith("_test.go") or p.startswith("eval/")]
         objective = {"passed": checks["exit_code"] == 0 and not test_changes,
                      "test_changes": test_changes, "duration_ms": checks["duration_ms"]}
-    record = {"harness_hash": harness_hash, "pallium_binary_hash": digest(Path(binary).read_bytes()), "isolated_codex_config": args.isolated_codex_config, "simulation": args.simulation, "worker_binary": args.codex, "objective_checks": objective, "run_id": run_id, "task_id": task["id"], "family": task["family"],
+    worker_identity = resolved_executable(args.codex)
+    record = {"harness_hash": harness_hash, "pallium_binary_hash": digest(Path(binary).read_bytes()), "routing_config_hash": digest(json.dumps(config, sort_keys=True, separators=(",", ":")).encode()), "isolated_codex_config": args.isolated_codex_config, "simulation": args.simulation, "worker_binary": args.codex, "worker_binary_path": worker_identity["path"], "worker_binary_hash": worker_identity["hash"], "objective_checks": objective, "run_id": run_id, "task_id": task["id"], "family": task["family"],
               "split": task["proposed_split"], "split_group": task.get("split_group",task["id"]), "candidate": args.candidate,
-              "model": candidate["model"], "reasoning_effort": candidate["reasoning_effort"],
+              "provider": candidate["provider"], "model": candidate["model"], "reasoning_effort": candidate["reasoning_effort"],
               "fixture_hash": task["fixture_hash"], "prompt_hash": task["prompt_hash"],
               "duration_ms": result["duration_ms"] + (objective["duration_ms"] if objective else 0), "cost_usd": total_cost,
               "invocations": invocations, "provider_exit_code": result["exit_code"],
@@ -295,7 +320,7 @@ def report(args):
     records = [r for r in all_records if not r.get("simulation", True)]
     groups = {}
     for r in records:
-        key = r.get("harness_hash", "legacy-unpinned") + ":" + r.get("pallium_binary_hash", "unknown") + ":isolated=" + str(r.get("isolated_codex_config", False))
+        key = json.dumps(comparison_signature(r), separators=(",", ":"))
         groups.setdefault(key, []).append(r)
     print(json.dumps({"simulations_excluded": len(all_records) - len(records), "comparison_groups": {key: summarize(values) for key, values in groups.items()}, "promotion": "not_established",
                       "note": "No automatic non-inferiority claim; inspect paired tasks, independent grading, and confidence intervals."}, indent=2))
@@ -306,9 +331,15 @@ def suggest(args):
     config = json.loads(Path(args.config).read_text())
     all_records = [json.loads(p.read_text()) for p in Path(args.experiment).glob("*/runs/*/result.json")]
     records = [r for r in all_records if r.get("simulation") is False and r.get("split") == "calibration"]
-    signatures = {(r.get("harness_hash"), r.get("pallium_binary_hash"), r.get("isolated_codex_config")) for r in records}
-    if len(signatures) != 1 or any(None in signature for signature in signatures):
-        raise ValueError("suggest requires one pinned harness/binary/config group of calibration outcomes")
+    comparison_signatures = {comparison_signature(r) for r in records}
+    candidate_signatures = {}
+    for r in records:
+        candidate_signatures.setdefault(r["candidate"], set()).add(execution_signature(r))
+    if (len(comparison_signatures) != 1 or
+            any(None in signature for signature in comparison_signatures) or
+            any(len(signatures) != 1 or any(None in signature for signature in signatures)
+                for signatures in candidate_signatures.values())):
+        raise ValueError("suggest requires one pinned harness/binary/config group and one execution identity per candidate")
     if any(r["outcome"] == "pending_review" for r in records):
         raise ValueError("grade calibration outcomes before suggesting rules")
     enabled = {c["id"] for c in config["candidates"] if c["enabled"] and c["provider"] in config["allowed_providers"]}

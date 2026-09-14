@@ -43,6 +43,14 @@ class AccountingTests(unittest.TestCase):
             groups.setdefault(task["split_group"], set()).add(task["proposed_split"])
         self.assertTrue(all(len(splits) == 1 for splits in groups.values()))
 
+    def test_execution_signature_includes_effective_configuration(self):
+        base = dict(harness_hash="h", pallium_binary_hash="p", routing_config_hash="r",
+                    provider="codex", model="gpt-6-astra", reasoning_effort="high",
+                    worker_binary_path="/bin/codex", worker_binary_hash="w",
+                    isolated_codex_config=True)
+        changed = dict(base, model="gpt-5.6-luna")
+        self.assertNotEqual(runner.execution_signature(base), runner.execution_signature(changed))
+
 
 if __name__ == "__main__":
     unittest.main()

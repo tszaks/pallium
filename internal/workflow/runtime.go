@@ -572,23 +572,6 @@ func (r *Runner) runAgentGate(ctx context.Context, name, message string, opts Ga
 	if policyErr != nil && (!os.IsNotExist(policyErr) || os.Getenv("PALLIUM_ROUTING_CONFIG") != "") {
 		return nil, policyErr
 	}
-	keyRaw, _ := json.Marshal(struct {
-		Options GateOptions
-		Message string
-		Policy  string
-	}{opts, message, string(policyRaw)})
-	keyHash := sha256.Sum256(keyRaw)
-	gate, err := r.Store.EnsureGate(r.Run.ID, name, message, hex.EncodeToString(keyHash[:]))
-	if err != nil {
-		return nil, err
-	}
-	if gate.Status == "approved" {
-		return map[string]any{"approved": true, "gate": gate, "cached": true}, nil
-	}
-	if gate.Status == "rejected" {
-		return map[string]any{"approved": false, "gate": gate, "cached": true}, fmt.Errorf("workflow gate %q was already rejected", name)
-	}
-
 	failOnDeny := true
 	if opts.FailOnDeny != nil {
 		failOnDeny = *opts.FailOnDeny
@@ -606,6 +589,34 @@ func (r *Runner) runAgentGate(ctx context.Context, name, message string, opts Ga
 		TaskClass:       opts.TaskClass,
 		Schema:          defaultGateSchema(),
 	}
+	resolvedOpts, routingDecision, err := r.resolveRouting(agentOpts, mode)
+	if err != nil {
+		return nil, err
+	}
+	keyRaw, _ := json.Marshal(struct {
+		Options         GateOptions
+		Message         string
+		Policy          string
+		Provider        string
+		Model           string
+		ReasoningEffort string
+		RoutingDecision string
+	}{opts, message, string(policyRaw), ResolveProvider("", resolvedOpts.Provider), resolvedOpts.Model, resolvedOpts.ReasoningEffort, routingDecision})
+	keyHash := sha256.Sum256(keyRaw)
+	gate, err := r.Store.EnsureGate(r.Run.ID, name, message, hex.EncodeToString(keyHash[:]))
+	if err != nil {
+		return nil, err
+	}
+	if gate.Status == "approved" {
+		return map[string]any{"approved": true, "gate": gate, "cached": true}, nil
+	}
+	if gate.Status == "rejected" {
+		return map[string]any{"approved": false, "gate": gate, "cached": true}, fmt.Errorf("workflow gate %q was already rejected", name)
+	}
+
+	agentOpts.Provider = resolvedOpts.Provider
+	agentOpts.Model = resolvedOpts.Model
+	agentOpts.ReasoningEffort = resolvedOpts.ReasoningEffort
 	output, err := r.RunAgent(ctx, buildGatePrompt(name, message, opts.Criteria), agentOpts)
 	if err != nil {
 		return nil, err
@@ -760,17 +771,20 @@ func (r *Runner) jsTeam(ctx context.Context, vm *goja.Runtime) map[string]any {
 			if len(rawOpts) > 0 {
 				decodeOpts(rawOpts[0], &opts)
 			}
-			provider := ResolveProvider("", opts.Provider)
 			var err error
 			if opts.PlanRequired {
-				_, err = r.Store.SpawnPlanRequiredMember(teamID, name, provider, opts.Model, opts.Role, opts.ReasoningEffort)
+				_, err = r.Store.SpawnPlanRequiredMember(teamID, name, opts.Provider, opts.Model, opts.Role, opts.ReasoningEffort)
 			} else {
-				_, err = r.Store.SpawnMember(teamID, name, provider, opts.Model, opts.Role, opts.Mode, opts.ReasoningEffort)
+				_, err = r.Store.SpawnMember(teamID, name, opts.Provider, opts.Model, opts.Role, opts.Mode, opts.ReasoningEffort)
 			}
 			if err != nil {
 				panic(vm.ToValue(err.Error()))
 			}
-			return vm.ToValue(mintClaudeSessionIfNeeded(teamID, name, provider))
+			member, err := r.Store.GetMember(teamID, name)
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			return vm.ToValue(mintClaudeSessionIfNeeded(teamID, name, member.Provider))
 		},
 		"send": func(teamID, to, body string, from ...string) goja.Value {
 			sender := firstNonEmpty(strings.Join(from, ""), "lead")

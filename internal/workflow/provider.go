@@ -82,8 +82,9 @@ func DetectSteeringProvider() string {
 // function, so no caller special-cases codex or any other provider.
 func (r *Runner) runProviderCommand(ctx context.Context, provider, tmpDir, outFile, usageFile, cwd, prompt string, agent *Agent, opts AgentOptions, networkAllowed bool) (output string, callErr error) {
 	started := time.Now()
+	dispatched := false
 	defer func() {
-		if err := r.Store.recordInvocation(r.Run.ID, agent.ID, provider, opts.Model, opts.ReasoningEffort, started, usageFromFile(usageFile), callErr); err != nil {
+		if err := r.Store.recordInvocation(r.Run.ID, agent.ID, provider, opts.Model, opts.ReasoningEffort, started, usageFromFile(usageFile), callErr, dispatched); err != nil {
 			callErr = fmt.Errorf("record provider invocation: %w", err)
 		}
 	}()
@@ -91,9 +92,11 @@ func (r *Runner) runProviderCommand(ctx context.Context, provider, tmpDir, outFi
 		return "", err
 	}
 	if provider == "codex" {
+		dispatched = true
 		return r.runCodexCommand(ctx, tmpDir, outFile, cwd, prompt, agent, opts, networkAllowed)
 	}
 	if command := strings.TrimSpace(os.Getenv(providerCommandEnvName(provider))); command != "" {
+		dispatched = true
 		return r.runConfiguredProviderCommand(ctx, command, tmpDir, outFile, usageFile, cwd, prompt, agent, opts, networkAllowed)
 	}
 	if provider == "claude" {
@@ -103,6 +106,7 @@ func (r *Runner) runProviderCommand(ctx context.Context, provider, tmpDir, outFi
 		if networkAllowed {
 			fmt.Fprintf(os.Stderr, "[workflow] agent %s requested network but the built-in claude provider has no network tool; running without egress (configure a claude wrapper via %s for networked claude)\n", firstNonEmpty(agent.Label, agent.ID), providerCommandEnvName(provider))
 		}
+		dispatched = true
 		return r.runBuiltinClaudeCommand(ctx, usageFile, cwd, prompt, agent, opts)
 	}
 	return "", fmt.Errorf("workflow agent provider %q is not configured; set %s", provider, providerCommandEnvName(provider))
