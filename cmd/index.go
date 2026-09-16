@@ -21,7 +21,9 @@ func runIndex(out io.Writer, args []string, jsonOutput bool) error {
 	}
 
 	return output.Write(out, result, jsonOutput, func() string {
-		return fmt.Sprintf("Indexed %d commits, %d files, and %d co-change edges in %s",
-			result.CommitCount, result.FileCount, result.CochangeEdgeCount, result.RepoRoot)
+		return fmt.Sprintf("Indexed %d commits, %d files, and %d co-change edges in %s\nContent: %d symbols and %d imports across %d source files (%d reparsed, %d unchanged)",
+			result.CommitCount, result.FileCount, result.CochangeEdgeCount, result.RepoRoot,
+			result.Content.Symbols, result.Content.Imports, result.Content.Files,
+			result.Content.Reparsed, result.Content.Unchanged)
 	})
 }

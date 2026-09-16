@@ -1,0 +1,323 @@
+package codeindex
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/tszaks/pallium/internal/db"
+)
+
+func TestRunIndexesGoSymbolsAndImports(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"go.mod": "module example.com/app\n\ngo 1.26.0\n",
+		"internal/store/store.go": `package store
+
+// Store holds the connection.
+type Store struct{ name string }
+
+// Open returns a Store.
+func Open(name string) (*Store, error) { return &Store{name: name}, nil }
+
+func (s *Store) Name() string { return s.name }
+
+const DefaultName = "main"
+
+func unexportedHelper() {}
+`,
+		"main.go": `package main
+
+import "example.com/app/internal/store"
+
+func main() {
+	s, _ := store.Open("x")
+	_ = s.Name()
+}
+`,
+	})
+
+	store, repoID := openIndexed(t, repo)
+	result, err := Run(store, repoID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if result.Reparsed != 2 {
+		t.Fatalf("expected 2 files reparsed, got %d (%+v)", result.Reparsed, result)
+	}
+
+	symbols, err := store.SymbolsInFile(repoID, "internal/store/store.go")
+	if err != nil {
+		t.Fatalf("symbols: %v", err)
+	}
+	byName := map[string]db.CodeSymbol{}
+	for _, symbol := range symbols {
+		byName[symbol.Name] = symbol
+	}
+
+	if got := byName["Store"]; got.Kind != "struct" || !got.Exported {
+		t.Fatalf("Store should be an exported struct, got %+v", got)
+	}
+	if got := byName["Store"]; got.Doc != "Store holds the connection." {
+		t.Fatalf("expected the doc comment on Store, got %q", got.Doc)
+	}
+	if got := byName["Open"]; got.Kind != "func" || got.Signature != "func Open(name string) (*Store, error)" {
+		t.Fatalf("unexpected Open symbol: %+v", got)
+	}
+	if got := byName["Name"]; got.Kind != "method" || got.Receiver != "*Store" {
+		t.Fatalf("Name should be a method on *Store, got %+v", got)
+	}
+	if got := byName["DefaultName"]; got.Kind != "const" {
+		t.Fatalf("DefaultName should be a const, got %+v", got)
+	}
+	if got := byName["unexportedHelper"]; got.Exported {
+		t.Fatal("unexportedHelper should not be marked exported")
+	}
+
+	imports, err := store.ImportsFrom(repoID, "main.go")
+	if err != nil {
+		t.Fatalf("imports: %v", err)
+	}
+	if len(imports) != 1 {
+		t.Fatalf("expected one import, got %+v", imports)
+	}
+	// A Go import addresses a package, so the edge points at the directory.
+	if imports[0].ToPath != "internal/store" || imports[0].External {
+		t.Fatalf("expected a resolved in-repo package edge, got %+v", imports[0])
+	}
+
+	callers, err := store.PathsReferencing(repoID, "Open")
+	if err != nil {
+		t.Fatalf("callers: %v", err)
+	}
+	if len(callers) != 1 || callers[0] != "main.go" {
+		t.Fatalf("expected main.go to reference Open, got %v", callers)
+	}
+}
+
+func TestRunOnlyReparsesChangedFiles(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"go.mod":  "module example.com/app\n\ngo 1.26.0\n",
+		"a.go":    "package main\n\nfunc A() {}\n",
+		"b.go":    "package main\n\nfunc B() {}\n",
+		"main.go": "package main\n\nfunc main() { A(); B() }\n",
+	})
+
+	store, repoID := openIndexed(t, repo)
+	if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+
+	second, err := Run(store, repoID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if second.Reparsed != 0 || second.Unchanged != 3 {
+		t.Fatalf("an unchanged repo should reparse nothing, got %+v", second)
+	}
+
+	write(t, filepath.Join(repo, "a.go"), "package main\n\nfunc A() {}\n\nfunc ANew() {}\n")
+	third, err := Run(store, repoID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("third run: %v", err)
+	}
+	if third.Reparsed != 1 || third.Unchanged != 2 {
+		t.Fatalf("only the edited file should reparse, got %+v", third)
+	}
+
+	symbols, err := store.SymbolsInFile(repoID, "a.go")
+	if err != nil {
+		t.Fatalf("symbols: %v", err)
+	}
+	if len(symbols) != 2 {
+		t.Fatalf("expected the new symbol to land, got %+v", symbols)
+	}
+}
+
+func TestRunDropsDeletedFiles(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"go.mod":  "module example.com/app\n\ngo 1.26.0\n",
+		"gone.go": "package main\n\nfunc Gone() {}\n",
+		"main.go": "package main\n\nfunc main() { Gone() }\n",
+	})
+
+	store, repoID := openIndexed(t, repo)
+	if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+
+	if err := os.Remove(filepath.Join(repo, "gone.go")); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	git(t, repo, "add", "-A")
+
+	result, err := Run(store, repoID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if result.Removed != 1 {
+		t.Fatalf("expected the deleted file to be dropped, got %+v", result)
+	}
+
+	symbols, err := store.SymbolsInFile(repoID, "gone.go")
+	if err != nil {
+		t.Fatalf("symbols: %v", err)
+	}
+	if len(symbols) != 0 {
+		t.Fatalf("stale symbols survived deletion: %+v", symbols)
+	}
+}
+
+func TestRunSkipsGeneratedFiles(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"go.mod":         "module example.com/app\n\ngo 1.26.0\n",
+		"generated.go":   "// Code generated by protoc. DO NOT EDIT.\n\npackage main\n\nfunc Generated() {}\n",
+		"handwritten.go": "package main\n\nfunc Handwritten() {}\n",
+	})
+
+	store, repoID := openIndexed(t, repo)
+	result, err := Run(store, repoID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if result.Reparsed != 1 || result.Skipped != 1 {
+		t.Fatalf("expected the generated file to be skipped, got %+v", result)
+	}
+
+	matches, err := store.SymbolsNamed(repoID, "Generated")
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("generated symbols should stay out of the index, got %+v", matches)
+	}
+}
+
+func TestRunIndexesTypeScriptPythonAndSwift(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"web/session.ts": "export interface Session { id: string }\n\nexport function openSession(): Session {\n  return { id: '1' }\n}\n",
+		"web/app.ts":     "import { openSession } from './session'\n\nexport const app = () => openSession()\n",
+		"api/helper.py":  "class Helper:\n    def run(self):\n        return 1\n\ndef helper():\n    return Helper()\n",
+		"api/app.py":     "from .helper import helper\n\ndef app():\n    return helper()\n",
+		"ios/View.swift": "import SwiftUI\n\nstruct ContentView: View {\n    var body: some View { Text(\"hi\") }\n}\n\nfinal class Model {\n    func load() {}\n}\n",
+	})
+
+	store, repoID := openIndexed(t, repo)
+	if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	assertSymbol(t, store, repoID, "web/session.ts", "openSession", "func")
+	assertSymbol(t, store, repoID, "web/session.ts", "Session", "interface")
+	assertSymbol(t, store, repoID, "api/helper.py", "Helper", "class")
+	assertSymbol(t, store, repoID, "api/helper.py", "run", "method")
+	assertSymbol(t, store, repoID, "ios/View.swift", "ContentView", "struct")
+	assertSymbol(t, store, repoID, "ios/View.swift", "Model", "class")
+	assertSymbol(t, store, repoID, "ios/View.swift", "load", "func")
+
+	tsImports, err := store.ImportsFrom(repoID, "web/app.ts")
+	if err != nil {
+		t.Fatalf("ts imports: %v", err)
+	}
+	if len(tsImports) != 1 || tsImports[0].ToPath != "web/session.ts" {
+		t.Fatalf("expected a resolved relative TS import, got %+v", tsImports)
+	}
+
+	pyImports, err := store.ImportsFrom(repoID, "api/app.py")
+	if err != nil {
+		t.Fatalf("py imports: %v", err)
+	}
+	if len(pyImports) != 1 || pyImports[0].ToPath != "api/helper.py" {
+		t.Fatalf("expected a resolved relative Python import, got %+v", pyImports)
+	}
+}
+
+func TestSearchSymbolsRanksNameMatchesFirst(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"go.mod": "module example.com/app\n\ngo 1.26.0\n",
+		"a.go": `package main
+
+// ReconcileLedger settles the outstanding entries.
+func ReconcileLedger() {}
+
+// Unrelated mentions reconcile only in prose.
+func Unrelated() {}
+`,
+	})
+
+	store, repoID := openIndexed(t, repo)
+	if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	matches, err := store.SearchSymbols(repoID, "reconcile", 5)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(matches) == 0 || matches[0].Name != "ReconcileLedger" {
+		t.Fatalf("expected the name match ranked first, got %+v", matches)
+	}
+}
+
+func assertSymbol(t *testing.T, store *db.Store, repoID int64, path, name, kind string) {
+	t.Helper()
+	symbols, err := store.SymbolsInFile(repoID, path)
+	if err != nil {
+		t.Fatalf("symbols for %s: %v", path, err)
+	}
+	for _, symbol := range symbols {
+		if symbol.Name == name && symbol.Kind == kind {
+			return
+		}
+	}
+	t.Fatalf("expected %s %s in %s, got %+v", kind, name, path, symbols)
+}
+
+func openIndexed(t *testing.T, repo string) (*db.Store, int64) {
+	t.Helper()
+	store, err := db.OpenPath(repo, filepath.Join(t.TempDir(), "index.sqlite"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	record, err := store.UpsertRepo("main", "", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("upsert repo: %v", err)
+	}
+	return store, record.ID
+}
+
+func newRepo(t *testing.T, files map[string]string) string {
+	t.Helper()
+	repo := t.TempDir()
+	git(t, repo, "init", "-b", "main")
+	git(t, repo, "config", "user.name", "Test User")
+	git(t, repo, "config", "user.email", "test@example.com")
+	for path, content := range files {
+		write(t, filepath.Join(repo, path), content)
+	}
+	git(t, repo, "add", "-A")
+	git(t, repo, "commit", "-m", "init")
+	return repo
+}
+
+func write(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func git(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, output)
+	}
+}
