@@ -154,4 +154,45 @@ CREATE TABLE IF NOT EXISTS code_refs (
 );
 CREATE INDEX IF NOT EXISTS idx_code_refs_name ON code_refs(repo_id, name);
 CREATE INDEX IF NOT EXISTS idx_code_refs_name_lower ON code_refs(repo_id, name_lower);
+
+-- Knowledge base. A doc is a synthesized description of one module, or a
+-- deterministic one (the incident list) derived from history. cited_paths and
+-- cited_symbols are not decoration: a doc is only marked verified when every
+-- citation in it resolves against code_files and code_symbols, and claims
+-- whose citations do not resolve are dropped into dropped_claims_json rather
+-- than published.
+CREATE TABLE IF NOT EXISTS knowledge_docs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  repo_id INTEGER NOT NULL,
+  slug TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  title TEXT NOT NULL,
+  summary TEXT NOT NULL DEFAULT '',
+  body_md TEXT NOT NULL DEFAULT '',
+  cited_paths_json TEXT NOT NULL DEFAULT '[]',
+  cited_symbols_json TEXT NOT NULL DEFAULT '[]',
+  dropped_claims_json TEXT NOT NULL DEFAULT '[]',
+  source_commit TEXT NOT NULL DEFAULT '',
+  fingerprint TEXT NOT NULL DEFAULT '',
+  generator TEXT NOT NULL DEFAULT '',
+  verified INTEGER NOT NULL DEFAULT 0,
+  generated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_docs_slug ON knowledge_docs(repo_id, slug);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
+  title,
+  summary,
+  body_md,
+  content='knowledge_docs',
+  content_rowid='id'
+);
+CREATE TRIGGER IF NOT EXISTS knowledge_docs_fts_insert AFTER INSERT ON knowledge_docs BEGIN
+  INSERT INTO knowledge_fts(rowid, title, summary, body_md)
+  VALUES (new.id, new.title, new.summary, new.body_md);
+END;
+CREATE TRIGGER IF NOT EXISTS knowledge_docs_fts_delete AFTER DELETE ON knowledge_docs BEGIN
+  INSERT INTO knowledge_fts(knowledge_fts, rowid, title, summary, body_md)
+  VALUES ('delete', old.id, old.title, old.summary, old.body_md);
+END;
 `

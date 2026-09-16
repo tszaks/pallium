@@ -62,6 +62,8 @@ func (a *App) Run(args []string) error {
 		return runCallers(a.stdout, filtered[1:], jsonOutput)
 	case "search":
 		return runSearch(a.stdout, filtered[1:], jsonOutput)
+	case "knowledge":
+		return runKnowledge(a.stdout, filtered[1:], jsonOutput)
 	case "decisions":
 		return runDecisions(a.stdout, filtered[1:], jsonOutput)
 	case "safe":
@@ -105,6 +107,7 @@ Usage:
   pallium symbols <path> [repo-path] [--json]
   pallium callers <symbol> [repo-path] [--json]
   pallium search <query> [repo-path] [--json]
+  pallium knowledge <map|build|list|get|search> [--force] [--no-model] [--only slug] [--json]
   pallium doctor [repo-path] [--json]
   pallium version [--version | -V] [--json]
   pallium explain <path> [repo-path] [--json]

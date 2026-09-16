@@ -1,0 +1,346 @@
+package knowledge
+
+import (
+	"context"
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/tszaks/pallium/internal/codeindex"
+	"github.com/tszaks/pallium/internal/db"
+	"github.com/tszaks/pallium/internal/index"
+)
+
+type stubSynth struct {
+	response string
+	err      error
+	prompts  []string
+}
+
+func (s *stubSynth) Synthesize(_ context.Context, prompt string) (string, error) {
+	s.prompts = append(s.prompts, prompt)
+	if s.err != nil {
+		return "", s.err
+	}
+	return s.response, nil
+}
+
+// TestBuildDropsUnresolvableClaims is the reason this package exists. A model
+// that invents a symbol must not be able to put it in the knowledge base, and
+// the doc must say so rather than quietly shipping a shorter version.
+func TestBuildDropsUnresolvableClaims(t *testing.T) {
+	store, repoID, repoRoot := indexedRepo(t)
+
+	synth := &stubSynth{response: `{
+  "summary": "Storage layer.",
+  "purpose": "Opens and queries the database.",
+  "entry_points": [{"claim": "Open is the way in", "cited_paths": ["storage/store.go"], "cited_symbols": ["Open"]}],
+  "invariants": [
+    {"claim": "Real claim about a real symbol", "cited_symbols": ["Store"], "cited_paths": []},
+    {"claim": "Invented claim", "cited_symbols": ["QuantumReconciler"], "cited_paths": []},
+    {"claim": "Points at a file that does not exist", "cited_paths": ["storage/ghost.go"], "cited_symbols": []},
+    {"claim": "Cites nothing at all", "cited_paths": [], "cited_symbols": []}
+  ]
+}`}
+
+	report, err := Build(store, repoID, repoRoot, BuildOptions{Synth: synth, Only: []string{"storage"}})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if report.Dropped != 3 {
+		t.Fatalf("expected 3 dropped claims, got %d", report.Dropped)
+	}
+
+	doc, found, err := store.KnowledgeDoc(repoID, "storage")
+	if err != nil || !found {
+		t.Fatalf("doc not stored: %v found=%t", err, found)
+	}
+	if doc.Verified {
+		t.Fatal("a doc with dropped claims must not be marked verified")
+	}
+	if !strings.Contains(doc.Body, "Real claim about a real symbol") {
+		t.Fatalf("the surviving claim should be in the body:\n%s", doc.Body)
+	}
+	for _, forbidden := range []string{"QuantumReconciler", "storage/ghost.go", "Cites nothing at all"} {
+		if strings.Contains(doc.Body, forbidden) {
+			t.Fatalf("unverified claim %q leaked into the body:\n%s", forbidden, doc.Body)
+		}
+	}
+	if len(doc.DroppedClaims) != 3 {
+		t.Fatalf("dropped claims should be recorded on the doc, got %v", doc.DroppedClaims)
+	}
+}
+
+func TestBuildWithoutModelStillProducesDocs(t *testing.T) {
+	store, repoID, repoRoot := indexedRepo(t)
+
+	report, err := Build(store, repoID, repoRoot, BuildOptions{})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if report.Written == 0 {
+		t.Fatal("a structural build should still write docs")
+	}
+	if report.Generator != "structural" {
+		t.Fatalf("expected a structural generator, got %q", report.Generator)
+	}
+	if report.Unverified != 0 {
+		t.Fatalf("structural docs have nothing to disprove, got %d unverified", report.Unverified)
+	}
+
+	for _, slug := range []string{"overview", "incidents", "storage"} {
+		if _, found, err := store.KnowledgeDoc(repoID, slug); err != nil || !found {
+			t.Fatalf("expected a %s doc: %v found=%t", slug, err, found)
+		}
+	}
+}
+
+// TestBuildSkipsUnchangedModules covers the fingerprint: rebuilding an
+// untouched repo must not pay for a second round of model calls.
+func TestBuildSkipsUnchangedModules(t *testing.T) {
+	store, repoID, repoRoot := indexedRepo(t)
+
+	if _, err := Build(store, repoID, repoRoot, BuildOptions{}); err != nil {
+		t.Fatalf("first build: %v", err)
+	}
+
+	synth := &stubSynth{response: `{"summary":"x","purpose":"y"}`}
+	second, err := Build(store, repoID, repoRoot, BuildOptions{Synth: synth})
+	if err != nil {
+		t.Fatalf("second build: %v", err)
+	}
+	if len(synth.prompts) != 0 {
+		t.Fatalf("unchanged modules should not be synthesized again, got %d prompts", len(synth.prompts))
+	}
+	if second.Unchanged == 0 {
+		t.Fatalf("expected unchanged modules, got %+v", second)
+	}
+}
+
+func TestBuildRecordsSynthesizerFailureWithoutLosingTheDoc(t *testing.T) {
+	store, repoID, repoRoot := indexedRepo(t)
+
+	synth := &stubSynth{err: errors.New("provider exploded")}
+	report, err := Build(store, repoID, repoRoot, BuildOptions{Synth: synth, Only: []string{"storage"}})
+	if err != nil {
+		t.Fatalf("a failing model should not fail the build: %v", err)
+	}
+	if len(report.Failures) != 1 || !strings.Contains(report.Failures[0].Reason, "provider exploded") {
+		t.Fatalf("expected the failure recorded, got %+v", report.Failures)
+	}
+
+	doc, found, err := store.KnowledgeDoc(repoID, "storage")
+	if err != nil || !found {
+		t.Fatalf("the structural doc should still exist: %v found=%t", err, found)
+	}
+	if !strings.Contains(doc.Body, "storage/store.go") {
+		t.Fatalf("structural content missing from the fallback doc:\n%s", doc.Body)
+	}
+}
+
+func TestModulesDeriveDependenciesFromImports(t *testing.T) {
+	store, repoID, _ := indexedRepo(t)
+
+	modules, err := Modules(store, repoID, ModuleOptions{})
+	if err != nil {
+		t.Fatalf("modules: %v", err)
+	}
+
+	bySlug := map[string]Module{}
+	for _, module := range modules {
+		bySlug[module.Slug] = module
+	}
+
+	api, ok := bySlug["api"]
+	if !ok {
+		t.Fatalf("expected an api module, got %v", slugs(modules))
+	}
+	if !contains(api.DependsOn, "storage") {
+		t.Fatalf("api imports storage, expected the edge: %+v", api.DependsOn)
+	}
+
+	storage, ok := bySlug["storage"]
+	if !ok {
+		t.Fatal("expected a storage module")
+	}
+	if !contains(storage.DependedOnBy, "api") {
+		t.Fatalf("expected the reverse edge on storage: %+v", storage.DependedOnBy)
+	}
+	// Ranking is exported-first, then by how many files reference the name.
+	// Here every exported symbol is referenced once, so the tie breaks
+	// alphabetically; what matters is that the module's surface is what shows
+	// up, not the unexported field or a test helper.
+	names := map[string]bool{}
+	for _, symbol := range storage.KeySymbols {
+		if !symbol.Exported {
+			t.Fatalf("unexported symbol ranked into the surface: %+v", symbol)
+		}
+		names[symbol.Name] = true
+	}
+	for _, want := range []string{"Open", "Store", "Query"} {
+		if !names[want] {
+			t.Fatalf("expected %s in the module surface, got %+v", want, storage.KeySymbols)
+		}
+	}
+}
+
+func TestMaterializeWritesAndClearsStalePages(t *testing.T) {
+	store, repoID, repoRoot := indexedRepo(t)
+	dir := filepath.Join(repoRoot, ".pallium", "knowledge")
+
+	if _, err := Build(store, repoID, repoRoot, BuildOptions{Materialize: true}); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "storage.md")); err != nil {
+		t.Fatalf("expected a materialized page: %v", err)
+	}
+
+	stale := filepath.Join(dir, "module-that-merged-away.md")
+	if err := os.WriteFile(stale, []byte("# old\n"), 0o644); err != nil {
+		t.Fatalf("write stale page: %v", err)
+	}
+	if err := Materialize(store, repoID, dir); err != nil {
+		t.Fatalf("materialize: %v", err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatal("a page with no doc behind it should be removed, not left looking current")
+	}
+}
+
+func TestIncidentDocOnlyNamesRealCommits(t *testing.T) {
+	store, repoID, repoRoot := indexedRepo(t)
+
+	if _, err := Build(store, repoID, repoRoot, BuildOptions{}); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	doc, found, err := store.KnowledgeDoc(repoID, "incidents")
+	if err != nil || !found {
+		t.Fatalf("incidents doc missing: %v found=%t", err, found)
+	}
+	if !strings.Contains(doc.Body, "Revert the broken cache write") {
+		t.Fatalf("expected the revert commit in the incident list:\n%s", doc.Body)
+	}
+	if strings.Contains(doc.Body, "add api handler") {
+		t.Fatalf("an ordinary commit should not be an incident:\n%s", doc.Body)
+	}
+}
+
+func TestSearchKnowledgeRanksBySummaryAndBody(t *testing.T) {
+	store, repoID, repoRoot := indexedRepo(t)
+	if _, err := Build(store, repoID, repoRoot, BuildOptions{}); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	docs, err := store.SearchKnowledge(repoID, "storage", 5)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(docs) == 0 {
+		t.Fatal("expected a match for storage")
+	}
+}
+
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func slugs(modules []Module) []string {
+	out := make([]string, 0, len(modules))
+	for _, module := range modules {
+		out = append(out, module.Slug)
+	}
+	return out
+}
+
+func indexedRepo(t *testing.T) (*db.Store, int64, string) {
+	t.Helper()
+	repo := t.TempDir()
+	git(t, repo, "init", "-b", "main")
+	git(t, repo, "config", "user.name", "Test User")
+	git(t, repo, "config", "user.email", "test@example.com")
+
+	files := map[string]string{
+		"go.mod": "module example.com/app\n\ngo 1.26.0\n",
+		"storage/store.go": `package storage
+
+// Store owns the connection.
+type Store struct{ name string }
+
+// Open returns a Store.
+func Open(name string) *Store { return &Store{name: name} }
+
+func (s *Store) Name() string { return s.name }
+`,
+		"storage/query.go": "package storage\n\nfunc Query(s *Store) string { return s.Name() }\n",
+		"storage/cache.go": "package storage\n\nfunc Cache() string { return \"c\" }\n",
+		"api/handler.go": `package api
+
+import "example.com/app/storage"
+
+func Handle() string {
+	s := storage.Open("x")
+	return storage.Query(s)
+}
+`,
+		"api/router.go": "package api\n\nfunc Route() string { return Handle() }\n",
+		"api/mw.go":     "package api\n\nfunc Middleware() string { return Route() }\n",
+	}
+	for path, content := range files {
+		write(t, filepath.Join(repo, path), content)
+	}
+	git(t, repo, "add", "-A")
+	git(t, repo, "commit", "-m", "feat: add api handler")
+
+	write(t, filepath.Join(repo, "storage", "cache.go"), "package storage\n\nfunc Cache() string { return \"cached\" }\n")
+	git(t, repo, "add", "-A")
+	git(t, repo, "commit", "-m", "Revert the broken cache write")
+
+	store, err := db.OpenPath(repo, filepath.Join(t.TempDir(), "index.sqlite"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	if _, err := index.New(store).Run(); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	record, err := store.Repo()
+	if err != nil {
+		t.Fatalf("repo: %v", err)
+	}
+	if !store.HasCodeIndex(record.ID) {
+		t.Fatal("expected a content index")
+	}
+	_ = codeindex.Lang("x.go")
+	_ = time.Now()
+	return store, record.ID, repo
+}
+
+func write(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func git(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, output)
+	}
+}
