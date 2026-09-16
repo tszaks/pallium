@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -176,4 +177,48 @@ func ReadHistory(repoRoot string) ([]Commit, error) {
 	}
 
 	return commits, nil
+}
+
+// TrackedFiles lists every repo-relative path git considers part of the
+// working tree: files in the index plus untracked files that .gitignore does
+// not exclude. Callers use it instead of walking the filesystem so that
+// dependency directories (node_modules, vendor, build output) never reach a
+// scanner. Paths are NUL-separated and core.quotepath is disabled so unicode
+// and spaces survive verbatim.
+func TrackedFiles(repoRoot string) ([]string, error) {
+	cmd := exec.Command(
+		"git",
+		"-C",
+		repoRoot,
+		"-c",
+		"core.quotepath=false",
+		"ls-files",
+		"-z",
+		"--cached",
+		"--others",
+		"--exclude-standard",
+	)
+
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, wrapGitError("failed to list git tracked files", err)
+	}
+
+	parts := bytes.Split(output, []byte{0})
+	files := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		path := strings.TrimSpace(string(part))
+		if path == "" {
+			continue
+		}
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		files = append(files, filepath.ToSlash(path))
+	}
+
+	sort.Strings(files)
+	return files, nil
 }

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/tszaks/pallium/internal/db"
+	"github.com/tszaks/pallium/internal/gitlog"
 )
 
 type StructuralLink struct {
@@ -190,7 +191,35 @@ func BlastRadius(store *db.Store, targetPath string, limit int) ([]string, error
 	return uniqueStrings(out, limit), nil
 }
 
+// maxScannedFileBytes caps how much of any single file a content scanner will
+// read. Minified bundles, lockfiles and generated clients are megabytes of one
+// line: regexing them costs real time and yields nothing a human would call an
+// import. Files larger than this are listed but their contents are skipped.
+const maxScannedFileBytes = 512 * 1024
+
+// repoFiles lists the repo-relative paths worth scanning for content.
+//
+// This asks git rather than walking the filesystem. The walk it replaced
+// descended into every directory except .git, .pallium and .codex-memory,
+// which meant a repo with a node_modules or a vendor directory had its entire
+// dependency tree read from disk on every explain, risk and review call. A
+// measured case: a three-file repo answered explain in 1.9s, and 12.2s once
+// 20,000 gitignored files existed beside it, for the same single result.
+// git ls-files with --exclude-standard inherits .gitignore for free, and
+// --others keeps files the agent just created but has not staged yet, which a
+// tracked-only listing would miss.
+//
+// Falling back to the walk matters for tests and for directories that are not
+// git repos; the fallback keeps the old skip list.
 func repoFiles(repoRoot string) ([]string, error) {
+	files, err := gitlog.TrackedFiles(repoRoot)
+	if err == nil {
+		return files, nil
+	}
+	return walkRepoFiles(repoRoot)
+}
+
+func walkRepoFiles(repoRoot string) ([]string, error) {
 	out := make([]string, 0)
 	err := filepath.WalkDir(repoRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -420,7 +449,17 @@ func hasGoTests(paths []string) bool {
 	return false
 }
 
+// osReadFile reads a file for content scanning, refusing anything past
+// maxScannedFileBytes. Scanners treat an empty result as "nothing to see",
+// which is the right answer for a 4MB minified bundle.
 func osReadFile(path string) ([]byte, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() > maxScannedFileBytes {
+		return nil, nil
+	}
 	return os.ReadFile(path)
 }
 
