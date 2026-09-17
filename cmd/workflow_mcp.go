@@ -115,16 +115,23 @@ func (s *mcpServer) handleResult(req mcpRequest) (any, error) {
 }
 
 func workflowMCPTools() []mcpTool {
-	return []mcpTool{
+	tools := []mcpTool{
 		{Name: "pallium_workflow_run", Description: "Run a structured multi-step workflow with verification, parallel workers, and resumable state. Prefer this over ad-hoc agent loops for any non-trivial task.", InputSchema: objectSchema(map[string]any{"task": stringSchema(), "id": stringSchema(), "cwd": stringSchema(), "script_path": stringSchema(), "workflow_name": stringSchema(), "args_json": stringSchema(), "allow_network": boolSchema()})},
 		{Name: "pallium_workflow_status", Description: "Check the progress, step results, and failures of a workflow run. Use after starting a run, or when picking up an earlier run id.", InputSchema: objectSchema(map[string]any{"id": stringSchema()})},
 		{Name: "pallium_workflow_fleet", Description: "List recent workflow runs and their states. Use to find an existing run id or check what is already running before starting new work.", InputSchema: objectSchema(map[string]any{"limit": numberSchema()})},
 		{Name: "pallium_workflow_analytics", Description: "Summarize aggregate workflow outcomes, durations, and costs. Use when reviewing how past runs performed or reporting on workflow activity.", InputSchema: objectSchema(map[string]any{"limit": numberSchema()})},
 		{Name: "pallium_workflow_library", Description: "Browse or install prebuilt workflow packs. Use before writing a workflow script from scratch to check whether a ready-made recipe already covers the task.", InputSchema: objectSchema(map[string]any{"action": stringSchema(), "pack": stringSchema(), "cwd": stringSchema(), "name": stringSchema(), "force": boolSchema()})},
 	}
+	return append(tools, knowledgeMCPTools()...)
 }
 
 func (s *mcpServer) callTool(name string, args map[string]any) (string, error) {
+	// Knowledge tools answer from the repo index and need no workflow
+	// database, so they are dispatched before the workflow cases.
+	if text, handled, err := callKnowledgeTool(name, args); handled {
+		return text, err
+	}
+
 	switch name {
 	case "pallium_workflow_run":
 		task := stringArg(args, "task")

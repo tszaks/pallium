@@ -219,6 +219,34 @@ WHERE last_touched_at = ''
 		return err
 	}
 
+	if err := s.migrateKnowledgeDocClaims(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// migrateKnowledgeDocClaims adds claims_json to knowledge_docs. The rendered
+// body was the only record of what a doc claimed, which meant the audit pass
+// had no structured claims to re-check; storing them is what makes a doc
+// auditable after the fact. Docs written before this column keep an empty
+// object and simply have nothing to audit until they are rebuilt.
+func (s *Store) migrateKnowledgeDocClaims() error {
+	columns, err := s.tableColumns("knowledge_docs")
+	if err != nil {
+		return fmt.Errorf("read knowledge_docs columns: %w", err)
+	}
+	// A database predating the knowledge base has no such table; the schema
+	// statement above creates it with the column already present.
+	if len(columns) == 0 {
+		return nil
+	}
+	if _, ok := columns["claims_json"]; ok {
+		return nil
+	}
+	if _, err := s.q.Exec(`ALTER TABLE knowledge_docs ADD COLUMN claims_json TEXT NOT NULL DEFAULT '{}'`); err != nil {
+		return fmt.Errorf("add knowledge_docs.claims_json column: %w", err)
+	}
 	return nil
 }
 
@@ -230,8 +258,8 @@ WHERE last_touched_at = ''
 // `workflow preflight` would then present that stranger's task_scope as if
 // it were the calling session's own. SQLite can't ALTER a PRIMARY KEY in
 // place, so this recreates the table inside a transaction. Existing rows
-// migrate with branch='' (their true branch at task-start time is unknown
-// now) — safe, not a data loss: '' never matches any REAL current branch
+// migrate with branch=” (their true branch at task-start time is unknown
+// now) — safe, not a data loss: ” never matches any REAL current branch
 // going forward (see currentBranchForActiveTask, which returns "" only on a
 // git error, an edge case not worth chasing further), so a pre-migration
 // row simply stops being returned rather than continuing to leak.

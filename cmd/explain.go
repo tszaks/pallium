@@ -33,6 +33,15 @@ func runExplain(out io.Writer, args []string, jsonOutput bool) error {
 			fmt.Sprintf("Confidence: %s (%d)", report.Confidence.Level, report.Confidence.Score),
 			fmt.Sprintf("Summary: %s", report.Summary),
 		}
+		if len(report.Declares) > 0 {
+			lines = append(lines, "", "Declares:")
+			for _, symbol := range report.Declares {
+				lines = append(lines, fmt.Sprintf("- %s (%s) line %d", symbolLabel(symbol.Name, symbol.Receiver), symbol.Kind, symbol.StartLine))
+			}
+		}
+		if report.Module != nil {
+			lines = append(lines, "", fmt.Sprintf("Module: %s — see `pallium knowledge get %s`", report.Module.Title, report.Module.Slug))
+		}
 		if freshnessLines := renderFreshness(report.Freshness); len(freshnessLines) > 0 {
 			lines = append(lines, "")
 			lines = append(lines, freshnessLines...)

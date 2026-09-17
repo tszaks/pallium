@@ -2,9 +2,11 @@ package analysis
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/tszaks/pallium/internal/db"
 	"github.com/tszaks/pallium/internal/gitlog"
+	"github.com/tszaks/pallium/internal/knowledge"
 	"github.com/tszaks/pallium/internal/sessionmemory"
 )
 
@@ -14,9 +16,19 @@ type CommitSummary struct {
 	CommittedAt string `json:"committed_at"`
 }
 
+// ModuleRef points an explanation at the knowledge doc covering the file.
+type ModuleRef struct {
+	Slug     string `json:"slug"`
+	Title    string `json:"title"`
+	Summary  string `json:"summary"`
+	Verified bool   `json:"verified"`
+}
+
 type ExplainReport struct {
 	Path            string                       `json:"path"`
 	Summary         string                       `json:"summary"`
+	Declares        []db.CodeSymbol              `json:"declares"`
+	Module          *ModuleRef                   `json:"module,omitempty"`
 	Freshness       Freshness                    `json:"freshness"`
 	Evidence        Evidence                     `json:"evidence"`
 	EditChecklist   []string                     `json:"edit_checklist"`
@@ -106,9 +118,13 @@ LIMIT 5
 		Limit:        3,
 	})
 
+	declares, module := fileIdentity(store, repo.ID, risk.Path)
+
 	return ExplainReport{
 		Path:            risk.Path,
-		Summary:         explainSummary(risk, commits, decisions),
+		Summary:         explainSummary(risk, commits, decisions, risk.Path, declares, module),
+		Declares:        declares,
+		Module:          module,
 		Freshness:       freshness,
 		Evidence:        evidence,
 		EditChecklist:   editChecklist(risk, commits),
@@ -127,18 +143,86 @@ LIMIT 5
 	}, nil
 }
 
-func explainSummary(risk RiskReport, commits []CommitSummary, decisions []Decision) string {
+// fileIdentity gathers what the file declares and which module it belongs to.
+// Both are optional: a repo with no content index, or one where the knowledge
+// base has not been built, still gets the risk half of an explanation.
+func fileIdentity(store *db.Store, repoID int64, path string) ([]db.CodeSymbol, *ModuleRef) {
+	if !store.HasCodeIndex(repoID) {
+		return []db.CodeSymbol{}, nil
+	}
+
+	symbols, err := store.SymbolsInFile(repoID, path)
+	if err != nil {
+		symbols = []db.CodeSymbol{}
+	}
+	exported := make([]db.CodeSymbol, 0, len(symbols))
+	for _, symbol := range symbols {
+		if symbol.Exported {
+			exported = append(exported, symbol)
+		}
+	}
+	if len(exported) == 0 {
+		exported = symbols
+	}
+	if len(exported) > 8 {
+		exported = exported[:8]
+	}
+
+	doc, found, err := knowledge.DocForPath(store, repoID, path)
+	if err != nil || !found {
+		return exported, nil
+	}
+	return exported, &ModuleRef{
+		Slug:     doc.Slug,
+		Title:    doc.Title,
+		Summary:  doc.Summary,
+		Verified: doc.Verified,
+	}
+}
+
+// explainSummary now leads with what the file is before saying how dangerous
+// it is. It used to return one of three fixed strings chosen by risk level,
+// which meant explain could tell you a file was risky but never what it did.
+func explainSummary(risk RiskReport, commits []CommitSummary, decisions []Decision, path string, declares []db.CodeSymbol, module *ModuleRef) string {
+	parts := make([]string, 0, 3)
+
+	if len(declares) > 0 {
+		names := make([]string, 0, 3)
+		for _, symbol := range declares {
+			if len(names) == 3 {
+				break
+			}
+			names = append(names, symbol.Name)
+		}
+		lead := fmt.Sprintf("Declares %s", strings.Join(names, ", "))
+		if extra := len(declares) - len(names); extra > 0 {
+			lead += fmt.Sprintf(" and %d more", extra)
+		}
+		parts = append(parts, lead+".")
+	}
+
+	if module != nil && strings.TrimSpace(module.Summary) != "" {
+		note := fmt.Sprintf("Part of %s: %s", module.Title, strings.TrimSpace(module.Summary))
+		if !module.Verified {
+			note += " (module doc not fully verified)"
+		}
+		parts = append(parts, note)
+	}
+
 	switch risk.Level {
 	case "high":
-		return "High-risk file. Check recent commits and related files before making changes."
+		parts = append(parts, "High-risk file. Check recent commits and related files before making changes.")
 	case "medium":
-		return "Medium-risk file. A quick scan of recent history and neighbors will lower surprise regressions."
+		parts = append(parts, "Medium-risk file. A quick scan of recent history and neighbors will lower surprise regressions.")
 	default:
 		if len(decisions) > 0 {
-			return "Lower-risk file, but there is some history worth reading before you edit."
+			parts = append(parts, "Lower-risk file, but there is some history worth reading before you edit.")
+		} else {
+			parts = append(parts, "Lower-risk file with limited recent churn.")
 		}
-		return "Lower-risk file with limited recent churn."
 	}
+
+	return strings.Join(parts, " ")
 }
 
 func editChecklist(risk RiskReport, commits []CommitSummary) []string {

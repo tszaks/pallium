@@ -192,3 +192,46 @@ func run(t *testing.T, dir string, name string, args ...string) {
 		t.Fatalf("%s %v failed: %v\n%s", name, args, err, string(output))
 	}
 }
+
+func TestTrackedFilesExcludesIgnoredAndKeepsNewUntracked(t *testing.T) {
+	repo := initTempRepo(t)
+
+	writeFile(t, filepath.Join(repo, ".gitignore"), "node_modules/\n")
+	run(t, repo, "git", "add", ".gitignore")
+	run(t, repo, "git", "commit", "-m", "chore: ignore deps")
+
+	if err := os.MkdirAll(filepath.Join(repo, "node_modules", "left-pad"), 0o755); err != nil {
+		t.Fatalf("mkdir node_modules: %v", err)
+	}
+	writeFile(t, filepath.Join(repo, "node_modules", "left-pad", "index.js"), "module.exports = 1\n")
+
+	// Untracked but not ignored: an agent that just created a file should
+	// still see it, so --others is part of the listing.
+	writeFile(t, filepath.Join(repo, "brand-new.ts"), "export const x = 1\n")
+
+	files, err := TrackedFiles(repo)
+	if err != nil {
+		t.Fatalf("TrackedFiles: %v", err)
+	}
+
+	want := map[string]bool{".gitignore": false, "README.md": false, "main.go": false, "brand-new.ts": false}
+	for _, path := range files {
+		if strings.HasPrefix(path, "node_modules/") {
+			t.Fatalf("ignored path leaked into listing: %s", path)
+		}
+		if _, ok := want[path]; ok {
+			want[path] = true
+		}
+	}
+	for path, seen := range want {
+		if !seen {
+			t.Fatalf("expected %s in listing, got %v", path, files)
+		}
+	}
+}
+
+func TestTrackedFilesErrorsOutsideGitRepo(t *testing.T) {
+	if _, err := TrackedFiles(t.TempDir()); err == nil {
+		t.Fatal("expected error outside a git repo")
+	}
+}
