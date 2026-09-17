@@ -176,7 +176,8 @@ func isLocalGoImport(spec, module string, requires []string) bool {
 		return false
 	}
 	for _, required := range requires {
-		if spec == required || strings.HasPrefix(spec, required+"/") {
+		if required != module && strings.HasPrefix(required, module+"/") &&
+			(spec == required || strings.HasPrefix(spec, required+"/")) {
 			return false
 		}
 	}

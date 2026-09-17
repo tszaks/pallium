@@ -168,8 +168,11 @@ func Build(store *db.Store, repoID int64, repoRoot string, opts BuildOptions) (B
 		reusableClaims := true
 		if opts.Synth != nil {
 			var stored synthesis
-			if err := json.Unmarshal([]byte(existing.Claims), &stored); err == nil {
-				reusableClaims = !hasUncitedClaims(flattenClaims(stored))
+			if err := json.Unmarshal([]byte(existing.Claims), &stored); err != nil {
+				reusableClaims = false
+			} else {
+				flat := flattenClaims(stored)
+				reusableClaims = len(flat) > 0 && !hasUncitedClaims(flat)
 			}
 		}
 		if found && !opts.Force && existing.Fingerprint == module.Fingerprint &&

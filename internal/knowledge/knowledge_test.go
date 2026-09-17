@@ -963,6 +963,74 @@ func TestBuildRebuildsLegacyUncitedDocs(t *testing.T) {
 	}
 }
 
+func storeLegacyModelDoc(t *testing.T, store *db.Store, repoID int64, claims string) {
+	t.Helper()
+	modules, err := Modules(store, repoID, ModuleOptions{})
+	if err != nil {
+		t.Fatalf("modules: %v", err)
+	}
+	for _, module := range modules {
+		if module.Slug != "storage" {
+			continue
+		}
+		doc := db.KnowledgeDoc{
+			Slug:        "storage",
+			Kind:        "module",
+			Title:       module.Title,
+			Body:        "legacy body",
+			Claims:      claims,
+			Fingerprint: module.Fingerprint,
+			Generator:   "structural+model",
+			Verified:    true,
+			GeneratedAt: time.Now().UTC(),
+		}
+		if err := store.UpsertKnowledgeDoc(repoID, doc); err != nil {
+			t.Fatalf("store legacy doc: %v", err)
+		}
+		return
+	}
+	t.Fatal("storage module not found")
+}
+
+func assertLegacyClaimsRebuilt(t *testing.T, claims string) {
+	t.Helper()
+	store, repoID, repoRoot := indexedRepo(t)
+	storeLegacyModelDoc(t, store, repoID, claims)
+	structural, err := Build(store, repoID, repoRoot, BuildOptions{Only: []string{"storage"}})
+	if err != nil {
+		t.Fatalf("no-model build: %v", err)
+	}
+	if structural.Unchanged != 1 {
+		t.Fatalf("no-model build should reuse legacy docs: %+v", structural)
+	}
+	synth := &stubSynth{response: `{"summary":{"claim":"Storage","cited_symbols":["Open"]},"purpose":{"claim":"Purpose","cited_symbols":["Open"]}}`}
+	model, err := Build(store, repoID, repoRoot, BuildOptions{
+		Synth: synth,
+		Only:  []string{"storage"},
+	})
+	if err != nil {
+		t.Fatalf("model build: %v", err)
+	}
+	if model.Unchanged != 0 || synth.promptCount() != 1 {
+		t.Fatalf("model build should rebuild legacy docs: report=%+v calls=%d", model, synth.promptCount())
+	}
+}
+
+func TestBuildRebuildsEmptyClaimDocs(t *testing.T) {
+	for name, claims := range map[string]string{
+		"object": "{}",
+		"empty":  "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			assertLegacyClaimsRebuilt(t, claims)
+		})
+	}
+}
+
+func TestBuildRebuildsMalformedClaimDocs(t *testing.T) {
+	assertLegacyClaimsRebuilt(t, "{not json")
+}
+
 func TestBuildRejectsCitationsOutsideModule(t *testing.T) {
 	store, repoID, repoRoot := indexedRepo(t)
 	synth := &stubSynth{response: `{"summary":{"claim":"Storage","cited_paths":["api/handler.go"]},"purpose":{"claim":"Purpose","cited_symbols":["Open"]}}`}

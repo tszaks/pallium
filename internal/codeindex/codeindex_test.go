@@ -554,6 +554,38 @@ func Main() {}
 			}
 		})
 	}
+	t.Run("ancestor requirement", func(t *testing.T) {
+		repo := newRepo(t, map[string]string{
+			"go.mod": "module example.com/lib/v2\n\ngo 1.26.0\n\nrequire example.com/lib v1.0.0\n",
+			"main.go": `package main
+
+import (
+	_ "example.com/lib/v2/internal/missing"
+	_ "example.com/lib/foo"
+)
+
+func Main() {}
+`,
+		})
+		store, repoID := openIndexed(t, repo)
+		if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		imports, err := store.ImportsFrom(repoID, "main.go")
+		if err != nil {
+			t.Fatalf("imports: %v", err)
+		}
+		bySpec := map[string]db.CodeImport{}
+		for _, item := range imports {
+			bySpec[item.RawSpec] = item
+		}
+		if item := bySpec["example.com/lib/v2/internal/missing"]; item.External || item.ToPath != "" {
+			t.Fatalf("current nested module import should stay local: %+v", item)
+		}
+		if item := bySpec["example.com/lib/foo"]; !item.External || item.ToPath != "" {
+			t.Fatalf("outside current module import should stay external: %+v", item)
+		}
+	})
 }
 
 func TestResolverKeyIgnoresMissingTrackedConfigs(t *testing.T) {
