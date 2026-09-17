@@ -38,10 +38,12 @@ const maxParsedFileBytes = 512 * 1024
 // 2: TypeScript ESM specifiers ("../server/auth.js") now resolve to their .ts
 //
 //	sources, which an entire class of Node repo depends on.
-const ParserVersion = "2"
+//
+// 3: resolver inputs are tagged and generic Go call references are indexed.
+const ParserVersion = "3"
 
-func parserTag(parser string) string {
-	return parser + "@" + ParserVersion
+func parserTag(parser, key string) string {
+	return parser + "@" + ParserVersion + "#" + key
 }
 
 // ParsedFile is one file's contribution to the index.
@@ -87,6 +89,10 @@ func Run(store *db.Store, repoID int64, indexedAt time.Time) (Result, error) {
 		candidates = append(candidates, path)
 	}
 	sort.Strings(candidates)
+	resolverKey, err := resolverKey(store.RepoRoot, paths)
+	if err != nil {
+		return Result{}, err
+	}
 
 	existing, err := store.CodeFileStates(repoID)
 	if err != nil {
@@ -101,9 +107,11 @@ func Run(store *db.Store, repoID int64, indexedAt time.Time) (Result, error) {
 	for _, path := range candidates {
 		live[path] = struct{}{}
 
-		absolute := filepath.Join(store.RepoRoot, filepath.FromSlash(path))
-		info, statErr := os.Stat(absolute)
-		if statErr != nil {
+		content, size, ok := readIndexable(store.RepoRoot, path)
+		if !ok {
+			if _, statErr := os.Lstat(filepath.Join(store.RepoRoot, filepath.FromSlash(path))); statErr == nil {
+				result.Skipped++
+			}
 			// Listed by git but gone from disk: a deleted-but-staged file.
 			// Drop whatever the index still holds for it.
 			if _, ok := existing[path]; ok {
@@ -111,31 +119,16 @@ func Run(store *db.Store, repoID int64, indexedAt time.Time) (Result, error) {
 					return Result{}, err
 				}
 				result.Removed++
+				delete(existing, path)
 			}
-			delete(live, path)
-			continue
-		}
-		if info.Size() > maxParsedFileBytes {
-			result.Skipped++
-			delete(live, path)
-			continue
-		}
-
-		content, readErr := os.ReadFile(absolute)
-		if readErr != nil {
-			result.Skipped++
-			delete(live, path)
-			continue
-		}
-		if looksGenerated(content) {
-			result.Skipped++
 			delete(live, path)
 			continue
 		}
 
 		sum := sha256.Sum256(content)
 		contentSHA := hex.EncodeToString(sum[:])
-		if previous, ok := existing[path]; ok && previous.ContentSHA == contentSHA && strings.HasSuffix(previous.Parser, "@"+ParserVersion) {
+		if previous, ok := existing[path]; ok && previous.ContentSHA == contentSHA &&
+			strings.HasSuffix(previous.Parser, "@"+ParserVersion+"#"+resolverKey) {
 			result.Unchanged++
 			continue
 		}
@@ -150,9 +143,9 @@ func Run(store *db.Store, repoID int64, indexedAt time.Time) (Result, error) {
 		file := db.CodeFile{
 			Path:       path,
 			Lang:       parsed.Lang,
-			SizeBytes:  info.Size(),
+			SizeBytes:  size,
 			ContentSHA: contentSHA,
-			Parser:     parserTag(parsed.Parser),
+			Parser:     parserTag(parsed.Parser, resolverKey),
 		}
 		if err := store.ReplaceCodeFile(repoID, file, parsed.Symbols, parsed.Imports, parsed.Refs, indexedAt); err != nil {
 			return Result{}, err
@@ -176,7 +169,126 @@ func Run(store *db.Store, repoID int64, indexedAt time.Time) (Result, error) {
 		result.Removed++
 	}
 
+	stats, err := store.Stats(repoID)
+	if err != nil {
+		return Result{}, err
+	}
+	result.Symbols = stats.Symbols
+	result.Imports = stats.Imports
+	result.Refs = stats.Refs
 	return result, nil
+}
+
+func readIndexable(repoRoot, path string) ([]byte, int64, bool) {
+	content, size, ok := readContained(repoRoot, path)
+	if !ok || looksGenerated(content) {
+		return nil, 0, false
+	}
+	return content, size, true
+}
+
+func readContained(repoRoot, path string) ([]byte, int64, bool) {
+	absolute, err := filepath.Abs(filepath.Join(repoRoot, filepath.FromSlash(path)))
+	if err != nil {
+		return nil, 0, false
+	}
+	root, err := filepath.EvalSymlinks(repoRoot)
+	if err != nil {
+		return nil, 0, false
+	}
+	target, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return nil, 0, false
+	}
+	relative, err := filepath.Rel(root, target)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return nil, 0, false
+	}
+	info, err := os.Stat(target)
+	if err != nil || !info.Mode().IsRegular() || info.Size() > maxParsedFileBytes {
+		return nil, 0, false
+	}
+	content, err := os.ReadFile(target)
+	if err != nil {
+		return nil, 0, false
+	}
+	return content, info.Size(), true
+}
+
+func UnindexedCandidates(repoRoot string, indexed map[string]struct{}) ([]string, error) {
+	paths, err := gitlog.TrackedFiles(repoRoot)
+	if err != nil {
+		return nil, err
+	}
+	resolver := NewResolver(repoRoot, paths)
+	out := make([]string, 0)
+	for _, path := range paths {
+		if vendorish(path) || !Parseable(Lang(path)) {
+			continue
+		}
+		if _, ok := indexed[path]; ok {
+			continue
+		}
+		content, _, ok := readIndexable(repoRoot, path)
+		if !ok {
+			continue
+		}
+		if _, ok := Parse(path, content, resolver); ok {
+			out = append(out, path)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func resolverKey(repoRoot string, paths []string) (string, error) {
+	hasher := sha256.New()
+	sorted := append([]string{}, paths...)
+	sort.Strings(sorted)
+	for _, path := range sorted {
+		hasher.Write([]byte(path))
+		hasher.Write([]byte{0})
+	}
+	configs := make(map[string]struct{})
+	seenDirs := make(map[string]struct{})
+	for _, path := range sorted {
+		lang := Lang(path)
+		if lang != "typescript" && lang != "tsx" && lang != "javascript" && lang != "jsx" {
+			continue
+		}
+		dir := filepath.ToSlash(filepath.Dir(path))
+		if _, ok := seenDirs[dir]; ok {
+			continue
+		}
+		seenDirs[dir] = struct{}{}
+		configPath := findNearestTSConfig(repoRoot, dir)
+		if configPath == "" {
+			continue
+		}
+		for _, path := range tsConfigChain(repoRoot, configPath, map[string]struct{}{}) {
+			configs[path] = struct{}{}
+		}
+	}
+	configPaths := make([]string, 0, len(configs))
+	for path := range configs {
+		configPaths = append(configPaths, path)
+	}
+	sort.Strings(configPaths)
+	for _, path := range configPaths {
+		content, _, ok := readContained(repoRoot, path)
+		if !ok {
+			continue
+		}
+		hasher.Write([]byte(path))
+		hasher.Write([]byte{0})
+		hasher.Write(content)
+		hasher.Write([]byte{0})
+	}
+	if content, _, ok := readContained(repoRoot, "go.mod"); ok {
+		hasher.Write(content)
+	}
+	sum := hasher.Sum(nil)
+	return hex.EncodeToString(sum)[:12], nil
 }
 
 // Parse dispatches to the right parser for a file. Exported so a caller can

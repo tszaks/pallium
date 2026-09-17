@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -86,8 +87,8 @@ func readTSConfigFile(repoRoot, configPath string, visited map[string]struct{}) 
 	}
 	visited[configPath] = struct{}{}
 
-	content, err := os.ReadFile(filepath.Join(repoRoot, filepath.FromSlash(configPath)))
-	if err != nil {
+	content, _, ok := readContained(repoRoot, configPath)
+	if !ok {
 		return TSConfigAliases{}
 	}
 	cleaned := jsonCommentRegex.ReplaceAllString(string(content), "")
@@ -132,6 +133,32 @@ func readTSConfigFile(repoRoot, configPath string, visited map[string]struct{}) 
 	return merged
 }
 
+func tsConfigChain(repoRoot, configPath string, visited map[string]struct{}) []string {
+	configPath = filepath.ToSlash(filepath.Clean(configPath))
+	if _, ok := visited[configPath]; ok {
+		return nil
+	}
+	visited[configPath] = struct{}{}
+
+	out := []string{configPath}
+	content, _, ok := readContained(repoRoot, configPath)
+	if !ok {
+		return out
+	}
+	cleaned := jsonCommentRegex.ReplaceAllString(string(content), "")
+	var parsed struct {
+		Extends string `json:"extends"`
+	}
+	if err := json.Unmarshal([]byte(cleaned), &parsed); err != nil {
+		return out
+	}
+	parentPath := resolveTSConfigExtendsPath(repoRoot, filepath.Dir(configPath), parsed.Extends)
+	if parentPath != "" {
+		out = append(out, tsConfigChain(repoRoot, parentPath, visited)...)
+	}
+	return out
+}
+
 func resolveTSConfigExtendsPath(repoRoot, configDir, extends string) string {
 	value := strings.TrimSpace(extends)
 	if value == "" {
@@ -154,14 +181,42 @@ func resolveTSAliasBases(spec string, aliases TSConfigAliases) []string {
 	if len(aliases.Paths) == 0 {
 		return nil
 	}
-	out := make([]string, 0, 4)
+	type match struct {
+		pattern   string
+		targets   []string
+		remainder string
+		prefix    int
+		suffix    int
+	}
+	matches := make([]match, 0, len(aliases.Paths))
 	for pattern, targets := range aliases.Paths {
 		remainder, ok := matchTSAlias(pattern, spec)
 		if !ok {
 			continue
 		}
-		for _, target := range targets {
-			resolved := strings.Replace(target, "*", remainder, 1)
+		parts := strings.SplitN(pattern, "*", 2)
+		suffix := 0
+		if len(parts) == 2 {
+			suffix = len(parts[1])
+		}
+		matches = append(matches, match{
+			pattern: pattern, targets: targets, remainder: remainder,
+			prefix: len(parts[0]), suffix: suffix,
+		})
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		if matches[i].prefix != matches[j].prefix {
+			return matches[i].prefix > matches[j].prefix
+		}
+		if matches[i].suffix != matches[j].suffix {
+			return matches[i].suffix > matches[j].suffix
+		}
+		return matches[i].pattern < matches[j].pattern
+	})
+	out := make([]string, 0, 4)
+	for _, item := range matches {
+		for _, target := range item.targets {
+			resolved := strings.Replace(target, "*", item.remainder, 1)
 			resolved = repoJoinSlash("", resolved)
 			out = append(out, resolved)
 		}
@@ -243,23 +298,54 @@ func repoJoinSlash(base, value string) string {
 	return filepath.ToSlash(filepath.Clean(filepath.Join(base, value)))
 }
 
-func readGoModulePath(repoRoot string) string {
-	content, err := os.ReadFile(filepath.Join(repoRoot, "go.mod"))
-	if err != nil {
-		return ""
+func readGoModuleInfo(repoRoot string) (string, []string) {
+	content, _, ok := readContained(repoRoot, "go.mod")
+	if !ok {
+		return "", nil
 	}
+	module := ""
+	requires := make([]string, 0)
+	inRequireBlock := false
 	for _, line := range strings.Split(string(content), "\n") {
 		line = strings.TrimSpace(line)
+		if comment := strings.Index(line, "//"); comment >= 0 {
+			line = strings.TrimSpace(line[:comment])
+		}
+		if line == "" {
+			continue
+		}
+		if inRequireBlock {
+			if line == ")" {
+				inRequireBlock = false
+				continue
+			}
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				requires = append(requires, fields[0])
+			}
+			continue
+		}
 		if strings.HasPrefix(line, "module ") {
-			return strings.TrimSpace(strings.TrimPrefix(line, "module "))
+			module = strings.TrimSpace(strings.TrimPrefix(line, "module "))
+			continue
+		}
+		if line == "require (" {
+			inRequireBlock = true
+			continue
+		}
+		if strings.HasPrefix(line, "require ") {
+			fields := strings.Fields(strings.TrimSpace(strings.TrimPrefix(line, "require ")))
+			if len(fields) >= 2 {
+				requires = append(requires, fields[0])
+			}
 		}
 	}
-	return ""
+	return module, uniqueStrings(requires, 0)
 }
 
 func fileExists(path string) bool {
 	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
+	return err == nil && info.Mode().IsRegular()
 }
 
 func dirExists(path string) bool {
@@ -322,11 +408,12 @@ func isPythonFile(path string) bool {
 // concurrent use; the indexer is single-threaded by design so that a repo's
 // sqlite file only ever has one writer.
 type Resolver struct {
-	repoRoot  string
-	goModule  string
-	knownPath map[string]struct{}
-	knownDir  map[string]struct{}
-	tsCache   map[string]TSConfigAliases
+	repoRoot   string
+	goModule   string
+	goRequires []string
+	knownPath  map[string]struct{}
+	knownDir   map[string]struct{}
+	tsCache    map[string]TSConfigAliases
 }
 
 // NewResolver takes the repo's file list so resolution can check whether a
@@ -340,16 +427,22 @@ func NewResolver(repoRoot string, paths []string) *Resolver {
 		// resolved package directory is never confused with "not found".
 		dirs[filepath.ToSlash(filepath.Dir(path))] = struct{}{}
 	}
+	goModule, goRequires := readGoModuleInfo(repoRoot)
 	return &Resolver{
-		repoRoot:  repoRoot,
-		goModule:  readGoModulePath(repoRoot),
-		knownPath: known,
-		knownDir:  dirs,
-		tsCache:   map[string]TSConfigAliases{},
+		repoRoot:   repoRoot,
+		goModule:   goModule,
+		goRequires: goRequires,
+		knownPath:  known,
+		knownDir:   dirs,
+		tsCache:    map[string]TSConfigAliases{},
 	}
 }
 
 func (r *Resolver) GoModulePath() string { return r.goModule }
+
+func (r *Resolver) GoRequires() []string {
+	return append([]string(nil), r.goRequires...)
+}
 
 // ResolveGo maps a Go import path to the in-repo package directory it names,
 // or "" when the import is stdlib or a third-party module. The result is a
@@ -391,6 +484,14 @@ func (r *Resolver) ResolveJS(sourcePath, spec string) string {
 		}
 	}
 	return ""
+}
+
+func (r *Resolver) MatchesJSAlias(sourcePath, spec string) bool {
+	if !isJSImportFile(sourcePath) {
+		return false
+	}
+	sourceDir := filepath.ToSlash(filepath.Dir(sourcePath))
+	return len(resolveTSAliasBases(spec, r.tsAliases(sourceDir, sourcePath))) > 0
 }
 
 // ResolvePy maps a Python import spec to a repo path, handling both relative

@@ -12,6 +12,7 @@ package knowledge
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -106,7 +107,6 @@ func Modules(store *db.Store, repoID int64, opts ModuleOptions) ([]Module, error
 			Dir:           dir,
 			Title:         titleForDir(dir),
 			Files:         files,
-			Fingerprint:   fingerprint(files, shas),
 			RecentCommits: []CommitNote{},
 		}
 		module.Languages = languagesFor(files)
@@ -126,7 +126,7 @@ func Modules(store *db.Store, repoID int64, opts ModuleOptions) ([]Module, error
 		module.SymbolCount = len(owned)
 		module.KeySymbols = rankSymbols(owned, refCounts, 12)
 
-		commits, err := store.RecentSubjectsUnderPrefix(repoID, dir, 5)
+		commits, err := store.RecentSubjectsForPaths(repoID, files, 5)
 		if err != nil {
 			return nil, err
 		}
@@ -144,6 +144,9 @@ func Modules(store *db.Store, repoID int64, opts ModuleOptions) ([]Module, error
 	if err := attachDependencies(store, repoID, owner, modules); err != nil {
 		return nil, err
 	}
+	for index := range modules {
+		modules[index].Fingerprint = fingerprint(modules[index], shas)
+	}
 
 	return modules, nil
 }
@@ -157,7 +160,8 @@ func clusterPaths(paths []string, opts ModuleOptions) map[string][]string {
 		buckets[dir] = append(buckets[dir], path)
 	}
 
-	mergeOnce := func(minFiles int) {
+	mergeOnce := func(minFiles int) bool {
+		merged := false
 		dirs := make([]string, 0, len(buckets))
 		for dir := range buckets {
 			dirs = append(dirs, dir)
@@ -181,14 +185,18 @@ func clusterPaths(paths []string, opts ModuleOptions) map[string][]string {
 			parent := filepath.ToSlash(filepath.Dir(dir))
 			buckets[parent] = append(buckets[parent], buckets[dir]...)
 			delete(buckets, dir)
+			merged = true
 		}
+		return merged
 	}
 
-	mergeOnce(opts.MinFiles)
+	for mergeOnce(opts.MinFiles) {
+	}
 	// Still too many modules: raise the bar and merge again rather than
 	// truncating, because a truncated map silently hides part of the repo.
 	for minFiles := opts.MinFiles * 2; len(buckets) > opts.MaxModules && minFiles < 4096; minFiles *= 2 {
-		mergeOnce(minFiles)
+		for mergeOnce(minFiles) {
+		}
 	}
 	return buckets
 }
@@ -391,13 +399,37 @@ func languagesFor(files []string) []string {
 // fingerprint hashes the module's file content hashes. A doc records the
 // fingerprint it was written against, which is how refresh knows the module
 // changed without re-reading a line of it.
-func fingerprint(files []string, shas map[string]string) string {
+func fingerprint(module Module, shas map[string]string) string {
 	hasher := sha256.New()
-	for _, path := range files {
+	for _, path := range module.Files {
 		hasher.Write([]byte(path))
 		hasher.Write([]byte{0})
 		hasher.Write([]byte(shas[path]))
 		hasher.Write([]byte{0})
+	}
+	for _, value := range module.DependsOn {
+		hasher.Write([]byte("depends"))
+		hasher.Write([]byte{0})
+		hasher.Write([]byte(value))
+		hasher.Write([]byte{0})
+	}
+	for _, value := range module.DependedOnBy {
+		hasher.Write([]byte("depended"))
+		hasher.Write([]byte{0})
+		hasher.Write([]byte(value))
+		hasher.Write([]byte{0})
+	}
+	for _, value := range module.ExternalDeps {
+		hasher.Write([]byte("external"))
+		hasher.Write([]byte{0})
+		hasher.Write([]byte(value))
+		hasher.Write([]byte{0})
+	}
+	for _, symbol := range module.KeySymbols {
+		for _, value := range []string{symbol.Path, symbol.Name, symbol.Kind, symbol.Receiver, fmt.Sprintf("%d", symbol.StartLine), symbol.Signature} {
+			hasher.Write([]byte(value))
+			hasher.Write([]byte{0})
+		}
 	}
 	return hex.EncodeToString(hasher.Sum(nil))[:16]
 }

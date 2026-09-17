@@ -4,6 +4,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -387,5 +389,455 @@ func TestRunReparsesWhenParserVersionChanges(t *testing.T) {
 	}
 	if result.Reparsed != 1 || result.Unchanged != 0 {
 		t.Fatalf("a stale parser tag must force a reparse, got %+v", result)
+	}
+}
+
+func TestRunSkipsSymlinksEscapingRepo(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"main.go": "package main\nfunc Main() {}\n",
+	})
+	outside := filepath.Join(t.TempDir(), "secret.py")
+	write(t, outside, `SECRET = "x"`+"\n")
+	if err := os.Symlink(outside, filepath.Join(repo, "leak.py")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	git(t, repo, "add", "leak.py")
+	store, repoID := openIndexed(t, repo)
+	result, err := Run(store, repoID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if result.Skipped < 1 {
+		t.Fatalf("escaping symlink was not skipped: %+v", result)
+	}
+	symbols, err := store.SymbolsInFile(repoID, "leak.py")
+	if err != nil {
+		t.Fatalf("symbols: %v", err)
+	}
+	if len(symbols) != 0 {
+		t.Fatalf("escaping symlink leaked symbols: %+v", symbols)
+	}
+}
+
+func TestRunSkipsFilesUnderEscapingSymlinkDir(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"main.go": "package main\nfunc Main() {}\n",
+	})
+	outside := t.TempDir()
+	outsideFile := filepath.Join(outside, "file.go")
+	write(t, outsideFile, "package outside\nfunc Secret() {}\n")
+	if err := os.Symlink(outside, filepath.Join(repo, "pkg")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	hash := exec.Command("git", "hash-object", "-w", outsideFile)
+	hash.Dir = repo
+	blob, err := hash.Output()
+	if err != nil {
+		t.Fatalf("hash object: %v", err)
+	}
+	git(t, repo, "update-index", "--add", "--cacheinfo",
+		"100644,"+strings.TrimSpace(string(blob))+",pkg/file.go")
+
+	store, repoID := openIndexed(t, repo)
+	result, err := Run(store, repoID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if result.Skipped < 1 {
+		t.Fatalf("file under escaping symlink directory was not skipped: %+v", result)
+	}
+	symbols, err := store.SymbolsInFile(repoID, "pkg/file.go")
+	if err != nil {
+		t.Fatalf("symbols: %v", err)
+	}
+	if len(symbols) != 0 {
+		t.Fatalf("escaping symlink directory leaked symbols: %+v", symbols)
+	}
+}
+
+func TestVendorishKeepsNestedOutputNames(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"internal/build/runner.go": "package runner\nfunc Run() {}\n",
+		"src/out/encoder.ts":       "export function Encode() {}\n",
+		"pkg/dist/types.go":        "package dist\nfunc Type() {}\n",
+		"dist/bundle.js":           "function bundle() {}\n",
+		"build/x.go":               "package build\nfunc X() {}\n",
+		"foo/node_modules/x.js":    "function x() {}\n",
+	})
+	store, repoID := openIndexed(t, repo)
+	if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	paths, err := store.CodeIndexedPaths(repoID)
+	if err != nil {
+		t.Fatalf("paths: %v", err)
+	}
+	got := map[string]bool{}
+	for _, path := range paths {
+		got[path] = true
+	}
+	for _, path := range []string{"internal/build/runner.go", "src/out/encoder.ts", "pkg/dist/types.go"} {
+		if !got[path] {
+			t.Fatalf("nested source output path was excluded: %s", path)
+		}
+	}
+	for _, path := range []string{"dist/bundle.js", "build/x.go", "foo/node_modules/x.js"} {
+		if got[path] {
+			t.Fatalf("vendorish path was indexed: %s", path)
+		}
+	}
+}
+
+func TestRunReparsesWhenResolverInputsChange(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"go.mod": "module example.com/app\n\ngo 1.26.0\n",
+		"a.go":   "package main\nimport _ \"example.com/app/lib\"\nfunc A() {}\n",
+	})
+	store, repoID := openIndexed(t, repo)
+	if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	imports, err := store.ImportsFrom(repoID, "a.go")
+	if err != nil || len(imports) != 1 || imports[0].External || imports[0].ToPath != "" {
+		t.Fatalf("missing local package should remain non-external: %+v err=%v", imports, err)
+	}
+	write(t, filepath.Join(repo, "lib", "lib.go"), "package lib\nfunc L() {}\n")
+	git(t, repo, "add", "-A")
+	result, err := Run(store, repoID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if result.Reparsed == 0 {
+		t.Fatalf("resolver input change did not reparse files: %+v", result)
+	}
+	imports, err = store.ImportsFrom(repoID, "a.go")
+	if err != nil || len(imports) != 1 || imports[0].External || imports[0].ToPath != "lib" {
+		t.Fatalf("new package was not resolved: %+v err=%v", imports, err)
+	}
+}
+
+func TestNestedGoModulesStayExternal(t *testing.T) {
+	for name, requireLine := range map[string]string{
+		"block":  "require (\n\texample.com/lib/v2 v2.0.0\n)",
+		"single": "require example.com/lib/v2 v2.0.0",
+	} {
+		t.Run(name, func(t *testing.T) {
+			repo := newRepo(t, map[string]string{
+				"go.mod": "module example.com/lib\n\ngo 1.26.0\n\n" + requireLine + "\n",
+				"main.go": `package main
+
+import (
+	_ "example.com/lib/v2/foo"
+	_ "example.com/lib/internal/missing"
+)
+
+func Main() {}
+`,
+			})
+			store, repoID := openIndexed(t, repo)
+			if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			imports, err := store.ImportsFrom(repoID, "main.go")
+			if err != nil {
+				t.Fatalf("imports: %v", err)
+			}
+			bySpec := map[string]db.CodeImport{}
+			for _, item := range imports {
+				bySpec[item.RawSpec] = item
+			}
+			if item := bySpec["example.com/lib/v2/foo"]; !item.External || item.ToPath != "" {
+				t.Fatalf("nested module import should stay external: %+v", item)
+			}
+			if item := bySpec["example.com/lib/internal/missing"]; item.External || item.ToPath != "" {
+				t.Fatalf("unresolved in-module import should stay local: %+v", item)
+			}
+		})
+	}
+	t.Run("ancestor requirement", func(t *testing.T) {
+		repo := newRepo(t, map[string]string{
+			"go.mod": "module example.com/lib/v2\n\ngo 1.26.0\n\nrequire example.com/lib v1.0.0\n",
+			"main.go": `package main
+
+import (
+	_ "example.com/lib/v2/internal/missing"
+	_ "example.com/lib/foo"
+)
+
+func Main() {}
+`,
+		})
+		store, repoID := openIndexed(t, repo)
+		if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		imports, err := store.ImportsFrom(repoID, "main.go")
+		if err != nil {
+			t.Fatalf("imports: %v", err)
+		}
+		bySpec := map[string]db.CodeImport{}
+		for _, item := range imports {
+			bySpec[item.RawSpec] = item
+		}
+		if item := bySpec["example.com/lib/v2/internal/missing"]; item.External || item.ToPath != "" {
+			t.Fatalf("current nested module import should stay local: %+v", item)
+		}
+		if item := bySpec["example.com/lib/foo"]; !item.External || item.ToPath != "" {
+			t.Fatalf("outside current module import should stay external: %+v", item)
+		}
+	})
+}
+
+func TestResolverKeyIgnoresMissingTrackedConfigs(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"tsconfig.json": `{"compilerOptions":{"baseUrl":"."}}`,
+		"src/main.ts":   "export function Main() {}\n",
+	})
+	store, repoID := openIndexed(t, repo)
+	if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	if err := os.Remove(filepath.Join(repo, "tsconfig.json")); err != nil {
+		t.Fatalf("remove config: %v", err)
+	}
+	if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+		t.Fatalf("run with missing tracked config: %v", err)
+	}
+}
+
+func TestUnindexedCandidatesSkipsUnparseableFiles(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"main.go": "package main\nfunc Main() {}\n",
+	})
+	write(t, filepath.Join(repo, "bad.go"), "")
+	write(t, filepath.Join(repo, "ok.go"), "package main\nfunc OK() {}\n")
+	git(t, repo, "add", "bad.go", "ok.go")
+	candidates, err := UnindexedCandidates(repo, map[string]struct{}{"main.go": {}})
+	if err != nil {
+		t.Fatalf("candidates: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0] != "ok.go" {
+		t.Fatalf("unexpected unindexed candidates: %v", candidates)
+	}
+}
+
+func TestResolverKeyTracksUntrackedConfigs(t *testing.T) {
+	t.Run("root config", func(t *testing.T) {
+		repo := newRepo(t, map[string]string{
+			"src/a.ts": "export const value = 1\n",
+		})
+		paths := []string{"src/a.ts"}
+		first, err := resolverKey(repo, paths)
+		if err != nil {
+			t.Fatalf("first key: %v", err)
+		}
+		write(t, filepath.Join(repo, "tsconfig.json"), `{"compilerOptions":{"paths":{"@/*":["src/*"]}}}`)
+		second, err := resolverKey(repo, paths)
+		if err != nil {
+			t.Fatalf("second key: %v", err)
+		}
+		if first == second {
+			t.Fatal("creating an untracked resolver config did not change the key")
+		}
+		write(t, filepath.Join(repo, "tsconfig.json"), `{"compilerOptions":{"paths":{"@/*":["other/*"]}}}`)
+		third, err := resolverKey(repo, paths)
+		if err != nil {
+			t.Fatalf("third key: %v", err)
+		}
+		if second == third {
+			t.Fatal("editing an untracked resolver config did not change the key")
+		}
+	})
+	t.Run("untracked extends parent", func(t *testing.T) {
+		repo := newRepo(t, map[string]string{
+			"src/a.ts": "export const value = 1\n",
+		})
+		write(t, filepath.Join(repo, "tsconfig.json"), `{"extends":"./base.json"}`)
+		write(t, filepath.Join(repo, "base.json"), `{"compilerOptions":{"baseUrl":"src"}}`)
+		paths := []string{"src/a.ts"}
+		first, err := resolverKey(repo, paths)
+		if err != nil {
+			t.Fatalf("first key: %v", err)
+		}
+		write(t, filepath.Join(repo, "base.json"), `{"compilerOptions":{"baseUrl":"other"}}`)
+		second, err := resolverKey(repo, paths)
+		if err != nil {
+			t.Fatalf("second key: %v", err)
+		}
+		if first == second {
+			t.Fatal("editing an untracked extends parent did not change the key")
+		}
+	})
+}
+
+func TestRunReparsesWhenUntrackedTSConfigChanges(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"src/a.ts": "export const value = 1\n",
+	})
+	write(t, filepath.Join(repo, "tsconfig.json"), `{"compilerOptions":{"paths":{"@/*":["src/*"]}}}`)
+	store, repoID := openIndexed(t, repo)
+	if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	write(t, filepath.Join(repo, "tsconfig.json"), `{"compilerOptions":{"paths":{"@/*":["other/*"]}}}`)
+	result, err := Run(store, repoID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if result.Reparsed == 0 {
+		t.Fatalf("untracked resolver config change did not reparse: %+v", result)
+	}
+}
+
+func TestResolverInputsRejectSpecialFiles(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"src/a.ts": "import value from '@/value'\nexport const result = value\n",
+	})
+	outside := t.TempDir()
+	outsideConfig := filepath.Join(outside, "tsconfig.json")
+	write(t, outsideConfig, `{"compilerOptions":{"paths":{"@/*":["outside/*"]}}}`)
+	if err := os.Symlink(outsideConfig, filepath.Join(repo, "tsconfig.json")); err != nil {
+		t.Fatalf("tsconfig symlink: %v", err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(repo, "jsconfig.json"), 0o600); err != nil {
+		t.Logf("skipping FIFO subcase: %v", err)
+	} else {
+		if _, _, ok := readContained(repo, "jsconfig.json"); ok {
+			t.Fatal("FIFO resolver config was readable")
+		}
+	}
+	write(t, filepath.Join(outside, "go.mod"), "module outside.example/app\n")
+	if err := os.Symlink(filepath.Join(outside, "go.mod"), filepath.Join(repo, "go.mod")); err != nil {
+		t.Fatalf("go.mod symlink: %v", err)
+	}
+	if _, _, ok := readContained(repo, "go.mod"); ok {
+		t.Fatal("outside go.mod symlink was readable")
+	}
+	if _, err := resolverKey(repo, []string{"src/a.ts"}); err != nil {
+		t.Fatalf("resolver key followed a rejected input: %v", err)
+	}
+	resolver := NewResolver(repo, []string{"src/a.ts"})
+	parsed, ok := Parse("src/a.ts", []byte("import value from '@/value'\nexport const result = value\n"), resolver)
+	if !ok {
+		t.Fatal("TypeScript fixture was not parsed")
+	}
+	for _, imp := range parsed.Imports {
+		if imp.ToPath != "" {
+			t.Fatalf("resolver followed a rejected config: %+v", imp)
+		}
+	}
+}
+
+func TestUnresolvedTSAliasImportsStayLocal(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"tsconfig.json": `{"compilerOptions":{"paths":{"@/*":["src/*"]}}}`,
+		"src/a.ts":      "import missing from '@/missing'\nimport react from 'react'\nexport const value = missing || react\n",
+	})
+	store, repoID := openIndexed(t, repo)
+	if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	imports, err := store.ImportsFrom(repoID, "src/a.ts")
+	if err != nil {
+		t.Fatalf("imports: %v", err)
+	}
+	bySpec := map[string]db.CodeImport{}
+	for _, item := range imports {
+		bySpec[item.RawSpec] = item
+	}
+	if item := bySpec["@/missing"]; item.External || item.ToPath != "" {
+		t.Fatalf("unresolved TS alias should stay local: %+v", item)
+	}
+	if item := bySpec["react"]; !item.External || item.ToPath != "" {
+		t.Fatalf("package import should stay external: %+v", item)
+	}
+}
+
+func TestUnresolvedRelativeImportsStayLocal(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"app.js": "import missing from './missing'; import react from 'react';\nexport function App() { return missing || react }\n",
+		"app.py": "from .missing import x\n\ndef app():\n    return x\n",
+	})
+	store, repoID := openIndexed(t, repo)
+	if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	js, err := store.ImportsFrom(repoID, "app.js")
+	if err != nil {
+		t.Fatalf("js imports: %v", err)
+	}
+	bySpec := map[string]db.CodeImport{}
+	for _, item := range js {
+		bySpec[item.RawSpec] = item
+	}
+	if bySpec["./missing"].External || bySpec["./missing"].ToPath != "" || !bySpec["react"].External {
+		t.Fatalf("unexpected JS import classification: %+v", bySpec)
+	}
+	py, err := store.ImportsFrom(repoID, "app.py")
+	if err != nil {
+		t.Fatalf("py imports: %v", err)
+	}
+	if len(py) != 1 || py[0].External || py[0].ToPath != "" {
+		t.Fatalf("unexpected Python import classification: %+v", py)
+	}
+}
+
+func TestTSAliasOrderIsDeterministic(t *testing.T) {
+	aliases := TSConfigAliases{Paths: map[string][]string{
+		"@/*":         {"src/*"},
+		"@/special/*": {"special/*"},
+	}}
+	for iteration := 0; iteration < 20; iteration++ {
+		bases := resolveTSAliasBases("@/special/thing", aliases)
+		if len(bases) == 0 || bases[0] != "special/thing" {
+			t.Fatalf("specific alias did not win on iteration %d: %v", iteration, bases)
+		}
+	}
+}
+
+func TestGoRefsRecordGenericCalls(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"go.mod": "module example.com/app\n\ngo 1.26.0\n",
+		"defs.go": `package main
+func Transform[T any](v T) T { return v }
+func Combine[A any, B any](a A) B { var b B; return b }
+`,
+		"main.go": `package main
+func main() {
+	Transform[string]("x")
+	Combine[int, string](1)
+}
+`,
+	})
+	store, repoID := openIndexed(t, repo)
+	if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	for _, name := range []string{"Transform", "Combine"} {
+		callers, err := store.PathsReferencing(repoID, name)
+		if err != nil {
+			t.Fatalf("refs %s: %v", name, err)
+		}
+		if len(callers) != 1 || callers[0] != "main.go" {
+			t.Fatalf("generic call %s was not indexed: %v", name, callers)
+		}
+	}
+}
+
+func TestRunReportsTotalCounts(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"go.mod":  "module example.com/app\n\ngo 1.26.0\n",
+		"main.go": "package main\nfunc Main() {}\n",
+	})
+	store, repoID := openIndexed(t, repo)
+	if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	result, err := Run(store, repoID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if result.Unchanged == 0 || result.Symbols == 0 {
+		t.Fatalf("second run lost total counts: %+v", result)
 	}
 }

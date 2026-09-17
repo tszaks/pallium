@@ -69,8 +69,8 @@ func modulePrompt(module Module) string {
 Return ONLY a JSON object with this shape and no prose around it:
 
 {
-  "summary": "one sentence: what this module is for",
-  "purpose": "two to four sentences: what problem it solves and how it fits the rest of the repo",
+  "summary": {"claim": "one sentence: what this module is for", "cited_paths": [], "cited_symbols": []},
+  "purpose": {"claim": "two to four sentences: what problem it solves and how it fits the rest of the repo", "cited_paths": [], "cited_symbols": []},
   "entry_points": [{"claim": "why a reader should start here", "cited_paths": ["path/from/the/list/above"], "cited_symbols": []}],
   "key_symbols": [{"claim": "what this symbol does and why it matters", "cited_paths": [], "cited_symbols": ["SymbolName"]}],
   "invariants": [{"claim": "a rule this module relies on that is not obvious from a signature", "cited_paths": [], "cited_symbols": ["SymbolName"]}],
@@ -82,6 +82,7 @@ Rules, enforced automatically after you answer:
   appear verbatim in the lists above. Uncited or unresolvable claims are
   deleted before storage and recorded as dropped, so a guess costs you the
   whole claim.
+- Summary and purpose must cite too.
 - Do not restate the file list, the dependency list, or the commit list. Those
   are already stored and rendered; your job is only what they do not say.
 - Prefer four precise claims to twelve vague ones. Say nothing rather than
@@ -95,12 +96,12 @@ func renderModuleDoc(module Module, result synthesis) string {
 	var builder strings.Builder
 
 	fmt.Fprintf(&builder, "# %s\n\n", module.Title)
-	if summary := strings.TrimSpace(result.Summary); summary != "" {
+	if summary := strings.TrimSpace(result.Summary.Claim); summary != "" {
 		fmt.Fprintf(&builder, "%s\n\n", summary)
 	} else {
 		fmt.Fprintf(&builder, "%s\n\n", structuralSummary(module))
 	}
-	if purpose := strings.TrimSpace(result.Purpose); purpose != "" {
+	if purpose := strings.TrimSpace(result.Purpose.Claim); purpose != "" {
 		fmt.Fprintf(&builder, "## Purpose\n\n%s\n\n", purpose)
 	}
 
