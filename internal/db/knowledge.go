@@ -3,6 +3,7 @@ package db
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -206,40 +207,66 @@ ORDER BY path, start_line
 `, repoID, pattern, exact)
 }
 
-// RecentSubjectsUnderPrefix returns the newest commit subjects touching a
-// directory subtree: the module's own change history, in one query.
-func (s *Store) RecentSubjectsUnderPrefix(repoID int64, prefix string, limit int) ([]CommitRecord, error) {
+// RecentSubjectsForPaths returns the newest commits touching the module's
+// owned files.
+func (s *Store) RecentSubjectsForPaths(repoID int64, paths []string, limit int) ([]CommitRecord, error) {
+	if len(paths) == 0 {
+		return []CommitRecord{}, nil
+	}
 	if limit <= 0 {
 		limit = 5
 	}
-	pattern, exact := prefixPattern(prefix)
-	rows, err := s.q.Query(`
+	records := make(map[string]CommitRecord)
+	for start := 0; start < len(paths); start += 500 {
+		end := start + 500
+		if end > len(paths) {
+			end = len(paths)
+		}
+		placeholders := make([]string, end-start)
+		args := []any{repoID}
+		for index, path := range paths[start:end] {
+			placeholders[index] = "?"
+			args = append(args, path)
+		}
+		args = append(args, limit)
+		rows, err := s.q.Query(`
 SELECT c.sha, c.subject, c.committed_at
 FROM file_commits fc
 JOIN commits c ON c.repo_id = fc.repo_id AND c.sha = fc.commit_sha
-WHERE fc.repo_id = ? AND (fc.file_path LIKE ? ESCAPE '\' OR fc.file_path = ?)
+WHERE fc.repo_id = ? AND fc.file_path IN (`+strings.Join(placeholders, ",")+`)
 GROUP BY c.sha
 ORDER BY c.committed_at DESC
-LIMIT ?
-`, repoID, pattern, exact, limit)
-	if err != nil {
-		return nil, fmt.Errorf("query module commits: %w", err)
+LIMIT ?`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("query module commits: %w", err)
+		}
+		for rows.Next() {
+			var record CommitRecord
+			var committedAt string
+			if err := rows.Scan(&record.SHA, &record.Subject, &committedAt); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan module commit: %w", err)
+			}
+			if parsed, err := time.Parse(time.RFC3339, committedAt); err == nil {
+				record.CommittedAt = parsed
+			}
+			records[record.SHA] = record
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
 	}
-	defer rows.Close()
-
-	out := make([]CommitRecord, 0)
-	for rows.Next() {
-		var record CommitRecord
-		var committedAt string
-		if err := rows.Scan(&record.SHA, &record.Subject, &committedAt); err != nil {
-			return nil, fmt.Errorf("scan module commit: %w", err)
-		}
-		if parsed, err := time.Parse(time.RFC3339, committedAt); err == nil {
-			record.CommittedAt = parsed
-		}
+	out := make([]CommitRecord, 0, len(records))
+	for _, record := range records {
 		out = append(out, record)
 	}
-	return out, rows.Err()
+	sort.Slice(out, func(i, j int) bool { return out[i].CommittedAt.After(out[j].CommittedAt) })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
 // CommitsMatchingSubjects finds commits whose subject contains any of the

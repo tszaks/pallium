@@ -78,6 +78,8 @@ func runKnowledgeBuild(out io.Writer, args []string, jsonOutput bool) error {
 			useModel = false
 		case "--no-materialize":
 			opts.Materialize = false
+		case "--allow-stale":
+			opts.AllowStale = true
 		case "--concurrency":
 			if index+1 >= len(args) {
 				return fmt.Errorf("--concurrency needs a number")

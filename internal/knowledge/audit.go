@@ -139,7 +139,7 @@ func Audit(store *db.Store, repoID int64, repoRoot string, opts AuditOptions) (A
 		}
 		flat := flattenClaims(claims)
 		if len(flat) == 0 {
-			if strings.Contains(doc.Generator, "model") {
+			if doc.Generator == "structural+model" {
 				report.NeedsRebuild++
 			} else {
 				// Nothing a model asserted, so nothing to refute. A
@@ -196,14 +196,16 @@ func Audit(store *db.Store, repoID int64, repoRoot string, opts AuditOptions) (A
 		}
 
 		flat := flattenClaims(item.claims)
+		if err := validateVerdicts(rulings, len(flat)); err != nil {
+			report.Failures = append(report.Failures, BuildFailure{Slug: item.doc.Slug, Reason: err.Error()})
+			continue
+		}
 		report.Audited++
 		report.Claims += len(flat)
 
 		removals := make(map[string]string)
+		unclear := make(map[string]string)
 		for _, ruling := range rulings {
-			if ruling.Index < 1 || ruling.Index > len(flat) {
-				continue
-			}
 			claim := flat[ruling.Index-1]
 			switch strings.ToLower(strings.TrimSpace(ruling.Ruling)) {
 			case "unsupported":
@@ -215,13 +217,14 @@ func Audit(store *db.Store, repoID int64, repoRoot string, opts AuditOptions) (A
 					Reason: truncate(strings.TrimSpace(ruling.Why), 200),
 				})
 			case "unclear":
+				unclear[claim.Claim] = strings.TrimSpace(ruling.Why)
 				report.Unclear++
-			default:
+			case "supported":
 				report.Supported++
 			}
 		}
 
-		if len(removals) == 0 {
+		if len(removals) == 0 && len(unclear) == 0 {
 			continue
 		}
 
@@ -238,6 +241,9 @@ func Audit(store *db.Store, repoID int64, repoRoot string, opts AuditOptions) (A
 			for claim, why := range removals {
 				updated.DroppedClaims = append(updated.DroppedClaims, fmt.Sprintf("audit: %q removed, %s", truncate(claim, 90), why))
 			}
+			for claim, why := range unclear {
+				updated.DroppedClaims = append(updated.DroppedClaims, fmt.Sprintf("audit: %q unclear, kept pending review, %s", truncate(claim, 90), why))
+			}
 			updated.Verified = false
 			if err := store.UpsertKnowledgeDoc(repoID, updated); err != nil {
 				return AuditReport{}, err
@@ -253,6 +259,9 @@ func Audit(store *db.Store, repoID int64, repoRoot string, opts AuditOptions) (A
 		}
 		for claim, why := range removals {
 			updated.DroppedClaims = append(updated.DroppedClaims, fmt.Sprintf("audit: %q removed, %s", truncate(claim, 90), why))
+		}
+		for claim, why := range unclear {
+			updated.DroppedClaims = append(updated.DroppedClaims, fmt.Sprintf("audit: %q unclear, kept pending review, %s", truncate(claim, 90), why))
 		}
 		updated.Verified = false
 		updated.GeneratedAt = time.Now().UTC()
@@ -278,6 +287,11 @@ func Audit(store *db.Store, repoID int64, repoRoot string, opts AuditOptions) (A
 // verdicts can be matched back by index instead of by fuzzy text matching.
 func flattenClaims(result synthesis) []citedClaim {
 	out := make([]citedClaim, 0)
+	for _, claim := range []citedClaim{result.Summary, result.Purpose} {
+		if strings.TrimSpace(claim.Claim) != "" {
+			out = append(out, claim)
+		}
+	}
 	for _, group := range [][]citedClaim{result.EntryPoints, result.KeySymbols, result.Invariants, result.Risks} {
 		out = append(out, group...)
 	}
@@ -296,13 +310,44 @@ func pruneClaims(result synthesis, removals map[string]string) synthesis {
 		return out
 	}
 	return synthesis{
-		Summary:     result.Summary,
-		Purpose:     result.Purpose,
+		Summary:     pruneOne(result.Summary, removals),
+		Purpose:     pruneOne(result.Purpose, removals),
 		EntryPoints: keep(result.EntryPoints),
 		KeySymbols:  keep(result.KeySymbols),
 		Invariants:  keep(result.Invariants),
 		Risks:       keep(result.Risks),
 	}
+}
+
+func pruneOne(claim citedClaim, removals map[string]string) citedClaim {
+	if _, removed := removals[claim.Claim]; removed {
+		return citedClaim{}
+	}
+	return claim
+}
+
+func validateVerdicts(rulings []verdict, claims int) error {
+	seen := make(map[int]struct{}, len(rulings))
+	for _, ruling := range rulings {
+		if ruling.Index < 1 || ruling.Index > claims {
+			return fmt.Errorf("verdict index %d out of range", ruling.Index)
+		}
+		if _, ok := seen[ruling.Index]; ok {
+			return fmt.Errorf("duplicate verdict index %d", ruling.Index)
+		}
+		seen[ruling.Index] = struct{}{}
+		switch strings.ToLower(strings.TrimSpace(ruling.Ruling)) {
+		case "supported", "unsupported", "unclear":
+		default:
+			return fmt.Errorf("invalid verdict ruling %q", ruling.Ruling)
+		}
+	}
+	for index := 1; index <= claims; index++ {
+		if _, ok := seen[index]; !ok {
+			return fmt.Errorf("missing verdict index %d", index)
+		}
+	}
+	return nil
 }
 
 // auditPrompt hands the skeptic the claims and the actual source of every
@@ -441,6 +486,13 @@ func claimExcerpts(store *db.Store, repoID int64, repoRoot string, claims []cite
 		symbols, err := store.SymbolsNamed(repoID, item.name)
 		if err != nil {
 			return nil, nil, err
+		}
+		if len(symbols) == 0 && strings.Contains(item.name, ".") {
+			tail := item.name[strings.LastIndex(item.name, ".")+1:]
+			symbols, err = store.SymbolsNamed(repoID, tail)
+			if err != nil {
+				return nil, nil, err
+			}
 		}
 
 		chosen := pickDeclarations(symbols, item.paths, moduleFiles)

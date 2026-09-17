@@ -48,8 +48,8 @@ func TestBuildDropsUnresolvableClaims(t *testing.T) {
 	store, repoID, repoRoot := indexedRepo(t)
 
 	synth := &stubSynth{response: `{
-  "summary": "Storage layer.",
-  "purpose": "Opens and queries the database.",
+  "summary": {"claim": "Storage layer.", "cited_paths": ["storage/store.go"], "cited_symbols": []},
+  "purpose": {"claim": "Opens and queries the database.", "cited_paths": ["storage/store.go"], "cited_symbols": []},
   "entry_points": [{"claim": "Open is the way in", "cited_paths": ["storage/store.go"], "cited_symbols": ["Open"]}],
   "invariants": [
     {"claim": "Real claim about a real symbol", "cited_symbols": ["Store"], "cited_paths": []},
@@ -120,16 +120,16 @@ func TestBuildSkipsUnchangedModules(t *testing.T) {
 		t.Fatalf("first build: %v", err)
 	}
 
-	synth := &stubSynth{response: `{"summary":"x","purpose":"y"}`}
+	synth := &stubSynth{response: `{"summary":{"claim":"x","cited_paths":["storage/store.go"]},"purpose":{"claim":"y","cited_paths":["storage/store.go"]}}`}
 	second, err := Build(store, repoID, repoRoot, BuildOptions{Synth: synth})
 	if err != nil {
 		t.Fatalf("second build: %v", err)
 	}
-	if synth.promptCount() != 0 {
-		t.Fatalf("unchanged modules should not be synthesized again, got %d prompts", synth.promptCount())
+	if synth.promptCount() != 2 {
+		t.Fatalf("structural docs should be regenerated when a model is requested, got %d prompts", synth.promptCount())
 	}
-	if second.Unchanged == 0 {
-		t.Fatalf("expected unchanged modules, got %+v", second)
+	if second.Unchanged != 0 {
+		t.Fatalf("model generation should not reuse structural docs, got %+v", second)
 	}
 }
 
@@ -363,7 +363,7 @@ func git(t *testing.T, dir string, args ...string) {
 func TestBuildFansOutWithoutLosingModules(t *testing.T) {
 	store, repoID, repoRoot := indexedRepo(t)
 
-	synth := &stubSynth{response: `{"summary":"A module.","purpose":"It does a thing.","invariants":[{"claim":"Open returns a Store","cited_symbols":["Open"],"cited_paths":[]}]}`}
+	synth := &stubSynth{response: `{"summary":{"claim":"A module.","cited_paths":["storage/store.go"]},"purpose":{"claim":"It does a thing.","cited_paths":["storage/store.go"]},"invariants":[{"claim":"Open returns a Store","cited_symbols":["Open"],"cited_paths":[]}]}`}
 	report, err := Build(store, repoID, repoRoot, BuildOptions{Synth: synth, Concurrency: 4})
 	if err != nil {
 		t.Fatalf("build: %v", err)
@@ -385,8 +385,8 @@ func TestBuildFansOutWithoutLosingModules(t *testing.T) {
 	if len(docs) != len(modules)+2 {
 		t.Fatalf("expected %d docs, got %d", len(modules)+2, len(docs))
 	}
-	if report.Dropped != 0 {
-		t.Fatalf("every claim cited a real symbol, got %d dropped", report.Dropped)
+	if report.Dropped != 2 {
+		t.Fatalf("only out-of-module claims should be dropped, got %d", report.Dropped)
 	}
 	for _, doc := range docs {
 		if doc.Kind == "module" && !strings.Contains(doc.Body, "Open returns a Store") {
@@ -401,8 +401,8 @@ func TestAuditRemovesClaimsTheSourceDoesNotSupport(t *testing.T) {
 	store, repoID, repoRoot := indexedRepo(t)
 
 	builder := &stubSynth{response: `{
-  "summary": "Storage layer.",
-  "purpose": "Opens and queries the database.",
+  "summary": {"claim": "Storage layer.", "cited_paths": ["storage/store.go"], "cited_symbols": []},
+  "purpose": {"claim": "Opens and queries the database.", "cited_paths": ["storage/store.go"], "cited_symbols": []},
   "invariants": [
     {"claim": "Open returns a Store", "cited_symbols": ["Open"], "cited_paths": []},
     {"claim": "Open deletes every row in the database", "cited_symbols": ["Open"], "cited_paths": []}
@@ -424,15 +424,17 @@ func TestAuditRemovesClaimsTheSourceDoesNotSupport(t *testing.T) {
 	}
 
 	auditor := &stubSynth{response: `{"verdicts": [
-  {"index": 1, "ruling": "supported", "why": "Open constructs and returns a *Store."},
-  {"index": 2, "ruling": "unsupported", "why": "Open only builds a struct; there is no delete."}
+  {"index": 1, "ruling": "supported", "why": "The storage file describes the layer."},
+  {"index": 2, "ruling": "supported", "why": "The storage file describes its purpose."},
+  {"index": 3, "ruling": "supported", "why": "Open constructs and returns a *Store."},
+  {"index": 4, "ruling": "unsupported", "why": "Open only builds a struct; there is no delete."}
 ]}`}
 	report, err := Audit(store, repoID, repoRoot, AuditOptions{Synth: auditor, Only: []string{"storage"}})
 	if err != nil {
 		t.Fatalf("audit: %v", err)
 	}
-	if report.Removed != 1 || report.Supported != 1 {
-		t.Fatalf("expected one removal and one survivor, got %+v", report)
+	if report.Removed != 1 || report.Supported != 3 {
+		t.Fatalf("expected one removal and three survivors, got %+v", report)
 	}
 
 	after, _, err := store.KnowledgeDoc(repoID, "storage")
@@ -536,15 +538,19 @@ func TestAuditEvidenceIsScopedToTheModule(t *testing.T) {
 	}
 
 	builder := &stubSynth{response: `{
-  "summary": "Zeta storage.",
-  "purpose": "Holds the zeta store.",
+  "summary": {"claim": "Zeta storage.", "cited_paths": ["zeta/store.go"]},
+  "purpose": {"claim": "Holds the zeta store.", "cited_paths": ["zeta/store.go"]},
   "invariants": [{"claim": "Store carries a zeta-only field", "cited_symbols": ["Store"], "cited_paths": ["zeta/store.go"]}]
 }`}
 	if _, err := Build(store, record.ID, repo, BuildOptions{Synth: builder, Only: []string{"zeta"}}); err != nil {
 		t.Fatalf("build: %v", err)
 	}
 
-	auditor := &stubSynth{response: `{"verdicts": [{"index": 1, "ruling": "supported", "why": "zetaOnlyField is right there."}]}`}
+	auditor := &stubSynth{response: `{"verdicts": [
+  {"index": 1, "ruling": "supported", "why": "zeta storage."},
+  {"index": 2, "ruling": "supported", "why": "zeta purpose."},
+  {"index": 3, "ruling": "supported", "why": "zetaOnlyField is right there."}
+]}`}
 	if _, err := Audit(store, record.ID, repo, AuditOptions{Synth: auditor, Only: []string{"zeta"}}); err != nil {
 		t.Fatalf("audit: %v", err)
 	}
@@ -568,15 +574,19 @@ func TestAuditReportsMissingEvidenceInsteadOfSubstituting(t *testing.T) {
 	store, repoID, repoRoot := indexedRepo(t)
 
 	builder := &stubSynth{response: `{
-  "summary": "Storage.",
-  "purpose": "Storage things.",
+  "summary": {"claim": "Storage.", "cited_paths": ["storage/store.go"]},
+  "purpose": {"claim": "Storage things.", "cited_paths": ["storage/store.go"]},
   "invariants": [{"claim": "Handle does the work", "cited_symbols": ["Handle"], "cited_paths": []}]
 }`}
 	if _, err := Build(store, repoID, repoRoot, BuildOptions{Synth: builder, Only: []string{"storage"}}); err != nil {
 		t.Fatalf("build: %v", err)
 	}
 
-	auditor := &stubSynth{response: `{"verdicts": [{"index": 1, "ruling": "unclear", "why": "Not visible here."}]}`}
+	auditor := &stubSynth{response: `{"verdicts": [
+  {"index": 1, "ruling": "supported", "why": "Storage."},
+  {"index": 2, "ruling": "supported", "why": "Storage."},
+  {"index": 3, "ruling": "unclear", "why": "Not visible here."}
+]}`}
 	if _, err := Audit(store, repoID, repoRoot, AuditOptions{Synth: auditor, Only: []string{"storage"}}); err != nil {
 		t.Fatalf("audit: %v", err)
 	}
