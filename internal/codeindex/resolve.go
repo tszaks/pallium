@@ -278,7 +278,7 @@ func resolveJSImportCandidates(repoRoot, sourceDir, spec string, aliases TSConfi
 		}
 	}
 
-	candidates := make([]string, 0, len(bases)*9)
+	candidates := make([]string, 0, len(bases)*14)
 	for _, base := range uniqueStrings(bases, 0) {
 		candidates = append(candidates,
 			base,
@@ -291,6 +291,13 @@ func resolveJSImportCandidates(repoRoot, sourceDir, spec string, aliases TSConfi
 			base+"/index.ts",
 			base+"/index.tsx",
 		)
+		// TypeScript's NodeNext and ESM output convention: the import
+		// specifier names the COMPILED file ("../server/auth.js") while the
+		// source on disk is "../server/auth.ts". Without this, an entire
+		// ESM-style TypeScript repo resolves to zero in-repo import edges.
+		// Found on a real 858-file Next.js repo whose api/ directory showed
+		// no dependencies at all for exactly this reason.
+		candidates = append(candidates, typeScriptSourceFor(base)...)
 	}
 	_ = repoRoot
 	return uniqueStrings(candidates, 0)
@@ -408,4 +415,27 @@ func (r *Resolver) tsAliases(sourceDir, sourcePath string) TSConfigAliases {
 	aliases := tsAliasesFor(r.repoRoot, sourcePath)
 	r.tsCache[sourceDir] = aliases
 	return aliases
+}
+
+// typeScriptSourceFor maps a compiled-JS import specifier back to the
+// TypeScript sources that could have produced it. Returns nil when the
+// specifier does not name a JS output file.
+func typeScriptSourceFor(base string) []string {
+	swaps := map[string][]string{
+		".js":  {".ts", ".tsx"},
+		".jsx": {".tsx"},
+		".mjs": {".mts", ".ts"},
+		".cjs": {".cts", ".ts"},
+	}
+	extension := filepath.Ext(base)
+	replacements, ok := swaps[extension]
+	if !ok {
+		return nil
+	}
+	stem := strings.TrimSuffix(base, extension)
+	out := make([]string, 0, len(replacements))
+	for _, replacement := range replacements {
+		out = append(out, stem+replacement)
+	}
+	return out
 }

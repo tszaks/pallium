@@ -130,24 +130,49 @@ func (s *Store) DeleteCodeFile(repoID int64, path string) error {
 	return nil
 }
 
-// CodeFileSHAs returns path to content hash for the whole repo, which is how
-// the indexer decides what to reparse.
-func (s *Store) CodeFileSHAs(repoID int64) (map[string]string, error) {
-	rows, err := s.q.Query(`SELECT path, content_sha FROM code_files WHERE repo_id = ?`, repoID)
+// CodeFileState is what the index already holds for a path: the content hash
+// and the parser tag that produced it.
+type CodeFileState struct {
+	ContentSHA string
+	Parser     string
+}
+
+// CodeFileStates is how the indexer decides what to reparse. It returns the
+// parser tag alongside the hash because a content hash alone is not enough: if
+// the parsers improve, every file's content is unchanged and a hash-only check
+// would keep a stale index forever. The tag carries a version so an upgraded
+// Pallium reparses on its next run.
+func (s *Store) CodeFileStates(repoID int64) (map[string]CodeFileState, error) {
+	rows, err := s.q.Query(`SELECT path, content_sha, parser FROM code_files WHERE repo_id = ?`, repoID)
 	if err != nil {
-		return nil, fmt.Errorf("query code file hashes: %w", err)
+		return nil, fmt.Errorf("query code file states: %w", err)
 	}
 	defer rows.Close()
 
-	out := make(map[string]string)
+	out := make(map[string]CodeFileState)
 	for rows.Next() {
-		var path, sha string
-		if err := rows.Scan(&path, &sha); err != nil {
-			return nil, fmt.Errorf("scan code file hash: %w", err)
+		var path string
+		var state CodeFileState
+		if err := rows.Scan(&path, &state.ContentSHA, &state.Parser); err != nil {
+			return nil, fmt.Errorf("scan code file state: %w", err)
 		}
-		out[path] = sha
+		out[path] = state
 	}
 	return out, rows.Err()
+}
+
+// CodeFileSHAs projects CodeFileStates down to hashes, which is all a module
+// fingerprint needs.
+func (s *Store) CodeFileSHAs(repoID int64) (map[string]string, error) {
+	states, err := s.CodeFileStates(repoID)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(states))
+	for path, state := range states {
+		out[path] = state.ContentSHA
+	}
+	return out, nil
 }
 
 func (s *Store) CodeIndexedPaths(repoID int64) ([]string, error) {

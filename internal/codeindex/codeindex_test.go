@@ -321,3 +321,71 @@ func git(t *testing.T, dir string, args ...string) {
 		t.Fatalf("git %v: %v\n%s", args, err, output)
 	}
 }
+
+// TestRunResolvesTypeScriptESMSpecifiers covers the NodeNext convention where
+// the import names the compiled file and the source on disk is TypeScript.
+// Found on a real 858-file repo whose api/ directory reported zero in-repo
+// dependencies for exactly this reason.
+func TestRunResolvesTypeScriptESMSpecifiers(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"server/auth.ts":   "export function authenticate() { return true }\n",
+		"server/audit.mts": "export function audit() {}\n",
+		"api/handler.ts": `import { authenticate } from "../server/auth.js";
+import { audit } from "../server/audit.mjs";
+
+export function handle() {
+  audit();
+  return authenticate();
+}
+`,
+	})
+
+	store, repoID := openIndexed(t, repo)
+	if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	imports, err := store.ImportsFrom(repoID, "api/handler.ts")
+	if err != nil {
+		t.Fatalf("imports: %v", err)
+	}
+	resolved := map[string]string{}
+	for _, imp := range imports {
+		resolved[imp.RawSpec] = imp.ToPath
+	}
+	if got := resolved["../server/auth.js"]; got != "server/auth.ts" {
+		t.Fatalf("expected ../server/auth.js to resolve to server/auth.ts, got %q", got)
+	}
+	if got := resolved["../server/audit.mjs"]; got != "server/audit.mts" {
+		t.Fatalf("expected ../server/audit.mjs to resolve to server/audit.mts, got %q", got)
+	}
+}
+
+// TestRunReparsesWhenParserVersionChanges is the guard for the failure this
+// found in practice: after improving a parser, every content hash still
+// matched, so nothing reparsed and the index stayed as wrong as before.
+func TestRunReparsesWhenParserVersionChanges(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"go.mod": "module example.com/app\n\ngo 1.26.0\n",
+		"a.go":   "package main\n\nfunc A() {}\n",
+	})
+
+	store, repoID := openIndexed(t, repo)
+	if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+
+	// Simulate an index written by a Pallium with older parsers: same content
+	// hash, stale parser tag.
+	if _, err := store.DB().Exec(`UPDATE code_files SET parser = 'go/ast@0' WHERE repo_id = ?`, repoID); err != nil {
+		t.Fatalf("age the parser tag: %v", err)
+	}
+
+	result, err := Run(store, repoID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if result.Reparsed != 1 || result.Unchanged != 0 {
+		t.Fatalf("a stale parser tag must force a reparse, got %+v", result)
+	}
+}

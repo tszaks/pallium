@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/tszaks/pallium/internal/db"
@@ -27,6 +28,21 @@ import (
 // symbols nobody will ever search for, and parsing it costs more than every
 // hand-written file in the repo combined.
 const maxParsedFileBytes = 512 * 1024
+
+// ParserVersion invalidates the content index when the parsers themselves
+// change. A file's content hash cannot notice that Pallium got better at
+// reading it: after an upgrade every hash matches, nothing reparses, and the
+// index stays as wrong as it was. Bump this whenever a parser or an import
+// resolver changes what it would produce for unchanged input.
+//
+// 2: TypeScript ESM specifiers ("../server/auth.js") now resolve to their .ts
+//
+//	sources, which an entire class of Node repo depends on.
+const ParserVersion = "2"
+
+func parserTag(parser string) string {
+	return parser + "@" + ParserVersion
+}
 
 // ParsedFile is one file's contribution to the index.
 type ParsedFile struct {
@@ -72,7 +88,7 @@ func Run(store *db.Store, repoID int64, indexedAt time.Time) (Result, error) {
 	}
 	sort.Strings(candidates)
 
-	existing, err := store.CodeFileSHAs(repoID)
+	existing, err := store.CodeFileStates(repoID)
 	if err != nil {
 		return Result{}, err
 	}
@@ -119,7 +135,7 @@ func Run(store *db.Store, repoID int64, indexedAt time.Time) (Result, error) {
 
 		sum := sha256.Sum256(content)
 		contentSHA := hex.EncodeToString(sum[:])
-		if previous, ok := existing[path]; ok && previous == contentSHA {
+		if previous, ok := existing[path]; ok && previous.ContentSHA == contentSHA && strings.HasSuffix(previous.Parser, "@"+ParserVersion) {
 			result.Unchanged++
 			continue
 		}
@@ -136,7 +152,7 @@ func Run(store *db.Store, repoID int64, indexedAt time.Time) (Result, error) {
 			Lang:       parsed.Lang,
 			SizeBytes:  info.Size(),
 			ContentSHA: contentSHA,
-			Parser:     parsed.Parser,
+			Parser:     parserTag(parsed.Parser),
 		}
 		if err := store.ReplaceCodeFile(repoID, file, parsed.Symbols, parsed.Imports, parsed.Refs, indexedAt); err != nil {
 			return Result{}, err
