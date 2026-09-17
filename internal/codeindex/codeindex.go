@@ -180,6 +180,14 @@ func Run(store *db.Store, repoID int64, indexedAt time.Time) (Result, error) {
 }
 
 func readIndexable(repoRoot, path string) ([]byte, int64, bool) {
+	content, size, ok := readContained(repoRoot, path)
+	if !ok || looksGenerated(content) {
+		return nil, 0, false
+	}
+	return content, size, true
+}
+
+func readContained(repoRoot, path string) ([]byte, int64, bool) {
 	absolute, err := filepath.Abs(filepath.Join(repoRoot, filepath.FromSlash(path)))
 	if err != nil {
 		return nil, 0, false
@@ -197,11 +205,11 @@ func readIndexable(repoRoot, path string) ([]byte, int64, bool) {
 		return nil, 0, false
 	}
 	info, err := os.Stat(target)
-	if err != nil || info.IsDir() || info.Size() > maxParsedFileBytes {
+	if err != nil || !info.Mode().IsRegular() || info.Size() > maxParsedFileBytes {
 		return nil, 0, false
 	}
 	content, err := os.ReadFile(target)
-	if err != nil || looksGenerated(content) {
+	if err != nil {
 		return nil, 0, false
 	}
 	return content, info.Size(), true
@@ -267,23 +275,18 @@ func resolverKey(repoRoot string, paths []string) (string, error) {
 	}
 	sort.Strings(configPaths)
 	for _, path := range configPaths {
-		content, err := os.ReadFile(filepath.Join(repoRoot, filepath.FromSlash(path)))
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return "", err
+		content, _, ok := readContained(repoRoot, path)
+		if !ok {
+			continue
 		}
 		hasher.Write([]byte(path))
 		hasher.Write([]byte{0})
 		hasher.Write(content)
 		hasher.Write([]byte{0})
 	}
-	content, err := os.ReadFile(filepath.Join(repoRoot, "go.mod"))
-	if err != nil && !os.IsNotExist(err) {
-		return "", err
+	if content, _, ok := readContained(repoRoot, "go.mod"); ok {
+		hasher.Write(content)
 	}
-	hasher.Write(content)
 	sum := hasher.Sum(nil)
 	return hex.EncodeToString(sum)[:12], nil
 }

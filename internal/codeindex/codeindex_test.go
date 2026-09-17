@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -613,6 +614,45 @@ func TestRunReparsesWhenUntrackedTSConfigChanges(t *testing.T) {
 	}
 	if result.Reparsed == 0 {
 		t.Fatalf("untracked resolver config change did not reparse: %+v", result)
+	}
+}
+
+func TestResolverInputsRejectSpecialFiles(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"src/a.ts": "import value from '@/value'\nexport const result = value\n",
+	})
+	outside := t.TempDir()
+	outsideConfig := filepath.Join(outside, "tsconfig.json")
+	write(t, outsideConfig, `{"compilerOptions":{"paths":{"@/*":["outside/*"]}}}`)
+	if err := os.Symlink(outsideConfig, filepath.Join(repo, "tsconfig.json")); err != nil {
+		t.Fatalf("tsconfig symlink: %v", err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(repo, "jsconfig.json"), 0o600); err != nil {
+		t.Logf("skipping FIFO subcase: %v", err)
+	} else {
+		if _, _, ok := readContained(repo, "jsconfig.json"); ok {
+			t.Fatal("FIFO resolver config was readable")
+		}
+	}
+	write(t, filepath.Join(outside, "go.mod"), "module outside.example/app\n")
+	if err := os.Symlink(filepath.Join(outside, "go.mod"), filepath.Join(repo, "go.mod")); err != nil {
+		t.Fatalf("go.mod symlink: %v", err)
+	}
+	if _, _, ok := readContained(repo, "go.mod"); ok {
+		t.Fatal("outside go.mod symlink was readable")
+	}
+	if _, err := resolverKey(repo, []string{"src/a.ts"}); err != nil {
+		t.Fatalf("resolver key followed a rejected input: %v", err)
+	}
+	resolver := NewResolver(repo, []string{"src/a.ts"})
+	parsed, ok := Parse("src/a.ts", []byte("import value from '@/value'\nexport const result = value\n"), resolver)
+	if !ok {
+		t.Fatal("TypeScript fixture was not parsed")
+	}
+	for _, imp := range parsed.Imports {
+		if imp.ToPath != "" {
+			t.Fatalf("resolver followed a rejected config: %+v", imp)
+		}
 	}
 }
 

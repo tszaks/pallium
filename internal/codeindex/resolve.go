@@ -87,8 +87,8 @@ func readTSConfigFile(repoRoot, configPath string, visited map[string]struct{}) 
 	}
 	visited[configPath] = struct{}{}
 
-	content, err := os.ReadFile(filepath.Join(repoRoot, filepath.FromSlash(configPath)))
-	if err != nil {
+	content, _, ok := readContained(repoRoot, configPath)
+	if !ok {
 		return TSConfigAliases{}
 	}
 	cleaned := jsonCommentRegex.ReplaceAllString(string(content), "")
@@ -141,8 +141,8 @@ func tsConfigChain(repoRoot, configPath string, visited map[string]struct{}) []s
 	visited[configPath] = struct{}{}
 
 	out := []string{configPath}
-	content, err := os.ReadFile(filepath.Join(repoRoot, filepath.FromSlash(configPath)))
-	if err != nil {
+	content, _, ok := readContained(repoRoot, configPath)
+	if !ok {
 		return out
 	}
 	cleaned := jsonCommentRegex.ReplaceAllString(string(content), "")
@@ -299,8 +299,8 @@ func repoJoinSlash(base, value string) string {
 }
 
 func readGoModulePath(repoRoot string) string {
-	content, err := os.ReadFile(filepath.Join(repoRoot, "go.mod"))
-	if err != nil {
+	content, _, ok := readContained(repoRoot, "go.mod")
+	if !ok {
 		return ""
 	}
 	for _, line := range strings.Split(string(content), "\n") {
@@ -314,7 +314,7 @@ func readGoModulePath(repoRoot string) string {
 
 func fileExists(path string) bool {
 	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
+	return err == nil && info.Mode().IsRegular()
 }
 
 func dirExists(path string) bool {
