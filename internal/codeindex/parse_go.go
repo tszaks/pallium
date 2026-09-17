@@ -109,7 +109,7 @@ func parseGo(path string, content []byte, resolver *Resolver) (ParsedFile, bool)
 			RawSpec:  spec,
 			ToPath:   target,
 			Kind:     "go-import",
-			External: target == "",
+			External: target == "" && !isLocalGoImport(spec, resolver.GoModulePath()),
 		})
 	}
 
@@ -146,6 +146,20 @@ func goRefs(file *ast.File, declared map[string]struct{}, path string) []db.Code
 				add(fun.Name)
 			case *ast.SelectorExpr:
 				add(fun.Sel.Name)
+			case *ast.IndexExpr:
+				switch expression := fun.X.(type) {
+				case *ast.Ident:
+					add(expression.Name)
+				case *ast.SelectorExpr:
+					add(expression.Sel.Name)
+				}
+			case *ast.IndexListExpr:
+				switch expression := fun.X.(type) {
+				case *ast.Ident:
+					add(expression.Name)
+				case *ast.SelectorExpr:
+					add(expression.Sel.Name)
+				}
 			}
 		case *ast.SelectorExpr:
 			add(item.Sel.Name)
@@ -155,6 +169,10 @@ func goRefs(file *ast.File, declared map[string]struct{}, path string) []db.Code
 		return true
 	})
 	return refs
+}
+
+func isLocalGoImport(spec, module string) bool {
+	return module != "" && (spec == module || strings.HasPrefix(spec, module+"/"))
 }
 
 func goTypeKind(spec *ast.TypeSpec) string {

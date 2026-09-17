@@ -188,7 +188,7 @@ func scanImports(path, lang, text string, resolver *Resolver) []db.CodeImport {
 			RawSpec:  spec,
 			ToPath:   target,
 			Kind:     kind,
-			External: target == "",
+			External: target == "" && !isLocalScanImport(kind, spec),
 		})
 	}
 
@@ -212,6 +212,17 @@ func scanImports(path, lang, text string, resolver *Resolver) []db.CodeImport {
 		}
 	}
 	return out
+}
+
+func isLocalScanImport(kind, spec string) bool {
+	switch kind {
+	case "js-import":
+		return strings.HasPrefix(spec, ".") || strings.HasPrefix(spec, "/")
+	case "py-import":
+		return strings.HasPrefix(spec, ".")
+	default:
+		return false
+	}
 }
 
 func scanRefs(path, text string, declared map[string]struct{}) []db.CodeRef {

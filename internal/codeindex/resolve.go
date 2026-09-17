@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -154,14 +155,42 @@ func resolveTSAliasBases(spec string, aliases TSConfigAliases) []string {
 	if len(aliases.Paths) == 0 {
 		return nil
 	}
-	out := make([]string, 0, 4)
+	type match struct {
+		pattern   string
+		targets   []string
+		remainder string
+		prefix    int
+		suffix    int
+	}
+	matches := make([]match, 0, len(aliases.Paths))
 	for pattern, targets := range aliases.Paths {
 		remainder, ok := matchTSAlias(pattern, spec)
 		if !ok {
 			continue
 		}
-		for _, target := range targets {
-			resolved := strings.Replace(target, "*", remainder, 1)
+		parts := strings.SplitN(pattern, "*", 2)
+		suffix := 0
+		if len(parts) == 2 {
+			suffix = len(parts[1])
+		}
+		matches = append(matches, match{
+			pattern: pattern, targets: targets, remainder: remainder,
+			prefix: len(parts[0]), suffix: suffix,
+		})
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		if matches[i].prefix != matches[j].prefix {
+			return matches[i].prefix > matches[j].prefix
+		}
+		if matches[i].suffix != matches[j].suffix {
+			return matches[i].suffix > matches[j].suffix
+		}
+		return matches[i].pattern < matches[j].pattern
+	})
+	out := make([]string, 0, 4)
+	for _, item := range matches {
+		for _, target := range item.targets {
+			resolved := strings.Replace(target, "*", item.remainder, 1)
 			resolved = repoJoinSlash("", resolved)
 			out = append(out, resolved)
 		}
