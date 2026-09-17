@@ -516,6 +516,46 @@ func TestRunReparsesWhenResolverInputsChange(t *testing.T) {
 	}
 }
 
+func TestNestedGoModulesStayExternal(t *testing.T) {
+	for name, requireLine := range map[string]string{
+		"block":  "require (\n\texample.com/lib/v2 v2.0.0\n)",
+		"single": "require example.com/lib/v2 v2.0.0",
+	} {
+		t.Run(name, func(t *testing.T) {
+			repo := newRepo(t, map[string]string{
+				"go.mod": "module example.com/lib\n\ngo 1.26.0\n\n" + requireLine + "\n",
+				"main.go": `package main
+
+import (
+	_ "example.com/lib/v2/foo"
+	_ "example.com/lib/internal/missing"
+)
+
+func Main() {}
+`,
+			})
+			store, repoID := openIndexed(t, repo)
+			if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			imports, err := store.ImportsFrom(repoID, "main.go")
+			if err != nil {
+				t.Fatalf("imports: %v", err)
+			}
+			bySpec := map[string]db.CodeImport{}
+			for _, item := range imports {
+				bySpec[item.RawSpec] = item
+			}
+			if item := bySpec["example.com/lib/v2/foo"]; !item.External || item.ToPath != "" {
+				t.Fatalf("nested module import should stay external: %+v", item)
+			}
+			if item := bySpec["example.com/lib/internal/missing"]; item.External || item.ToPath != "" {
+				t.Fatalf("unresolved in-module import should stay local: %+v", item)
+			}
+		})
+	}
+}
+
 func TestResolverKeyIgnoresMissingTrackedConfigs(t *testing.T) {
 	repo := newRepo(t, map[string]string{
 		"tsconfig.json": `{"compilerOptions":{"baseUrl":"."}}`,
@@ -653,6 +693,31 @@ func TestResolverInputsRejectSpecialFiles(t *testing.T) {
 		if imp.ToPath != "" {
 			t.Fatalf("resolver followed a rejected config: %+v", imp)
 		}
+	}
+}
+
+func TestUnresolvedTSAliasImportsStayLocal(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"tsconfig.json": `{"compilerOptions":{"paths":{"@/*":["src/*"]}}}`,
+		"src/a.ts":      "import missing from '@/missing'\nimport react from 'react'\nexport const value = missing || react\n",
+	})
+	store, repoID := openIndexed(t, repo)
+	if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	imports, err := store.ImportsFrom(repoID, "src/a.ts")
+	if err != nil {
+		t.Fatalf("imports: %v", err)
+	}
+	bySpec := map[string]db.CodeImport{}
+	for _, item := range imports {
+		bySpec[item.RawSpec] = item
+	}
+	if item := bySpec["@/missing"]; item.External || item.ToPath != "" {
+		t.Fatalf("unresolved TS alias should stay local: %+v", item)
+	}
+	if item := bySpec["react"]; !item.External || item.ToPath != "" {
+		t.Fatalf("package import should stay external: %+v", item)
 	}
 }
 

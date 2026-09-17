@@ -188,7 +188,8 @@ func scanImports(path, lang, text string, resolver *Resolver) []db.CodeImport {
 			RawSpec:  spec,
 			ToPath:   target,
 			Kind:     kind,
-			External: target == "" && !isLocalScanImport(kind, spec),
+			External: target == "" && !isLocalScanImport(kind, spec) &&
+				!(kind == "js-import" && resolver.MatchesJSAlias(path, spec)),
 		})
 	}
 

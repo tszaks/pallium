@@ -140,6 +140,10 @@ func Audit(store *db.Store, repoID int64, repoRoot string, opts AuditOptions) (A
 			_ = json.Unmarshal([]byte(doc.Claims), &claims)
 		}
 		flat := flattenClaims(claims)
+		if len(flat) > 0 && hasUncitedClaims(flat) {
+			report.NeedsRebuild++
+			continue
+		}
 		if len(flat) == 0 {
 			if doc.Generator == "structural+model" {
 				report.NeedsRebuild++
@@ -314,6 +318,16 @@ func flattenClaims(result synthesis) []citedClaim {
 		out = append(out, group...)
 	}
 	return out
+}
+
+func hasUncitedClaims(flat []citedClaim) bool {
+	for _, claim := range flat {
+		if strings.TrimSpace(claim.Claim) != "" &&
+			len(claim.CitedPaths) == 0 && len(claim.CitedSymbols) == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func pruneClaims(result synthesis, removed map[int]struct{}) synthesis {

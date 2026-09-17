@@ -298,18 +298,49 @@ func repoJoinSlash(base, value string) string {
 	return filepath.ToSlash(filepath.Clean(filepath.Join(base, value)))
 }
 
-func readGoModulePath(repoRoot string) string {
+func readGoModuleInfo(repoRoot string) (string, []string) {
 	content, _, ok := readContained(repoRoot, "go.mod")
 	if !ok {
-		return ""
+		return "", nil
 	}
+	module := ""
+	requires := make([]string, 0)
+	inRequireBlock := false
 	for _, line := range strings.Split(string(content), "\n") {
 		line = strings.TrimSpace(line)
+		if comment := strings.Index(line, "//"); comment >= 0 {
+			line = strings.TrimSpace(line[:comment])
+		}
+		if line == "" {
+			continue
+		}
+		if inRequireBlock {
+			if line == ")" {
+				inRequireBlock = false
+				continue
+			}
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				requires = append(requires, fields[0])
+			}
+			continue
+		}
 		if strings.HasPrefix(line, "module ") {
-			return strings.TrimSpace(strings.TrimPrefix(line, "module "))
+			module = strings.TrimSpace(strings.TrimPrefix(line, "module "))
+			continue
+		}
+		if line == "require (" {
+			inRequireBlock = true
+			continue
+		}
+		if strings.HasPrefix(line, "require ") {
+			fields := strings.Fields(strings.TrimSpace(strings.TrimPrefix(line, "require ")))
+			if len(fields) >= 2 {
+				requires = append(requires, fields[0])
+			}
 		}
 	}
-	return ""
+	return module, uniqueStrings(requires, 0)
 }
 
 func fileExists(path string) bool {
@@ -377,11 +408,12 @@ func isPythonFile(path string) bool {
 // concurrent use; the indexer is single-threaded by design so that a repo's
 // sqlite file only ever has one writer.
 type Resolver struct {
-	repoRoot  string
-	goModule  string
-	knownPath map[string]struct{}
-	knownDir  map[string]struct{}
-	tsCache   map[string]TSConfigAliases
+	repoRoot   string
+	goModule   string
+	goRequires []string
+	knownPath  map[string]struct{}
+	knownDir   map[string]struct{}
+	tsCache    map[string]TSConfigAliases
 }
 
 // NewResolver takes the repo's file list so resolution can check whether a
@@ -395,16 +427,22 @@ func NewResolver(repoRoot string, paths []string) *Resolver {
 		// resolved package directory is never confused with "not found".
 		dirs[filepath.ToSlash(filepath.Dir(path))] = struct{}{}
 	}
+	goModule, goRequires := readGoModuleInfo(repoRoot)
 	return &Resolver{
-		repoRoot:  repoRoot,
-		goModule:  readGoModulePath(repoRoot),
-		knownPath: known,
-		knownDir:  dirs,
-		tsCache:   map[string]TSConfigAliases{},
+		repoRoot:   repoRoot,
+		goModule:   goModule,
+		goRequires: goRequires,
+		knownPath:  known,
+		knownDir:   dirs,
+		tsCache:    map[string]TSConfigAliases{},
 	}
 }
 
 func (r *Resolver) GoModulePath() string { return r.goModule }
+
+func (r *Resolver) GoRequires() []string {
+	return append([]string(nil), r.goRequires...)
+}
 
 // ResolveGo maps a Go import path to the in-repo package directory it names,
 // or "" when the import is stdlib or a third-party module. The result is a
@@ -446,6 +484,14 @@ func (r *Resolver) ResolveJS(sourcePath, spec string) string {
 		}
 	}
 	return ""
+}
+
+func (r *Resolver) MatchesJSAlias(sourcePath, spec string) bool {
+	if !isJSImportFile(sourcePath) {
+		return false
+	}
+	sourceDir := filepath.ToSlash(filepath.Dir(sourcePath))
+	return len(resolveTSAliasBases(spec, r.tsAliases(sourceDir, sourcePath))) > 0
 }
 
 // ResolvePy maps a Python import spec to a repo path, handling both relative

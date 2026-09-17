@@ -165,8 +165,15 @@ func Build(store *db.Store, repoID int64, repoRoot string, opts BuildOptions) (B
 		if err != nil {
 			return BuildReport{}, err
 		}
+		reusableClaims := true
+		if opts.Synth != nil {
+			var stored synthesis
+			if err := json.Unmarshal([]byte(existing.Claims), &stored); err == nil {
+				reusableClaims = !hasUncitedClaims(flattenClaims(stored))
+			}
+		}
 		if found && !opts.Force && existing.Fingerprint == module.Fingerprint &&
-			(opts.Synth == nil || existing.Generator == "structural+model") {
+			(opts.Synth == nil || (existing.Generator == "structural+model" && reusableClaims)) {
 			report.Unchanged++
 			report.Docs = append(report.Docs, DocSummary{
 				Slug: module.Slug, Kind: "module", Title: module.Title,

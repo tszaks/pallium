@@ -480,6 +480,53 @@ func TestAuditNeedsAModel(t *testing.T) {
 	}
 }
 
+func TestAuditRequiresRebuildForLegacyUncitedClaims(t *testing.T) {
+	store, repoID, repoRoot := indexedRepo(t)
+	modules, err := Modules(store, repoID, ModuleOptions{})
+	if err != nil {
+		t.Fatalf("modules: %v", err)
+	}
+	var storage Module
+	for _, module := range modules {
+		if module.Slug == "storage" {
+			storage = module
+			break
+		}
+	}
+	legacy := db.KnowledgeDoc{
+		Slug:        "storage",
+		Kind:        "module",
+		Title:       storage.Title,
+		Body:        "legacy body",
+		Claims:      `{"summary":"legacy summary","purpose":"legacy purpose","entry_points":[{"claim":"Open","cited_symbols":["Open"]}]}`,
+		Fingerprint: storage.Fingerprint,
+		Generator:   "structural+model",
+		Verified:    true,
+		GeneratedAt: time.Now().UTC(),
+	}
+	if err := store.UpsertKnowledgeDoc(repoID, legacy); err != nil {
+		t.Fatalf("store legacy doc: %v", err)
+	}
+	auditor := &stubSynth{err: errors.New("legacy claims must not be audited")}
+	report, err := Audit(store, repoID, repoRoot, AuditOptions{
+		Synth: auditor,
+		Only:  []string{"storage"},
+	})
+	if err != nil {
+		t.Fatalf("audit: %v", err)
+	}
+	if report.NeedsRebuild != 1 || auditor.promptCount() != 0 {
+		t.Fatalf("legacy uncited claims should require rebuild without auditing: %+v calls=%d", report, auditor.promptCount())
+	}
+	after, _, err := store.KnowledgeDoc(repoID, "storage")
+	if err != nil {
+		t.Fatalf("read legacy doc: %v", err)
+	}
+	if after.Claims != legacy.Claims || after.Body != legacy.Body || !after.Verified {
+		t.Fatalf("legacy doc changed during audit: before=%+v after=%+v", legacy, after)
+	}
+}
+
 // TestAuditSkipsStructuralDocs keeps the audit from spending calls on docs
 // where no model asserted anything.
 func TestAuditSkipsStructuralDocs(t *testing.T) {
@@ -867,6 +914,53 @@ func TestBuildRetriesFallbackDocsWhenModelIsAvailable(t *testing.T) {
 			t.Fatalf("model doc should be reusable without a model: %+v", report)
 		}
 	})
+}
+
+func TestBuildRebuildsLegacyUncitedDocs(t *testing.T) {
+	store, repoID, repoRoot := indexedRepo(t)
+	modules, err := Modules(store, repoID, ModuleOptions{})
+	if err != nil {
+		t.Fatalf("modules: %v", err)
+	}
+	var storage Module
+	for _, module := range modules {
+		if module.Slug == "storage" {
+			storage = module
+			break
+		}
+	}
+	legacy := db.KnowledgeDoc{
+		Slug:        "storage",
+		Kind:        "module",
+		Title:       storage.Title,
+		Body:        "legacy body",
+		Claims:      `{"summary":"legacy summary","purpose":"legacy purpose","entry_points":[{"claim":"Open","cited_symbols":["Open"]}]}`,
+		Fingerprint: storage.Fingerprint,
+		Generator:   "structural+model",
+		Verified:    true,
+		GeneratedAt: time.Now().UTC(),
+	}
+	if err := store.UpsertKnowledgeDoc(repoID, legacy); err != nil {
+		t.Fatalf("store legacy doc: %v", err)
+	}
+	structural, err := Build(store, repoID, repoRoot, BuildOptions{Only: []string{"storage"}})
+	if err != nil {
+		t.Fatalf("no-model build: %v", err)
+	}
+	if structural.Unchanged != 1 {
+		t.Fatalf("no-model build should reuse legacy docs: %+v", structural)
+	}
+	synth := &stubSynth{response: `{"summary":{"claim":"Storage","cited_symbols":["Open"]},"purpose":{"claim":"Purpose","cited_symbols":["Open"]}}`}
+	model, err := Build(store, repoID, repoRoot, BuildOptions{
+		Synth: synth,
+		Only:  []string{"storage"},
+	})
+	if err != nil {
+		t.Fatalf("model build: %v", err)
+	}
+	if model.Unchanged != 0 || synth.promptCount() != 1 {
+		t.Fatalf("model build should rebuild legacy docs: report=%+v calls=%d", model, synth.promptCount())
+	}
 }
 
 func TestBuildRejectsCitationsOutsideModule(t *testing.T) {

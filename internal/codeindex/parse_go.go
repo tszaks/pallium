@@ -109,7 +109,7 @@ func parseGo(path string, content []byte, resolver *Resolver) (ParsedFile, bool)
 			RawSpec:  spec,
 			ToPath:   target,
 			Kind:     "go-import",
-			External: target == "" && !isLocalGoImport(spec, resolver.GoModulePath()),
+			External: target == "" && !isLocalGoImport(spec, resolver.GoModulePath(), resolver.GoRequires()),
 		})
 	}
 
@@ -171,8 +171,16 @@ func goRefs(file *ast.File, declared map[string]struct{}, path string) []db.Code
 	return refs
 }
 
-func isLocalGoImport(spec, module string) bool {
-	return module != "" && (spec == module || strings.HasPrefix(spec, module+"/"))
+func isLocalGoImport(spec, module string, requires []string) bool {
+	if module == "" || (spec != module && !strings.HasPrefix(spec, module+"/")) {
+		return false
+	}
+	for _, required := range requires {
+		if spec == required || strings.HasPrefix(spec, required+"/") {
+			return false
+		}
+	}
+	return true
 }
 
 func goTypeKind(spec *ast.TypeSpec) string {
