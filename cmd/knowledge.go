@@ -23,6 +23,8 @@ func runKnowledge(out io.Writer, args []string, jsonOutput bool) error {
 		return runKnowledgeMap(out, args, jsonOutput)
 	case "build":
 		return runKnowledgeBuild(out, args, jsonOutput)
+	case "audit":
+		return runKnowledgeAudit(out, args, jsonOutput)
 	case "list", "status":
 		return runKnowledgeList(out, args, jsonOutput)
 	case "get":
@@ -30,7 +32,7 @@ func runKnowledge(out io.Writer, args []string, jsonOutput bool) error {
 	case "search":
 		return runKnowledgeSearch(out, args, jsonOutput)
 	default:
-		return fmt.Errorf("unknown knowledge action: %s (want map, build, list, get, or search)", action)
+		return fmt.Errorf("unknown knowledge action: %s (want map, build, audit, list, get, or search)", action)
 	}
 }
 
@@ -254,6 +256,70 @@ func runKnowledgeSearch(out io.Writer, args []string, jsonOutput bool) error {
 		}
 		if len(docs) == 0 {
 			builder.WriteString("Nothing matched. Run `pallium knowledge build` if the base is empty.\n")
+		}
+		return builder.String()
+	})
+}
+
+// runKnowledgeAudit re-checks stored claims against the source. Build proves a
+// citation resolves; only this proves the claim is true.
+func runKnowledgeAudit(out io.Writer, args []string, jsonOutput bool) error {
+	opts := knowledge.AuditOptions{Materialize: true}
+	positional := make([]string, 0, len(args))
+	for index := 0; index < len(args); index++ {
+		switch args[index] {
+		case "--no-materialize":
+			opts.Materialize = false
+		case "--concurrency":
+			if index+1 >= len(args) {
+				return fmt.Errorf("--concurrency needs a number")
+			}
+			index++
+			value, convErr := strconv.Atoi(args[index])
+			if convErr != nil || value < 1 {
+				return fmt.Errorf("--concurrency needs a positive number, got %q", args[index])
+			}
+			opts.Concurrency = value
+		case "--only":
+			if index+1 >= len(args) {
+				return fmt.Errorf("--only needs a module slug")
+			}
+			index++
+			opts.Only = append(opts.Only, strings.Split(args[index], ",")...)
+		default:
+			positional = append(positional, args[index])
+		}
+	}
+
+	indexer, err := openIndexedStore(optionalRepoArg(positional, 0))
+	if err != nil {
+		return err
+	}
+	defer indexer.Store.Close()
+
+	repo, err := indexer.Store.Repo()
+	if err != nil {
+		return err
+	}
+	opts.Synth = knowledge.ProviderSynthesizer{RepoRoot: indexer.Store.RepoRoot}
+
+	report, err := knowledge.Audit(indexer.Store, repo.ID, indexer.Store.RepoRoot, opts)
+	if err != nil {
+		return err
+	}
+
+	return output.Write(out, report, jsonOutput, func() string {
+		var builder strings.Builder
+		fmt.Fprintf(&builder, "Audited %d of %d module doc(s), %d skipped as structural-only.\n", report.Audited, report.Docs, report.Skipped)
+		if report.NeedsRebuild > 0 {
+			fmt.Fprintf(&builder, "%d doc(s) were written by a model before claims were stored and cannot be audited: run `pallium knowledge build --force` first.\n", report.NeedsRebuild)
+		}
+		fmt.Fprintf(&builder, "%d claim(s) checked: %d supported, %d unclear, %d REMOVED.\n", report.Claims, report.Supported, report.Unclear, report.Removed)
+		for _, finding := range report.Findings {
+			fmt.Fprintf(&builder, "- %s: %s\n    %s\n", finding.Slug, finding.Claim, finding.Reason)
+		}
+		for _, failure := range report.Failures {
+			fmt.Fprintf(&builder, "! %s: %s\n", failure.Slug, failure.Reason)
 		}
 		return builder.String()
 	})

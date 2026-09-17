@@ -172,6 +172,7 @@ CREATE TABLE IF NOT EXISTS knowledge_docs (
   cited_paths_json TEXT NOT NULL DEFAULT '[]',
   cited_symbols_json TEXT NOT NULL DEFAULT '[]',
   dropped_claims_json TEXT NOT NULL DEFAULT '[]',
+  claims_json TEXT NOT NULL DEFAULT '{}',
   source_commit TEXT NOT NULL DEFAULT '',
   fingerprint TEXT NOT NULL DEFAULT '',
   generator TEXT NOT NULL DEFAULT '',

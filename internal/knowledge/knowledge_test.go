@@ -394,3 +394,101 @@ func TestBuildFansOutWithoutLosingModules(t *testing.T) {
 		}
 	}
 }
+
+// TestAuditRemovesClaimsTheSourceDoesNotSupport covers the gap build cannot
+// close: a claim can cite a symbol that exists and still be false.
+func TestAuditRemovesClaimsTheSourceDoesNotSupport(t *testing.T) {
+	store, repoID, repoRoot := indexedRepo(t)
+
+	builder := &stubSynth{response: `{
+  "summary": "Storage layer.",
+  "purpose": "Opens and queries the database.",
+  "invariants": [
+    {"claim": "Open returns a Store", "cited_symbols": ["Open"], "cited_paths": []},
+    {"claim": "Open deletes every row in the database", "cited_symbols": ["Open"], "cited_paths": []}
+  ]
+}`}
+	if _, err := Build(store, repoID, repoRoot, BuildOptions{Synth: builder, Only: []string{"storage"}}); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	before, _, err := store.KnowledgeDoc(repoID, "storage")
+	if err != nil {
+		t.Fatalf("doc: %v", err)
+	}
+	if !before.Verified {
+		t.Fatalf("both citations resolve, so build should call this verified: %v", before.DroppedClaims)
+	}
+	if !strings.Contains(before.Body, "deletes every row") {
+		t.Fatal("build cannot catch a false claim about a real symbol; that is the point of the audit")
+	}
+
+	auditor := &stubSynth{response: `{"verdicts": [
+  {"index": 1, "ruling": "supported", "why": "Open constructs and returns a *Store."},
+  {"index": 2, "ruling": "unsupported", "why": "Open only builds a struct; there is no delete."}
+]}`}
+	report, err := Audit(store, repoID, repoRoot, AuditOptions{Synth: auditor, Only: []string{"storage"}})
+	if err != nil {
+		t.Fatalf("audit: %v", err)
+	}
+	if report.Removed != 1 || report.Supported != 1 {
+		t.Fatalf("expected one removal and one survivor, got %+v", report)
+	}
+
+	after, _, err := store.KnowledgeDoc(repoID, "storage")
+	if err != nil {
+		t.Fatalf("doc after audit: %v", err)
+	}
+	if strings.Contains(after.Body, "deletes every row") {
+		t.Fatalf("the refuted claim survived in the body:\n%s", after.Body)
+	}
+	if !strings.Contains(after.Body, "Open returns a Store") {
+		t.Fatalf("the supported claim should remain:\n%s", after.Body)
+	}
+	if after.Verified {
+		t.Fatal("a doc that lost a claim to the audit is no longer clean")
+	}
+	found := false
+	for _, dropped := range after.DroppedClaims {
+		if strings.HasPrefix(dropped, "audit:") && strings.Contains(dropped, "no delete") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the audit's reason should travel with the doc, got %v", after.DroppedClaims)
+	}
+
+	// The prompt must contain real source, or this is a second opinion rather
+	// than an audit.
+	if len(auditor.prompts) == 0 || !strings.Contains(auditor.prompts[0], "func Open(name string) *Store") {
+		t.Fatal("the auditor was not shown the cited symbol's source")
+	}
+}
+
+func TestAuditNeedsAModel(t *testing.T) {
+	store, repoID, repoRoot := indexedRepo(t)
+	if _, err := Audit(store, repoID, repoRoot, AuditOptions{}); err == nil {
+		t.Fatal("an audit with no model should refuse rather than report everything clean")
+	}
+}
+
+// TestAuditSkipsStructuralDocs keeps the audit from spending calls on docs
+// where no model asserted anything.
+func TestAuditSkipsStructuralDocs(t *testing.T) {
+	store, repoID, repoRoot := indexedRepo(t)
+	if _, err := Build(store, repoID, repoRoot, BuildOptions{}); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	auditor := &stubSynth{response: `{"verdicts": [{"index": 1, "ruling": "supported", "why": "x"}]}`}
+	report, err := Audit(store, repoID, repoRoot, AuditOptions{Synth: auditor})
+	if err != nil {
+		t.Fatalf("audit: %v", err)
+	}
+	if report.Audited != 0 || report.Skipped == 0 {
+		t.Fatalf("structural docs have no claims to audit, got %+v", report)
+	}
+	if auditor.promptCount() != 0 {
+		t.Fatalf("no model calls should have been made, got %d", auditor.promptCount())
+	}
+}

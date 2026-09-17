@@ -274,6 +274,9 @@ func buildModuleDoc(module Module, index citationIndex, sourceCommit string, res
 	doc.Body = renderModuleDoc(module, verified)
 	doc.CitedPaths = citedPaths(module, verified)
 	doc.CitedSymbols = citedSymbols(verified)
+	if encoded, err := json.Marshal(verified); err == nil {
+		doc.Claims = string(encoded)
+	}
 	return doc, failure
 }
 

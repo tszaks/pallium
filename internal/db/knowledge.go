@@ -15,19 +15,23 @@ import (
 // knowledge base that cannot say which of its claims failed to check out is
 // just prose with a database behind it.
 type KnowledgeDoc struct {
-	Slug          string    `json:"slug"`
-	Kind          string    `json:"kind"`
-	Title         string    `json:"title"`
-	Summary       string    `json:"summary"`
-	Body          string    `json:"body_md"`
-	CitedPaths    []string  `json:"cited_paths"`
-	CitedSymbols  []string  `json:"cited_symbols"`
-	DroppedClaims []string  `json:"dropped_claims"`
-	SourceCommit  string    `json:"source_commit"`
-	Fingerprint   string    `json:"fingerprint"`
-	Generator     string    `json:"generator"`
-	Verified      bool      `json:"verified"`
-	GeneratedAt   time.Time `json:"generated_at"`
+	Slug          string   `json:"slug"`
+	Kind          string   `json:"kind"`
+	Title         string   `json:"title"`
+	Summary       string   `json:"summary"`
+	Body          string   `json:"body_md"`
+	CitedPaths    []string `json:"cited_paths"`
+	CitedSymbols  []string `json:"cited_symbols"`
+	DroppedClaims []string `json:"dropped_claims"`
+	// Claims is the structured, verified synthesis the body was rendered
+	// from. Stored so a later audit pass can re-check each claim against the
+	// source rather than trying to parse markdown back into assertions.
+	Claims       string    `json:"claims,omitempty"`
+	SourceCommit string    `json:"source_commit"`
+	Fingerprint  string    `json:"fingerprint"`
+	Generator    string    `json:"generator"`
+	Verified     bool      `json:"verified"`
+	GeneratedAt  time.Time `json:"generated_at"`
 }
 
 func (s *Store) UpsertKnowledgeDoc(repoID int64, doc KnowledgeDoc) error {
@@ -59,10 +63,10 @@ func (s *Store) UpsertKnowledgeDoc(repoID int64, doc KnowledgeDoc) error {
 	if _, err := s.q.Exec(`
 INSERT INTO knowledge_docs
   (repo_id, slug, kind, title, summary, body_md, cited_paths_json, cited_symbols_json,
-   dropped_claims_json, source_commit, fingerprint, generator, verified, generated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+   dropped_claims_json, claims_json, source_commit, fingerprint, generator, verified, generated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `, repoID, doc.Slug, doc.Kind, doc.Title, doc.Summary, doc.Body, string(citedPaths),
-		string(citedSymbols), string(dropped), doc.SourceCommit, doc.Fingerprint,
+		string(citedSymbols), string(dropped), defaultJSONObject(doc.Claims), doc.SourceCommit, doc.Fingerprint,
 		doc.Generator, verified, doc.GeneratedAt.UTC().Format(time.RFC3339)); err != nil {
 		return fmt.Errorf("insert knowledge doc %s: %w", doc.Slug, err)
 	}
@@ -79,7 +83,7 @@ func (s *Store) DeleteKnowledgeDoc(repoID int64, slug string) error {
 func (s *Store) KnowledgeDoc(repoID int64, slug string) (KnowledgeDoc, bool, error) {
 	docs, err := s.scanKnowledgeDocs(`
 SELECT slug, kind, title, summary, body_md, cited_paths_json, cited_symbols_json,
-       dropped_claims_json, source_commit, fingerprint, generator, verified, generated_at
+       dropped_claims_json, claims_json, source_commit, fingerprint, generator, verified, generated_at
 FROM knowledge_docs
 WHERE repo_id = ? AND slug = ?
 `, repoID, slug)
@@ -95,7 +99,7 @@ WHERE repo_id = ? AND slug = ?
 func (s *Store) KnowledgeDocs(repoID int64) ([]KnowledgeDoc, error) {
 	return s.scanKnowledgeDocs(`
 SELECT slug, kind, title, summary, body_md, cited_paths_json, cited_symbols_json,
-       dropped_claims_json, source_commit, fingerprint, generator, verified, generated_at
+       dropped_claims_json, claims_json, source_commit, fingerprint, generator, verified, generated_at
 FROM knowledge_docs
 WHERE repo_id = ?
 ORDER BY kind, slug
@@ -115,7 +119,7 @@ func (s *Store) SearchKnowledge(repoID int64, query string, limit int) ([]Knowle
 	}
 	return s.scanKnowledgeDocs(`
 SELECT d.slug, d.kind, d.title, d.summary, d.body_md, d.cited_paths_json, d.cited_symbols_json,
-       d.dropped_claims_json, d.source_commit, d.fingerprint, d.generator, d.verified, d.generated_at
+       d.dropped_claims_json, d.claims_json, d.source_commit, d.fingerprint, d.generator, d.verified, d.generated_at
 FROM knowledge_fts f
 JOIN knowledge_docs d ON d.id = f.rowid
 WHERE knowledge_fts MATCH ? AND d.repo_id = ?
@@ -137,7 +141,7 @@ func (s *Store) scanKnowledgeDocs(query string, args ...any) ([]KnowledgeDoc, er
 		var citedPaths, citedSymbols, dropped, generatedAt string
 		var verified int
 		if err := rows.Scan(&doc.Slug, &doc.Kind, &doc.Title, &doc.Summary, &doc.Body,
-			&citedPaths, &citedSymbols, &dropped, &doc.SourceCommit, &doc.Fingerprint,
+			&citedPaths, &citedSymbols, &dropped, &doc.Claims, &doc.SourceCommit, &doc.Fingerprint,
 			&doc.Generator, &verified, &generatedAt); err != nil {
 			return nil, fmt.Errorf("scan knowledge doc: %w", err)
 		}
@@ -316,6 +320,15 @@ func prefixPattern(prefix string) (string, string) {
 	}
 	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(prefix)
 	return escaped + "/%", prefix
+}
+
+// defaultJSONObject keeps claims_json valid JSON even for a doc that has no
+// structured claims, so a reader never has to special-case an empty string.
+func defaultJSONObject(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "{}"
+	}
+	return value
 }
 
 func nonNil(values []string) []string {

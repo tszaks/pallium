@@ -291,9 +291,9 @@ func TestActiveTaskAgesOutAfterStaleWindow(t *testing.T) {
 
 // TestMigrateActiveTasksBranchScopingPreservesOldRows proves the migration
 // from the original repo-only PRIMARY KEY to (repo_id, branch) doesn't lose
-// data: an old-shaped row survives with branch='' (its true branch at
+// data: an old-shaped row survives with branch=” (its true branch at
 // migration time is unknowable — see the migration's own doc comment for
-// why '' is a safe placeholder, not silent data loss).
+// why ” is a safe placeholder, not silent data loss).
 func TestMigrateActiveTasksBranchScopingPreservesOldRows(t *testing.T) {
 	repo := t.TempDir()
 	store, err := OpenPath(repo, filepath.Join(t.TempDir(), "test.sqlite"))
