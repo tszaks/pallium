@@ -449,3 +449,28 @@ func isTestPath(path string) bool {
 	}
 	return strings.Contains(path, "/__tests__/") || strings.HasPrefix(path, "__tests__/")
 }
+
+// DocForPath finds the module doc that covers a file by walking up its
+// directory chain and checking each candidate slug. Slugs are derived from
+// directories, so this is exact and costs a handful of indexed lookups rather
+// than re-clustering the repo.
+func DocForPath(store *db.Store, repoID int64, path string) (db.KnowledgeDoc, bool, error) {
+	dir := filepath.ToSlash(filepath.Dir(path))
+	for {
+		doc, found, err := store.KnowledgeDoc(repoID, slugForDir(dir))
+		if err != nil {
+			return db.KnowledgeDoc{}, false, err
+		}
+		if found && doc.Kind == "module" {
+			return doc, true, nil
+		}
+		if dir == "." || dir == "" || dir == "/" {
+			return db.KnowledgeDoc{}, false, nil
+		}
+		next := filepath.ToSlash(filepath.Dir(dir))
+		if next == dir {
+			return db.KnowledgeDoc{}, false, nil
+		}
+		dir = next
+	}
+}

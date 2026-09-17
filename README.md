@@ -12,7 +12,7 @@ context, memory, execution shape, and verification while keeping authority with
 the user. Durable orchestration and state live outside the context window, so
 the work can survive a crash, restart, or end of chat.
 
-One kernel, six services. Any model powers the work. Any agent drives it.
+One kernel, seven services. Any model powers the work. Any agent drives it.
 
 ```bash
 npm i -g pallium
@@ -38,7 +38,7 @@ Pallium moves the durable parts out of the model:
   The agent steering Pallium and the agents doing the work can be different
   models.
 
-## The six services
+## The seven services
 
 Pallium is one binary and one local database. The services share that kernel and
 compose through public interfaces.
@@ -104,18 +104,53 @@ pallium team status <team-id>
 
 ### Repo intelligence: context before an edit
 
-Fast, scriptable answers about a codebase: what a file does, what usually changes
-with it, what is risky to touch, what changed in the working tree, and how to
-hand work off.
+Fast, scriptable answers about a codebase: what a file declares, what usually
+changes with it, what is risky to touch, what changed in the working tree, and
+how to hand work off.
+
+`pallium index` builds two halves. The git half is churn, co-change and
+decision notes. The content half is symbols with kinds, signatures and doc
+comments, resolved import edges, and the identifiers each file references. Go
+parses through `go/parser`; other languages use line-anchored scanners, because
+Pallium ships as a single cgo-free binary. The content half is keyed by content
+hash, so reindexing only reparses files that changed.
 
 ```bash
-pallium index   # one-time per repo, before the queries below
+pallium index   # per repo; incremental after the first run
 pallium explain cmd/workflow.go --json
+pallium symbols internal/workflow/runtime.go --json
+pallium callers ResolveProvider --json
+pallium search "verification plan" --json
 pallium risk internal/workflow/runtime.go --json
 pallium neighbors cmd/app.go --json
 pallium changed-now --json
 pallium handoff origin/main --json
 ```
+
+### Knowledge base: what each part of the repo is for
+
+```bash
+pallium knowledge map                # modules and dependencies, no model
+pallium knowledge build --no-model   # the whole base, no model calls
+pallium knowledge build              # adds synthesized prose, verified
+pallium knowledge search "sessions"
+pallium knowledge get internal-workflow
+```
+
+Modules are clustered from the content index. Their file lists, symbol surfaces
+ranked by how many files reference each name, dependency edges in both
+directions, external packages and recent history are all derived, so they are
+correct by construction. An `incidents` doc is mined from commit subjects that
+announce a revert, rollback, hotfix or outage, which means every entry is a
+real SHA with a real file list.
+
+A model is used for one thing: the prose explaining why a module exists. It
+never writes markdown. It fills a fixed JSON schema of cited claims, and every
+citation is checked against the symbol index before storage. A claim citing a
+file or symbol that does not exist is deleted, listed in the doc's dropped
+claims, and the doc is marked unverified. Docs live in SQLite with BM25 search
+and materialize to `.pallium/knowledge/*.md` so they can be read in an editor
+or committed and reviewed.
 
 ### Session awareness and decisions
 
@@ -251,6 +286,7 @@ go run . --help
 ## Data locations
 
 - Repo-local index and verification data: `.pallium/`
+- Materialized knowledge base: `.pallium/knowledge/*.md`
 - Session memory database: `~/.pallium/codex-sessions.sqlite`
 - Workflow run artifacts: `~/.pallium/workflow-runs/`
 - User workflow library: `~/.pallium/workflows/`
