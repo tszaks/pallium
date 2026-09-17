@@ -242,12 +242,18 @@ func resolverKey(repoRoot string, paths []string) (string, error) {
 		hasher.Write([]byte{0})
 	}
 	configs := make(map[string]struct{})
+	seenDirs := make(map[string]struct{})
 	for _, path := range sorted {
 		lang := Lang(path)
 		if lang != "typescript" && lang != "tsx" && lang != "javascript" && lang != "jsx" {
 			continue
 		}
-		configPath := findNearestTSConfig(repoRoot, filepath.ToSlash(filepath.Dir(path)))
+		dir := filepath.ToSlash(filepath.Dir(path))
+		if _, ok := seenDirs[dir]; ok {
+			continue
+		}
+		seenDirs[dir] = struct{}{}
+		configPath := findNearestTSConfig(repoRoot, dir)
 		if configPath == "" {
 			continue
 		}
