@@ -19,7 +19,7 @@ func parseGo(path string, content []byte, resolver *Resolver) (ParsedFile, bool)
 	// usable declaration list, and refusing to index it would make the tool
 	// least useful exactly when someone is working.
 	file, err := parser.ParseFile(fset, path, content, parser.ParseComments|parser.SkipObjectResolution)
-	if file == nil {
+	if file == nil || (err != nil && len(file.Decls) == 0) {
 		return ParsedFile{}, false
 	}
 	_ = err

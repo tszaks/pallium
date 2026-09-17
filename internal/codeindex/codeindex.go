@@ -188,20 +188,13 @@ func readIndexable(repoRoot, path string) ([]byte, int64, bool) {
 	if err != nil {
 		return nil, 0, false
 	}
-	entry, err := os.Lstat(absolute)
+	target, err := filepath.EvalSymlinks(absolute)
 	if err != nil {
 		return nil, 0, false
 	}
-	target := absolute
-	if entry.Mode()&os.ModeSymlink != 0 {
-		target, err = filepath.EvalSymlinks(absolute)
-		if err != nil {
-			return nil, 0, false
-		}
-		relative, err := filepath.Rel(root, target)
-		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-			return nil, 0, false
-		}
+	relative, err := filepath.Rel(root, target)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return nil, 0, false
 	}
 	info, err := os.Stat(target)
 	if err != nil || info.IsDir() || info.Size() > maxParsedFileBytes {
@@ -219,6 +212,7 @@ func UnindexedCandidates(repoRoot string, indexed map[string]struct{}) ([]string
 	if err != nil {
 		return nil, err
 	}
+	resolver := NewResolver(repoRoot, paths)
 	out := make([]string, 0)
 	for _, path := range paths {
 		if vendorish(path) || !Parseable(Lang(path)) {
@@ -227,7 +221,11 @@ func UnindexedCandidates(repoRoot string, indexed map[string]struct{}) ([]string
 		if _, ok := indexed[path]; ok {
 			continue
 		}
-		if _, _, ok := readIndexable(repoRoot, path); ok {
+		content, _, ok := readIndexable(repoRoot, path)
+		if !ok {
+			continue
+		}
+		if _, ok := Parse(path, content, resolver); ok {
 			out = append(out, path)
 		}
 	}
@@ -243,11 +241,26 @@ func resolverKey(repoRoot string, paths []string) (string, error) {
 		hasher.Write([]byte(path))
 		hasher.Write([]byte{0})
 	}
+	configs := make(map[string]struct{})
 	for _, path := range sorted {
-		base := filepath.Base(path)
-		if base != "tsconfig.json" && base != "jsconfig.json" {
+		lang := Lang(path)
+		if lang != "typescript" && lang != "tsx" && lang != "javascript" && lang != "jsx" {
 			continue
 		}
+		configPath := findNearestTSConfig(repoRoot, filepath.ToSlash(filepath.Dir(path)))
+		if configPath == "" {
+			continue
+		}
+		for _, path := range tsConfigChain(repoRoot, configPath, map[string]struct{}{}) {
+			configs[path] = struct{}{}
+		}
+	}
+	configPaths := make([]string, 0, len(configs))
+	for path := range configs {
+		configPaths = append(configPaths, path)
+	}
+	sort.Strings(configPaths)
+	for _, path := range configPaths {
 		content, err := os.ReadFile(filepath.Join(repoRoot, filepath.FromSlash(path)))
 		if err != nil {
 			if os.IsNotExist(err) {

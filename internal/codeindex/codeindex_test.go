@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -417,6 +418,42 @@ func TestRunSkipsSymlinksEscapingRepo(t *testing.T) {
 	}
 }
 
+func TestRunSkipsFilesUnderEscapingSymlinkDir(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"main.go": "package main\nfunc Main() {}\n",
+	})
+	outside := t.TempDir()
+	outsideFile := filepath.Join(outside, "file.go")
+	write(t, outsideFile, "package outside\nfunc Secret() {}\n")
+	if err := os.Symlink(outside, filepath.Join(repo, "pkg")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	hash := exec.Command("git", "hash-object", "-w", outsideFile)
+	hash.Dir = repo
+	blob, err := hash.Output()
+	if err != nil {
+		t.Fatalf("hash object: %v", err)
+	}
+	git(t, repo, "update-index", "--add", "--cacheinfo",
+		"100644,"+strings.TrimSpace(string(blob))+",pkg/file.go")
+
+	store, repoID := openIndexed(t, repo)
+	result, err := Run(store, repoID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if result.Skipped < 1 {
+		t.Fatalf("file under escaping symlink directory was not skipped: %+v", result)
+	}
+	symbols, err := store.SymbolsInFile(repoID, "pkg/file.go")
+	if err != nil {
+		t.Fatalf("symbols: %v", err)
+	}
+	if len(symbols) != 0 {
+		t.Fatalf("escaping symlink directory leaked symbols: %+v", symbols)
+	}
+}
+
 func TestVendorishKeepsNestedOutputNames(t *testing.T) {
 	repo := newRepo(t, map[string]string{
 		"internal/build/runner.go": "package runner\nfunc Run() {}\n",
@@ -481,7 +518,7 @@ func TestRunReparsesWhenResolverInputsChange(t *testing.T) {
 func TestResolverKeyIgnoresMissingTrackedConfigs(t *testing.T) {
 	repo := newRepo(t, map[string]string{
 		"tsconfig.json": `{"compilerOptions":{"baseUrl":"."}}`,
-		"main.go":       "package main\nfunc Main() {}\n",
+		"src/main.ts":   "export function Main() {}\n",
 	})
 	store, repoID := openIndexed(t, repo)
 	if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
@@ -492,6 +529,90 @@ func TestResolverKeyIgnoresMissingTrackedConfigs(t *testing.T) {
 	}
 	if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
 		t.Fatalf("run with missing tracked config: %v", err)
+	}
+}
+
+func TestUnindexedCandidatesSkipsUnparseableFiles(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"main.go": "package main\nfunc Main() {}\n",
+	})
+	write(t, filepath.Join(repo, "bad.go"), "")
+	write(t, filepath.Join(repo, "ok.go"), "package main\nfunc OK() {}\n")
+	git(t, repo, "add", "bad.go", "ok.go")
+	candidates, err := UnindexedCandidates(repo, map[string]struct{}{"main.go": {}})
+	if err != nil {
+		t.Fatalf("candidates: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0] != "ok.go" {
+		t.Fatalf("unexpected unindexed candidates: %v", candidates)
+	}
+}
+
+func TestResolverKeyTracksUntrackedConfigs(t *testing.T) {
+	t.Run("root config", func(t *testing.T) {
+		repo := newRepo(t, map[string]string{
+			"src/a.ts": "export const value = 1\n",
+		})
+		paths := []string{"src/a.ts"}
+		first, err := resolverKey(repo, paths)
+		if err != nil {
+			t.Fatalf("first key: %v", err)
+		}
+		write(t, filepath.Join(repo, "tsconfig.json"), `{"compilerOptions":{"paths":{"@/*":["src/*"]}}}`)
+		second, err := resolverKey(repo, paths)
+		if err != nil {
+			t.Fatalf("second key: %v", err)
+		}
+		if first == second {
+			t.Fatal("creating an untracked resolver config did not change the key")
+		}
+		write(t, filepath.Join(repo, "tsconfig.json"), `{"compilerOptions":{"paths":{"@/*":["other/*"]}}}`)
+		third, err := resolverKey(repo, paths)
+		if err != nil {
+			t.Fatalf("third key: %v", err)
+		}
+		if second == third {
+			t.Fatal("editing an untracked resolver config did not change the key")
+		}
+	})
+	t.Run("untracked extends parent", func(t *testing.T) {
+		repo := newRepo(t, map[string]string{
+			"src/a.ts": "export const value = 1\n",
+		})
+		write(t, filepath.Join(repo, "tsconfig.json"), `{"extends":"./base.json"}`)
+		write(t, filepath.Join(repo, "base.json"), `{"compilerOptions":{"baseUrl":"src"}}`)
+		paths := []string{"src/a.ts"}
+		first, err := resolverKey(repo, paths)
+		if err != nil {
+			t.Fatalf("first key: %v", err)
+		}
+		write(t, filepath.Join(repo, "base.json"), `{"compilerOptions":{"baseUrl":"other"}}`)
+		second, err := resolverKey(repo, paths)
+		if err != nil {
+			t.Fatalf("second key: %v", err)
+		}
+		if first == second {
+			t.Fatal("editing an untracked extends parent did not change the key")
+		}
+	})
+}
+
+func TestRunReparsesWhenUntrackedTSConfigChanges(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"src/a.ts": "export const value = 1\n",
+	})
+	write(t, filepath.Join(repo, "tsconfig.json"), `{"compilerOptions":{"paths":{"@/*":["src/*"]}}}`)
+	store, repoID := openIndexed(t, repo)
+	if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	write(t, filepath.Join(repo, "tsconfig.json"), `{"compilerOptions":{"paths":{"@/*":["other/*"]}}}`)
+	result, err := Run(store, repoID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if result.Reparsed == 0 {
+		t.Fatalf("untracked resolver config change did not reparse: %+v", result)
 	}
 }
 

@@ -133,6 +133,32 @@ func readTSConfigFile(repoRoot, configPath string, visited map[string]struct{}) 
 	return merged
 }
 
+func tsConfigChain(repoRoot, configPath string, visited map[string]struct{}) []string {
+	configPath = filepath.ToSlash(filepath.Clean(configPath))
+	if _, ok := visited[configPath]; ok {
+		return nil
+	}
+	visited[configPath] = struct{}{}
+
+	out := []string{configPath}
+	content, err := os.ReadFile(filepath.Join(repoRoot, filepath.FromSlash(configPath)))
+	if err != nil {
+		return out
+	}
+	cleaned := jsonCommentRegex.ReplaceAllString(string(content), "")
+	var parsed struct {
+		Extends string `json:"extends"`
+	}
+	if err := json.Unmarshal([]byte(cleaned), &parsed); err != nil {
+		return out
+	}
+	parentPath := resolveTSConfigExtendsPath(repoRoot, filepath.Dir(configPath), parsed.Extends)
+	if parentPath != "" {
+		out = append(out, tsConfigChain(repoRoot, parentPath, visited)...)
+	}
+	return out
+}
+
 func resolveTSConfigExtendsPath(repoRoot, configDir, extends string) string {
 	value := strings.TrimSpace(extends)
 	if value == "" {

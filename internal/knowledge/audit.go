@@ -528,15 +528,15 @@ func claimExcerpts(store *db.Store, repoID int64, repoRoot string, claims []cite
 		if err != nil {
 			return nil, nil, err
 		}
-		if len(symbols) == 0 && strings.Contains(item.name, ".") {
+		chosen := pickDeclarations(symbols, item.paths, moduleFiles)
+		if len(chosen) == 0 && strings.Contains(item.name, ".") {
 			tail := item.name[strings.LastIndex(item.name, ".")+1:]
 			symbols, err = store.SymbolsNamed(repoID, tail)
 			if err != nil {
 				return nil, nil, err
 			}
+			chosen = pickDeclarations(symbols, item.paths, moduleFiles)
 		}
-
-		chosen := pickDeclarations(symbols, item.paths, moduleFiles)
 		if len(chosen) == 0 {
 			missing = append(missing, item.name)
 			continue

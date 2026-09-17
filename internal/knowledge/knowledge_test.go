@@ -766,6 +766,39 @@ func TestAuditEvidenceNormalizesQualifiedSymbols(t *testing.T) {
 	}
 }
 
+func TestAuditEvidenceFallsBackToTailAfterModuleScoping(t *testing.T) {
+	store, repoID, repoRoot := indexedRepo(t)
+	write(t, filepath.Join(repoRoot, "api", "fake.go"), "package api\nfunc Fake() {}\n")
+	if err := store.ReplaceCodeFile(repoID, db.CodeFile{
+		Path:       "api/fake.go",
+		Lang:       "go",
+		SizeBytes:  25,
+		ContentSHA: "fake",
+		Parser:     "go/ast",
+	}, []db.CodeSymbol{{
+		Path:      "api/fake.go",
+		Name:      "Store.Open",
+		Kind:      "func",
+		Signature: "func Store.Open() *Store",
+		StartLine: 1,
+		EndLine:   1,
+	}}, nil, nil, time.Now().UTC()); err != nil {
+		t.Fatalf("insert qualified symbol: %v", err)
+	}
+	builder := &stubSynth{response: `{"summary":{"claim":"Storage","cited_symbols":["Open"]},"purpose":{"claim":"Purpose","cited_symbols":["Open"]},"invariants":[{"claim":"Qualified open","cited_symbols":["Store.Open"]}]}`}
+	if _, err := Build(store, repoID, repoRoot, BuildOptions{Synth: builder, Only: []string{"storage"}}); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	auditor := &stubSynth{response: `{"verdicts":[{"index":1,"ruling":"supported"},{"index":2,"ruling":"supported"},{"index":3,"ruling":"supported"}]}`}
+	if _, err := Audit(store, repoID, repoRoot, AuditOptions{Synth: auditor, Only: []string{"storage"}}); err != nil {
+		t.Fatalf("audit: %v", err)
+	}
+	if len(auditor.prompts) != 1 || !strings.Contains(auditor.prompts[0], "func Open(name string) *Store") ||
+		strings.Contains(auditor.prompts[0], "No declaration was found in this module for: Store.Open") {
+		t.Fatalf("qualified symbol evidence did not fall back after scoping:\n%s", auditor.prompts[0])
+	}
+}
+
 func TestBuildRequiresCitedSummaryAndPurpose(t *testing.T) {
 	store, repoID, repoRoot := indexedRepo(t)
 	synth := &stubSynth{response: `{"summary":"uncited summary","purpose":{"claim":"uncited purpose"} }`}
