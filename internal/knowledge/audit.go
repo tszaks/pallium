@@ -79,6 +79,8 @@ type auditResponse struct {
 	Verdicts []verdict `json:"verdicts"`
 }
 
+const auditUnclearMarker = " unclear, kept pending review, "
+
 func Audit(store *db.Store, repoID int64, repoRoot string, opts AuditOptions) (AuditReport, error) {
 	if opts.Synth == nil {
 		return AuditReport{}, fmt.Errorf("audit needs a model: it re-reads each claim against the source")
@@ -204,12 +206,14 @@ func Audit(store *db.Store, repoID int64, repoRoot string, opts AuditOptions) (A
 		report.Claims += len(flat)
 
 		removals := make(map[string]string)
+		removedIdx := make(map[int]struct{})
 		unclear := make(map[string]string)
 		for _, ruling := range rulings {
 			claim := flat[ruling.Index-1]
 			switch strings.ToLower(strings.TrimSpace(ruling.Ruling)) {
 			case "unsupported":
 				removals[claim.Claim] = strings.TrimSpace(ruling.Why)
+				removedIdx[ruling.Index] = struct{}{}
 				report.Removed++
 				report.Findings = append(report.Findings, AuditRemoval{
 					Slug:   item.doc.Slug,
@@ -224,12 +228,13 @@ func Audit(store *db.Store, repoID int64, repoRoot string, opts AuditOptions) (A
 			}
 		}
 
-		if len(removals) == 0 && len(unclear) == 0 {
+		hadUnclear := len(stripUnclearNotes(item.doc.DroppedClaims)) != len(item.doc.DroppedClaims)
+		if len(removals) == 0 && len(unclear) == 0 && !hadUnclear {
 			continue
 		}
 
 		updated := item.doc
-		pruned := pruneClaims(item.claims, removals)
+		pruned := pruneClaims(item.claims, removedIdx)
 		var module *Module
 		if found, ok := moduleBySlug[item.doc.Slug]; ok {
 			module = &found
@@ -238,13 +243,21 @@ func Audit(store *db.Store, repoID int64, repoRoot string, opts AuditOptions) (A
 			// The module boundary moved since the doc was written; leave the
 			// body alone rather than re-rendering against a guess, but still
 			// record the rejections.
+			updated.DroppedClaims = stripUnclearNotes(item.doc.DroppedClaims)
 			for claim, why := range removals {
 				updated.DroppedClaims = append(updated.DroppedClaims, fmt.Sprintf("audit: %q removed, %s", truncate(claim, 90), why))
 			}
 			for claim, why := range unclear {
-				updated.DroppedClaims = append(updated.DroppedClaims, fmt.Sprintf("audit: %q unclear, kept pending review, %s", truncate(claim, 90), why))
+				updated.DroppedClaims = append(updated.DroppedClaims, fmt.Sprintf("audit: %q"+auditUnclearMarker+"%s", truncate(claim, 90), why))
 			}
-			updated.Verified = false
+			if item.claims.Summary.Claim != "" && pruned.Summary.Claim == "" {
+				updated.Summary = updated.Title
+			}
+			if encoded, err := json.Marshal(pruned); err == nil {
+				updated.Claims = string(encoded)
+			}
+			updated.Verified = len(updated.DroppedClaims) == 0
+			updated.GeneratedAt = time.Now().UTC()
 			if err := store.UpsertKnowledgeDoc(repoID, updated); err != nil {
 				return AuditReport{}, err
 			}
@@ -254,16 +267,21 @@ func Audit(store *db.Store, repoID int64, repoRoot string, opts AuditOptions) (A
 		updated.Body = renderModuleDoc(*module, pruned)
 		updated.CitedPaths = citedPaths(*module, pruned)
 		updated.CitedSymbols = citedSymbols(pruned)
+		updated.Summary = strings.TrimSpace(pruned.Summary.Claim)
+		if updated.Summary == "" {
+			updated.Summary = structuralSummary(*module)
+		}
 		if encoded, err := json.Marshal(pruned); err == nil {
 			updated.Claims = string(encoded)
 		}
+		updated.DroppedClaims = stripUnclearNotes(item.doc.DroppedClaims)
 		for claim, why := range removals {
 			updated.DroppedClaims = append(updated.DroppedClaims, fmt.Sprintf("audit: %q removed, %s", truncate(claim, 90), why))
 		}
 		for claim, why := range unclear {
-			updated.DroppedClaims = append(updated.DroppedClaims, fmt.Sprintf("audit: %q unclear, kept pending review, %s", truncate(claim, 90), why))
+			updated.DroppedClaims = append(updated.DroppedClaims, fmt.Sprintf("audit: %q"+auditUnclearMarker+"%s", truncate(claim, 90), why))
 		}
-		updated.Verified = false
+		updated.Verified = len(updated.DroppedClaims) == 0
 		updated.GeneratedAt = time.Now().UTC()
 		if err := store.UpsertKnowledgeDoc(repoID, updated); err != nil {
 			return AuditReport{}, err
@@ -298,32 +316,40 @@ func flattenClaims(result synthesis) []citedClaim {
 	return out
 }
 
-func pruneClaims(result synthesis, removals map[string]string) synthesis {
+func pruneClaims(result synthesis, removed map[int]struct{}) synthesis {
+	index := 0
+	keepOne := func(claim citedClaim) citedClaim {
+		index++
+		if _, ok := removed[index]; ok {
+			return citedClaim{}
+		}
+		return claim
+	}
+	keepTopLevel := func(claim citedClaim) citedClaim {
+		if strings.TrimSpace(claim.Claim) == "" {
+			return claim
+		}
+		return keepOne(claim)
+	}
 	keep := func(claims []citedClaim) []citedClaim {
 		out := make([]citedClaim, 0, len(claims))
 		for _, claim := range claims {
-			if _, removed := removals[claim.Claim]; removed {
+			kept := keepOne(claim)
+			if kept.Claim == "" {
 				continue
 			}
-			out = append(out, claim)
+			out = append(out, kept)
 		}
 		return out
 	}
 	return synthesis{
-		Summary:     pruneOne(result.Summary, removals),
-		Purpose:     pruneOne(result.Purpose, removals),
+		Summary:     keepTopLevel(result.Summary),
+		Purpose:     keepTopLevel(result.Purpose),
 		EntryPoints: keep(result.EntryPoints),
 		KeySymbols:  keep(result.KeySymbols),
 		Invariants:  keep(result.Invariants),
 		Risks:       keep(result.Risks),
 	}
-}
-
-func pruneOne(claim citedClaim, removals map[string]string) citedClaim {
-	if _, removed := removals[claim.Claim]; removed {
-		return citedClaim{}
-	}
-	return claim
 }
 
 func validateVerdicts(rulings []verdict, claims int) error {
@@ -337,7 +363,11 @@ func validateVerdicts(rulings []verdict, claims int) error {
 		}
 		seen[ruling.Index] = struct{}{}
 		switch strings.ToLower(strings.TrimSpace(ruling.Ruling)) {
-		case "supported", "unsupported", "unclear":
+		case "supported":
+		case "unsupported", "unclear":
+			if strings.TrimSpace(ruling.Why) == "" {
+				return fmt.Errorf("verdict index %d has no reason", ruling.Index)
+			}
 		default:
 			return fmt.Errorf("invalid verdict ruling %q", ruling.Ruling)
 		}
@@ -348,6 +378,17 @@ func validateVerdicts(rulings []verdict, claims int) error {
 		}
 	}
 	return nil
+}
+
+func stripUnclearNotes(notes []string) []string {
+	out := make([]string, 0, len(notes))
+	for _, note := range notes {
+		if strings.HasPrefix(note, "audit: ") && strings.Contains(note, auditUnclearMarker) {
+			continue
+		}
+		out = append(out, note)
+	}
+	return out
 }
 
 // auditPrompt hands the skeptic the claims and the actual source of every

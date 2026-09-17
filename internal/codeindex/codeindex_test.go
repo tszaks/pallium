@@ -478,6 +478,23 @@ func TestRunReparsesWhenResolverInputsChange(t *testing.T) {
 	}
 }
 
+func TestResolverKeyIgnoresMissingTrackedConfigs(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"tsconfig.json": `{"compilerOptions":{"baseUrl":"."}}`,
+		"main.go":       "package main\nfunc Main() {}\n",
+	})
+	store, repoID := openIndexed(t, repo)
+	if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	if err := os.Remove(filepath.Join(repo, "tsconfig.json")); err != nil {
+		t.Fatalf("remove config: %v", err)
+	}
+	if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+		t.Fatalf("run with missing tracked config: %v", err)
+	}
+}
+
 func TestUnresolvedRelativeImportsStayLocal(t *testing.T) {
 	repo := newRepo(t, map[string]string{
 		"app.js": "import missing from './missing'; import react from 'react';\nexport function App() { return missing || react }\n",

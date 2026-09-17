@@ -616,6 +616,7 @@ func TestAuditRejectsIncompleteVerdictSets(t *testing.T) {
 		{"duplicate index", `[{"index":1,"ruling":"supported"},{"index":1,"ruling":"supported"},{"index":2,"ruling":"supported"},{"index":3,"ruling":"supported"}]`},
 		{"out of range", `[{"index":1,"ruling":"supported"},{"index":2,"ruling":"supported"},{"index":4,"ruling":"supported"}]`},
 		{"unknown ruling", `[{"index":1,"ruling":"not_supported"},{"index":2,"ruling":"supported"},{"index":3,"ruling":"supported"}]`},
+		{"unsupported without reason", `[{"index":1,"ruling":"unsupported"},{"index":2,"ruling":"supported"},{"index":3,"ruling":"supported"}]`},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -670,6 +671,82 @@ func TestAuditPersistsUnclearAsUnverified(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("unclear outcome was not persisted: %v", doc.DroppedClaims)
+	}
+}
+
+func TestAuditPrunesByIndexNotText(t *testing.T) {
+	store, repoID, repoRoot := indexedRepo(t)
+	builder := &stubSynth{response: `{"summary":{"claim":"Same claim","cited_symbols":["Open"]},"purpose":{"claim":"Purpose","cited_symbols":["Open"]},"key_symbols":[{"claim":"Same claim","cited_symbols":["Store"]}]}`}
+	if _, err := Build(store, repoID, repoRoot, BuildOptions{Synth: builder, Only: []string{"storage"}}); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	auditor := &stubSynth{response: `{"verdicts":[{"index":1,"ruling":"unsupported","why":"summary is wrong"},{"index":2,"ruling":"supported"},{"index":3,"ruling":"supported"}]}`}
+	if _, err := Audit(store, repoID, repoRoot, AuditOptions{Synth: auditor, Only: []string{"storage"}}); err != nil {
+		t.Fatalf("audit: %v", err)
+	}
+	doc, _, err := store.KnowledgeDoc(repoID, "storage")
+	if err != nil {
+		t.Fatalf("doc: %v", err)
+	}
+	var claims synthesis
+	if err := json.Unmarshal([]byte(doc.Claims), &claims); err != nil {
+		t.Fatalf("claims: %v", err)
+	}
+	if claims.Summary.Claim != "" || len(claims.KeySymbols) != 1 || claims.KeySymbols[0].Claim != "Same claim" {
+		t.Fatalf("index-based pruning removed the wrong duplicate: %+v", claims)
+	}
+}
+
+func TestAuditRefreshesSummaryAfterRejection(t *testing.T) {
+	store, repoID, repoRoot := indexedRepo(t)
+	builder := &stubSynth{response: `{"summary":{"claim":"Rejected summary","cited_symbols":["Open"]},"purpose":{"claim":"Purpose","cited_symbols":["Open"]}}`}
+	if _, err := Build(store, repoID, repoRoot, BuildOptions{Synth: builder, Only: []string{"storage"}}); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	auditor := &stubSynth{response: `{"verdicts":[{"index":1,"ruling":"unsupported","why":"wrong"},{"index":2,"ruling":"supported"}]}`}
+	if _, err := Audit(store, repoID, repoRoot, AuditOptions{Synth: auditor, Only: []string{"storage"}}); err != nil {
+		t.Fatalf("audit: %v", err)
+	}
+	doc, _, err := store.KnowledgeDoc(repoID, "storage")
+	if err != nil {
+		t.Fatalf("doc: %v", err)
+	}
+	modules, err := Modules(store, repoID, ModuleOptions{})
+	if err != nil {
+		t.Fatalf("modules: %v", err)
+	}
+	module := moduleBySlugForTest(modules)["storage"]
+	if doc.Summary == "Rejected summary" || doc.Summary != structuralSummary(module) {
+		t.Fatalf("summary was not refreshed after rejection: got %q want %q", doc.Summary, structuralSummary(module))
+	}
+}
+
+func TestAuditRestoresVerificationAfterUnclearResolved(t *testing.T) {
+	store, repoID, repoRoot := indexedRepo(t)
+	builder := &stubSynth{response: `{"summary":{"claim":"Storage","cited_symbols":["Open"]},"purpose":{"claim":"Purpose","cited_symbols":["Open"]},"invariants":[{"claim":"Invariant","cited_symbols":["Open"]}]}`}
+	if _, err := Build(store, repoID, repoRoot, BuildOptions{Synth: builder, Only: []string{"storage"}}); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	first := &stubSynth{response: `{"verdicts":[{"index":1,"ruling":"supported"},{"index":2,"ruling":"supported"},{"index":3,"ruling":"unclear","why":"not enough"}]}`}
+	if _, err := Audit(store, repoID, repoRoot, AuditOptions{Synth: first, Only: []string{"storage"}}); err != nil {
+		t.Fatalf("first audit: %v", err)
+	}
+	doc, _, _ := store.KnowledgeDoc(repoID, "storage")
+	if doc.Verified {
+		t.Fatal("unclear audit should make the doc unverified")
+	}
+	second := &stubSynth{response: `{"verdicts":[{"index":1,"ruling":"supported"},{"index":2,"ruling":"supported"},{"index":3,"ruling":"supported"}]}`}
+	if _, err := Audit(store, repoID, repoRoot, AuditOptions{Synth: second, Only: []string{"storage"}}); err != nil {
+		t.Fatalf("second audit: %v", err)
+	}
+	doc, _, _ = store.KnowledgeDoc(repoID, "storage")
+	for _, note := range doc.DroppedClaims {
+		if strings.Contains(note, "unclear, kept pending review") {
+			t.Fatalf("resolved unclear note remained: %v", doc.DroppedClaims)
+		}
+	}
+	if !doc.Verified {
+		t.Fatalf("resolved unclear outcome did not restore verification: %v", doc.DroppedClaims)
 	}
 }
 

@@ -250,6 +250,9 @@ func resolverKey(repoRoot string, paths []string) (string, error) {
 		}
 		content, err := os.ReadFile(filepath.Join(repoRoot, filepath.FromSlash(path)))
 		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
 			return "", err
 		}
 		hasher.Write([]byte(path))
