@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,18 +16,29 @@ import (
 	"github.com/tszaks/pallium/internal/index"
 )
 
+// stubSynth is called from several goroutines once synthesis fans out, so it
+// guards its own bookkeeping.
 type stubSynth struct {
+	mu       sync.Mutex
 	response string
 	err      error
 	prompts  []string
 }
 
 func (s *stubSynth) Synthesize(_ context.Context, prompt string) (string, error) {
+	s.mu.Lock()
 	s.prompts = append(s.prompts, prompt)
+	s.mu.Unlock()
 	if s.err != nil {
 		return "", s.err
 	}
 	return s.response, nil
+}
+
+func (s *stubSynth) promptCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.prompts)
 }
 
 // TestBuildDropsUnresolvableClaims is the reason this package exists. A model
@@ -113,8 +125,8 @@ func TestBuildSkipsUnchangedModules(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second build: %v", err)
 	}
-	if len(synth.prompts) != 0 {
-		t.Fatalf("unchanged modules should not be synthesized again, got %d prompts", len(synth.prompts))
+	if synth.promptCount() != 0 {
+		t.Fatalf("unchanged modules should not be synthesized again, got %d prompts", synth.promptCount())
 	}
 	if second.Unchanged == 0 {
 		t.Fatalf("expected unchanged modules, got %+v", second)
@@ -342,5 +354,43 @@ func git(t *testing.T, dir string, args ...string) {
 	cmd.Dir = dir
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %v: %v\n%s", args, err, output)
+	}
+}
+
+// TestBuildFansOutWithoutLosingModules covers the concurrency added for real
+// repos: synthesis runs in parallel, storage does not, and every module still
+// gets exactly one call and one doc.
+func TestBuildFansOutWithoutLosingModules(t *testing.T) {
+	store, repoID, repoRoot := indexedRepo(t)
+
+	synth := &stubSynth{response: `{"summary":"A module.","purpose":"It does a thing.","invariants":[{"claim":"Open returns a Store","cited_symbols":["Open"],"cited_paths":[]}]}`}
+	report, err := Build(store, repoID, repoRoot, BuildOptions{Synth: synth, Concurrency: 4})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	modules, err := Modules(store, repoID, ModuleOptions{})
+	if err != nil {
+		t.Fatalf("modules: %v", err)
+	}
+	if synth.promptCount() != len(modules) {
+		t.Fatalf("expected one call per module (%d), got %d", len(modules), synth.promptCount())
+	}
+
+	docs, err := store.KnowledgeDocs(repoID)
+	if err != nil {
+		t.Fatalf("docs: %v", err)
+	}
+	// One doc per module, plus the overview and incident docs.
+	if len(docs) != len(modules)+2 {
+		t.Fatalf("expected %d docs, got %d", len(modules)+2, len(docs))
+	}
+	if report.Dropped != 0 {
+		t.Fatalf("every claim cited a real symbol, got %d dropped", report.Dropped)
+	}
+	for _, doc := range docs {
+		if doc.Kind == "module" && !strings.Contains(doc.Body, "Open returns a Store") {
+			t.Fatalf("module doc %s lost its synthesized claim:\n%s", doc.Slug, doc.Body)
+		}
 	}
 }

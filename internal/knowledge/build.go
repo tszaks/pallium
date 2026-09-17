@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tszaks/pallium/internal/db"
@@ -28,6 +29,11 @@ type BuildOptions struct {
 	Only          []string
 	Materialize   bool
 	MaterializeTo string
+	// Concurrency bounds how many modules are synthesized at once. Synthesis
+	// is the only slow part and it is a pure function of the module card, so
+	// it fans out; storage stays strictly sequential because the repo's
+	// sqlite file has exactly one writer by design.
+	Concurrency int
 }
 
 type BuildReport struct {
@@ -103,6 +109,9 @@ func Build(store *db.Store, repoID int64, repoRoot string, opts BuildOptions) (B
 		only[slug] = struct{}{}
 	}
 
+	// First pass decides what needs work, so synthesis can fan out over
+	// exactly that set instead of discovering skips one at a time.
+	pending := make([]Module, 0, len(modules))
 	for _, module := range modules {
 		if len(only) > 0 {
 			if _, ok := only[module.Slug]; !ok {
@@ -122,8 +131,13 @@ func Build(store *db.Store, repoID int64, repoRoot string, opts BuildOptions) (B
 			})
 			continue
 		}
+		pending = append(pending, module)
+	}
 
-		doc, failure := buildModuleDoc(module, index, repo.LastIndexedCommit, opts.Synth)
+	responses := synthesizeModules(pending, opts.Synth, opts.Concurrency)
+
+	for _, module := range pending {
+		doc, failure := buildModuleDoc(module, index, repo.LastIndexedCommit, responses[module.Slug])
 		if failure != "" {
 			report.Failures = append(report.Failures, BuildFailure{Slug: module.Slug, Reason: failure})
 		}
@@ -179,7 +193,49 @@ func Build(store *db.Store, repoID int64, repoRoot string, opts BuildOptions) (B
 	return report, nil
 }
 
-func buildModuleDoc(module Module, index citationIndex, sourceCommit string, synth Synthesizer) (db.KnowledgeDoc, string) {
+// synthResult is one module's model response, or the error that replaced it.
+type synthResult struct {
+	raw string
+	err error
+}
+
+// synthesizeModules runs the model over every pending module, bounded by
+// concurrency. A single failure never fails the batch: the module falls back
+// to its structural doc and the reason is reported.
+func synthesizeModules(modules []Module, synth Synthesizer, concurrency int) map[string]synthResult {
+	out := make(map[string]synthResult, len(modules))
+	if synth == nil || len(modules) == 0 {
+		return out
+	}
+	if concurrency <= 0 {
+		concurrency = 4
+	}
+	if concurrency > len(modules) {
+		concurrency = len(modules)
+	}
+
+	var mutex sync.Mutex
+	var group sync.WaitGroup
+	slots := make(chan struct{}, concurrency)
+
+	for _, module := range modules {
+		group.Add(1)
+		go func(module Module) {
+			defer group.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
+
+			raw, err := synth.Synthesize(context.Background(), modulePrompt(module))
+			mutex.Lock()
+			out[module.Slug] = synthResult{raw: raw, err: err}
+			mutex.Unlock()
+		}(module)
+	}
+	group.Wait()
+	return out
+}
+
+func buildModuleDoc(module Module, index citationIndex, sourceCommit string, response synthResult) (db.KnowledgeDoc, string) {
 	doc := db.KnowledgeDoc{
 		Slug:         module.Slug,
 		Kind:         "module",
@@ -193,11 +249,11 @@ func buildModuleDoc(module Module, index citationIndex, sourceCommit string, syn
 
 	var result synthesis
 	failure := ""
-	if synth != nil {
-		raw, err := synth.Synthesize(context.Background(), modulePrompt(module))
-		if err != nil {
-			failure = err.Error()
-		} else if parsed, parseErr := parseSynthesis(raw); parseErr != nil {
+	switch {
+	case response.err != nil:
+		failure = response.err.Error()
+	case strings.TrimSpace(response.raw) != "":
+		if parsed, parseErr := parseSynthesis(response.raw); parseErr != nil {
 			failure = parseErr.Error()
 		} else {
 			result = parsed

@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 
 	"github.com/tszaks/pallium/internal/db"
@@ -75,6 +76,16 @@ func runKnowledgeBuild(out io.Writer, args []string, jsonOutput bool) error {
 			useModel = false
 		case "--no-materialize":
 			opts.Materialize = false
+		case "--concurrency":
+			if index+1 >= len(args) {
+				return fmt.Errorf("--concurrency needs a number")
+			}
+			index++
+			value, convErr := strconv.Atoi(args[index])
+			if convErr != nil || value < 1 {
+				return fmt.Errorf("--concurrency needs a positive number, got %q", args[index])
+			}
+			opts.Concurrency = value
 		case "--only":
 			if index+1 >= len(args) {
 				return fmt.Errorf("--only needs a module slug")
