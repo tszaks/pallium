@@ -1,6 +1,7 @@
 package knowledge
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -45,6 +46,7 @@ type BuildReport struct {
 	Modules   int `json:"modules"`
 	Written   int `json:"written"`
 	Unchanged int `json:"unchanged"`
+	Pruned    int `json:"pruned"`
 	// NeedsReindex counts modules skipped because their files drifted from
 	// the index.
 	NeedsReindex int            `json:"needs_reindex"`
@@ -76,8 +78,8 @@ type BuildFailure struct {
 // fill named fields cannot smuggle an unchecked citation into prose, which is
 // the difference between a knowledge base and a confident essay.
 type synthesis struct {
-	Summary     string       `json:"summary"`
-	Purpose     string       `json:"purpose"`
+	Summary     citedClaim   `json:"summary"`
+	Purpose     citedClaim   `json:"purpose"`
 	EntryPoints []citedClaim `json:"entry_points"`
 	KeySymbols  []citedClaim `json:"key_symbols"`
 	Invariants  []citedClaim `json:"invariants"`
@@ -88,6 +90,25 @@ type citedClaim struct {
 	Claim        string   `json:"claim"`
 	CitedPaths   []string `json:"cited_paths"`
 	CitedSymbols []string `json:"cited_symbols"`
+}
+
+func (c *citedClaim) UnmarshalJSON(data []byte) error {
+	type alias citedClaim
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) > 0 && trimmed[0] == '"' {
+		var claim string
+		if err := json.Unmarshal(data, &claim); err != nil {
+			return err
+		}
+		*c = citedClaim{Claim: claim}
+		return nil
+	}
+	var value alias
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	*c = citedClaim(value)
+	return nil
 }
 
 func Build(store *db.Store, repoID int64, repoRoot string, opts BuildOptions) (BuildReport, error) {
@@ -144,7 +165,18 @@ func Build(store *db.Store, repoID int64, repoRoot string, opts BuildOptions) (B
 		if err != nil {
 			return BuildReport{}, err
 		}
-		if found && !opts.Force && existing.Fingerprint == module.Fingerprint {
+		reusableClaims := true
+		if opts.Synth != nil {
+			var stored synthesis
+			if err := json.Unmarshal([]byte(existing.Claims), &stored); err != nil {
+				reusableClaims = false
+			} else {
+				flat := flattenClaims(stored)
+				reusableClaims = len(flat) > 0 && !hasUncitedClaims(flat)
+			}
+		}
+		if found && !opts.Force && existing.Fingerprint == module.Fingerprint &&
+			(opts.Synth == nil || (existing.Generator == "structural+model" && reusableClaims)) {
 			report.Unchanged++
 			report.Docs = append(report.Docs, DocSummary{
 				Slug: module.Slug, Kind: "module", Title: module.Title,
@@ -198,6 +230,27 @@ func Build(store *db.Store, repoID int64, repoRoot string, opts BuildOptions) (B
 		report.Written++
 		report.Verified++
 		report.Docs = append(report.Docs, DocSummary{Slug: incidents.Slug, Kind: incidents.Kind, Title: incidents.Title, Verified: true, Status: "written"})
+
+		current := make(map[string]struct{}, len(modules))
+		for _, module := range modules {
+			current[module.Slug] = struct{}{}
+		}
+		docs, err := store.KnowledgeDocs(repoID)
+		if err != nil {
+			return BuildReport{}, err
+		}
+		for _, doc := range docs {
+			if doc.Kind != "module" {
+				continue
+			}
+			if _, ok := current[doc.Slug]; ok {
+				continue
+			}
+			if err := store.DeleteKnowledgeDoc(repoID, doc.Slug); err != nil {
+				return BuildReport{}, err
+			}
+			report.Pruned++
+		}
 	}
 
 	if opts.Materialize {
@@ -283,12 +336,15 @@ func buildModuleDoc(module Module, index citationIndex, sourceCommit string, res
 	}
 
 	verified, dropped := verifySynthesis(result, module, index)
+	if failure != "" {
+		doc.Generator = "structural+model-failed"
+	}
 	doc.DroppedClaims = dropped
 	// A doc is unverified when the model said something the index could not
 	// confirm. The doc is still stored, because the structural half of it is
 	// true regardless, but the flag and the dropped list travel with it.
 	doc.Verified = len(dropped) == 0 && failure == ""
-	doc.Summary = strings.TrimSpace(verified.Summary)
+	doc.Summary = strings.TrimSpace(verified.Summary.Claim)
 	if doc.Summary == "" {
 		doc.Summary = structuralSummary(module)
 	}
@@ -328,6 +384,10 @@ func verifySynthesis(result synthesis, module Module, index citationIndex) (synt
 					bad = "no such file " + path
 					break
 				}
+				if _, ok := moduleFiles[strings.TrimSpace(path)]; !ok {
+					bad = "file outside module " + strings.TrimSpace(path)
+					break
+				}
 			}
 			if bad == "" {
 				for _, symbol := range claim.CitedSymbols {
@@ -346,9 +406,16 @@ func verifySynthesis(result synthesis, module Module, index citationIndex) (synt
 		return out
 	}
 
+	keepOne := func(claim citedClaim, label string) citedClaim {
+		kept := keep([]citedClaim{claim}, label)
+		if len(kept) == 0 {
+			return citedClaim{}
+		}
+		return kept[0]
+	}
 	verified := synthesis{
-		Summary:     result.Summary,
-		Purpose:     result.Purpose,
+		Summary:     keepOne(result.Summary, "summary"),
+		Purpose:     keepOne(result.Purpose, "purpose"),
 		EntryPoints: keep(result.EntryPoints, "entry point"),
 		KeySymbols:  keep(result.KeySymbols, "key symbol"),
 		Invariants:  keep(result.Invariants, "invariant"),
@@ -464,7 +531,7 @@ func sortedUnique(values []string) []string {
 
 func citedPaths(module Module, result synthesis) []string {
 	out := append([]string{}, module.Files...)
-	for _, group := range [][]citedClaim{result.EntryPoints, result.KeySymbols, result.Invariants, result.Risks} {
+	for _, group := range [][]citedClaim{{result.Summary, result.Purpose}, result.EntryPoints, result.KeySymbols, result.Invariants, result.Risks} {
 		for _, claim := range group {
 			out = append(out, claim.CitedPaths...)
 		}
@@ -474,7 +541,7 @@ func citedPaths(module Module, result synthesis) []string {
 
 func citedSymbols(result synthesis) []string {
 	out := make([]string, 0)
-	for _, group := range [][]citedClaim{result.EntryPoints, result.KeySymbols, result.Invariants, result.Risks} {
+	for _, group := range [][]citedClaim{{result.Summary, result.Purpose}, result.EntryPoints, result.KeySymbols, result.Invariants, result.Risks} {
 		for _, claim := range group {
 			out = append(out, claim.CitedSymbols...)
 		}

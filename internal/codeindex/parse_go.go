@@ -19,7 +19,7 @@ func parseGo(path string, content []byte, resolver *Resolver) (ParsedFile, bool)
 	// usable declaration list, and refusing to index it would make the tool
 	// least useful exactly when someone is working.
 	file, err := parser.ParseFile(fset, path, content, parser.ParseComments|parser.SkipObjectResolution)
-	if file == nil {
+	if file == nil || (err != nil && len(file.Decls) == 0) {
 		return ParsedFile{}, false
 	}
 	_ = err
@@ -109,7 +109,7 @@ func parseGo(path string, content []byte, resolver *Resolver) (ParsedFile, bool)
 			RawSpec:  spec,
 			ToPath:   target,
 			Kind:     "go-import",
-			External: target == "",
+			External: target == "" && !isLocalGoImport(spec, resolver.GoModulePath(), resolver.GoRequires()),
 		})
 	}
 
@@ -146,6 +146,20 @@ func goRefs(file *ast.File, declared map[string]struct{}, path string) []db.Code
 				add(fun.Name)
 			case *ast.SelectorExpr:
 				add(fun.Sel.Name)
+			case *ast.IndexExpr:
+				switch expression := fun.X.(type) {
+				case *ast.Ident:
+					add(expression.Name)
+				case *ast.SelectorExpr:
+					add(expression.Sel.Name)
+				}
+			case *ast.IndexListExpr:
+				switch expression := fun.X.(type) {
+				case *ast.Ident:
+					add(expression.Name)
+				case *ast.SelectorExpr:
+					add(expression.Sel.Name)
+				}
 			}
 		case *ast.SelectorExpr:
 			add(item.Sel.Name)
@@ -155,6 +169,19 @@ func goRefs(file *ast.File, declared map[string]struct{}, path string) []db.Code
 		return true
 	})
 	return refs
+}
+
+func isLocalGoImport(spec, module string, requires []string) bool {
+	if module == "" || (spec != module && !strings.HasPrefix(spec, module+"/")) {
+		return false
+	}
+	for _, required := range requires {
+		if required != module && strings.HasPrefix(required, module+"/") &&
+			(spec == required || strings.HasPrefix(spec, required+"/")) {
+			return false
+		}
+	}
+	return true
 }
 
 func goTypeKind(spec *ast.TypeSpec) string {

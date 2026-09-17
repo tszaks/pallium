@@ -104,26 +104,32 @@ func looksGenerated(content []byte) bool {
 	return false
 }
 
-// vendorishPrefixes are directories whose contents are someone else's code
-// even when they are committed. git ls-files already drops what .gitignore
-// excludes; this catches the repos that commit their dependencies.
-var vendorishPrefixes = []string{
+// vendorishAnywhere are directories whose contents are someone else's code even
+// when they are committed. git ls-files already drops what .gitignore
+// excludes; this catches repos that commit dependencies.
+var vendorishAnywhere = []string{
 	"vendor/",
 	"node_modules/",
 	"third_party/",
 	"Pods/",
 	".build/",
-	"dist/",
-	"build/",
-	"out/",
 	"coverage/",
 	".next/",
 	"__pycache__/",
 }
 
+// outputRootsOnly matches generated output directories only at the repository
+// root; nested names are often real source.
+var outputRootsOnly = []string{"dist/", "build/", "out/"}
+
 func vendorish(path string) bool {
-	for _, prefix := range vendorishPrefixes {
+	for _, prefix := range vendorishAnywhere {
 		if strings.HasPrefix(path, prefix) || strings.Contains(path, "/"+prefix) {
+			return true
+		}
+	}
+	for _, prefix := range outputRootsOnly {
+		if strings.HasPrefix(path, prefix) {
 			return true
 		}
 	}

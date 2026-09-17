@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/tszaks/pallium/internal/codeindex"
 	"github.com/tszaks/pallium/internal/db"
 )
 
@@ -54,6 +55,29 @@ func staleModuleSlugs(store *db.Store, repoID int64, repoRoot string, modules []
 				break
 			}
 		}
+	}
+	indexed := make(map[string]struct{}, len(stored))
+	for path := range stored {
+		indexed[path] = struct{}{}
+	}
+	candidates, err := codeindex.UnindexedCandidates(repoRoot, indexed)
+	if err != nil {
+		return nil, err
+	}
+	dirs := make([]string, 0, len(modules))
+	for _, module := range modules {
+		dirs = append(dirs, module.Dir)
+	}
+	owner := newOwnerIndex(dirs)
+	for _, path := range candidates {
+		dir := owner.moduleFor(path)
+		if dir == "" {
+			for _, module := range modules {
+				stale[module.Slug] = struct{}{}
+			}
+			continue
+		}
+		stale[slugForDir(dir)] = struct{}{}
 	}
 	return stale, nil
 }
