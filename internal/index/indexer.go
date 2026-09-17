@@ -7,17 +7,19 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tszaks/pallium/internal/codeindex"
 	"github.com/tszaks/pallium/internal/db"
 	"github.com/tszaks/pallium/internal/gitlog"
 )
 
 type Result struct {
-	RepoRoot          string    `json:"repo_root"`
-	Branch            string    `json:"branch"`
-	CommitCount       int       `json:"commit_count"`
-	FileCount         int       `json:"file_count"`
-	CochangeEdgeCount int       `json:"cochange_edge_count"`
-	IndexedAt         time.Time `json:"indexed_at"`
+	RepoRoot          string           `json:"repo_root"`
+	Branch            string           `json:"branch"`
+	CommitCount       int              `json:"commit_count"`
+	FileCount         int              `json:"file_count"`
+	CochangeEdgeCount int              `json:"cochange_edge_count"`
+	Content           codeindex.Result `json:"content"`
+	IndexedAt         time.Time        `json:"indexed_at"`
 }
 
 type Indexer struct {
@@ -52,7 +54,25 @@ func (i *Indexer) Run() (Result, error) {
 	err = i.Store.WithTx(func(tx *db.Store) error {
 		var txErr error
 		result, txErr = repopulate(tx, branch, lastIndexedCommit, indexedAt, commits)
-		return txErr
+		if txErr != nil {
+			return txErr
+		}
+
+		// Content indexing shares the transaction so an interrupted run
+		// leaves no half-written symbol table. It is deliberately NOT part
+		// of ResetRepoData's wipe: the git-derived tables are rebuilt from
+		// scratch every run, while the content tables are keyed by content
+		// hash and only the changed files get reparsed.
+		repo, repoErr := tx.Repo()
+		if repoErr != nil {
+			return repoErr
+		}
+		content, contentErr := codeindex.Run(tx, repo.ID, indexedAt)
+		if contentErr != nil {
+			return contentErr
+		}
+		result.Content = content
+		return nil
 	})
 	if err != nil {
 		return Result{}, err
