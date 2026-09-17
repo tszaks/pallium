@@ -492,3 +492,101 @@ func TestAuditSkipsStructuralDocs(t *testing.T) {
 		t.Fatalf("no model calls should have been made, got %d", auditor.promptCount())
 	}
 }
+
+// TestAuditEvidenceIsScopedToTheModule is the regression for the worst bug in
+// this feature. Symbol names repeat across packages (Pallium declares Store in
+// four and Run in six). Resolving a cited name repo-wide and taking the first
+// hit fed the auditor a stranger's source, and it then confidently refuted 44
+// claims that were true, because the code it was shown genuinely did not match
+// them. Wrong evidence is worse than no evidence.
+func TestAuditEvidenceIsScopedToTheModule(t *testing.T) {
+	repo := t.TempDir()
+	git(t, repo, "init", "-b", "main")
+	git(t, repo, "config", "user.name", "Test User")
+	git(t, repo, "config", "user.email", "test@example.com")
+
+	files := map[string]string{
+		"go.mod": "module example.com/app\n\ngo 1.26.0\n",
+		// Sorts first by path, so a repo-wide lookup would pick this one.
+		"alpha/store.go": "package alpha\n\ntype Store struct{ alphaOnlyField int }\n\nfunc Open() *Store { return &Store{} }\n",
+		"alpha/more.go":  "package alpha\n\nfunc AlphaMore() {}\n",
+		"alpha/extra.go": "package alpha\n\nfunc AlphaExtra() {}\n",
+		// The module under audit declares the same names.
+		"zeta/store.go": "package zeta\n\ntype Store struct{ zetaOnlyField string }\n\nfunc Open() *Store { return &Store{} }\n",
+		"zeta/more.go":  "package zeta\n\nfunc ZetaMore() {}\n",
+		"zeta/extra.go": "package zeta\n\nfunc ZetaExtra() {}\n",
+	}
+	for path, content := range files {
+		write(t, filepath.Join(repo, path), content)
+	}
+	git(t, repo, "add", "-A")
+	git(t, repo, "commit", "-m", "init")
+
+	store, err := db.OpenPath(repo, filepath.Join(t.TempDir(), "index.sqlite"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if _, err := index.New(store).Run(); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	record, err := store.Repo()
+	if err != nil {
+		t.Fatalf("repo: %v", err)
+	}
+
+	builder := &stubSynth{response: `{
+  "summary": "Zeta storage.",
+  "purpose": "Holds the zeta store.",
+  "invariants": [{"claim": "Store carries a zeta-only field", "cited_symbols": ["Store"], "cited_paths": ["zeta/store.go"]}]
+}`}
+	if _, err := Build(store, record.ID, repo, BuildOptions{Synth: builder, Only: []string{"zeta"}}); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	auditor := &stubSynth{response: `{"verdicts": [{"index": 1, "ruling": "supported", "why": "zetaOnlyField is right there."}]}`}
+	if _, err := Audit(store, record.ID, repo, AuditOptions{Synth: auditor, Only: []string{"zeta"}}); err != nil {
+		t.Fatalf("audit: %v", err)
+	}
+
+	if len(auditor.prompts) != 1 {
+		t.Fatalf("expected one audit prompt, got %d", len(auditor.prompts))
+	}
+	prompt := auditor.prompts[0]
+	if !strings.Contains(prompt, "zetaOnlyField") {
+		t.Fatalf("the audited module's own Store was not shown:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "alphaOnlyField") {
+		t.Fatalf("a same-named symbol from another module leaked into the evidence:\n%s", prompt)
+	}
+}
+
+// TestAuditReportsMissingEvidenceInsteadOfSubstituting keeps the fix honest:
+// when a cited symbol is nowhere in the module, the auditor must be told so
+// and steered to "unclear", not handed something else.
+func TestAuditReportsMissingEvidenceInsteadOfSubstituting(t *testing.T) {
+	store, repoID, repoRoot := indexedRepo(t)
+
+	builder := &stubSynth{response: `{
+  "summary": "Storage.",
+  "purpose": "Storage things.",
+  "invariants": [{"claim": "Handle does the work", "cited_symbols": ["Handle"], "cited_paths": []}]
+}`}
+	if _, err := Build(store, repoID, repoRoot, BuildOptions{Synth: builder, Only: []string{"storage"}}); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	auditor := &stubSynth{response: `{"verdicts": [{"index": 1, "ruling": "unclear", "why": "Not visible here."}]}`}
+	if _, err := Audit(store, repoID, repoRoot, AuditOptions{Synth: auditor, Only: []string{"storage"}}); err != nil {
+		t.Fatalf("audit: %v", err)
+	}
+
+	prompt := auditor.prompts[0]
+	// Handle is declared in the api module, not storage.
+	if !strings.Contains(prompt, "No declaration was found in this module for: Handle") {
+		t.Fatalf("missing evidence was not declared to the auditor:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "api/handler.go") {
+		t.Fatalf("evidence from another module leaked in:\n%s", prompt)
+	}
+}

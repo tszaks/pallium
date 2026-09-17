@@ -46,7 +46,11 @@ type AuditReport struct {
 	// NeedsRebuild counts docs a model wrote before claims were stored
 	// alongside the rendered body. Their assertions are unauditable, and
 	// counting them as "structural" would read as a clean bill of health.
-	NeedsRebuild int            `json:"needs_rebuild"`
+	NeedsRebuild int `json:"needs_rebuild"`
+	// NeedsReindex counts modules whose files changed since indexing. Their
+	// stored line numbers point at the wrong code, so auditing them would
+	// produce confident refutations of true claims.
+	NeedsReindex int            `json:"needs_reindex"`
 	Claims       int            `json:"claims"`
 	Supported    int            `json:"supported"`
 	Removed      int            `json:"removed"`
@@ -92,6 +96,20 @@ func Audit(store *db.Store, repoID int64, repoRoot string, opts AuditOptions) (A
 
 	report := AuditReport{Findings: []AuditRemoval{}, Failures: []BuildFailure{}}
 
+	modules, err := Modules(store, repoID, ModuleOptions{})
+	if err != nil {
+		return AuditReport{}, err
+	}
+	moduleBySlug := make(map[string]Module, len(modules))
+	for _, module := range modules {
+		moduleBySlug[module.Slug] = module
+	}
+
+	stale, err := staleModuleSlugs(store, repoID, repoRoot, modules)
+	if err != nil {
+		return AuditReport{}, err
+	}
+
 	type job struct {
 		doc    db.KnowledgeDoc
 		claims synthesis
@@ -110,6 +128,11 @@ func Audit(store *db.Store, repoID int64, repoRoot string, opts AuditOptions) (A
 			}
 		}
 
+		if _, drifted := stale[doc.Slug]; drifted {
+			report.NeedsReindex++
+			continue
+		}
+
 		var claims synthesis
 		if strings.TrimSpace(doc.Claims) != "" {
 			_ = json.Unmarshal([]byte(doc.Claims), &claims)
@@ -126,7 +149,7 @@ func Audit(store *db.Store, repoID int64, repoRoot string, opts AuditOptions) (A
 			continue
 		}
 
-		prompt, err := auditPrompt(store, repoID, repoRoot, doc, flat)
+		prompt, err := auditPrompt(store, repoID, repoRoot, doc, flat, moduleBySlug[doc.Slug])
 		if err != nil {
 			return AuditReport{}, err
 		}
@@ -204,9 +227,9 @@ func Audit(store *db.Store, repoID int64, repoRoot string, opts AuditOptions) (A
 
 		updated := item.doc
 		pruned := pruneClaims(item.claims, removals)
-		module, err := moduleForDoc(store, repoID, item.doc.Slug)
-		if err != nil {
-			return AuditReport{}, err
+		var module *Module
+		if found, ok := moduleBySlug[item.doc.Slug]; ok {
+			module = &found
 		}
 		if module == nil {
 			// The module boundary moved since the doc was written; leave the
@@ -282,24 +305,11 @@ func pruneClaims(result synthesis, removals map[string]string) synthesis {
 	}
 }
 
-func moduleForDoc(store *db.Store, repoID int64, slug string) (*Module, error) {
-	modules, err := Modules(store, repoID, ModuleOptions{})
-	if err != nil {
-		return nil, err
-	}
-	for index := range modules {
-		if modules[index].Slug == slug {
-			return &modules[index], nil
-		}
-	}
-	return nil, nil
-}
-
 // auditPrompt hands the skeptic the claims and the actual source of every
 // symbol they cite. Source excerpts are what make this an audit rather than a
 // second opinion: a model asked to re-judge a claim from memory would mostly
 // agree with itself.
-func auditPrompt(store *db.Store, repoID int64, repoRoot string, doc db.KnowledgeDoc, claims []citedClaim) (string, error) {
+func auditPrompt(store *db.Store, repoID int64, repoRoot string, doc db.KnowledgeDoc, claims []citedClaim, module Module) (string, error) {
 	var builder strings.Builder
 	fmt.Fprintf(&builder, "You are auditing generated documentation for the module %s. Your job is to REFUTE claims the source does not support.\n\n", doc.Title)
 
@@ -310,7 +320,7 @@ func auditPrompt(store *db.Store, repoID int64, repoRoot string, doc db.Knowledg
 		fmt.Fprintf(&builder, "%d. %s [cites: %s]\n", index+1, strings.TrimSpace(claim.Claim), strings.Join(citations, ", "))
 	}
 
-	excerpts, err := claimExcerpts(store, repoID, repoRoot, claims)
+	excerpts, missing, err := claimExcerpts(store, repoID, repoRoot, claims, module)
 	if err != nil {
 		return "", err
 	}
@@ -318,6 +328,25 @@ func auditPrompt(store *db.Store, repoID int64, repoRoot string, doc db.Knowledg
 		builder.WriteString("\nSource for the cited symbols:\n\n")
 		for _, excerpt := range excerpts {
 			fmt.Fprintf(&builder, "----- %s (%s:%d)\n%s\n", excerpt.name, excerpt.path, excerpt.line, excerpt.code)
+		}
+	}
+
+	if len(missing) > 0 {
+		// Naming what could not be found is the whole reason this list
+		// exists. Silently omitting evidence made the auditor rule
+		// "unsupported" on claims that were fine, because absence of proof
+		// reads identically to disproof.
+		builder.WriteString("\nNo declaration was found in this module for: " + strings.Join(missing, ", ") + ".\nTreat claims resting only on those as \"unclear\", never \"unsupported\".\n")
+	}
+
+	outlines, err := citedPathOutlines(store, repoID, claims, excerpts)
+	if err != nil {
+		return "", err
+	}
+	if len(outlines) > 0 {
+		builder.WriteString("\nDeclarations in the cited files:\n\n")
+		for _, outline := range outlines {
+			fmt.Fprintf(&builder, "----- %s\n%s\n", outline.path, outline.body)
 		}
 	}
 
@@ -350,70 +379,235 @@ type sourceExcerpt struct {
 // maxExcerptLines caps one symbol's excerpt. A 400-line function would crowd
 // out every other claim's evidence; the opening of a declaration is where its
 // contract lives.
-const maxExcerptLines = 45
+//
+// Raised from 45 after the first real audit: 242 of 307 claims came back
+// "unclear", which is the auditor correctly refusing to judge on evidence it
+// did not have rather than a fault in the ruling. Most claims are about
+// behavior that spans more than one declaration.
+const maxExcerptLines = 90
 
-func claimExcerpts(store *db.Store, repoID int64, repoRoot string, claims []citedClaim) ([]sourceExcerpt, error) {
-	wanted := make([]string, 0)
-	seen := make(map[string]struct{})
+// maxPathSymbolsListed bounds the declaration list shown for a cited FILE.
+// Claims citing a path used to arrive with no evidence at all, which is a
+// second reason the first run abstained so often.
+const maxPathSymbolsListed = 30
+
+// claimExcerpts pulls the source behind each cited symbol, scoped to the
+// module being audited.
+//
+// The scoping is the entire point. Resolving a name repo-wide and taking the
+// first hit by path handed the auditor a stranger's code: Pallium declares
+// Store in four packages, Run in six, Open in four. An audit of internal/db
+// was shown internal/console's Store, and correctly ruled that the claims did
+// not match the code it could see. That produced 44 confident refutations of
+// claims that were true. Preference order is the claim's own cited paths,
+// then the module's files, then nothing at all — and "nothing" is reported
+// rather than substituted, because wrong evidence is far worse than missing
+// evidence.
+func claimExcerpts(store *db.Store, repoID int64, repoRoot string, claims []citedClaim, module Module) ([]sourceExcerpt, []string, error) {
+	moduleFiles := make(map[string]struct{}, len(module.Files))
+	for _, path := range module.Files {
+		moduleFiles[path] = struct{}{}
+	}
+
+	type request struct {
+		name  string
+		paths map[string]struct{}
+	}
+	requests := make([]request, 0)
+	seen := make(map[string]int)
 	for _, claim := range claims {
 		for _, name := range claim.CitedSymbols {
 			name = strings.TrimSpace(name)
 			if name == "" {
 				continue
 			}
-			if _, ok := seen[name]; ok {
-				continue
+			index, ok := seen[name]
+			if !ok {
+				seen[name] = len(requests)
+				requests = append(requests, request{name: name, paths: map[string]struct{}{}})
+				index = len(requests) - 1
 			}
-			seen[name] = struct{}{}
-			wanted = append(wanted, name)
+			for _, path := range claim.CitedPaths {
+				requests[index].paths[strings.TrimSpace(path)] = struct{}{}
+			}
 		}
 	}
 
-	out := make([]sourceExcerpt, 0, len(wanted))
+	out := make([]sourceExcerpt, 0, len(requests))
+	missing := make([]string, 0)
 	cache := make(map[string][]string)
-	for _, name := range wanted {
-		symbols, err := store.SymbolsNamed(repoID, name)
+
+	for _, item := range requests {
+		symbols, err := store.SymbolsNamed(repoID, item.name)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		for _, symbol := range symbols {
-			lines, ok := cache[symbol.Path]
+
+		chosen := pickDeclarations(symbols, item.paths, moduleFiles)
+		if len(chosen) == 0 {
+			missing = append(missing, item.name)
+			continue
+		}
+		for _, symbol := range chosen {
+			excerpt, ok := readExcerpt(repoRoot, symbol, cache)
 			if !ok {
-				content, readErr := os.ReadFile(filepath.Join(repoRoot, filepath.FromSlash(symbol.Path)))
-				if readErr != nil {
-					cache[symbol.Path] = nil
-					continue
-				}
-				lines = strings.Split(string(content), "\n")
-				cache[symbol.Path] = lines
+				missing = append(missing, item.name)
+				continue
 			}
-			if lines == nil {
+			out = append(out, excerpt)
+		}
+	}
+	return out, sortedUnique(missing), nil
+}
+
+// maxDeclarationsPerName bounds how many same-named declarations inside one
+// module are shown. Two is enough to reveal an interface plus its
+// implementation without crowding out other claims' evidence.
+const maxDeclarationsPerName = 2
+
+func pickDeclarations(symbols []db.CodeSymbol, citedPaths, moduleFiles map[string]struct{}) []db.CodeSymbol {
+	inCited := make([]db.CodeSymbol, 0, 2)
+	inModule := make([]db.CodeSymbol, 0, 2)
+	for _, symbol := range symbols {
+		if _, ok := citedPaths[symbol.Path]; ok {
+			inCited = append(inCited, symbol)
+			continue
+		}
+		if _, ok := moduleFiles[symbol.Path]; ok {
+			inModule = append(inModule, symbol)
+		}
+	}
+
+	chosen := inCited
+	if len(chosen) == 0 {
+		chosen = inModule
+	}
+	if len(chosen) > maxDeclarationsPerName {
+		chosen = chosen[:maxDeclarationsPerName]
+	}
+	return chosen
+}
+
+func readExcerpt(repoRoot string, symbol db.CodeSymbol, cache map[string][]string) (sourceExcerpt, bool) {
+	lines, ok := cache[symbol.Path]
+	if !ok {
+		content, err := os.ReadFile(filepath.Join(repoRoot, filepath.FromSlash(symbol.Path)))
+		if err != nil {
+			cache[symbol.Path] = nil
+			return sourceExcerpt{}, false
+		}
+		lines = strings.Split(string(content), "\n")
+		cache[symbol.Path] = lines
+	}
+	if lines == nil {
+		return sourceExcerpt{}, false
+	}
+
+	start := symbol.StartLine - 1
+	if start < 0 {
+		start = 0
+	}
+	if start >= len(lines) {
+		return sourceExcerpt{}, false
+	}
+	end := symbol.EndLine
+	if end <= start {
+		end = start + 1
+	}
+	if end > start+maxExcerptLines {
+		end = start + maxExcerptLines
+	}
+	if end > len(lines) {
+		end = len(lines)
+	}
+	code := strings.Join(lines[start:end], "\n")
+	// Last line of defence against a misaligned index: if the declaration's
+	// own name is not near the top of what we are about to quote, the line
+	// number is wrong and this excerpt is someone else's code. Report it as
+	// missing rather than shipping it as evidence.
+	if !declarationVisible(lines, start, symbol.Name) {
+		return sourceExcerpt{}, false
+	}
+	return sourceExcerpt{
+		name: symbolName(symbol),
+		path: symbol.Path,
+		line: symbol.StartLine,
+		code: code,
+	}, true
+}
+
+// declarationHeadLines is how far past the recorded start line the name may
+// appear. A declaration can carry an attribute or a decorator above its name,
+// but not much more.
+const declarationHeadLines = 3
+
+func declarationVisible(lines []string, start int, name string) bool {
+	if name == "" {
+		return true
+	}
+	for offset := 0; offset < declarationHeadLines && start+offset < len(lines); offset++ {
+		if strings.Contains(lines[start+offset], name) {
+			return true
+		}
+	}
+	return false
+}
+
+type pathOutline struct {
+	path string
+	body string
+}
+
+// citedPathOutlines gives a claim that cites a FILE something to be judged
+// against. It lists that file's declarations from the index rather than
+// dumping the file, so the evidence stays bounded and costs no disk reads.
+// Files already covered by a symbol excerpt are skipped.
+func citedPathOutlines(store *db.Store, repoID int64, claims []citedClaim, excerpts []sourceExcerpt) ([]pathOutline, error) {
+	covered := make(map[string]struct{}, len(excerpts))
+	for _, excerpt := range excerpts {
+		covered[excerpt.path] = struct{}{}
+	}
+
+	seen := make(map[string]struct{})
+	out := make([]pathOutline, 0)
+	for _, claim := range claims {
+		for _, path := range claim.CitedPaths {
+			path = strings.TrimSpace(path)
+			if path == "" {
+				continue
+			}
+			if _, ok := covered[path]; ok {
+				continue
+			}
+			if _, ok := seen[path]; ok {
+				continue
+			}
+			seen[path] = struct{}{}
+
+			symbols, err := store.SymbolsInFile(repoID, path)
+			if err != nil {
+				return nil, err
+			}
+			if len(symbols) == 0 {
 				continue
 			}
 
-			start := symbol.StartLine - 1
-			if start < 0 {
-				start = 0
+			var body strings.Builder
+			for index, symbol := range symbols {
+				if index >= maxPathSymbolsListed {
+					fmt.Fprintf(&body, "  ...and %d more declarations\n", len(symbols)-maxPathSymbolsListed)
+					break
+				}
+				fmt.Fprintf(&body, "  %s:%d %s %s", path, symbol.StartLine, symbol.Kind, symbolName(symbol))
+				if symbol.Signature != "" {
+					fmt.Fprintf(&body, " — %s", truncate(symbol.Signature, 140))
+				}
+				body.WriteString("\n")
+				if symbol.Doc != "" {
+					fmt.Fprintf(&body, "      doc: %s\n", truncate(symbol.Doc, 180))
+				}
 			}
-			end := symbol.EndLine
-			if end <= start {
-				end = start + 1
-			}
-			if end > start+maxExcerptLines {
-				end = start + maxExcerptLines
-			}
-			if end > len(lines) {
-				end = len(lines)
-			}
-			out = append(out, sourceExcerpt{
-				name: symbolName(symbol),
-				path: symbol.Path,
-				line: symbol.StartLine,
-				code: strings.Join(lines[start:end], "\n"),
-			})
-			// One declaration per name is enough evidence; a name declared in
-			// several places would otherwise flood the prompt.
-			break
+			out = append(out, pathOutline{path: path, body: body.String()})
 		}
 	}
 	return out, nil

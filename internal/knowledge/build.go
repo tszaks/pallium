@@ -29,6 +29,11 @@ type BuildOptions struct {
 	Only          []string
 	Materialize   bool
 	MaterializeTo string
+	// AllowStale documents modules whose files have changed since indexing.
+	// Off by default: a synthesis prompt is built from stored line numbers,
+	// signatures and doc comments, so a stale module produces a doc written
+	// about code that is no longer there.
+	AllowStale bool
 	// Concurrency bounds how many modules are synthesized at once. Synthesis
 	// is the only slow part and it is a pure function of the module card, so
 	// it fans out; storage stays strictly sequential because the repo's
@@ -37,9 +42,12 @@ type BuildOptions struct {
 }
 
 type BuildReport struct {
-	Modules      int            `json:"modules"`
-	Written      int            `json:"written"`
-	Unchanged    int            `json:"unchanged"`
+	Modules   int `json:"modules"`
+	Written   int `json:"written"`
+	Unchanged int `json:"unchanged"`
+	// NeedsReindex counts modules skipped because their files drifted from
+	// the index.
+	NeedsReindex int            `json:"needs_reindex"`
 	Verified     int            `json:"verified"`
 	Unverified   int            `json:"unverified"`
 	Dropped      int            `json:"dropped_claims"`
@@ -103,6 +111,14 @@ func Build(store *db.Store, repoID int64, repoRoot string, opts BuildOptions) (B
 		generator = "structural+model"
 	}
 
+	stale := map[string]struct{}{}
+	if !opts.AllowStale {
+		stale, err = staleModuleSlugs(store, repoID, repoRoot, modules)
+		if err != nil {
+			return BuildReport{}, err
+		}
+	}
+
 	report := BuildReport{Modules: len(modules), Generator: generator, Docs: []DocSummary{}, Failures: []BuildFailure{}}
 	only := make(map[string]struct{}, len(opts.Only))
 	for _, slug := range opts.Only {
@@ -117,6 +133,11 @@ func Build(store *db.Store, repoID int64, repoRoot string, opts BuildOptions) (B
 			if _, ok := only[module.Slug]; !ok {
 				continue
 			}
+		}
+
+		if _, drifted := stale[module.Slug]; drifted {
+			report.NeedsReindex++
+			continue
 		}
 
 		existing, found, err := store.KnowledgeDoc(repoID, module.Slug)

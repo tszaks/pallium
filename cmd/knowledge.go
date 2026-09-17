@@ -132,6 +132,9 @@ func renderKnowledgeBuild(report knowledge.BuildReport) string {
 	fmt.Fprintf(&builder, "Built %d doc(s) across %d module(s) using %s.\n", report.Written, report.Modules, report.Generator)
 	fmt.Fprintf(&builder, "%d verified, %d unverified, %d unchanged, %d claim(s) dropped.\n",
 		report.Verified, report.Unverified, report.Unchanged, report.Dropped)
+	if report.NeedsReindex > 0 {
+		fmt.Fprintf(&builder, "%d module(s) changed since indexing and were SKIPPED: a doc built from stale line numbers describes code that moved. Run `pallium index`, or pass --allow-stale.\n", report.NeedsReindex)
+	}
 	if report.Materialized != "" {
 		fmt.Fprintf(&builder, "Markdown written to %s\n", report.Materialized)
 	}
@@ -311,6 +314,9 @@ func runKnowledgeAudit(out io.Writer, args []string, jsonOutput bool) error {
 	return output.Write(out, report, jsonOutput, func() string {
 		var builder strings.Builder
 		fmt.Fprintf(&builder, "Audited %d of %d module doc(s), %d skipped as structural-only.\n", report.Audited, report.Docs, report.Skipped)
+		if report.NeedsReindex > 0 {
+			fmt.Fprintf(&builder, "%d module(s) changed since indexing and were NOT audited: their stored line numbers point at the wrong code. Run `pallium index` first.\n", report.NeedsReindex)
+		}
 		if report.NeedsRebuild > 0 {
 			fmt.Fprintf(&builder, "%d doc(s) were written by a model before claims were stored and cannot be audited: run `pallium knowledge build --force` first.\n", report.NeedsRebuild)
 		}
