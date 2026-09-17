@@ -262,7 +262,12 @@ LIMIT ?`, args...)
 	for _, record := range records {
 		out = append(out, record)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].CommittedAt.After(out[j].CommittedAt) })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CommittedAt.Equal(out[j].CommittedAt) {
+			return out[i].SHA < out[j].SHA
+		}
+		return out[i].CommittedAt.After(out[j].CommittedAt)
+	})
 	if len(out) > limit {
 		out = out[:limit]
 	}

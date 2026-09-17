@@ -67,38 +67,9 @@ func runKnowledgeMap(out io.Writer, args []string, jsonOutput bool) error {
 }
 
 func runKnowledgeBuild(out io.Writer, args []string, jsonOutput bool) error {
-	opts := knowledge.BuildOptions{Materialize: true}
-	useModel := true
-	positional := make([]string, 0, len(args))
-	for index := 0; index < len(args); index++ {
-		switch args[index] {
-		case "--force":
-			opts.Force = true
-		case "--no-model", "--structural":
-			useModel = false
-		case "--no-materialize":
-			opts.Materialize = false
-		case "--allow-stale":
-			opts.AllowStale = true
-		case "--concurrency":
-			if index+1 >= len(args) {
-				return fmt.Errorf("--concurrency needs a number")
-			}
-			index++
-			value, convErr := strconv.Atoi(args[index])
-			if convErr != nil || value < 1 {
-				return fmt.Errorf("--concurrency needs a positive number, got %q", args[index])
-			}
-			opts.Concurrency = value
-		case "--only":
-			if index+1 >= len(args) {
-				return fmt.Errorf("--only needs a module slug")
-			}
-			index++
-			opts.Only = append(opts.Only, strings.Split(args[index], ",")...)
-		default:
-			positional = append(positional, args[index])
-		}
+	opts, useModel, positional, err := parseKnowledgeBuildArgs(args)
+	if err != nil {
+		return err
 	}
 
 	indexer, err := openIndexedStore(optionalRepoArg(positional, 0))
@@ -127,6 +98,43 @@ func runKnowledgeBuild(out io.Writer, args []string, jsonOutput bool) error {
 	return output.Write(out, report, jsonOutput, func() string {
 		return renderKnowledgeBuild(report)
 	})
+}
+
+func parseKnowledgeBuildArgs(args []string) (knowledge.BuildOptions, bool, []string, error) {
+	opts := knowledge.BuildOptions{Materialize: true}
+	useModel := true
+	positional := make([]string, 0, len(args))
+	for index := 0; index < len(args); index++ {
+		switch args[index] {
+		case "--force":
+			opts.Force = true
+		case "--no-model", "--structural":
+			useModel = false
+		case "--no-materialize":
+			opts.Materialize = false
+		case "--allow-stale":
+			opts.AllowStale = true
+		case "--concurrency":
+			if index+1 >= len(args) {
+				return knowledge.BuildOptions{}, false, nil, fmt.Errorf("--concurrency needs a number")
+			}
+			index++
+			value, convErr := strconv.Atoi(args[index])
+			if convErr != nil || value < 1 {
+				return knowledge.BuildOptions{}, false, nil, fmt.Errorf("--concurrency needs a positive number, got %q", args[index])
+			}
+			opts.Concurrency = value
+		case "--only":
+			if index+1 >= len(args) {
+				return knowledge.BuildOptions{}, false, nil, fmt.Errorf("--only needs a module slug")
+			}
+			index++
+			opts.Only = append(opts.Only, strings.Split(args[index], ",")...)
+		default:
+			positional = append(positional, args[index])
+		}
+	}
+	return opts, useModel, positional, nil
 }
 
 func renderKnowledgeBuild(report knowledge.BuildReport) string {

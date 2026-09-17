@@ -2,6 +2,7 @@ package knowledge
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -21,6 +22,7 @@ import (
 type stubSynth struct {
 	mu       sync.Mutex
 	response string
+	respond  func(string) string
 	err      error
 	prompts  []string
 }
@@ -31,6 +33,9 @@ func (s *stubSynth) Synthesize(_ context.Context, prompt string) (string, error)
 	s.mu.Unlock()
 	if s.err != nil {
 		return "", s.err
+	}
+	if s.respond != nil {
+		return s.respond(prompt), nil
 	}
 	return s.response, nil
 }
@@ -116,20 +121,21 @@ func TestBuildWithoutModelStillProducesDocs(t *testing.T) {
 func TestBuildSkipsUnchangedModules(t *testing.T) {
 	store, repoID, repoRoot := indexedRepo(t)
 
-	if _, err := Build(store, repoID, repoRoot, BuildOptions{}); err != nil {
+	firstSynth := &stubSynth{response: `{"summary":{"claim":"A module.","cited_symbols":["Open"]},"purpose":{"claim":"It does a thing.","cited_symbols":["Open"]}}`}
+	if _, err := Build(store, repoID, repoRoot, BuildOptions{Synth: firstSynth}); err != nil {
 		t.Fatalf("first build: %v", err)
 	}
 
-	synth := &stubSynth{response: `{"summary":{"claim":"x","cited_paths":["storage/store.go"]},"purpose":{"claim":"y","cited_paths":["storage/store.go"]}}`}
-	second, err := Build(store, repoID, repoRoot, BuildOptions{Synth: synth})
+	secondSynth := &stubSynth{response: firstSynth.response}
+	second, err := Build(store, repoID, repoRoot, BuildOptions{Synth: secondSynth})
 	if err != nil {
 		t.Fatalf("second build: %v", err)
 	}
-	if synth.promptCount() != 2 {
-		t.Fatalf("structural docs should be regenerated when a model is requested, got %d prompts", synth.promptCount())
+	if secondSynth.promptCount() != 0 {
+		t.Fatalf("unchanged modules should not be re-synthesized, got %d prompts", secondSynth.promptCount())
 	}
-	if second.Unchanged != 0 {
-		t.Fatalf("model generation should not reuse structural docs, got %+v", second)
+	if second.Unchanged == 0 {
+		t.Fatalf("expected unchanged model docs to be reused, got %+v", second)
 	}
 }
 
@@ -363,7 +369,7 @@ func git(t *testing.T, dir string, args ...string) {
 func TestBuildFansOutWithoutLosingModules(t *testing.T) {
 	store, repoID, repoRoot := indexedRepo(t)
 
-	synth := &stubSynth{response: `{"summary":{"claim":"A module.","cited_paths":["storage/store.go"]},"purpose":{"claim":"It does a thing.","cited_paths":["storage/store.go"]},"invariants":[{"claim":"Open returns a Store","cited_symbols":["Open"],"cited_paths":[]}]}`}
+	synth := &stubSynth{response: `{"summary":{"claim":"A module.","cited_symbols":["Open"]},"purpose":{"claim":"It does a thing.","cited_symbols":["Open"]},"invariants":[{"claim":"Open returns a Store","cited_symbols":["Open"],"cited_paths":[]}]}`}
 	report, err := Build(store, repoID, repoRoot, BuildOptions{Synth: synth, Concurrency: 4})
 	if err != nil {
 		t.Fatalf("build: %v", err)
@@ -385,8 +391,8 @@ func TestBuildFansOutWithoutLosingModules(t *testing.T) {
 	if len(docs) != len(modules)+2 {
 		t.Fatalf("expected %d docs, got %d", len(modules)+2, len(docs))
 	}
-	if report.Dropped != 2 {
-		t.Fatalf("only out-of-module claims should be dropped, got %d", report.Dropped)
+	if report.Dropped != 0 {
+		t.Fatalf("shared symbol citations should resolve for every module, got %d dropped", report.Dropped)
 	}
 	for _, doc := range docs {
 		if doc.Kind == "module" && !strings.Contains(doc.Body, "Open returns a Store") {
@@ -599,4 +605,347 @@ func TestAuditReportsMissingEvidenceInsteadOfSubstituting(t *testing.T) {
 	if strings.Contains(prompt, "api/handler.go") {
 		t.Fatalf("evidence from another module leaked in:\n%s", prompt)
 	}
+}
+
+func TestAuditRejectsIncompleteVerdictSets(t *testing.T) {
+	tests := []struct {
+		name     string
+		verdicts string
+	}{
+		{"missing index", `[{"index":1,"ruling":"supported"}]`},
+		{"duplicate index", `[{"index":1,"ruling":"supported"},{"index":1,"ruling":"supported"},{"index":2,"ruling":"supported"},{"index":3,"ruling":"supported"}]`},
+		{"out of range", `[{"index":1,"ruling":"supported"},{"index":2,"ruling":"supported"},{"index":4,"ruling":"supported"}]`},
+		{"unknown ruling", `[{"index":1,"ruling":"not_supported"},{"index":2,"ruling":"supported"},{"index":3,"ruling":"supported"}]`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store, repoID, repoRoot := indexedRepo(t)
+			builder := &stubSynth{response: `{"summary":{"claim":"Storage","cited_symbols":["Open"]},"purpose":{"claim":"Purpose","cited_symbols":["Open"]},"invariants":[{"claim":"Invariant","cited_symbols":["Open"]}]}`}
+			if _, err := Build(store, repoID, repoRoot, BuildOptions{Synth: builder, Only: []string{"storage"}}); err != nil {
+				t.Fatalf("build: %v", err)
+			}
+			before, _, err := store.KnowledgeDoc(repoID, "storage")
+			if err != nil {
+				t.Fatalf("before: %v", err)
+			}
+			auditor := &stubSynth{response: `{"verdicts":` + test.verdicts + `}`}
+			report, err := Audit(store, repoID, repoRoot, AuditOptions{Synth: auditor, Only: []string{"storage"}})
+			if err != nil {
+				t.Fatalf("audit: %v", err)
+			}
+			if len(report.Failures) != 1 || report.Removed != 0 || report.Supported != 0 {
+				t.Fatalf("invalid verdict set should fail atomically, got %+v", report)
+			}
+			after, _, err := store.KnowledgeDoc(repoID, "storage")
+			if err != nil {
+				t.Fatalf("after: %v", err)
+			}
+			if after.Body != before.Body || !after.Verified || len(after.DroppedClaims) != len(before.DroppedClaims) {
+				t.Fatalf("invalid verdict set changed the doc: before=%+v after=%+v", before, after)
+			}
+		})
+	}
+}
+
+func TestAuditPersistsUnclearAsUnverified(t *testing.T) {
+	store, repoID, repoRoot := indexedRepo(t)
+	builder := &stubSynth{response: `{"summary":{"claim":"Storage","cited_symbols":["Open"]},"purpose":{"claim":"Purpose","cited_symbols":["Open"]},"invariants":[{"claim":"Invariant","cited_symbols":["Open"]}]}`}
+	if _, err := Build(store, repoID, repoRoot, BuildOptions{Synth: builder, Only: []string{"storage"}}); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	auditor := &stubSynth{response: `{"verdicts":[{"index":1,"ruling":"unclear","why":"not enough"},{"index":2,"ruling":"unclear","why":"not enough"},{"index":3,"ruling":"unclear","why":"not enough"}]}`}
+	if _, err := Audit(store, repoID, repoRoot, AuditOptions{Synth: auditor, Only: []string{"storage"}}); err != nil {
+		t.Fatalf("audit: %v", err)
+	}
+	doc, _, err := store.KnowledgeDoc(repoID, "storage")
+	if err != nil {
+		t.Fatalf("doc: %v", err)
+	}
+	if doc.Verified || !strings.Contains(doc.Body, "Invariant") {
+		t.Fatalf("unclear claims should stay in an unverified body: %+v", doc)
+	}
+	found := false
+	for _, dropped := range doc.DroppedClaims {
+		found = found || strings.Contains(dropped, "unclear")
+	}
+	if !found {
+		t.Fatalf("unclear outcome was not persisted: %v", doc.DroppedClaims)
+	}
+}
+
+func TestAuditEvidenceNormalizesQualifiedSymbols(t *testing.T) {
+	store, repoID, repoRoot := indexedRepo(t)
+	builder := &stubSynth{response: `{"summary":{"claim":"Storage","cited_symbols":["Open"]},"purpose":{"claim":"Purpose","cited_symbols":["Open"]},"invariants":[{"claim":"Qualified open","cited_symbols":["Store.Open"]}]}`}
+	if _, err := Build(store, repoID, repoRoot, BuildOptions{Synth: builder, Only: []string{"storage"}}); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	auditor := &stubSynth{response: `{"verdicts":[{"index":1,"ruling":"supported"},{"index":2,"ruling":"supported"},{"index":3,"ruling":"supported"}]}`}
+	if _, err := Audit(store, repoID, repoRoot, AuditOptions{Synth: auditor, Only: []string{"storage"}}); err != nil {
+		t.Fatalf("audit: %v", err)
+	}
+	if len(auditor.prompts) != 1 || !strings.Contains(auditor.prompts[0], "func Open(") ||
+		strings.Contains(auditor.prompts[0], "No declaration was found in this module for: Store.Open") {
+		t.Fatalf("qualified symbol evidence was not normalized:\n%s", auditor.prompts[0])
+	}
+}
+
+func TestBuildRequiresCitedSummaryAndPurpose(t *testing.T) {
+	store, repoID, repoRoot := indexedRepo(t)
+	synth := &stubSynth{response: `{"summary":"uncited summary","purpose":{"claim":"uncited purpose"} }`}
+	report, err := Build(store, repoID, repoRoot, BuildOptions{Synth: synth, Only: []string{"storage"}})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if report.Dropped != 2 {
+		t.Fatalf("expected both uncited top-level claims dropped, got %+v", report)
+	}
+	doc, _, err := store.KnowledgeDoc(repoID, "storage")
+	if err != nil {
+		t.Fatalf("doc: %v", err)
+	}
+	if doc.Verified || !strings.HasPrefix(doc.Body, "# storage\n\n3 go files declaring") {
+		t.Fatalf("uncited summary/purpose should fall back structurally: %+v", doc)
+	}
+	var legacy synthesis
+	if err := json.Unmarshal([]byte(`{"summary":"text","purpose":"text"}`), &legacy); err != nil {
+		t.Fatalf("legacy claims should parse: %v", err)
+	}
+	if legacy.Summary.Claim != "text" || legacy.Purpose.Claim != "text" {
+		t.Fatalf("legacy claims did not round-trip: %+v", legacy)
+	}
+}
+
+func TestBuildRetriesFallbackDocsWhenModelIsAvailable(t *testing.T) {
+	t.Run("failed then working", func(t *testing.T) {
+		store, repoID, repoRoot := indexedRepo(t)
+		if _, err := Build(store, repoID, repoRoot, BuildOptions{Synth: &stubSynth{err: errors.New("offline")}, Only: []string{"storage"}}); err != nil {
+			t.Fatalf("failed build: %v", err)
+		}
+		working := &stubSynth{response: `{"summary":{"claim":"Storage","cited_symbols":["Open"]},"purpose":{"claim":"Purpose","cited_symbols":["Open"]}}`}
+		if _, err := Build(store, repoID, repoRoot, BuildOptions{Synth: working, Only: []string{"storage"}}); err != nil {
+			t.Fatalf("working build: %v", err)
+		}
+		doc, _, _ := store.KnowledgeDoc(repoID, "storage")
+		if working.promptCount() != 1 || doc.Generator != "structural+model" {
+			t.Fatalf("failed fallback was incorrectly reused: prompts=%d generator=%q", working.promptCount(), doc.Generator)
+		}
+	})
+	t.Run("structural then model", func(t *testing.T) {
+		store, repoID, repoRoot := indexedRepo(t)
+		if _, err := Build(store, repoID, repoRoot, BuildOptions{Only: []string{"storage"}}); err != nil {
+			t.Fatalf("structural build: %v", err)
+		}
+		working := &stubSynth{response: `{"summary":{"claim":"Storage","cited_symbols":["Open"]},"purpose":{"claim":"Purpose","cited_symbols":["Open"]}}`}
+		if _, err := Build(store, repoID, repoRoot, BuildOptions{Synth: working, Only: []string{"storage"}}); err != nil {
+			t.Fatalf("model build: %v", err)
+		}
+		if working.promptCount() != 1 {
+			t.Fatalf("structural fallback was incorrectly reused: %d prompts", working.promptCount())
+		}
+	})
+	t.Run("model then structural", func(t *testing.T) {
+		store, repoID, repoRoot := indexedRepo(t)
+		working := &stubSynth{response: `{"summary":{"claim":"Storage","cited_symbols":["Open"]},"purpose":{"claim":"Purpose","cited_symbols":["Open"]}}`}
+		if _, err := Build(store, repoID, repoRoot, BuildOptions{Synth: working, Only: []string{"storage"}}); err != nil {
+			t.Fatalf("model build: %v", err)
+		}
+		report, err := Build(store, repoID, repoRoot, BuildOptions{Only: []string{"storage"}})
+		if err != nil {
+			t.Fatalf("structural build: %v", err)
+		}
+		if report.Unchanged == 0 {
+			t.Fatalf("model doc should be reusable without a model: %+v", report)
+		}
+	})
+}
+
+func TestBuildRejectsCitationsOutsideModule(t *testing.T) {
+	store, repoID, repoRoot := indexedRepo(t)
+	synth := &stubSynth{response: `{"summary":{"claim":"Storage","cited_paths":["api/handler.go"]},"purpose":{"claim":"Purpose","cited_symbols":["Open"]}}`}
+	report, err := Build(store, repoID, repoRoot, BuildOptions{Synth: synth, Only: []string{"storage"}})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if report.Dropped != 1 {
+		t.Fatalf("expected one out-of-module claim dropped, got %+v", report)
+	}
+	doc, _, _ := store.KnowledgeDoc(repoID, "storage")
+	found := false
+	for _, dropped := range doc.DroppedClaims {
+		found = found || strings.Contains(dropped, "outside module")
+	}
+	if !found {
+		t.Fatalf("missing outside-module reason: %v", doc.DroppedClaims)
+	}
+}
+
+func TestBuildPrunesObsoleteModuleDocs(t *testing.T) {
+	store, repoID, repoRoot := indexedRepo(t)
+	fake := db.KnowledgeDoc{Slug: "ghost", Kind: "module", Title: "Ghost", GeneratedAt: time.Now().UTC()}
+	if err := store.UpsertKnowledgeDoc(repoID, fake); err != nil {
+		t.Fatalf("insert ghost: %v", err)
+	}
+	report, err := Build(store, repoID, repoRoot, BuildOptions{})
+	if err != nil {
+		t.Fatalf("full build: %v", err)
+	}
+	if report.Pruned != 1 {
+		t.Fatalf("expected one pruned module, got %+v", report)
+	}
+	if _, found, _ := store.KnowledgeDoc(repoID, "ghost"); found {
+		t.Fatal("obsolete module survived full build")
+	}
+	if err := store.UpsertKnowledgeDoc(repoID, fake); err != nil {
+		t.Fatalf("reinsert ghost: %v", err)
+	}
+	if _, err := Build(store, repoID, repoRoot, BuildOptions{Only: []string{"storage"}}); err != nil {
+		t.Fatalf("only build: %v", err)
+	}
+	if _, found, _ := store.KnowledgeDoc(repoID, "ghost"); !found {
+		t.Fatal("only build pruned an unrelated module")
+	}
+}
+
+func TestFingerprintTracksDependencies(t *testing.T) {
+	repo := newKnowledgeRepo(t, map[string]string{
+		"go.mod":       "module example.com/app\n\ngo 1.26.0\n",
+		"storage/a.go": "package storage\nfunc Open() {}\n",
+		"storage/b.go": "package storage\nfunc B() {}\n",
+		"storage/c.go": "package storage\nfunc C() {}\n",
+		"api/a.go":     "package api\nfunc A() {}\n",
+		"api/b.go":     "package api\nfunc B() {}\n",
+		"api/c.go":     "package api\nfunc C() {}\n",
+	})
+	store, repoID := openKnowledgeRepo(t, repo)
+	if _, err := index.New(store).Run(); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	before, err := Modules(store, repoID, ModuleOptions{})
+	if err != nil {
+		t.Fatalf("modules before: %v", err)
+	}
+	old := moduleBySlugForTest(before)["storage"].Fingerprint
+	write(t, filepath.Join(repo, "api", "import.go"), "package api\n\nimport \"example.com/app/storage\"\n\nfunc Use() { storage.Open() }\n")
+	git(t, repo, "add", "-A")
+	if _, err := index.New(store).Run(); err != nil {
+		t.Fatalf("reindex: %v", err)
+	}
+	after, err := Modules(store, repoID, ModuleOptions{})
+	if err != nil {
+		t.Fatalf("modules after: %v", err)
+	}
+	if old == moduleBySlugForTest(after)["storage"].Fingerprint {
+		t.Fatal("storage fingerprint did not include dependency changes")
+	}
+}
+
+func TestModuleHistoryOnlyOwnedFiles(t *testing.T) {
+	repo := newKnowledgeRepo(t, map[string]string{
+		"go.mod":    "module example.com/app\n\ngo 1.26.0\n",
+		"root/a.go": "package root\nfunc A() {}\n",
+		"root/b.go": "package root\nfunc B() {}\n",
+		"root/c.go": "package root\nfunc C() {}\n",
+		"sub/a.go":  "package sub\nfunc A() {}\n",
+		"sub/b.go":  "package sub\nfunc B() {}\n",
+		"sub/c.go":  "package sub\nfunc C() {}\n",
+	})
+	store, repoID := openKnowledgeRepo(t, repo)
+	if _, err := index.New(store).Run(); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	write(t, filepath.Join(repo, "sub", "a.go"), "package sub\nfunc A() { println(\"changed\") }\n")
+	git(t, repo, "add", "-A")
+	git(t, repo, "commit", "-m", "touch sub only")
+	if _, err := index.New(store).Run(); err != nil {
+		t.Fatalf("reindex: %v", err)
+	}
+	modules, err := Modules(store, repoID, ModuleOptions{})
+	if err != nil {
+		t.Fatalf("modules: %v", err)
+	}
+	bySlug := moduleBySlugForTest(modules)
+	for _, commit := range bySlug["root"].RecentCommits {
+		if commit.Subject == "touch sub only" {
+			t.Fatal("root module history included a sub-only commit")
+		}
+	}
+	found := false
+	for _, commit := range bySlug["sub"].RecentCommits {
+		found = found || commit.Subject == "touch sub only"
+	}
+	if !found {
+		t.Fatal("sub module history omitted its own commit")
+	}
+}
+
+func TestClusterPathsMergesNewParents(t *testing.T) {
+	paths := []string{"a/b/c/x.go", "a/b/y.go", "a/z.go", "root.go"}
+	buckets := clusterPaths(paths, ModuleOptions{MinFiles: 3})
+	for dir, files := range buckets {
+		if dir != "." && len(files) < 3 {
+			t.Fatalf("small parent bucket survived re-evaluation: %s=%v", dir, files)
+		}
+	}
+}
+
+func TestBuildDetectsNewlyAddedFiles(t *testing.T) {
+	store, repoID, repoRoot := indexedRepo(t)
+	write(t, filepath.Join(repoRoot, "storage", "new.go"), "package storage\nfunc New() {}\n")
+	git(t, repoRoot, "add", "-A")
+	report, err := Build(store, repoID, repoRoot, BuildOptions{Only: []string{"storage"}})
+	if err != nil {
+		t.Fatalf("stale build: %v", err)
+	}
+	if report.NeedsReindex < 1 {
+		t.Fatalf("new tracked file did not mark module stale: %+v", report)
+	}
+	if _, found, _ := store.KnowledgeDoc(repoID, "storage"); found {
+		t.Fatal("stale module should not have been written")
+	}
+	if _, err := index.New(store).Run(); err != nil {
+		t.Fatalf("reindex: %v", err)
+	}
+	report, err = Build(store, repoID, repoRoot, BuildOptions{Only: []string{"storage"}})
+	if err != nil {
+		t.Fatalf("fresh build: %v", err)
+	}
+	if report.NeedsReindex != 0 {
+		t.Fatalf("reindexed module remained stale: %+v", report)
+	}
+}
+
+func moduleBySlugForTest(modules []Module) map[string]Module {
+	out := make(map[string]Module, len(modules))
+	for _, module := range modules {
+		out[module.Slug] = module
+	}
+	return out
+}
+
+func newKnowledgeRepo(t *testing.T, files map[string]string) string {
+	t.Helper()
+	repo := t.TempDir()
+	git(t, repo, "init", "-b", "main")
+	git(t, repo, "config", "user.name", "Test User")
+	git(t, repo, "config", "user.email", "test@example.com")
+	for path, content := range files {
+		write(t, filepath.Join(repo, path), content)
+	}
+	git(t, repo, "add", "-A")
+	git(t, repo, "commit", "-m", "init")
+	return repo
+}
+
+func openKnowledgeRepo(t *testing.T, repo string) (*db.Store, int64) {
+	t.Helper()
+	store, err := db.OpenPath(repo, filepath.Join(t.TempDir(), "index.sqlite"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	record, err := store.UpsertRepo("main", "", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("upsert repo: %v", err)
+	}
+	return store, record.ID
 }

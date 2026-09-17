@@ -104,9 +104,9 @@ func looksGenerated(content []byte) bool {
 	return false
 }
 
-// vendorish directories contain someone else's code
-// even when they are committed. git ls-files already drops what .gitignore
-// excludes; this catches the repos that commit their dependencies.
+// vendorishAnywhere are directories whose contents are someone else's code even
+// when they are committed. git ls-files already drops what .gitignore
+// excludes; this catches repos that commit dependencies.
 var vendorishAnywhere = []string{
 	"vendor/",
 	"node_modules/",
@@ -117,6 +117,9 @@ var vendorishAnywhere = []string{
 	".next/",
 	"__pycache__/",
 }
+
+// outputRootsOnly matches generated output directories only at the repository
+// root; nested names are often real source.
 var outputRootsOnly = []string{"dist/", "build/", "out/"}
 
 func vendorish(path string) bool {

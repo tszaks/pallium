@@ -389,3 +389,180 @@ func TestRunReparsesWhenParserVersionChanges(t *testing.T) {
 		t.Fatalf("a stale parser tag must force a reparse, got %+v", result)
 	}
 }
+
+func TestRunSkipsSymlinksEscapingRepo(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"main.go": "package main\nfunc Main() {}\n",
+	})
+	outside := filepath.Join(t.TempDir(), "secret.py")
+	write(t, outside, `SECRET = "x"`+"\n")
+	if err := os.Symlink(outside, filepath.Join(repo, "leak.py")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	git(t, repo, "add", "leak.py")
+	store, repoID := openIndexed(t, repo)
+	result, err := Run(store, repoID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if result.Skipped < 1 {
+		t.Fatalf("escaping symlink was not skipped: %+v", result)
+	}
+	symbols, err := store.SymbolsInFile(repoID, "leak.py")
+	if err != nil {
+		t.Fatalf("symbols: %v", err)
+	}
+	if len(symbols) != 0 {
+		t.Fatalf("escaping symlink leaked symbols: %+v", symbols)
+	}
+}
+
+func TestVendorishKeepsNestedOutputNames(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"internal/build/runner.go": "package runner\nfunc Run() {}\n",
+		"src/out/encoder.ts":       "export function Encode() {}\n",
+		"pkg/dist/types.go":        "package dist\nfunc Type() {}\n",
+		"dist/bundle.js":           "function bundle() {}\n",
+		"build/x.go":               "package build\nfunc X() {}\n",
+		"foo/node_modules/x.js":    "function x() {}\n",
+	})
+	store, repoID := openIndexed(t, repo)
+	if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	paths, err := store.CodeIndexedPaths(repoID)
+	if err != nil {
+		t.Fatalf("paths: %v", err)
+	}
+	got := map[string]bool{}
+	for _, path := range paths {
+		got[path] = true
+	}
+	for _, path := range []string{"internal/build/runner.go", "src/out/encoder.ts", "pkg/dist/types.go"} {
+		if !got[path] {
+			t.Fatalf("nested source output path was excluded: %s", path)
+		}
+	}
+	for _, path := range []string{"dist/bundle.js", "build/x.go", "foo/node_modules/x.js"} {
+		if got[path] {
+			t.Fatalf("vendorish path was indexed: %s", path)
+		}
+	}
+}
+
+func TestRunReparsesWhenResolverInputsChange(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"go.mod": "module example.com/app\n\ngo 1.26.0\n",
+		"a.go":   "package main\nimport _ \"example.com/app/lib\"\nfunc A() {}\n",
+	})
+	store, repoID := openIndexed(t, repo)
+	if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	imports, err := store.ImportsFrom(repoID, "a.go")
+	if err != nil || len(imports) != 1 || imports[0].External || imports[0].ToPath != "" {
+		t.Fatalf("missing local package should remain non-external: %+v err=%v", imports, err)
+	}
+	write(t, filepath.Join(repo, "lib", "lib.go"), "package lib\nfunc L() {}\n")
+	git(t, repo, "add", "-A")
+	result, err := Run(store, repoID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if result.Reparsed == 0 {
+		t.Fatalf("resolver input change did not reparse files: %+v", result)
+	}
+	imports, err = store.ImportsFrom(repoID, "a.go")
+	if err != nil || len(imports) != 1 || imports[0].External || imports[0].ToPath != "lib" {
+		t.Fatalf("new package was not resolved: %+v err=%v", imports, err)
+	}
+}
+
+func TestUnresolvedRelativeImportsStayLocal(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"app.js": "import missing from './missing'; import react from 'react';\nexport function App() { return missing || react }\n",
+		"app.py": "from .missing import x\n\ndef app():\n    return x\n",
+	})
+	store, repoID := openIndexed(t, repo)
+	if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	js, err := store.ImportsFrom(repoID, "app.js")
+	if err != nil {
+		t.Fatalf("js imports: %v", err)
+	}
+	bySpec := map[string]db.CodeImport{}
+	for _, item := range js {
+		bySpec[item.RawSpec] = item
+	}
+	if bySpec["./missing"].External || bySpec["./missing"].ToPath != "" || !bySpec["react"].External {
+		t.Fatalf("unexpected JS import classification: %+v", bySpec)
+	}
+	py, err := store.ImportsFrom(repoID, "app.py")
+	if err != nil {
+		t.Fatalf("py imports: %v", err)
+	}
+	if len(py) != 1 || py[0].External || py[0].ToPath != "" {
+		t.Fatalf("unexpected Python import classification: %+v", py)
+	}
+}
+
+func TestTSAliasOrderIsDeterministic(t *testing.T) {
+	aliases := TSConfigAliases{Paths: map[string][]string{
+		"@/*":         {"src/*"},
+		"@/special/*": {"special/*"},
+	}}
+	for iteration := 0; iteration < 20; iteration++ {
+		bases := resolveTSAliasBases("@/special/thing", aliases)
+		if len(bases) == 0 || bases[0] != "special/thing" {
+			t.Fatalf("specific alias did not win on iteration %d: %v", iteration, bases)
+		}
+	}
+}
+
+func TestGoRefsRecordGenericCalls(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"go.mod": "module example.com/app\n\ngo 1.26.0\n",
+		"defs.go": `package main
+func Transform[T any](v T) T { return v }
+func Combine[A any, B any](a A) B { var b B; return b }
+`,
+		"main.go": `package main
+func main() {
+	Transform[string]("x")
+	Combine[int, string](1)
+}
+`,
+	})
+	store, repoID := openIndexed(t, repo)
+	if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	for _, name := range []string{"Transform", "Combine"} {
+		callers, err := store.PathsReferencing(repoID, name)
+		if err != nil {
+			t.Fatalf("refs %s: %v", name, err)
+		}
+		if len(callers) != 1 || callers[0] != "main.go" {
+			t.Fatalf("generic call %s was not indexed: %v", name, callers)
+		}
+	}
+}
+
+func TestRunReportsTotalCounts(t *testing.T) {
+	repo := newRepo(t, map[string]string{
+		"go.mod":  "module example.com/app\n\ngo 1.26.0\n",
+		"main.go": "package main\nfunc Main() {}\n",
+	})
+	store, repoID := openIndexed(t, repo)
+	if _, err := Run(store, repoID, time.Now().UTC()); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	result, err := Run(store, repoID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if result.Unchanged == 0 || result.Symbols == 0 {
+		t.Fatalf("second run lost total counts: %+v", result)
+	}
+}

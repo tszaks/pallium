@@ -202,10 +202,6 @@ func readIndexable(repoRoot, path string) ([]byte, int64, bool) {
 		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 			return nil, 0, false
 		}
-		info, err := os.Stat(target)
-		if err != nil || info.IsDir() {
-			return nil, 0, false
-		}
 	}
 	info, err := os.Stat(target)
 	if err != nil || info.IsDir() || info.Size() > maxParsedFileBytes {
