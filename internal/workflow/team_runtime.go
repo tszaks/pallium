@@ -827,6 +827,15 @@ func (r *Runner) dispatchTeamTurn(ctx context.Context, store *Store, teamID, lea
 		observedUsage = usage
 		cost, _ := usage["cost_usd"].(float64)
 		return out, member.SessionToken, cost, cerr
+	case member.Provider == "devin":
+		// devin mints its own session id (like codex's thread.started — the
+		// caller can't supply one), so the token comes back from the turn's
+		// ATIF export rather than being persisted mid-call. costUSD is 0:
+		// devin reports token counts but not dollar cost (ACU-billed), so a
+		// devin team shares codex's untracked-spend caveat.
+		out, token, usage, derr := r.runDevinTeamTurn(ctx, member.Mode, member.Model, member.SessionToken, cwd, prompt, teamDecisionSchema)
+		observedUsage = usage
+		return out, token, 0, derr
 	default:
 		return "", "", 0, fmt.Errorf("team member provider %q is not configured; set %s", member.Provider, providerCommandEnvName(member.Provider))
 	}
@@ -884,18 +893,20 @@ func teamGateHasHook(team Team, hook string) bool {
 }
 
 // UntrackedCostProviders reports which distinct providers among members are
-// known to under-report cost. Currently just "codex": its CLI has no
-// machine-readable usage/cost output the way claude and configured wrappers
-// (via PALLIUM_WORKFLOW_USAGE_FILE) do, so a codex-backed member's turns are
-// real spend that team status can never see. Shared by the CLI's `team
-// status` JSON and the team.status() workflow primitive — found by review:
-// the primitive used to omit this caveat entirely, so a script managing a
-// codex-backed team saw spend_usd as if it were complete.
+// known to under-report cost. "codex" has no machine-readable usage/cost
+// output the way claude and configured wrappers (via
+// PALLIUM_WORKFLOW_USAGE_FILE) do; "devin" reports token counts via its
+// ATIF export but no USD cost (it bills in ACU), so a codex- or
+// devin-backed member's turns are real spend that team status can never
+// see. Shared by the CLI's `team status` JSON and the team.status()
+// workflow primitive — found by review: the primitive used to omit this
+// caveat entirely, so a script managing a codex-backed team saw spend_usd
+// as if it were complete.
 func UntrackedCostProviders(members []TeamMember) []string {
 	seen := map[string]bool{}
 	var untracked []string
 	for _, m := range members {
-		if m.Provider == "codex" && !seen[m.Provider] {
+		if (m.Provider == "codex" || m.Provider == "devin") && !seen[m.Provider] {
 			seen[m.Provider] = true
 			untracked = append(untracked, m.Provider)
 		}

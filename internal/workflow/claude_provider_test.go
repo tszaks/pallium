@@ -192,7 +192,7 @@ func TestTruncateForError(t *testing.T) {
 }
 
 func TestBuildClaudePromptNoSchema(t *testing.T) {
-	got, err := buildClaudePrompt("review the code", nil)
+	got, err := buildSchemaPrompt("review the code", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +203,7 @@ func TestBuildClaudePromptNoSchema(t *testing.T) {
 
 func TestBuildClaudePromptWithSchema(t *testing.T) {
 	schema := map[string]any{"type": "object", "properties": map[string]any{"ok": map[string]any{"type": "boolean"}}}
-	got, err := buildClaudePrompt("review the code", schema)
+	got, err := buildSchemaPrompt("review the code", schema)
 	if err != nil {
 		t.Fatal(err)
 	}

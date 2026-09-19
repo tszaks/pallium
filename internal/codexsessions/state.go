@@ -175,6 +175,7 @@ func defaultDiscoveryCoverage() DiscoveryCoverage {
 			"Codex CLI sessions",
 			"Codex desktop tasks with open transcripts",
 			"Claude Code CLI sessions",
+			"Devin CLI sessions",
 		},
 		Excludes: []string{
 			"generic terminal shells",

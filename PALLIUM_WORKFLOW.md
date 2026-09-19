@@ -59,13 +59,13 @@ Pallium strips `meta` before execution. Phase names should match `phase()` calls
 ### `await agent(prompt, opts?)`
 
 Spawns one worker. Pallium adopts the model of whatever agent is steering
-it: run `pallium workflow run` from inside Claude Code and workers use
-Claude automatically, no `provider` option or env var required. Precedence,
-highest first:
+it: run `pallium workflow run` from inside Claude Code or the Devin CLI and
+workers use that agent automatically, no `provider` option or env var
+required. Precedence, highest first:
 
 1. The `provider` option on this `agent()` call.
 2. `PALLIUM_WORKFLOW_PROVIDER` (forces a provider for the whole run).
-3. The detected steering agent (currently: Claude Code, via `CLAUDECODE`/`CLAUDE_CODE_ENTRYPOINT`).
+3. The detected steering agent (Claude Code via `CLAUDECODE`/`CLAUDE_CODE_ENTRYPOINT`; Devin via `CHISEL_SESSION_DB`).
 4. `codex` (fallback when nothing else applies).
 
 ```js
@@ -112,6 +112,16 @@ directly (structured-output prompt contract, mode-scoped `--allowedTools`/
 Set `PALLIUM_WORKFLOW_PROVIDER_CLAUDE_COMMAND` to override this with your own
 wrapper instead; an explicitly configured command always wins over the
 built-in invocation.
+
+`provider: "devin"` likewise needs only the `devin` CLI on PATH. Pallium
+runs it headless (`-p --prompt-file`, `--respect-workspace-trust false`) and
+reads the final answer, session id, and token counts back out of the
+`--export` ATIF transcript rather than stdout — `-p` concatenates every
+assistant message, so the export is the deterministic channel. `read-only`
+maps to `--permission-mode auto` (verified fail-closed: write, exec, and
+networked tool calls are all rejected in print mode); `edit`/`test`/`check`
+map to `--permission-mode dangerous`. `PALLIUM_WORKFLOW_PROVIDER_DEVIN_COMMAND`
+overrides it with a wrapper the same way.
 
 Other non-Codex providers: `PALLIUM_WORKFLOW_PROVIDER_<NAME>_COMMAND`.
 Reference wrappers (Claude Code, Gemini CLI) and the full environment
@@ -352,6 +362,15 @@ read-only agent that opts into network is therefore upgraded to workspace-write
 (read-only has no per-mode network toggle). For configured providers, Pallium
 exports `PALLIUM_WORKFLOW_NETWORK=1` (else `0`) so the wrapper can decide
 whether to expose networked tools.
+
+**Devin implication.** Devin read-only workers run `--permission-mode auto`,
+which blocks networked tool calls too — verified fail-closed — so `network:
+true` cannot grant a devin read-only worker egress (Pallium logs a warning).
+Devin edit-capable workers run `--permission-mode dangerous`, which
+auto-approves everything including network: an edit/devin worker may reach the
+network even when `network: true` was not passed. Both are CLI limitations,
+not something a flag can fix; use a configured `PALLIUM_WORKFLOW_PROVIDER_DEVIN_COMMAND`
+wrapper if you need tighter egress control.
 
 **Known limitations (inherent to the Codex sandbox).** These are accepted
 tradeoffs of running a networked worker safely, not bugs:
