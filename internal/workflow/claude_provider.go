@@ -64,11 +64,12 @@ func editAllowedTools() string {
 	return claudeEditAllowedTools
 }
 
-// buildClaudePrompt appends a structured-output instruction to the base
+// buildSchemaPrompt appends a structured-output instruction to the base
 // prompt when a schema is set, matching the instruction configured provider
 // wrappers use (see providers/claude.sh) so Pallium's local schema
-// validation sees the same bare-JSON contract either way.
-func buildClaudePrompt(prompt string, schema map[string]any) (string, error) {
+// validation sees the same bare-JSON contract either way. Shared by every
+// built-in provider whose CLI lacks a native schema flag (claude, devin).
+func buildSchemaPrompt(prompt string, schema map[string]any) (string, error) {
 	if len(schema) == 0 {
 		return prompt, nil
 	}
@@ -128,7 +129,7 @@ func buildClaudeArgs(mode, model string, effort ...string) []string {
 // PATH. Parallels the codex exec block: same cwd (worktree for edit/
 // isolation, else the run cwd), same last-message-style return contract.
 func (r *Runner) runBuiltinClaudeCommand(ctx context.Context, usageFile, cwd, prompt string, agent *Agent, opts AgentOptions) (string, error) {
-	fullPrompt, err := buildClaudePrompt(prompt, opts.Schema)
+	fullPrompt, err := buildSchemaPrompt(prompt, opts.Schema)
 	if err != nil {
 		return "", fmt.Errorf("workflow provider \"claude\": %w", err)
 	}
@@ -202,7 +203,7 @@ func buildClaudeTeamArgs(mode, model, sessionToken string, isFirstTurn bool, eff
 // exactly like a regular worker's cwd, so edit-mode teammates get the same
 // isolation.
 func (r *Runner) runClaudeTeamTurn(ctx context.Context, mode, model, sessionToken string, isFirstTurn bool, cwd, prompt string, schema map[string]any, effort ...string) (string, map[string]any, error) {
-	fullPrompt, err := buildClaudePrompt(prompt, schema)
+	fullPrompt, err := buildSchemaPrompt(prompt, schema)
 	if err != nil {
 		return "", nil, fmt.Errorf("team turn (claude): %w", err)
 	}

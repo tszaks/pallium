@@ -203,7 +203,7 @@ func TestIndexAllDirectClaudeIncludeIsNotClaimedByCodex(t *testing.T) {
 	}
 
 	dbPath := filepath.Join(tmp, "sessions.sqlite")
-	count, err := Index(context.Background(), Options{DBPath: dbPath, CodexHome: filepath.Join(tmp, ".codex"), ClaudeHome: filepath.Join(tmp, ".claude"), Provider: "all", Machine: "test-host"}, []string{claudePath})
+	count, err := Index(context.Background(), Options{DBPath: dbPath, CodexHome: filepath.Join(tmp, ".codex"), ClaudeHome: filepath.Join(tmp, ".claude"), DevinDBPath: filepath.Join(tmp, "devin-absent.db"), Provider: "all", Machine: "test-host"}, []string{claudePath})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -2,11 +2,11 @@
 
 Pallium workflows are provider-agnostic: the engine orchestrates, and any
 agent CLI can do the work. Whichever model your guiding agent runs, Pallium
-workers can adopt it. Codex and Claude Code both have a built-in Go
-invocation (no wrapper script needed) — Pallium even auto-detects Claude
-Code as the steering agent and switches workers to it with zero
-configuration (see `PALLIUM_WORKFLOW.md`). Everything else plugs in through a
-small wrapper script.
+workers can adopt it. Codex, Claude Code, and the Devin CLI all have a
+built-in Go invocation (no wrapper script needed) — Pallium even
+auto-detects Claude Code or Devin as the steering agent and switches workers
+to it with zero configuration (see `PALLIUM_WORKFLOW.md`). Everything else
+plugs in through a small wrapper script.
 
 This directory ships reference wrappers:
 
@@ -14,6 +14,7 @@ This directory ships reference wrappers:
 |----------|---------|-------|
 | Claude Code | `claude.sh` | Optional: the built-in claude provider covers the common case. Use this wrapper instead when you need its extra hardening (`--safe-mode`, `--setting-sources user`, `--strict-mcp-config`, `--permission-mode plan`) — set `PALLIUM_WORKFLOW_PROVIDER_CLAUDE_COMMAND` to it to override the built-in path |
 | Gemini CLI | `gemini.sh` | Structured output via prompt contract; see security note below |
+| Devin CLI | *(built-in)* | `provider: "devin"` needs only the `devin` CLI on PATH. `read-only` maps to `--permission-mode auto` (fail-closed, no writes or network); `edit`/`test`/`check` map to `dangerous`. Teammates resume natively via the ATIF export's `session_id`. Caveat: `dangerous` auto-approves network egress, so `network: true` vs `false` is not enforced for edit-capable devin agents |
 
 **Security note on `gemini.sh`:** Gemini CLI runs `SessionStart` hooks from
 the target repo's `.gemini/settings.json` at startup, before this wrapper's

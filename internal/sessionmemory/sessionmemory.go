@@ -68,6 +68,7 @@ type Options struct {
 	DBPath         string
 	CodexHome      string
 	ClaudeHome     string
+	DevinDBPath    string
 	Machine        string
 	Provider       string
 	Force          bool
@@ -430,8 +431,8 @@ func Index(ctx context.Context, opts Options, include []string) (int, error) {
 	if provider == "" {
 		provider = "all"
 	}
-	if provider != "all" && provider != "codex" && provider != "claude" {
-		return 0, fmt.Errorf("unsupported session provider %q (want codex, claude, or all)", opts.Provider)
+	if provider != "all" && provider != "codex" && provider != "claude" && provider != "devin" {
+		return 0, fmt.Errorf("unsupported session provider %q (want codex, claude, devin, or all)", opts.Provider)
 	}
 	store, err := Open(opts.DBPath)
 	if err != nil {
@@ -548,6 +549,13 @@ func Index(ctx context.Context, opts Options, include []string) (int, error) {
 			}
 			count++
 		}
+	}
+	if provider == "all" || provider == "devin" {
+		devinCount, err := indexDevinSessions(ctx, store, opts, cutoff)
+		if err != nil {
+			return count, err
+		}
+		count += devinCount
 	}
 	return count, nil
 }

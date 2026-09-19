@@ -12,6 +12,7 @@ func clearProviderEnv(t *testing.T) {
 		"PALLIUM_WORKFLOW_PROVIDER",
 		"CLAUDECODE",
 		"CLAUDE_CODE_ENTRYPOINT",
+		devinSessionDBEnv,
 	} {
 		t.Setenv(name, "")
 	}

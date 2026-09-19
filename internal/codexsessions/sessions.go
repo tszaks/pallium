@@ -28,6 +28,7 @@ const (
 	codexToolLogTarget        = "codex_core::stream_events_utils"
 	providerCodex             = "codex"
 	providerClaude            = "claude"
+	providerDevin             = "devin"
 	activeSessionStatus       = "active"
 	waitingSessionStatus      = "waiting"
 	blockedSessionStatus      = "blocked"
@@ -52,6 +53,7 @@ var (
 	claudeHomeDirFunc          = claudeHomeDir
 	listLiveCodexProcessesVar  = listLiveCodexProcesses
 	listLiveClaudeProcessesVar = listLiveClaudeProcesses
+	listLiveDevinProcessesVar  = listLiveDevinProcesses
 	listOpenCodexRolloutsVar   = listOpenCodexRollouts
 	processCWDVar              = processCWD
 )
@@ -191,7 +193,7 @@ func CollectSessions(ctx context.Context, opts SessionCollectOptions) (*SessionS
 		sessions []SessionSummary
 		err      error
 	}
-	results := make(chan providerResult, 2)
+	results := make(chan providerResult, 3)
 	go func() {
 		sessions, err := collectCodexSessions(ctx, opts, generatedAt)
 		results <- providerResult{provider: providerCodex, sessions: sessions, err: err}
@@ -200,10 +202,14 @@ func CollectSessions(ctx context.Context, opts SessionCollectOptions) (*SessionS
 		sessions, err := collectClaudeSessions(ctx, opts, generatedAt)
 		results <- providerResult{provider: providerClaude, sessions: sessions, err: err}
 	}()
+	go func() {
+		sessions, err := collectDevinSessions(ctx, opts, generatedAt)
+		results <- providerResult{provider: providerDevin, sessions: sessions, err: err}
+	}()
 	sessions := []SessionSummary{}
 	warnings := []string{}
 	coverage := defaultDiscoveryCoverage()
-	for range 2 {
+	for range 3 {
 		result := <-results
 		if result.err != nil {
 			if ctx.Err() != nil {
@@ -239,6 +245,8 @@ func providerEvidence(provider string) string {
 		return "exact executable identity plus Codex state database and open transcript files"
 	case providerClaude:
 		return "exact executable identity plus Claude history and transcript files"
+	case providerDevin:
+		return "exact executable identity plus Devin sessions database"
 	default:
 		return "registered provider detector"
 	}

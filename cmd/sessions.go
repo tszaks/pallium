@@ -348,6 +348,7 @@ func runSessionsIndex(out io.Writer, args []string, jsonOutput bool) error {
 	fs := newSessionFlagSet("sessions index")
 	fs.StringVar(&opts.CodexHome, "codex-home", "", "")
 	fs.StringVar(&opts.ClaudeHome, "claude-home", "", "")
+	fs.StringVar(&opts.DevinDBPath, "devin-db", "", "")
 	fs.StringVar(&opts.Provider, "provider", "", "")
 	fs.StringVar(&opts.DBPath, "db", "", "")
 	fs.StringVar(&opts.Machine, "machine", "", "")
@@ -357,7 +358,7 @@ func runSessionsIndex(out io.Writer, args []string, jsonOutput bool) error {
 	fs.BoolVar(&opts.Force, "force", false, "")
 	fs.BoolVar(&opts.StoreRawEvents, "raw-events", false, "")
 	fs.Var((*multiStringFlag)(&include), "include", "")
-	if err := parseSessionFlags(fs, args, map[string]struct{}{"codex-home": {}, "claude-home": {}, "provider": {}, "db": {}, "machine": {}, "include": {}, "model": {}, "since": {}, "safety-buffer": {}}, map[string]struct{}{"force": {}, "raw-events": {}}); err != nil {
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"codex-home": {}, "claude-home": {}, "devin-db": {}, "provider": {}, "db": {}, "machine": {}, "include": {}, "model": {}, "since": {}, "safety-buffer": {}}, map[string]struct{}{"force": {}, "raw-events": {}}); err != nil {
 		return err
 	}
 	if fs.NArg() > 0 {
@@ -394,6 +395,7 @@ func runSessionsSync(out io.Writer, args []string, jsonOutput bool) error {
 	fs := newSessionFlagSet("sessions sync")
 	fs.StringVar(&opts.Index.CodexHome, "codex-home", "", "")
 	fs.StringVar(&opts.Index.ClaudeHome, "claude-home", "", "")
+	fs.StringVar(&opts.Index.DevinDBPath, "devin-db", "", "")
 	fs.StringVar(&opts.Index.Provider, "provider", "", "")
 	fs.StringVar(&opts.Index.DBPath, "db", "", "")
 	fs.StringVar(&opts.Index.Machine, "machine", "", "")
@@ -407,7 +409,7 @@ func runSessionsSync(out io.Writer, args []string, jsonOutput bool) error {
 	fs.IntVar(&opts.EmbedLimit, "embed-limit", 1_000_000, "")
 	fs.IntVar(&opts.BatchSize, "batch-size", 64, "")
 	fs.Var((*multiStringFlag)(&include), "include", "")
-	valueFlags := map[string]struct{}{"codex-home": {}, "claude-home": {}, "provider": {}, "db": {}, "machine": {}, "include": {}, "model": {}, "since": {}, "safety-buffer": {}, "timeout": {}, "embed-limit": {}, "batch-size": {}}
+	valueFlags := map[string]struct{}{"codex-home": {}, "claude-home": {}, "devin-db": {}, "provider": {}, "db": {}, "machine": {}, "include": {}, "model": {}, "since": {}, "safety-buffer": {}, "timeout": {}, "embed-limit": {}, "batch-size": {}}
 	boolFlags := map[string]struct{}{"force": {}, "raw-events": {}, "no-embed": {}}
 	if err := parseSessionFlags(fs, args, valueFlags, boolFlags); err != nil {
 		return err
@@ -896,6 +898,9 @@ func runSessionsOpen(out io.Writer, args []string, jsonOutput bool) error {
 		if strings.TrimSpace(location.RolloutPath) == "" {
 			return fmt.Errorf("session %s has no source transcript path", location.SessionID)
 		}
+		if strings.HasPrefix(location.RolloutPath, "devin-cli://") {
+			return fmt.Errorf("devin sessions live in the Devin CLI database, not a transcript file; resume one with `devin -r %s`", location.SessionID)
+		}
 		if err := exec.Command("open", location.RolloutPath).Start(); err != nil {
 			return fmt.Errorf("open source transcript: %w", err)
 		}
@@ -1263,18 +1268,19 @@ func parseSessionRetentionAge(value string) (time.Duration, error) {
 func printSessionsHelp(out io.Writer) {
 	fmt.Fprintln(out, `pallium sessions
 
-Live discovery covers local Codex CLI/Desktop and Claude Code sessions. It is
-best-effort and reports provider coverage plus explicit exclusions in JSON.
+Live discovery covers local Codex CLI/Desktop, Claude Code, and Devin CLI
+sessions. It is best-effort and reports provider coverage plus explicit
+exclusions in JSON.
 
 Usage:
   pallium sessions live [--all] [--running-only] [--details] [--json]
   pallium sessions watch [--all] [--running-only] [--details]
   pallium sessions find [query] [--state active|waiting|blocked|stuck|finished|idle|inactive] [--completion finished|not_finished|unknown] [--updated-within 2h] [--inactive-for 3h] [--finished-within 10m] [--sort updated|finished|status] [--limit 20] [--details] [--json]
-  pallium sessions index [--provider all|codex|claude] [--codex-home ~/.codex] [--claude-home ~/.claude] [--include path] [--machine name] [--model text-embedding-3-small] [--safety-buffer 30m] [--since 24h] [--force] [--raw-events] [--json]
-  pallium sessions sync [--provider all|codex|claude] [--include path] [--model name] [--force] [--no-embed] [--json]
+  pallium sessions index [--provider all|codex|claude|devin] [--codex-home ~/.codex] [--claude-home ~/.claude] [--devin-db path] [--include path] [--machine name] [--model text-embedding-3-small] [--safety-buffer 30m] [--since 24h] [--force] [--raw-events] [--json]
+  pallium sessions sync [--provider all|codex|claude|devin] [--devin-db path] [--include path] [--model name] [--force] [--no-embed] [--json]
   pallium sessions list [--limit 20] [--json]
-  pallium sessions search <query> [--limit 10] [--hybrid] [--repo path] [--cwd path] [--source codex|claude] [--file path] [--since 30d] [--before YYYY-MM-DD] [--model name] [--json]
-  pallium sessions recall <question> [--repo path] [--source codex|claude] [--file path] [--since 30d] [--lexical-only] [--json]
+  pallium sessions search <query> [--limit 10] [--hybrid] [--repo path] [--cwd path] [--source codex|claude|devin] [--file path] [--since 30d] [--before YYYY-MM-DD] [--model name] [--json]
+  pallium sessions recall <question> [--repo path] [--source codex|claude|devin] [--file path] [--since 30d] [--lexical-only] [--json]
   pallium sessions related [repo-path] [--file path] [--limit 10] [--json]
   pallium sessions grep <query> [--limit 20] [--json]
   pallium sessions show <session-id> [--db path] [--transcript] [--json]
