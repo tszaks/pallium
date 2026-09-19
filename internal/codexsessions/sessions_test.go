@@ -289,19 +289,25 @@ func TestCollectClaudeSessionsWithNoProcessReturnsBeforeFilesystemScan(t *testin
 func TestCollectSessionsPreservesOtherProviderWhenOneFails(t *testing.T) {
 	originalCodexHome := codexHomeDirFunc
 	originalClaudeHome := claudeHomeDirFunc
+	originalDevinDB := devinDBPathFunc
 	originalCodexProcesses := listLiveCodexProcessesVar
 	originalClaudeProcesses := listLiveClaudeProcessesVar
+	originalDevinProcesses := listLiveDevinProcessesVar
 	t.Cleanup(func() {
 		codexHomeDirFunc = originalCodexHome
 		claudeHomeDirFunc = originalClaudeHome
+		devinDBPathFunc = originalDevinDB
 		listLiveCodexProcessesVar = originalCodexProcesses
 		listLiveClaudeProcessesVar = originalClaudeProcesses
+		listLiveDevinProcessesVar = originalDevinProcesses
 	})
 	tmp := t.TempDir()
 	codexHomeDirFunc = func() (string, error) { return tmp, nil }
 	claudeHomeDirFunc = func() (string, error) { return tmp, nil }
+	devinDBPathFunc = func() (string, error) { return filepath.Join(tmp, "sessions.db"), nil }
 	listLiveCodexProcessesVar = func(context.Context) ([]liveAgentProcess, error) { return nil, errors.New("process lookup failed") }
 	listLiveClaudeProcessesVar = func(context.Context) ([]liveAgentProcess, error) { return nil, nil }
+	listLiveDevinProcessesVar = func(context.Context) ([]liveAgentProcess, error) { return nil, nil }
 	snapshot, err := CollectSessions(context.Background(), SessionCollectOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -309,7 +315,7 @@ func TestCollectSessionsPreservesOtherProviderWhenOneFails(t *testing.T) {
 	if len(snapshot.Warnings) != 1 || !strings.Contains(snapshot.Warnings[0], "codex") {
 		t.Fatalf("unexpected warnings: %+v", snapshot.Warnings)
 	}
-	if snapshot.Coverage.Scope != "local-agent-sessions" || len(snapshot.Coverage.Excludes) == 0 || len(snapshot.Coverage.Providers) != 2 {
+	if snapshot.Coverage.Scope != "local-agent-sessions" || len(snapshot.Coverage.Excludes) == 0 || len(snapshot.Coverage.Providers) != 3 {
 		t.Fatalf("coverage must disclose discovery scope: %+v", snapshot.Coverage)
 	}
 }
