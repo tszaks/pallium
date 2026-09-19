@@ -19,6 +19,8 @@ npm i -g pallium
 pallium route "review my workflow changes and fix what's broken" --authority edit --execute --json
 ```
 
+Update to the latest release any time with `pallium update`.
+
 ## The problem it solves
 
 A coding agent in a chat session is powerful but underused and fragile. Users

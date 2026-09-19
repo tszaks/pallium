@@ -38,6 +38,8 @@ func (a *App) Run(args []string) error {
 		return nil
 	case "version", "--version", "-V":
 		return runVersion(a.stdout, jsonOutput)
+	case "update":
+		return runUpdate(a.stdout, jsonOutput)
 	case "start":
 		return runStart(a.stdout, filtered[1:], jsonOutput)
 	case "route":
@@ -110,6 +112,7 @@ Usage:
   pallium knowledge <map|build|audit|list|get|search> [--force] [--no-model] [--only slug] [--concurrency n] [--allow-stale] [--json]
   pallium doctor [repo-path] [--json]
   pallium version [--version | -V] [--json]
+  pallium update [--json]
   pallium explain <path> [repo-path] [--json]
   pallium risk <path> [repo-path] [--json]
   pallium neighbors <path> [repo-path] [--json]

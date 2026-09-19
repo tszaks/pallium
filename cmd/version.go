@@ -25,15 +25,12 @@ type VersionReport struct {
 func runVersion(out io.Writer, jsonOutput bool) error {
 	report := VersionReport{
 		Module:    "github.com/tszaks/pallium",
-		Version:   buildVersion,
+		Version:   currentVersion(),
 		GoVersion: runtime.Version(),
 	}
 	if info, ok := debug.ReadBuildInfo(); ok {
 		if info.Main.Path != "" {
 			report.Module = info.Main.Path
-		}
-		if report.Version == "dev" && info.Main.Version != "" && info.Main.Version != "(devel)" {
-			report.Version = info.Main.Version
 		}
 		for _, setting := range info.Settings {
 			switch setting.Key {
