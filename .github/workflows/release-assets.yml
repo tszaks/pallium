@@ -15,16 +15,18 @@ permissions:
 
 jobs:
   build-assets:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - name: Resolve tag
         id: tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
-          fi
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft | grep -qx true
 
       - uses: actions/checkout@v4
         with:
@@ -82,4 +84,24 @@ jobs:
       - name: Upload release assets
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ steps.tag.outputs.tag }}" dist/*.tar.gz dist/checksums.txt --clobber
+        run: gh release upload "${{ steps.tag.outputs.tag }}" dist/*.tar.gz dist/checksums.txt
+
+  verify-published-assets:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify prepared assets without replacing them
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          mkdir assets
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir assets
+          cd assets
+          version="${RELEASE_TAG#v}"
+          for platform in darwin_arm64 darwin_amd64 linux_arm64 linux_amd64; do
+            test -s "pallium_${version}_${platform}.tar.gz"
+          done
+          test "$(wc -l < checksums.txt)" -eq 4
+          sha256sum --check checksums.txt

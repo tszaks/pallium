@@ -41,8 +41,8 @@ func buildIncidentDoc(store *db.Store, repoID int64, sourceCommit string) (db.Kn
 	}
 
 	var builder strings.Builder
-	builder.WriteString("# Incidents and reverts\n\n")
-	builder.WriteString("Mined from commit subjects. Every entry below is a real commit; nothing here is inferred.\n\n")
+	builder.WriteString("# Incident candidates and reverts\n\n")
+	builder.WriteString("Keyword matches from commit subjects. Each SHA is real; whether it represents an actual incident is unconfirmed.\n\n")
 
 	cited := make([]string, 0)
 	if len(commits) == 0 {
@@ -80,7 +80,7 @@ func buildIncidentDoc(store *db.Store, repoID int64, sourceCommit string) (db.Kn
 	return db.KnowledgeDoc{
 		Slug:         "incidents",
 		Kind:         "incident",
-		Title:        "Incidents and reverts",
+		Title:        "Incident candidates and reverts",
 		Summary:      fmt.Sprintf("%d commit(s) in history announce a revert, rollback, hotfix or outage.", len(commits)),
 		Body:         builder.String(),
 		CitedPaths:   sortedUnique(cited),

@@ -12,6 +12,12 @@ import (
 )
 
 func runKnowledge(out io.Writer, args []string, jsonOutput bool) error {
+	for _, arg := range args {
+		if arg == "--help" || arg == "-h" {
+			_, err := fmt.Fprintln(out, "pallium knowledge <map|build|audit|list|status|get|search|context|serve|maintain|decisions> [arguments] [repo]\nReads include freshness and evidence. search/context return bounded v2 JSON; --full returns legacy full documents. get <slug> --section <heading> reads a section.")
+			return err
+		}
+	}
 	action := "status"
 	if len(args) > 0 && !strings.HasPrefix(args[0], "--") {
 		action = args[0]
@@ -19,16 +25,26 @@ func runKnowledge(out io.Writer, args []string, jsonOutput bool) error {
 	}
 
 	switch action {
+	case "decisions":
+		return runKnowledgeDecisions(out, args, jsonOutput)
+	case "serve":
+		return runKnowledgeServe(out, args)
+	case "maintain":
+		return runKnowledgeMaintain(out, args, jsonOutput)
 	case "map":
 		return runKnowledgeMap(out, args, jsonOutput)
 	case "build":
 		return runKnowledgeBuild(out, args, jsonOutput)
 	case "audit":
 		return runKnowledgeAudit(out, args, jsonOutput)
-	case "list", "status":
+	case "status":
+		return runKnowledgeStatus(out, args, jsonOutput)
+	case "list":
 		return runKnowledgeList(out, args, jsonOutput)
 	case "get":
 		return runKnowledgeGet(out, args, jsonOutput)
+	case "context":
+		return runKnowledgeContext(out, args, jsonOutput)
 	case "search":
 		return runKnowledgeSearch(out, args, jsonOutput)
 	default:
@@ -37,6 +53,10 @@ func runKnowledge(out io.Writer, args []string, jsonOutput bool) error {
 }
 
 func runKnowledgeMap(out io.Writer, args []string, jsonOutput bool) error {
+	args, full, _, err := knowledgeReadArgs(args)
+	if err != nil {
+		return err
+	}
 	indexer, err := openIndexedStore(optionalRepoArg(args, 0))
 	if err != nil {
 		return err
@@ -52,7 +72,11 @@ func runKnowledgeMap(out io.Writer, args []string, jsonOutput bool) error {
 		return err
 	}
 
-	return output.Write(out, modules, jsonOutput, func() string {
+	var value any = map[string]any{"version": knowledge.ContractVersion, "modules": knowledge.CompactMap(modules)}
+	if full {
+		value = modules
+	}
+	return output.Write(out, value, jsonOutput, func() string {
 		var builder strings.Builder
 		fmt.Fprintf(&builder, "%d module(s)\n", len(modules))
 		for _, module := range modules {
@@ -95,6 +119,13 @@ func runKnowledgeBuild(out io.Writer, args []string, jsonOutput bool) error {
 		return err
 	}
 
+	if useModel {
+		audit, err := knowledge.Audit(indexer.Store, repo.ID, indexer.Store.RepoRoot, knowledge.AuditOptions{Synth: opts.Synth, Only: opts.Only, Concurrency: opts.Concurrency, Materialize: opts.Materialize})
+		if err != nil {
+			return err
+		}
+		report.Audit = &audit
+	}
 	return output.Write(out, report, jsonOutput, func() string {
 		return renderKnowledgeBuild(report)
 	})
@@ -140,10 +171,13 @@ func parseKnowledgeBuildArgs(args []string) (knowledge.BuildOptions, bool, []str
 func renderKnowledgeBuild(report knowledge.BuildReport) string {
 	var builder strings.Builder
 	fmt.Fprintf(&builder, "Built %d doc(s) across %d module(s) using %s.\n", report.Written, report.Modules, report.Generator)
-	fmt.Fprintf(&builder, "%d verified, %d unverified, %d unchanged, %d claim(s) dropped.\n",
+	fmt.Fprintf(&builder, "%d citation-resolved, %d with unresolved claims, %d unchanged, %d claim(s) dropped.\n",
 		report.Verified, report.Unverified, report.Unchanged, report.Dropped)
 	if report.NeedsReindex > 0 {
 		fmt.Fprintf(&builder, "%d module(s) changed since indexing and were SKIPPED: a doc built from stale line numbers describes code that moved. Run `pallium index`, or pass --allow-stale.\n", report.NeedsReindex)
+	}
+	if report.Audit != nil {
+		fmt.Fprintf(&builder, "Audit: %d supported, %d unclear, %d removed; %d failures.\n", report.Audit.Supported, report.Audit.Unclear, report.Audit.Removed, len(report.Audit.Failures))
 	}
 	if report.Materialized != "" {
 		fmt.Fprintf(&builder, "Markdown written to %s\n", report.Materialized)
@@ -181,7 +215,14 @@ func runKnowledgeList(out io.Writer, args []string, jsonOutput bool) error {
 		return err
 	}
 
-	return output.Write(out, docs, jsonOutput, func() string {
+	if err := knowledge.Assess(indexer.Store, docs); err != nil {
+		return err
+	}
+	summaries := []knowledge.Hit{}
+	for _, d := range docs {
+		summaries = append(summaries, knowledge.Hit{Slug: d.Slug, Title: d.Title, Kind: d.Kind, Snippet: truncateLine(d.Summary, 240), Freshness: d.Freshness, State: d.Evidence.State, SourceCommit: d.SourceCommit})
+	}
+	return output.Write(out, map[string]any{"version": knowledge.ContractVersion, "documents": summaries}, jsonOutput, func() string {
 		if len(docs) == 0 {
 			return "No knowledge docs yet. Run `pallium knowledge build`.\n"
 		}
@@ -199,6 +240,10 @@ func runKnowledgeList(out io.Writer, args []string, jsonOutput bool) error {
 }
 
 func runKnowledgeGet(out io.Writer, args []string, jsonOutput bool) error {
+	args, full, section, err := knowledgeReadArgs(args)
+	if err != nil {
+		return err
+	}
 	slug, err := requireArg(args, "slug")
 	if err != nil {
 		return err
@@ -221,6 +266,20 @@ func runKnowledgeGet(out io.Writer, args []string, jsonOutput bool) error {
 		return fmt.Errorf("no knowledge doc named %q", slug)
 	}
 
+	assessed := []db.KnowledgeDoc{doc}
+	if err := knowledge.Assess(indexer.Store, assessed); err != nil {
+		return err
+	}
+	doc = assessed[0]
+	if section != "" {
+		doc.Body = knowledge.Section(doc.Body, section)
+		if doc.Body == "" {
+			return fmt.Errorf("section %q not found", section)
+		}
+	}
+	if !full {
+		doc.Claims = ""
+	}
 	return output.Write(out, doc, jsonOutput, func() string {
 		return renderKnowledgeDoc(doc)
 	})
@@ -228,6 +287,7 @@ func runKnowledgeGet(out io.Writer, args []string, jsonOutput bool) error {
 
 func renderKnowledgeDoc(doc db.KnowledgeDoc) string {
 	var builder strings.Builder
+	fmt.Fprintf(&builder, "Freshness: %s · Evidence: %s\n\n", doc.Freshness, doc.Evidence.State)
 	builder.WriteString(doc.Body)
 	if !doc.Verified {
 		builder.WriteString("\nNOT FULLY VERIFIED — some generated claims did not resolve against the index.\n")
@@ -242,6 +302,10 @@ func renderKnowledgeDoc(doc db.KnowledgeDoc) string {
 }
 
 func runKnowledgeSearch(out io.Writer, args []string, jsonOutput bool) error {
+	args, full, _, err := knowledgeReadArgs(args)
+	if err != nil {
+		return err
+	}
 	query, err := requireArg(args, "query")
 	if err != nil {
 		return err
@@ -256,26 +320,40 @@ func runKnowledgeSearch(out io.Writer, args []string, jsonOutput bool) error {
 	if err != nil {
 		return err
 	}
-	docs, err := indexer.Store.SearchKnowledge(repo.ID, query, 10)
+	if full {
+		docs, err := indexer.Store.SearchKnowledge(repo.ID, query, 10)
+		if err != nil {
+			return err
+		}
+		if err := knowledge.Assess(indexer.Store, docs); err != nil {
+			return err
+		}
+		return output.Write(out, docs, jsonOutput, func() string {
+			var b strings.Builder
+			for _, d := range docs {
+				b.WriteString(renderKnowledgeDoc(d))
+			}
+			return b.String()
+		})
+	}
+	result, err := knowledge.Search(indexer.Store, repo.ID, query, 5, 8192)
 	if err != nil {
 		return err
 	}
-
-	return output.Write(out, docs, jsonOutput, func() string {
-		var builder strings.Builder
-		fmt.Fprintf(&builder, "%d match(es) for %q\n", len(docs), query)
-		for _, doc := range docs {
-			fmt.Fprintf(&builder, "  %-28s %s\n", doc.Slug, truncateLine(doc.Summary, 80))
+	return output.Write(out, result, jsonOutput, func() string {
+		var b strings.Builder
+		for _, hit := range result.Results {
+			fmt.Fprintf(&b, "%s [%s; %s] %s\n", hit.Slug, hit.Freshness, hit.State, hit.Snippet)
 		}
-		if len(docs) == 0 {
-			builder.WriteString("Nothing matched. Run `pallium knowledge build` if the base is empty.\n")
+		if len(result.Results) == 0 {
+			b.WriteString("No matching knowledge. Index and build this workspace first.\n")
 		}
-		return builder.String()
+		return b.String()
 	})
 }
 
 // runKnowledgeAudit re-checks stored claims against the source. Build proves a
-// citation resolves; only this proves the claim is true.
+// citation resolves; this records a model assessment of bounded source evidence.
 func runKnowledgeAudit(out io.Writer, args []string, jsonOutput bool) error {
 	opts := knowledge.AuditOptions{Materialize: true}
 	positional := make([]string, 0, len(args))

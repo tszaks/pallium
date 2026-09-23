@@ -95,7 +95,7 @@ var (
 	// behave identically once they read from the index instead of the disk.
 	callRefRegex = regexp.MustCompile(`\b([A-Za-z_$][\w$]*)\s*\(`)
 
-	jsImportSpecRegex = regexp.MustCompile(`(?m)(?:import|export)[^'"\n]*from\s+['"]([^'"]+)['"]|require\(\s*['"]([^'"]+)['"]\s*\)|import\(\s*['"]([^'"]+)['"]\s*\)|^\s*import\s+['"]([^'"]+)['"]`)
+	jsImportSpecRegex = regexp.MustCompile(`(?m)(?:import|export)[^'";]*from\s+['"]([^'"]+)['"]|require\(\s*['"]([^'"]+)['"]\s*\)|import\(\s*['"]([^'"]+)['"]\s*\)|^\s*import\s+['"]([^'"]+)['"]`)
 	pyImportSpecRegex = regexp.MustCompile(`(?m)^\s*(?:from\s+([.\w]+)\s+import|import\s+([.\w]+))`)
 	swiftImportRegex  = regexp.MustCompile(`(?m)^\s*import\s+([A-Za-z_][\w.]*)`)
 )
@@ -131,7 +131,13 @@ func parseScan(path, lang string, content []byte, resolver *Resolver) (ParsedFil
 		return ParsedFile{}, false
 	}
 
-	text := string(content)
+	original := string(content)
+	text := original
+	importsText := original
+	if lang != "python" && lang != "ruby" {
+		text = maskSource(original, true)
+		importsText = maskSource(original, false)
+	}
 	offsets := newLineOffsets(text)
 	parsed := ParsedFile{Lang: lang, Parser: "scan"}
 
@@ -152,21 +158,57 @@ func parseScan(path, lang string, content []byte, resolver *Resolver) (ParsedFil
 			}
 			seenSymbol[key] = struct{}{}
 			declared[name] = struct{}{}
-			startLine := offsets.line(match[0])
+			startLine := offsets.line(match[2])
 			parsed.Symbols = append(parsed.Symbols, db.CodeSymbol{
 				Path:      path,
 				Name:      name,
 				Kind:      rule.kind,
-				Signature: strings.TrimSpace(offsets.lineText(text, match[0])),
-				Doc:       precedingComment(text, offsets, match[0]),
+				Signature: strings.TrimSpace(offsets.lineText(original, match[2])),
+				Doc:       precedingComment(original, offsets, match[2]),
 				StartLine: startLine,
-				EndLine:   startLine,
-				Exported:  scanExported(lang, text, match[0], name),
+				EndLine:   scanEnd(text, match[2], offsets),
+				Exported:  scanExported(lang, original, match[2], name),
 			})
 		}
 	}
 
-	parsed.Imports = scanImports(path, lang, text, resolver)
+	// Class methods are scoped by the enclosing class span. Do not turn
+	// arbitrary call-shaped statements into declarations.
+	if lang == "typescript" || lang == "tsx" || lang == "javascript" || lang == "jsx" {
+		classes := append([]db.CodeSymbol(nil), parsed.Symbols...)
+		method := regexp.MustCompile(`(?m)^[ \t]+(?:(?:public|private|protected|static|async|override|readonly)\s+)*([A-Za-z_$][\w$]*)\s*\([^;{}]*\)\s*(?::[^;{\n]+)?\s*\{`)
+		for _, m := range method.FindAllStringSubmatchIndex(text, -1) {
+			name := text[m[2]:m[3]]
+			if isLanguageKeyword(name) {
+				continue
+			}
+			line := offsets.line(m[2])
+			for _, c := range classes {
+				if c.Kind != "class" || line <= c.StartLine || line >= c.EndLine {
+					continue
+				}
+				// At direct class-body depth only; nested calls and local functions are excluded.
+				start := offsets.starts[c.StartLine-1]
+				depth := 0
+				for _, ch := range text[start:m[2]] {
+					if ch == '{' {
+						depth++
+					}
+					if ch == '}' {
+						depth--
+					}
+				}
+				if depth != 1 {
+					continue
+				}
+				parsed.Symbols = append(parsed.Symbols, db.CodeSymbol{Path: path, Name: name, Kind: "method", Receiver: c.Name, Signature: strings.TrimSpace(offsets.lineText(original, m[2])), StartLine: line, EndLine: scanEnd(text, m[2], offsets), Exported: !strings.Contains(offsets.lineText(original, m[2]), "private")})
+				declared[name] = struct{}{}
+				break
+			}
+		}
+	}
+
+	parsed.Imports = scanImports(path, lang, importsText, resolver)
 	parsed.Refs = scanRefs(path, text, declared)
 	return parsed, true
 }

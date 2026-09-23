@@ -68,7 +68,8 @@ func Lang(path string) string {
 func Parseable(lang string) bool {
 	switch lang {
 	case "go", "typescript", "tsx", "javascript", "jsx", "python", "swift",
-		"ruby", "rust", "java", "kotlin", "csharp", "php", "c", "cpp", "objc":
+		"ruby", "rust", "java", "kotlin", "csharp", "php", "c", "cpp", "objc",
+		"markdown", "sql", "yaml", "json", "toml", "shell":
 		return true
 	default:
 		return false
@@ -123,6 +124,13 @@ var vendorishAnywhere = []string{
 var outputRootsOnly = []string{"dist/", "build/", "out/"}
 
 func vendorish(path string) bool {
+	base := strings.ToLower(filepath.Base(path))
+	if strings.HasSuffix(base, ".lock") || base == "package-lock.json" || base == "pnpm-lock.yaml" || base == "yarn.lock" || strings.HasPrefix(base, ".env") {
+		return true
+	}
+	if strings.HasPrefix(path, ".pallium/knowledge/") {
+		return true
+	}
 	for _, prefix := range vendorishAnywhere {
 		if strings.HasPrefix(path, prefix) || strings.Contains(path, "/"+prefix) {
 			return true

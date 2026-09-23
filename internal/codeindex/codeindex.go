@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/tszaks/pallium/internal/db"
-	"github.com/tszaks/pallium/internal/gitlog"
 )
 
 // maxParsedFileBytes caps what the parsers will look at. A file past this is
@@ -40,7 +39,7 @@ const maxParsedFileBytes = 512 * 1024
 //	sources, which an entire class of Node repo depends on.
 //
 // 3: resolver inputs are tagged and generic Go call references are indexed.
-const ParserVersion = "3"
+const ParserVersion = "4"
 
 func parserTag(parser, key string) string {
 	return parser + "@" + ParserVersion + "#" + key
@@ -73,14 +72,19 @@ type Result struct {
 // because the git index has already upserted the repo row in the same
 // transaction.
 func Run(store *db.Store, repoID int64, indexedAt time.Time) (Result, error) {
-	paths, err := gitlog.TrackedFiles(store.RepoRoot)
+	paths, err := SourcePaths(store.RepoRoot)
 	if err != nil {
 		return Result{}, fmt.Errorf("list repo files: %w", err)
 	}
 
+	opts, err := ReadProjectOptions(store.RepoRoot)
+	if err != nil {
+		return Result{}, err
+	}
+
 	candidates := make([]string, 0, len(paths))
 	for _, path := range paths {
-		if vendorish(path) {
+		if vendorish(path) || opts.Excluded(path) {
 			continue
 		}
 		if !Parseable(Lang(path)) {
@@ -216,7 +220,7 @@ func readContained(repoRoot, path string) ([]byte, int64, bool) {
 }
 
 func UnindexedCandidates(repoRoot string, indexed map[string]struct{}) ([]string, error) {
-	paths, err := gitlog.TrackedFiles(repoRoot)
+	paths, err := SourcePaths(repoRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -298,6 +302,9 @@ func Parse(path string, content []byte, resolver *Resolver) (ParsedFile, bool) {
 	lang := Lang(path)
 	if lang == "go" {
 		return parseGo(path, content, resolver)
+	}
+	if rulesFor(lang) == nil && Parseable(lang) {
+		return parseDocument(path, lang, content), true
 	}
 	return parseScan(path, lang, content, resolver)
 }
