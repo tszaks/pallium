@@ -1,7 +1,11 @@
 package knowledge
 
 import (
+	"github.com/tszaks/pallium/internal/index"
 	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -59,5 +63,51 @@ func TestDecisionsSurviveIndexAndExposeConflicts(t *testing.T) {
 	b, _, _ = store.KnowledgeDoc(id, b.Slug)
 	if b.Evidence.State != "superseded" {
 		t.Fatal("supersession lost")
+	}
+}
+
+func TestBrowserSourceConfinesIndexedPathsAtOpenTime(t *testing.T) {
+	store, _, root := indexedRepo(t)
+	store.Close()
+	store, err := index.OpenStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := index.New(store).Run(); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	b, err := NewBrowser(root, "127.0.0.1:8766")
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := func(path string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("GET", "http://"+b.Host+"/api/source?path="+url.QueryEscape(path), nil)
+		w := httptest.NewRecorder()
+		b.Handler().ServeHTTP(w, r)
+		return w
+	}
+	if w := read("storage/store.go"); w.Code != 200 || !strings.Contains(w.Body.String(), "Store owns") {
+		t.Fatalf("indexed read: %d %s", w.Code, w.Body)
+	}
+	secret := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(secret, []byte("outside-secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"../secret.txt", secret, ".git/config"} {
+		if w := read(path); w.Code == 200 || strings.Contains(w.Body.String(), "outside-secret") {
+			t.Fatalf("unexpected read: %s", path)
+		}
+	}
+	// The index still names a legitimate file, but it has since become a symlink.
+	target := filepath.Join(root, "storage/store.go")
+	if err := os.Remove(target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, target); err != nil {
+		t.Fatal(err)
+	}
+	if w := read("storage/store.go"); w.Code == 200 || strings.Contains(w.Body.String(), "outside-secret") {
+		t.Fatalf("symlink escaped: %s", w.Body)
 	}
 }

@@ -7,11 +7,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/tszaks/pallium/internal/db"
@@ -140,18 +140,7 @@ func (b *Browser) doc(w http.ResponseWriter, r *http.Request) {
 }
 func (b *Browser) source(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
-	full, err := filepath.EvalSymlinks(filepath.Join(b.Root, path))
-	if err != nil {
-		writeBrowserJSON(w, nil, err)
-		return
-	}
-	root, err := filepath.EvalSymlinks(b.Root)
-	if err != nil {
-		writeBrowserJSON(w, nil, err)
-		return
-	}
-	rel, err := filepath.Rel(root, full)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(path) {
+	if !filepath.IsLocal(path) {
 		http.Error(w, "outside repository", 403)
 		return
 	}
@@ -161,24 +150,43 @@ func (b *Browser) source(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return nil, err
 		}
-		if _, ok := paths[filepath.ToSlash(rel)]; !ok {
+		// Select the stored path, rather than using request data as a filesystem path.
+		indexedPath := ""
+		for candidate := range paths {
+			if candidate == path {
+				indexedPath = candidate
+				break
+			}
+		}
+		if indexedPath == "" {
 			return nil, fmt.Errorf("source is not indexed")
 		}
-		info, err := os.Stat(full)
+		// Root.Open prevents both traversal and symlink-swap escapes at open time.
+		root, err := os.OpenRoot(b.Root)
+		if err != nil {
+			return nil, err
+		}
+		defer root.Close()
+		file, err := root.Open(indexedPath)
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
+		info, err := file.Stat()
 		if err != nil {
 			return nil, err
 		}
 		if !info.Mode().IsRegular() || info.Size() > 512*1024 {
 			return nil, fmt.Errorf("source unavailable or too large")
 		}
-		data, err := os.ReadFile(full)
+		data, err := io.ReadAll(io.LimitReader(file, 64001))
 		if err != nil {
 			return nil, err
 		}
 		if len(data) > 64000 {
 			data = append(data[:64000], []byte("\n[source truncated at 64 KB]")...)
 		}
-		return map[string]string{"path": rel, "text": string(data)}, nil
+		return map[string]string{"path": indexedPath, "text": string(data)}, nil
 	})
 }
 func (b *Browser) control(w http.ResponseWriter, r *http.Request) {
