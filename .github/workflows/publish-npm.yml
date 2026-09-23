@@ -37,12 +37,15 @@ jobs:
 
       - name: Verify package version
         id: version
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           version="$(node -p 'require("./npm/package.json").version')"
-          tag_version="${{ inputs.tag }}"
+          tag_version="$RELEASE_TAG"
           tag_version="${tag_version#v}"
           if [ "$version" != "$tag_version" ]; then
-            echo "npm/package.json version $version does not match release tag ${{ inputs.tag }}" >&2
+            echo "npm/package.json version $version does not match release tag $RELEASE_TAG" >&2
             exit 1
           fi
           if npm view "pallium@$version" version >/dev/null 2>&1; then
@@ -51,6 +54,23 @@ jobs:
           else
             echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Require public downloadable release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft | grep -qx false
+          mkdir "$RUNNER_TEMP/release-assets"
+          gh release download "$RELEASE_TAG" --dir "$RUNNER_TEMP/release-assets"
+          cd "$RUNNER_TEMP/release-assets"
+          version="${RELEASE_TAG#v}"
+          for platform in darwin_arm64 darwin_amd64 linux_arm64 linux_amd64; do
+            test -s "pallium_${version}_${platform}.tar.gz"
+          done
+          test "$(wc -l < checksums.txt)" -eq 4
+          sha256sum --check checksums.txt
 
       - name: Publish with trusted publishing
         if: steps.version.outputs.publish == 'true'

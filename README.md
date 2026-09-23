@@ -134,16 +134,17 @@ pallium handoff origin/main --json
 ```bash
 pallium knowledge map                # modules and dependencies, no model
 pallium knowledge build --no-model   # the whole base, no model calls
-pallium knowledge build              # adds synthesized prose, verified
+pallium knowledge build              # adds prose with checked citations
 pallium knowledge audit             # skeptic re-checks claims against source
 pallium knowledge search "sessions"
-pallium knowledge get internal-workflow
+pallium knowledge get internal%2Fworkflow
 ```
 
 Modules are clustered from the content index. Their file lists, symbol surfaces
 ranked by how many files reference each name, dependency edges in both
-directions, external packages and recent history are all derived, so they are
-correct by construction. An `incidents` doc is mined from commit subjects that
+directions, external packages and recent history are derived from parsers. Go uses
+an AST; other code languages use labeled heuristics, with incomplete syntax reported.
+An `incidents` doc lists unconfirmed candidates mined from commit subjects that
 announce a revert, rollback, hotfix or outage, which means every entry is a
 real SHA with a real file list.
 
@@ -155,7 +156,7 @@ claims, and the doc is marked unverified.
 
 That check proves a citation resolves, not that the claim is true: "Open
 deletes the database", citing a real `Open`, would pass. `knowledge audit`
-closes that gap. It hands a skeptic each stored claim together with the actual
+assesses that gap; it does not prove truth. It hands a skeptic each stored claim together with the actual
 source of every symbol it cites and asks it to refute; `unclear` is a
 first-class verdict, because forcing a binary answer on insufficient evidence
 either deletes good knowledge or keeps bad knowledge. Refuted claims are
@@ -164,6 +165,51 @@ removed from the doc, from the markdown, and recorded with the reason.
 Docs live in SQLite with BM25 search and materialize to
 `.pallium/knowledge/*.md` so they can be read in an editor or committed and
 reviewed.
+
+### Freshness, agent context and automatic upkeep
+
+`knowledge search "question"` returns at most five compact results within 8 KB.
+`knowledge context "task"` (also `pallium_knowledge_context` over MCP) adds source
+paths, related tests and suggested checks within 12 KB. `knowledge get <slug>
+--section Surface` drills into a section. `--full` on search/get/map retains the
+full response for older integrations. Compact responses have `version: 2`.
+
+Every read reports freshness separately from evidence: source map, citations
+checked, audit supported/uncertain, or removed claims. Legacy documents require
+rebuilding. The compatibility `verified` field only means a current,
+audit-supported document; it is not a guarantee of truth. Changes during
+model work reject the candidate. Linked worktrees have separate index identities.
+
+Tracked Markdown, SQL, configuration and shell sources are included. Generated
+outputs, vendored sources and lockfiles are excluded. Optional
+`.pallium/modules.json` accepts `boundaries` (directory paths), `exclude`
+(directory/file paths) and `include_untracked` (explicit file paths). No general
+session-history import or untracked-directory sweep occurs.
+
+```sh
+pallium knowledge decisions link --title "Why SQLite" --file decision.md --source "ADR-12"
+pallium knowledge maintain enable       # explicitly registers this workspace
+pallium knowledge maintain install      # macOS launch agent, persists after editor exit
+pallium knowledge maintain status --json
+pallium knowledge maintain pause        # resume / retry / disable also available
+pallium knowledge serve                # loopback browser at http://127.0.0.1:8766
+```
+
+Decisions express authored intent. Same-title conflicting decisions remain visible;
+`--supersedes <decision-slug>` explicitly retires older intent. They survive indexing.
+
+Background maintenance refreshes local structure after 10 seconds of quiet and
+queues generation/audits after 60 seconds. A durable global ledger limits **all real
+knowledge model attempts to 40 per rolling 24 hours**, with at most two active calls
+and a three-minute timeout. Failed attempts count. Unknown cost stays unknown.
+Authentication/quota failures pause the affected repository; transient failures get
+one retry. Other platforms can supervise `knowledge maintain run` directly.
+
+The first migration backs up an existing knowledge database to
+`pallium.sqlite.pre-knowledge-v2`. Replaced documents remain in
+`knowledge_revisions`. Generated Markdown is atomically replaced per file; authored
+Markdown is preserved and a name collision fails visibly. See the release notes for
+rollback and migration details.
 
 ### Session awareness and decisions
 

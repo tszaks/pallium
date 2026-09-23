@@ -18,10 +18,12 @@ type CommitSummary struct {
 
 // ModuleRef points an explanation at the knowledge doc covering the file.
 type ModuleRef struct {
-	Slug     string `json:"slug"`
-	Title    string `json:"title"`
-	Summary  string `json:"summary"`
-	Verified bool   `json:"verified"`
+	Freshness     string `json:"freshness"`
+	EvidenceState string `json:"evidence_state"`
+	Slug          string `json:"slug"`
+	Title         string `json:"title"`
+	Summary       string `json:"summary"`
+	Verified      bool   `json:"verified"`
 }
 
 type ExplainReport struct {
@@ -173,6 +175,7 @@ func fileIdentity(store *db.Store, repoID int64, path string) ([]db.CodeSymbol, 
 		return exported, nil
 	}
 	return exported, &ModuleRef{
+		Freshness: doc.Freshness, EvidenceState: doc.Evidence.State,
 		Slug:     doc.Slug,
 		Title:    doc.Title,
 		Summary:  doc.Summary,
@@ -204,7 +207,7 @@ func explainSummary(risk RiskReport, commits []CommitSummary, decisions []Decisi
 	if module != nil && strings.TrimSpace(module.Summary) != "" {
 		note := fmt.Sprintf("Part of %s: %s", module.Title, strings.TrimSpace(module.Summary))
 		if !module.Verified {
-			note += " (module doc not fully verified)"
+			note += " (" + module.Freshness + "; " + module.EvidenceState + ")"
 		}
 		parts = append(parts, note)
 	}

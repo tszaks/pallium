@@ -22,9 +22,11 @@ func parseGo(path string, content []byte, resolver *Resolver) (ParsedFile, bool)
 	if file == nil || (err != nil && len(file.Decls) == 0) {
 		return ParsedFile{}, false
 	}
-	_ = err
 
 	parsed := ParsedFile{Lang: "go", Parser: "go/ast"}
+	if err != nil {
+		parsed.Parser = "go/ast-partial"
+	}
 	line := func(pos token.Pos) int {
 		if !pos.IsValid() {
 			return 0

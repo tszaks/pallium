@@ -118,3 +118,54 @@ func mcpTestRepo(t *testing.T) string {
 	}
 	return repo
 }
+
+func TestKnowledgeContextContractAndFreshness(t *testing.T) {
+	t.Setenv("PALLIUM_TEST_DB", filepath.Join(t.TempDir(), "global.sqlite"))
+	repo := mcpTestRepo(t)
+	if _, err := runIndexForTest(repo); err != nil {
+		t.Fatal(err)
+	}
+	var build strings.Builder
+	if err := runKnowledge(&build, []string{"build", "--no-model", "--no-materialize", repo}, true); err != nil {
+		t.Fatal(err)
+	}
+	server := &mcpServer{}
+	text, err := server.callTool("pallium_knowledge_context", map[string]any{"query": "where does Open return a Store", "cwd": repo})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(text) > 12000 {
+		t.Fatal("MCP context budget exceeded")
+	}
+	var pack struct {
+		Version int `json:"version"`
+		Results []struct {
+			Freshness string `json:"freshness"`
+		}
+	}
+	if err := json.Unmarshal([]byte(text), &pack); err != nil {
+		t.Fatal(err)
+	}
+	if pack.Version != 2 || len(pack.Results) == 0 {
+		t.Fatal(text)
+	}
+	for _, r := range pack.Results {
+		if r.Freshness != "current" {
+			t.Fatal("fresh document not current")
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repo, "storage/store.go"), []byte("package storage\nfunc Refresh(){}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	text, err = server.callTool("pallium_knowledge_search", map[string]any{"query": "storage", "cwd": repo})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(text) > 8192 || !strings.Contains(text, `"freshness": "stale"`) {
+		t.Fatal(text)
+	}
+	var help strings.Builder
+	if err := runKnowledge(&help, []string{"--help"}, false); err != nil {
+		t.Fatal(err)
+	}
+}
