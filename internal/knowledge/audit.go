@@ -28,6 +28,7 @@ import (
 // idiom pointed at its own output.
 
 type AuditOptions struct {
+	Context     context.Context
 	Synth       Synthesizer
 	Only        []string
 	Concurrency int
@@ -82,10 +83,17 @@ type auditResponse struct {
 const auditUnclearMarker = " unclear, kept pending review, "
 
 func Audit(store *db.Store, repoID int64, repoRoot string, opts AuditOptions) (AuditReport, error) {
+	if opts.Context == nil {
+		opts.Context = context.Background()
+	}
 	if opts.Synth == nil {
 		return AuditReport{}, fmt.Errorf("audit needs a model: it re-reads each claim against the source")
 	}
 
+	snapshot, err := Snapshot(repoRoot)
+	if err != nil {
+		return AuditReport{}, err
+	}
 	docs, err := store.KnowledgeDocs(repoID)
 	if err != nil {
 		return AuditReport{}, err
@@ -130,7 +138,7 @@ func Audit(store *db.Store, repoID int64, repoRoot string, opts AuditOptions) (A
 			}
 		}
 
-		if _, drifted := stale[doc.Slug]; drifted {
+		if _, drifted := stale[doc.Slug]; drifted || doc.Fingerprint != moduleBySlug[doc.Slug].Fingerprint {
 			report.NeedsReindex++
 			continue
 		}
@@ -164,7 +172,7 @@ func Audit(store *db.Store, repoID int64, repoRoot string, opts AuditOptions) (A
 
 	concurrency := opts.Concurrency
 	if concurrency <= 0 {
-		concurrency = 4
+		concurrency = 2
 	}
 	if concurrency > len(jobs) && len(jobs) > 0 {
 		concurrency = len(jobs)
@@ -181,7 +189,27 @@ func Audit(store *db.Store, repoID int64, repoRoot string, opts AuditOptions) (A
 			slots <- struct{}{}
 			defer func() { <-slots }()
 
-			raw, err := opts.Synth.Synthesize(context.Background(), prompt)
+			raw, err := opts.Synth.Synthesize(opts.Context, prompt)
+			// One bounded evidence expansion may resolve an honest abstention.
+			// If capacity is unavailable, keep the original uncertain assessment.
+			if err == nil && (strings.Contains(prompt, "[file truncated]") || strings.Contains(prompt, "excerpt budget exhausted")) {
+				rulings, parseErr := parseAuditResponse(raw)
+				uncertain := false
+				for _, v := range rulings {
+					if v.Ruling == "unclear" {
+						uncertain = true
+					}
+				}
+				if parseErr == nil && uncertain {
+					expanded := prompt + "\nAdditional source evidence. Reassess all numbered claims; retain unclear where evidence is still insufficient.\n" + sourceForModule(repoRoot, moduleBySlug[slug], 48000)
+					next, nextErr := opts.Synth.Synthesize(opts.Context, expanded)
+					if nextErr == nil {
+						if verdicts, e := parseAuditResponse(next); e == nil && validateVerdicts(verdicts, len(rulings)) == nil {
+							raw = next
+						}
+					}
+				}
+			}
 			mutex.Lock()
 			responses[slug] = synthResult{raw: raw, err: err}
 			mutex.Unlock()
@@ -232,12 +260,29 @@ func Audit(store *db.Store, repoID int64, repoRoot string, opts AuditOptions) (A
 			}
 		}
 
-		hadUnclear := len(stripUnclearNotes(item.doc.DroppedClaims)) != len(item.doc.DroppedClaims)
-		if len(removals) == 0 && len(unclear) == 0 && !hadUnclear {
-			continue
+		current, err := Snapshot(repoRoot)
+		if err != nil {
+			return report, err
+		}
+		if current != snapshot {
+			return report, fmt.Errorf("workspace changed during audit")
+		}
+		updated := item.doc
+		encodedVerdicts, _ := json.Marshal(rulings)
+		updated.Evidence.AuditedAt = time.Now().UTC().Format(time.RFC3339)
+		updated.Evidence.Verdicts = string(encodedVerdicts)
+		updated.Evidence.State = "audited_supported"
+		if p, ok := opts.Synth.(ProviderSynthesizer); ok {
+			updated.Evidence.Provider = p.Provider
+			updated.Evidence.Model = p.Model
+		}
+		if len(unclear) > 0 {
+			updated.Evidence.State = "audited_unclear"
+		}
+		if len(removals) > 0 {
+			updated.Evidence.State = "claims_removed"
 		}
 
-		updated := item.doc
 		pruned := pruneClaims(item.claims, removedIdx)
 		var module *Module
 		if found, ok := moduleBySlug[item.doc.Slug]; ok {
@@ -262,7 +307,7 @@ func Audit(store *db.Store, repoID int64, repoRoot string, opts AuditOptions) (A
 			}
 			updated.Verified = len(updated.DroppedClaims) == 0
 			updated.GeneratedAt = time.Now().UTC()
-			if err := store.UpsertKnowledgeDoc(repoID, updated); err != nil {
+			if err := store.UpdateKnowledgeDoc(repoID, item.doc, updated); err != nil {
 				return AuditReport{}, err
 			}
 			continue
@@ -287,7 +332,7 @@ func Audit(store *db.Store, repoID int64, repoRoot string, opts AuditOptions) (A
 		}
 		updated.Verified = len(updated.DroppedClaims) == 0
 		updated.GeneratedAt = time.Now().UTC()
-		if err := store.UpsertKnowledgeDoc(repoID, updated); err != nil {
+		if err := store.UpdateKnowledgeDoc(repoID, item.doc, updated); err != nil {
 			return AuditReport{}, err
 		}
 	}
@@ -450,6 +495,7 @@ func auditPrompt(store *db.Store, repoID int64, repoRoot string, doc db.Knowledg
 		}
 	}
 
+	builder.WriteString(sourceForModule(repoRoot, module, 24000))
 	builder.WriteString(`
 Rule for each claim, in order of preference:
 - "unsupported" if the source contradicts it, or if it asserts behavior that
@@ -549,7 +595,13 @@ func claimExcerpts(store *db.Store, repoID int64, repoRoot string, claims []cite
 			if err != nil {
 				return nil, nil, err
 			}
-			chosen = pickDeclarations(symbols, item.paths, moduleFiles)
+			var exact []db.CodeSymbol
+			for _, symbol := range symbols {
+				if item.name == symbol.Receiver+"."+symbol.Name || item.name == strings.TrimPrefix(symbol.Receiver, "*")+"."+symbol.Name {
+					exact = append(exact, symbol)
+				}
+			}
+			chosen = pickDeclarations(exact, item.paths, moduleFiles)
 		}
 		if len(chosen) == 0 {
 			missing = append(missing, item.name)
@@ -576,6 +628,9 @@ func pickDeclarations(symbols []db.CodeSymbol, citedPaths, moduleFiles map[strin
 	inCited := make([]db.CodeSymbol, 0, 2)
 	inModule := make([]db.CodeSymbol, 0, 2)
 	for _, symbol := range symbols {
+		if _, ok := moduleFiles[symbol.Path]; !ok {
+			continue
+		}
 		if _, ok := citedPaths[symbol.Path]; ok {
 			inCited = append(inCited, symbol)
 			continue

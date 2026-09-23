@@ -1,0 +1,12 @@
+[
+ {"topic":"cache","question":"where are expired cached entries removed","description":"Cache evicts expired entries using a time to live cutoff.","symbol":"EvictExpired"},
+ {"topic":"billing","question":"how does a customer payment get refunded","description":"Billing refunds customer payments using the original transaction identifier.","symbol":"RefundPayment"},
+ {"topic":"auth","question":"where is the login session token checked","description":"Authentication checks the login session token before granting access.","symbol":"ValidateSession"},
+ {"topic":"queue","question":"how are failed jobs retried","description":"Queue retries failed jobs with exponential backoff and a retry limit.","symbol":"RetryJob"},
+ {"topic":"upload","question":"where are uploaded file sizes limited","description":"Upload rejects files exceeding the maximum allowed size in bytes.","symbol":"CheckUploadSize"},
+ {"topic":"search","question":"how are search results ranked","description":"Search ranks results by relevance and recency before pagination.","symbol":"RankResults"},
+ {"topic":"export","question":"where are reports converted into csv","description":"Export converts reports into CSV rows with escaped values.","symbol":"ExportCSV"},
+ {"topic":"notification","question":"how do duplicate notifications get suppressed","description":"Notification suppresses duplicate delivery using an idempotency key.","symbol":"DeduplicateNotification"},
+ {"topic":"backup","question":"where does restoring a database backup happen","description":"Backup restores database snapshots and verifies their checksums.","symbol":"RestoreBackup"},
+ {"topic":"budget","question":"where are agent spending budgets enforced","description":"Budget enforces agent spending limits before reserving a model call.","symbol":"ReserveBudget"}
+]

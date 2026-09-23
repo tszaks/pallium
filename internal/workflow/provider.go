@@ -145,6 +145,16 @@ func markProviderStarted(ctx context.Context) {
 // --llm`) dispatch through the exact same codex/wrapper/claude resolution a
 // running agent uses, instead of hardcoding a provider.
 func (r *Runner) RunProviderText(ctx context.Context, prompt string) (string, error) {
+	return r.RunProviderTextOptions(ctx, prompt, AgentOptions{})
+}
+
+// ResolveTextOptions resolves once so background work can pin its settings.
+func (r *Runner) ResolveTextOptions() (AgentOptions, error) {
+	opts, _, err := r.resolveRouting(AgentOptions{TaskClass: "planning"}, "read-only")
+	return opts, err
+}
+
+func (r *Runner) RunProviderTextOptions(ctx context.Context, prompt string, pinned AgentOptions) (string, error) {
 	if r.CodexBinary == "" {
 		r.CodexBinary = "codex"
 	}
@@ -163,7 +173,11 @@ func (r *Runner) RunProviderText(ctx context.Context, prompt string) (string, er
 	defer os.RemoveAll(tmpDir)
 	outFile := filepath.Join(tmpDir, "last-message.txt")
 	usageFile := filepath.Join(tmpDir, "usage.json")
-	opts, decision, err := r.resolveRouting(AgentOptions{TaskClass: "planning"}, "read-only")
+	request := pinned
+	if request.Provider == "" {
+		request.TaskClass = "planning"
+	}
+	opts, decision, err := r.resolveRouting(request, "read-only")
 	if err != nil {
 		return "", err
 	}

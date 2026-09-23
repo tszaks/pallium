@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/tszaks/pallium/internal/codeindex"
 	"github.com/tszaks/pallium/internal/db"
@@ -47,10 +48,14 @@ func staleModuleSlugs(store *db.Store, repoID int64, repoRoot string, modules []
 		return hash
 	}
 
+	states, err := store.CodeFileStates(repoID)
+	if err != nil {
+		return nil, err
+	}
 	stale := make(map[string]struct{})
 	for _, module := range modules {
 		for _, path := range module.Files {
-			if hashOf(path) != stored[path] {
+			if hashOf(path) != stored[path] || !strings.Contains(states[path].Parser, "@"+codeindex.ParserVersion+"#") {
 				stale[module.Slug] = struct{}{}
 				break
 			}

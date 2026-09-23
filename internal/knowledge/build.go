@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tszaks/pallium/internal/codeindex"
 	"github.com/tszaks/pallium/internal/db"
 )
 
@@ -24,6 +25,7 @@ type Synthesizer interface {
 }
 
 type BuildOptions struct {
+	Context       context.Context
 	Modules       ModuleOptions
 	Synth         Synthesizer
 	Force         bool
@@ -43,10 +45,11 @@ type BuildOptions struct {
 }
 
 type BuildReport struct {
-	Modules   int `json:"modules"`
-	Written   int `json:"written"`
-	Unchanged int `json:"unchanged"`
-	Pruned    int `json:"pruned"`
+	Audit     *AuditReport `json:"audit,omitempty"`
+	Modules   int          `json:"modules"`
+	Written   int          `json:"written"`
+	Unchanged int          `json:"unchanged"`
+	Pruned    int          `json:"pruned"`
 	// NeedsReindex counts modules skipped because their files drifted from
 	// the index.
 	NeedsReindex int            `json:"needs_reindex"`
@@ -112,6 +115,10 @@ func (c *citedClaim) UnmarshalJSON(data []byte) error {
 }
 
 func Build(store *db.Store, repoID int64, repoRoot string, opts BuildOptions) (BuildReport, error) {
+	snapshot, err := Snapshot(repoRoot)
+	if err != nil {
+		return BuildReport{}, err
+	}
 	modules, err := Modules(store, repoID, opts.Modules)
 	if err != nil {
 		return BuildReport{}, err
@@ -132,12 +139,9 @@ func Build(store *db.Store, repoID int64, repoRoot string, opts BuildOptions) (B
 		generator = "structural+model"
 	}
 
-	stale := map[string]struct{}{}
-	if !opts.AllowStale {
-		stale, err = staleModuleSlugs(store, repoID, repoRoot, modules)
-		if err != nil {
-			return BuildReport{}, err
-		}
+	stale, err := staleModuleSlugs(store, repoID, repoRoot, modules)
+	if err != nil {
+		return BuildReport{}, err
 	}
 
 	report := BuildReport{Modules: len(modules), Generator: generator, Docs: []DocSummary{}, Failures: []BuildFailure{}}
@@ -156,7 +160,7 @@ func Build(store *db.Store, repoID int64, repoRoot string, opts BuildOptions) (B
 			}
 		}
 
-		if _, drifted := stale[module.Slug]; drifted {
+		if _, drifted := stale[module.Slug]; drifted && !opts.AllowStale {
 			report.NeedsReindex++
 			continue
 		}
@@ -175,8 +179,14 @@ func Build(store *db.Store, repoID int64, repoRoot string, opts BuildOptions) (B
 				reusableClaims = len(flat) > 0 && !hasUncitedClaims(flat)
 			}
 		}
-		if found && !opts.Force && existing.Fingerprint == module.Fingerprint &&
+		if found && !opts.Force && existing.Fingerprint == module.Fingerprint && existing.Evidence.ParserVersion == codeindex.ParserVersion &&
 			(opts.Synth == nil || (existing.Generator == "structural+model" && reusableClaims)) {
+			if existing.Evidence.Snapshot != snapshot {
+				existing.Evidence.Snapshot = snapshot
+				if err := store.UpsertKnowledgeDoc(repoID, existing); err != nil {
+					return report, err
+				}
+			}
 			report.Unchanged++
 			report.Docs = append(report.Docs, DocSummary{
 				Slug: module.Slug, Kind: "module", Title: module.Title,
@@ -184,15 +194,40 @@ func Build(store *db.Store, repoID int64, repoRoot string, opts BuildOptions) (B
 			})
 			continue
 		}
+		module.Source = sourceForModule(repoRoot, module, 24000)
 		pending = append(pending, module)
 	}
 
-	responses := synthesizeModules(pending, opts.Synth, opts.Concurrency)
+	responses := synthesizeModules(opts.Context, pending, opts.Synth, opts.Concurrency)
 
+	currentSnapshot, err := Snapshot(repoRoot)
+	if err != nil {
+		return report, err
+	}
+	if currentSnapshot != snapshot {
+		return report, fmt.Errorf("workspace changed during generation; retry after indexing")
+	}
 	for _, module := range pending {
 		doc, failure := buildModuleDoc(module, index, repo.LastIndexedCommit, responses[module.Slug])
 		if failure != "" {
 			report.Failures = append(report.Failures, BuildFailure{Slug: module.Slug, Reason: failure})
+		}
+		stamp(&doc, snapshot)
+		doc.Evidence.Limitations = []string{"Module boundaries follow directories and configured overrides; references are name-based, not a type-resolved call graph."}
+		for _, lang := range module.Languages {
+			if lang != "go" && lang != "markdown" && lang != "sql" && lang != "json" && lang != "yaml" && lang != "toml" && lang != "shell" {
+				doc.Evidence.Limitations = append(doc.Evidence.Limitations, "Non-Go code declarations use heuristic scanning and can be incomplete.")
+				break
+			}
+		}
+		if _, drifted := stale[module.Slug]; drifted {
+			doc.Evidence.State = "stale_input"
+			doc.Evidence.Snapshot = ""
+			doc.Verified = false
+		}
+		if p, ok := opts.Synth.(ProviderSynthesizer); ok {
+			doc.Evidence.Provider = p.Provider
+			doc.Evidence.Model = p.Model
 		}
 		if err := store.UpsertKnowledgeDoc(repoID, doc); err != nil {
 			return BuildReport{}, err
@@ -213,6 +248,7 @@ func Build(store *db.Store, repoID int64, repoRoot string, opts BuildOptions) (B
 
 	if len(only) == 0 {
 		overview := buildOverviewDoc(modules, repo.LastIndexedCommit)
+		stamp(&overview, snapshot)
 		if err := store.UpsertKnowledgeDoc(repoID, overview); err != nil {
 			return BuildReport{}, err
 		}
@@ -224,6 +260,7 @@ func Build(store *db.Store, repoID int64, repoRoot string, opts BuildOptions) (B
 		if err != nil {
 			return BuildReport{}, err
 		}
+		stamp(&incidents, snapshot)
 		if err := store.UpsertKnowledgeDoc(repoID, incidents); err != nil {
 			return BuildReport{}, err
 		}
@@ -276,13 +313,16 @@ type synthResult struct {
 // synthesizeModules runs the model over every pending module, bounded by
 // concurrency. A single failure never fails the batch: the module falls back
 // to its structural doc and the reason is reported.
-func synthesizeModules(modules []Module, synth Synthesizer, concurrency int) map[string]synthResult {
+func synthesizeModules(ctx context.Context, modules []Module, synth Synthesizer, concurrency int) map[string]synthResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	out := make(map[string]synthResult, len(modules))
 	if synth == nil || len(modules) == 0 {
 		return out
 	}
 	if concurrency <= 0 {
-		concurrency = 4
+		concurrency = 2
 	}
 	if concurrency > len(modules) {
 		concurrency = len(modules)
@@ -299,7 +339,7 @@ func synthesizeModules(modules []Module, synth Synthesizer, concurrency int) map
 			slots <- struct{}{}
 			defer func() { <-slots }()
 
-			raw, err := synth.Synthesize(context.Background(), modulePrompt(module))
+			raw, err := synth.Synthesize(ctx, modulePrompt(module)+module.Source)
 			mutex.Lock()
 			out[module.Slug] = synthResult{raw: raw, err: err}
 			mutex.Unlock()
@@ -390,8 +430,15 @@ func verifySynthesis(result synthesis, module Module, index citationIndex) (synt
 				}
 			}
 			if bad == "" {
+				symbolFiles := moduleFiles
+				if len(claim.CitedPaths) > 0 {
+					symbolFiles = map[string]struct{}{}
+					for _, p := range claim.CitedPaths {
+						symbolFiles[strings.TrimSpace(p)] = struct{}{}
+					}
+				}
 				for _, symbol := range claim.CitedSymbols {
-					if !index.hasSymbol(symbol) {
+					if !index.hasModuleSymbol(symbol, symbolFiles) {
 						bad = "no such symbol " + symbol
 						break
 					}
@@ -425,8 +472,9 @@ func verifySynthesis(result synthesis, module Module, index citationIndex) (synt
 }
 
 type citationIndex struct {
-	paths   map[string]struct{}
-	symbols map[string]struct{}
+	paths        map[string]struct{}
+	symbols      map[string]struct{}
+	declarations []db.CodeSymbol
 }
 
 func newCitationIndex(store *db.Store, repoID int64) (citationIndex, error) {
@@ -442,6 +490,10 @@ func newCitationIndex(store *db.Store, repoID int64) (citationIndex, error) {
 		index.paths[path] = struct{}{}
 	}
 
+	index.declarations, err = store.SymbolsUnderPrefix(repoID, ".")
+	if err != nil {
+		return citationIndex{}, err
+	}
 	names, err := store.AllSymbolNames(repoID)
 	if err != nil {
 		return citationIndex{}, err
@@ -462,17 +514,23 @@ func (c citationIndex) hasSymbol(name string) bool {
 	if name == "" {
 		return false
 	}
-	// A model often cites "Store.Open" or "pkg.Open" where the index holds
-	// "Open". Accept the tail rather than failing a claim that is right about
-	// the code and only verbose about the name.
-	if _, ok := c.symbols[name]; ok {
-		return true
+	_, ok := c.symbols[name]
+	return ok
+}
+
+func (c citationIndex) hasModuleSymbol(name string, files map[string]struct{}) bool {
+	name = strings.TrimSpace(name)
+	matches := 0
+	for _, symbol := range c.declarations {
+		if _, owned := files[symbol.Path]; !owned {
+			continue
+		}
+		qualified := strings.TrimPrefix(symbol.Receiver, "*") + "." + symbol.Name
+		if name == symbol.Name || (symbol.Receiver != "" && name == qualified || name == symbol.Receiver+"."+symbol.Name) {
+			matches++
+		}
 	}
-	if index := strings.LastIndex(name, "."); index >= 0 && index+1 < len(name) {
-		_, ok := c.symbols[name[index+1:]]
-		return ok
-	}
-	return false
+	return matches == 1
 }
 
 func parseSynthesis(raw string) (synthesis, error) {

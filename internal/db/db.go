@@ -28,10 +28,9 @@ type Store struct {
 	// RepoRoot is the actual filesystem repo root used for git and file
 	// operations, e.g. the linked worktree the caller ran from.
 	RepoRoot string
-	// CanonicalRoot identifies the repo in the `repos` table and determines
-	// the sqlite file location. It is shared by every worktree of the same
-	// repo (see gitlog.CanonicalRepoRoot), so they read and write the same
-	// index. For a non-worktree checkout it equals RepoRoot.
+	// CanonicalRoot determines the shared SQLite file location. Repo rows and
+	// indexes are keyed by RepoRoot, isolating each physical worktree.
+	// For a non-worktree checkout it equals RepoRoot.
 	CanonicalRoot string
 	DBPath        string
 }
@@ -102,8 +101,8 @@ func Open(repoRoot string) (*Store, error) {
 }
 
 // OpenCanonical opens the store for repoRoot (used for git/file operations)
-// while keying the index identity and sqlite file location on canonicalRoot
-// (shared across worktrees of the same repo). Passing the same value for
+// while locating SQLite at canonicalRoot. Each actual workspace has its own
+// repo row and content index in that file. Passing the same value for
 // both is equivalent to Open.
 func OpenCanonical(repoRoot, canonicalRoot string) (*Store, error) {
 	dbPath := DefaultDBPath(canonicalRoot)
@@ -219,6 +218,32 @@ WHERE last_touched_at = ''
 		return err
 	}
 
+	cols, err := s.tableColumns("knowledge_docs")
+	if err != nil {
+		return err
+	}
+	if _, ok := cols["evidence_json"]; !ok {
+		var count int
+		if err := s.q.QueryRow(`SELECT COUNT(*) FROM knowledge_docs`).Scan(&count); err != nil {
+			return err
+		}
+		if count > 0 {
+			backup := s.DBPath + ".pre-knowledge-v2"
+			if _, err := os.Stat(backup); os.IsNotExist(err) {
+				if _, err := s.q.Exec(`VACUUM INTO ?`, backup); err != nil {
+					return fmt.Errorf("backup knowledge database: %w", err)
+				}
+			} else if err != nil {
+				return err
+			}
+		}
+		if _, err := s.q.Exec(`ALTER TABLE knowledge_docs ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '{}'`); err != nil {
+			return err
+		}
+	}
+	if _, err := s.q.Exec(`CREATE TABLE IF NOT EXISTS knowledge_revisions(id INTEGER PRIMARY KEY, repo_id INTEGER NOT NULL, slug TEXT NOT NULL, document_json TEXT NOT NULL, archived_at TEXT NOT NULL)`); err != nil {
+		return err
+	}
 	if err := s.migrateKnowledgeDocClaims(); err != nil {
 		return err
 	}
@@ -363,7 +388,7 @@ ON CONFLICT(root) DO UPDATE SET
   branch = excluded.branch,
   last_indexed_commit = excluded.last_indexed_commit,
   indexed_at = excluded.indexed_at
-`, s.CanonicalRoot, branch, lastIndexedCommit, indexedAt.UTC().Format(time.RFC3339)); err != nil {
+`, s.RepoRoot, branch, lastIndexedCommit, indexedAt.UTC().Format(time.RFC3339)); err != nil {
 		return RepoRecord{}, fmt.Errorf("upsert repo: %w", err)
 	}
 
@@ -371,7 +396,7 @@ ON CONFLICT(root) DO UPDATE SET
 }
 
 func (s *Store) Repo() (RepoRecord, error) {
-	row := s.q.QueryRow(`SELECT id, root, branch, COALESCE(last_indexed_commit, ''), indexed_at FROM repos WHERE root = ?`, s.CanonicalRoot)
+	row := s.q.QueryRow(`SELECT id, root, branch, COALESCE(last_indexed_commit, ''), indexed_at FROM repos WHERE root = ?`, s.RepoRoot)
 	var repo RepoRecord
 	var indexedAt string
 	if err := row.Scan(&repo.ID, &repo.Root, &repo.Branch, &repo.LastIndexedCommit, &indexedAt); err != nil {

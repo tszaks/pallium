@@ -1,6 +1,7 @@
 package db
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -16,6 +17,8 @@ import (
 // knowledge base that cannot say which of its claims failed to check out is
 // just prose with a database behind it.
 type KnowledgeDoc struct {
+	Evidence      Evidence `json:"evidence"`
+	Freshness     string   `json:"freshness"`
 	Slug          string   `json:"slug"`
 	Kind          string   `json:"kind"`
 	Title         string   `json:"title"`
@@ -36,6 +39,13 @@ type KnowledgeDoc struct {
 }
 
 func (s *Store) UpsertKnowledgeDoc(repoID int64, doc KnowledgeDoc) error {
+	if _, inTx := s.q.(*sql.Tx); !inTx {
+		return s.WithTx(func(tx *Store) error { return tx.UpsertKnowledgeDoc(repoID, doc) })
+	}
+	evidence, err := json.Marshal(doc.Evidence)
+	if err != nil {
+		return err
+	}
 	citedPaths, err := json.Marshal(nonNil(doc.CitedPaths))
 	if err != nil {
 		return fmt.Errorf("encode cited paths: %w", err)
@@ -64,17 +74,34 @@ func (s *Store) UpsertKnowledgeDoc(repoID int64, doc KnowledgeDoc) error {
 	if _, err := s.q.Exec(`
 INSERT INTO knowledge_docs
   (repo_id, slug, kind, title, summary, body_md, cited_paths_json, cited_symbols_json,
-   dropped_claims_json, claims_json, source_commit, fingerprint, generator, verified, generated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+   dropped_claims_json, claims_json, source_commit, fingerprint, generator, verified, generated_at, evidence_json)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `, repoID, doc.Slug, doc.Kind, doc.Title, doc.Summary, doc.Body, string(citedPaths),
 		string(citedSymbols), string(dropped), defaultJSONObject(doc.Claims), doc.SourceCommit, doc.Fingerprint,
-		doc.Generator, verified, doc.GeneratedAt.UTC().Format(time.RFC3339)); err != nil {
+		doc.Generator, verified, doc.GeneratedAt.UTC().Format(time.RFC3339), string(evidence)); err != nil {
 		return fmt.Errorf("insert knowledge doc %s: %w", doc.Slug, err)
 	}
 	return nil
 }
 
 func (s *Store) DeleteKnowledgeDoc(repoID int64, slug string) error {
+	if _, inTx := s.q.(*sql.Tx); !inTx {
+		return s.WithTx(func(tx *Store) error { return tx.DeleteKnowledgeDoc(repoID, slug) })
+	}
+	old, found, err := s.KnowledgeDoc(repoID, slug)
+	if err != nil {
+		return err
+	}
+	if found {
+		encoded, err := json.Marshal(old)
+		if err != nil {
+			return err
+		}
+		if _, err := s.q.Exec(`INSERT INTO knowledge_revisions(repo_id,slug,document_json,archived_at) VALUES(?,?,?,?)`, repoID, slug, string(encoded), time.Now().UTC().Format(time.RFC3339)); err != nil {
+			return err
+		}
+	}
+
 	if _, err := s.q.Exec(`DELETE FROM knowledge_docs WHERE repo_id = ? AND slug = ?`, repoID, slug); err != nil {
 		return fmt.Errorf("delete knowledge doc %s: %w", slug, err)
 	}
@@ -84,7 +111,7 @@ func (s *Store) DeleteKnowledgeDoc(repoID int64, slug string) error {
 func (s *Store) KnowledgeDoc(repoID int64, slug string) (KnowledgeDoc, bool, error) {
 	docs, err := s.scanKnowledgeDocs(`
 SELECT slug, kind, title, summary, body_md, cited_paths_json, cited_symbols_json,
-       dropped_claims_json, claims_json, source_commit, fingerprint, generator, verified, generated_at
+       dropped_claims_json, claims_json, source_commit, fingerprint, generator, verified, generated_at, evidence_json
 FROM knowledge_docs
 WHERE repo_id = ? AND slug = ?
 `, repoID, slug)
@@ -100,7 +127,7 @@ WHERE repo_id = ? AND slug = ?
 func (s *Store) KnowledgeDocs(repoID int64) ([]KnowledgeDoc, error) {
 	return s.scanKnowledgeDocs(`
 SELECT slug, kind, title, summary, body_md, cited_paths_json, cited_symbols_json,
-       dropped_claims_json, claims_json, source_commit, fingerprint, generator, verified, generated_at
+       dropped_claims_json, claims_json, source_commit, fingerprint, generator, verified, generated_at, evidence_json
 FROM knowledge_docs
 WHERE repo_id = ?
 ORDER BY kind, slug
@@ -120,7 +147,7 @@ func (s *Store) SearchKnowledge(repoID int64, query string, limit int) ([]Knowle
 	}
 	return s.scanKnowledgeDocs(`
 SELECT d.slug, d.kind, d.title, d.summary, d.body_md, d.cited_paths_json, d.cited_symbols_json,
-       d.dropped_claims_json, d.claims_json, d.source_commit, d.fingerprint, d.generator, d.verified, d.generated_at
+       d.dropped_claims_json, d.claims_json, d.source_commit, d.fingerprint, d.generator, d.verified, d.generated_at, d.evidence_json
 FROM knowledge_fts f
 JOIN knowledge_docs d ON d.id = f.rowid
 WHERE knowledge_fts MATCH ? AND d.repo_id = ?
@@ -139,14 +166,15 @@ func (s *Store) scanKnowledgeDocs(query string, args ...any) ([]KnowledgeDoc, er
 	out := make([]KnowledgeDoc, 0)
 	for rows.Next() {
 		var doc KnowledgeDoc
-		var citedPaths, citedSymbols, dropped, generatedAt string
+		var citedPaths, citedSymbols, dropped, generatedAt, evidence string
 		var verified int
 		if err := rows.Scan(&doc.Slug, &doc.Kind, &doc.Title, &doc.Summary, &doc.Body,
 			&citedPaths, &citedSymbols, &dropped, &doc.Claims, &doc.SourceCommit, &doc.Fingerprint,
-			&doc.Generator, &verified, &generatedAt); err != nil {
+			&doc.Generator, &verified, &generatedAt, &evidence); err != nil {
 			return nil, fmt.Errorf("scan knowledge doc: %w", err)
 		}
 		doc.Verified = verified == 1
+		_ = json.Unmarshal([]byte(evidence), &doc.Evidence)
 		_ = json.Unmarshal([]byte(citedPaths), &doc.CitedPaths)
 		_ = json.Unmarshal([]byte(citedSymbols), &doc.CitedSymbols)
 		_ = json.Unmarshal([]byte(dropped), &doc.DroppedClaims)
@@ -399,4 +427,18 @@ func (s *Store) AllSymbolNames(repoID int64) ([]string, error) {
 		out = append(out, name)
 	}
 	return out, rows.Err()
+}
+
+// UpdateKnowledgeDoc refuses to overwrite a candidate changed by another writer.
+func (s *Store) UpdateKnowledgeDoc(repoID int64, old, updated KnowledgeDoc) error {
+	return s.WithTx(func(tx *Store) error {
+		current, found, err := tx.KnowledgeDoc(repoID, old.Slug)
+		if err != nil {
+			return err
+		}
+		if !found || current.Fingerprint != old.Fingerprint || current.Claims != old.Claims || !current.GeneratedAt.Equal(old.GeneratedAt) {
+			return fmt.Errorf("knowledge candidate changed during audit")
+		}
+		return tx.UpsertKnowledgeDoc(repoID, updated)
+	})
 }

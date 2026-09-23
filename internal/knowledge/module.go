@@ -4,7 +4,7 @@
 // The design rule here is that everything a computer can determine, a computer
 // determines. Module boundaries, file lists, symbol rankings, dependency
 // edges and the incident list are all derived from the index with no model
-// involved, and they are correct by construction. A model is used for exactly
+// involved; accuracy is limited by parser coverage. A model is used for exactly
 // one thing, writing the prose that explains why a module exists, and anything
 // it claims is checked against the index before it is stored.
 package knowledge
@@ -13,6 +13,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -23,6 +24,7 @@ import (
 
 // Module is a cluster of files treated as one unit of knowledge.
 type Module struct {
+	Source          string          `json:"-"`
 	Slug            string          `json:"slug"`
 	Dir             string          `json:"dir"`
 	Title           string          `json:"title"`
@@ -53,7 +55,7 @@ type ModuleOptions struct {
 
 func (o ModuleOptions) withDefaults() ModuleOptions {
 	if o.MinFiles <= 0 {
-		o.MinFiles = 3
+		o.MinFiles = 1
 	}
 	if o.MaxModules <= 0 {
 		o.MaxModules = 40
@@ -79,6 +81,36 @@ func Modules(store *db.Store, repoID int64, opts ModuleOptions) ([]Module, error
 	}
 
 	buckets := clusterPaths(paths, opts)
+	project, err := codeindex.ReadProjectOptions(store.RepoRoot)
+	if err != nil {
+		return nil, err
+	}
+	if len(project.Boundaries) > 0 {
+		original := make(map[string][]string, len(buckets))
+		for d, f := range buckets {
+			original[d] = f
+		}
+		buckets = map[string][]string{}
+		for dir, files := range original {
+			var remaining []string
+			for _, p := range files {
+				owner := ""
+				for _, boundary := range project.Boundaries {
+					if strings.HasPrefix(p, boundary+"/") && (len(boundary) > len(owner)) {
+						owner = boundary
+					}
+				}
+				if owner != "" && owner != dir {
+					buckets[owner] = append(buckets[owner], p)
+				} else {
+					remaining = append(remaining, p)
+				}
+			}
+			if len(remaining) > 0 {
+				buckets[dir] = append(buckets[dir], remaining...)
+			}
+		}
+	}
 
 	shas, err := store.CodeFileSHAs(repoID)
 	if err != nil {
@@ -401,6 +433,7 @@ func languagesFor(files []string) []string {
 // changed without re-reading a line of it.
 func fingerprint(module Module, shas map[string]string) string {
 	hasher := sha256.New()
+	hasher.Write([]byte("knowledge-v2:" + codeindex.ParserVersion))
 	for _, path := range module.Files {
 		hasher.Write([]byte(path))
 		hasher.Write([]byte{0})
@@ -438,16 +471,15 @@ func slugForDir(dir string) string {
 	if dir == "." || dir == "" {
 		return "root"
 	}
-	slug := strings.ToLower(dir)
-	slug = strings.NewReplacer("/", "-", " ", "-", "_", "-", ".", "-").Replace(slug)
-	slug = strings.Trim(slug, "-")
-	for strings.Contains(slug, "--") {
-		slug = strings.ReplaceAll(slug, "--", "-")
+	if dir == "root" {
+		return "%72oot"
 	}
-	if slug == "" {
-		return "root"
+	escaped := url.PathEscape(dir)
+	if len(escaped) > 180 {
+		sum := sha256.Sum256([]byte(dir))
+		return "%~" + hex.EncodeToString(sum[:])
 	}
-	return slug
+	return escaped
 }
 
 func titleForDir(dir string) string {
@@ -494,7 +526,11 @@ func DocForPath(store *db.Store, repoID int64, path string) (db.KnowledgeDoc, bo
 			return db.KnowledgeDoc{}, false, err
 		}
 		if found && doc.Kind == "module" {
-			return doc, true, nil
+			docs := []db.KnowledgeDoc{doc}
+			if err := Assess(store, docs); err != nil {
+				return db.KnowledgeDoc{}, false, err
+			}
+			return docs[0], true, nil
 		}
 		if dir == "." || dir == "" || dir == "/" {
 			return db.KnowledgeDoc{}, false, nil

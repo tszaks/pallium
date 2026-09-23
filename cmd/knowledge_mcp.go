@@ -16,15 +16,16 @@ import (
 // repo into its context window to find out.
 func knowledgeMCPTools() []mcpTool {
 	return []mcpTool{
+		{Name: "pallium_knowledge_context", Description: "Get a bounded v2 task context pack with freshness, evidence and next source paths. Start here for a task; stale results are explicitly historical.", InputSchema: objectSchema(map[string]any{"query": stringSchema(), "cwd": stringSchema()})},
 		{
 			Name:        "pallium_knowledge_search",
-			Description: "Search the repo's knowledge base for how a part of the system works. BM25-ranked over module descriptions, not substring matching. Start here before reading source: a module doc says what something is for, which the code does not.",
-			InputSchema: objectSchema(map[string]any{"query": stringSchema(), "cwd": stringSchema()}),
+			Description: "Search project knowledge. Version 2 returns at most five excerpts within 8 KB, with freshness and evidence states. Use full only when you need the legacy complete payload.",
+			InputSchema: objectSchema(map[string]any{"query": stringSchema(), "cwd": stringSchema(), "full": boolSchema()}),
 		},
 		{
 			Name:        "pallium_knowledge_get",
-			Description: "Read one knowledge doc in full by slug, including its symbol surface, dependencies and recent history. Use the slug from pallium_knowledge_search or pallium_knowledge_map. Docs report whether their claims were verified against the index.",
-			InputSchema: objectSchema(map[string]any{"slug": stringSchema(), "cwd": stringSchema()}),
+			Description: "Read a document or one section by slug. Freshness is separate from citation/audit evidence; an audit does not prove truth. The full option includes raw structured claims.",
+			InputSchema: objectSchema(map[string]any{"slug": stringSchema(), "cwd": stringSchema(), "section": stringSchema(), "full": boolSchema()}),
 		},
 		{
 			Name:        "pallium_knowledge_map",
@@ -60,13 +61,26 @@ func callKnowledgeTool(name string, args map[string]any) (string, bool, error) {
 	cwd := stringArg(args, "cwd")
 
 	switch name {
+	case "pallium_knowledge_context":
+		query := stringArg(args, "query")
+		if query == "" {
+			return "", true, fmt.Errorf("query is required")
+		}
+		text, err := captureCommand(func(out *bytes.Buffer) error {
+			return runKnowledgeContext(out, withOptionalRepo([]string{query}, cwd), true)
+		})
+		return text, true, err
 	case "pallium_knowledge_search":
 		query := stringArg(args, "query")
 		if query == "" {
 			return "", true, fmt.Errorf("query is required")
 		}
 		text, err := captureCommand(func(out *bytes.Buffer) error {
-			return runKnowledge(out, withOptionalRepo([]string{"search", query}, cwd), true)
+			argv := []string{"search", query}
+			if boolArg(args, "full") {
+				argv = append(argv, "--full")
+			}
+			return runKnowledge(out, withOptionalRepo(argv, cwd), true)
 		})
 		return text, true, err
 	case "pallium_knowledge_get":
@@ -75,7 +89,14 @@ func callKnowledgeTool(name string, args map[string]any) (string, bool, error) {
 			return "", true, fmt.Errorf("slug is required")
 		}
 		text, err := captureCommand(func(out *bytes.Buffer) error {
-			return runKnowledge(out, withOptionalRepo([]string{"get", slug}, cwd), true)
+			argv := []string{"get", slug}
+			if section := stringArg(args, "section"); section != "" {
+				argv = append(argv, "--section", section)
+			}
+			if boolArg(args, "full") {
+				argv = append(argv, "--full")
+			}
+			return runKnowledge(out, withOptionalRepo(argv, cwd), true)
 		})
 		return text, true, err
 	case "pallium_knowledge_map":

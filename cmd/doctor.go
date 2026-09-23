@@ -9,11 +9,13 @@ import (
 
 	"github.com/tszaks/pallium/internal/db"
 	"github.com/tszaks/pallium/internal/gitlog"
+	"github.com/tszaks/pallium/internal/knowledge"
 	"github.com/tszaks/pallium/internal/output"
 	"github.com/tszaks/pallium/internal/sessionmemory"
 )
 
 type DoctorReport struct {
+	Knowledge              knowledge.Health    `json:"knowledge"`
 	RepoRoot               string              `json:"repo_root"`
 	RepoDBPath             string              `json:"repo_db_path"`
 	RepoDBExists           bool                `json:"repo_db_exists"`
@@ -51,6 +53,11 @@ func runDoctor(out io.Writer, args []string, jsonOutput bool) error {
 		EmbeddingModel:     sessionmemory.ActiveEmbeddingModel(),
 		OpenAIKeyAvailable: sessionmemory.ReadEmbeddingStatus().APIKeyConfigured,
 	}
+	canonical, err := gitlog.CanonicalRepoRoot(repoRoot)
+	if err != nil {
+		return err
+	}
+	report.RepoDBPath = db.DefaultDBPath(canonical)
 	report.ExecutablePath, _ = os.Executable()
 
 	currentBranch, _ := gitlog.CurrentBranch(repoRoot)
@@ -68,6 +75,13 @@ func runDoctor(out io.Writer, args []string, jsonOutput bool) error {
 			return err
 		}
 		repo, err := store.Repo()
+		if err == nil {
+			var knowledgeErr error
+			report.Knowledge, knowledgeErr = knowledge.HealthReport(store, repo.ID)
+			if knowledgeErr != nil {
+				report.Notes = append(report.Notes, "Knowledge health unavailable: "+knowledgeErr.Error())
+			}
+		}
 		closeErr := store.Close()
 		if closeErr != nil && err == nil {
 			err = closeErr

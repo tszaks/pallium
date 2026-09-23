@@ -169,7 +169,7 @@ func TestIndexerRunKeepsCochangeEdgesWithColonPathsDistinct(t *testing.T) {
 	}
 }
 
-func TestOpenStoreSharesIndexAcrossLinkedWorktree(t *testing.T) {
+func TestOpenStoreIsolatesIndexAcrossLinkedWorktree(t *testing.T) {
 	repo := gitlogTestRepo(t)
 
 	store, err := OpenStore(repo)
@@ -201,13 +201,32 @@ func TestOpenStoreSharesIndexAcrossLinkedWorktree(t *testing.T) {
 		t.Fatalf("expected worktree db path %q to match main db path %q", wtStore.DBPath, mainDBPath)
 	}
 
+	if _, err := wtStore.Repo(); err == nil {
+		t.Fatal("worktree reused another workspace index")
+	}
+	if _, err := New(wtStore).Run(); err != nil {
+		t.Fatal(err)
+	}
 	wtRepo, err := wtStore.Repo()
 	if err != nil {
-		t.Fatalf("expected preflight lookup from the worktree to find the existing index, got: %v", err)
+		t.Fatal(err)
 	}
-	if wtRepo.ID != mainRepo.ID {
-		t.Fatalf("expected same repo_id across worktrees, got main=%d worktree=%d", mainRepo.ID, wtRepo.ID)
+	if wtRepo.ID == mainRepo.ID {
+		t.Fatal("workspaces share an index identity")
 	}
+	main, err := OpenStore(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer main.Close()
+	original, err := main.Repo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if original.ID != mainRepo.ID || original.Branch == wtRepo.Branch {
+		t.Fatal("worktree indexing overwrote main")
+	}
+
 }
 
 func gitlogTestRepo(t *testing.T) string {

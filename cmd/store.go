@@ -47,5 +47,5 @@ func resolvePalliumDBPath(dbPath string) string {
 			dbPath = testDB
 		}
 	}
-	return dbPath
+	return workflow.ResolveStorePath(dbPath)
 }

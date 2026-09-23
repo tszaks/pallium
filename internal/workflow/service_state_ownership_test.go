@@ -28,11 +28,15 @@ import (
 // of scope for the PR that added this test. Extend the map as each of
 // those gets its own cleanup, not by loosening the rule for new tables.
 var serviceOwnedTables = map[string]string{
-	"teams":          "team_store.go",
-	"team_members":   "team_store.go",
-	"team_tasks":     "team_store.go",
-	"team_messages":  "team_store.go",
-	"workflow_loops": "loop_store.go",
+	"knowledge_calls":            "knowledge_store.go",
+	"knowledge_registrations":    "knowledge_store.go",
+	"knowledge_jobs":             "knowledge_store.go",
+	"knowledge_context_requests": "knowledge_store.go",
+	"teams":                      "team_store.go",
+	"team_members":               "team_store.go",
+	"team_tasks":                 "team_store.go",
+	"team_messages":              "team_store.go",
+	"workflow_loops":             "loop_store.go",
 }
 
 // backtickStringRe extracts the contents of every raw (backtick-delimited)
