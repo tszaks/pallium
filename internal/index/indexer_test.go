@@ -1,6 +1,7 @@
 package index
 
 import (
+	"fmt"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -166,6 +167,41 @@ func TestIndexerRunKeepsCochangeEdgesWithColonPathsDistinct(t *testing.T) {
 	}
 	if stored != 12 {
 		t.Fatalf("expected 12 stored cochange edges, got %d", stored)
+	}
+}
+
+func TestIndexerRunSkipsCochangeForBulkCommits(t *testing.T) {
+	repo := t.TempDir()
+	run(t, repo, "git", "init", "-b", "main")
+	run(t, repo, "git", "config", "user.name", "Test User")
+	run(t, repo, "git", "config", "user.email", "test@example.com")
+
+	for i := 0; i <= maxCochangeFilesPerCommit; i++ {
+		writeFile(t, filepath.Join(repo, fmt.Sprintf("file-%03d.txt", i)), "initial\n")
+	}
+	run(t, repo, "git", "add", ".")
+	run(t, repo, "git", "commit", "-m", "Import project")
+
+	for _, i := range []int{0, 1} {
+		writeFile(t, filepath.Join(repo, fmt.Sprintf("file-%03d.txt", i)), "updated\n")
+	}
+	run(t, repo, "git", "add", ".")
+	run(t, repo, "git", "commit", "-m", "Update two files")
+
+	store, err := OpenStore(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	result, err := New(store).Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.CommitCount != 2 || result.FileCount != maxCochangeFilesPerCommit+1 {
+		t.Fatalf("bulk commit history was lost: %+v", result)
+	}
+	if result.CochangeEdgeCount != 2 {
+		t.Fatalf("expected only the focused edit's two directed edges, got %d", result.CochangeEdgeCount)
 	}
 }
 
