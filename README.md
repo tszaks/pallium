@@ -21,6 +21,15 @@ pallium route "review my workflow changes and fix what's broken" --authority edi
 
 Update to the latest release any time with `pallium update`.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/architecture-dark.svg">
+  <img src="assets/architecture-light.svg" alt="Pallium architecture: any agent drives pallium route, which picks one of six services built on one kernel with SQLite state, worktrees, verification gates, budgets and a run journal; any provider does the work" width="100%">
+</picture>
+
+Route a task, then check a file before editing it:
+
+<img src="assets/demo.gif" alt="Terminal demo: pallium route picks repo review for a merge check, then pallium risk and pallium neighbors show a file's risk and the files that change with it" width="100%">
+
 ## The problem it solves
 
 A coding agent in a chat session is powerful but underused and fragile. Users

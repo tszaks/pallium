@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 600" width="960" height="600" role="img" aria-label="Pallium architecture: any agent drives pallium route, which picks one of six services built on one kernel; any provider does the work">
+<rect width="960" height="600" rx="14" fill="#0a0a0a"/>
+<text x="40" y="46" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#666666" text-anchor="start" letter-spacing="1.2">ANY AGENT DRIVES IT</text>
+<rect x="252.9" y="60" width="115.8" height="30" rx="15" fill="none" stroke="#2e2e2e"/>
+<text x="310.79999999999995" y="80" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#a1a1a1" text-anchor="middle" letter-spacing="0">Claude Code</text>
+<rect x="378.7" y="60" width="69.0" height="30" rx="15" fill="none" stroke="#2e2e2e"/>
+<text x="413.2" y="80" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#a1a1a1" text-anchor="middle" letter-spacing="0">Codex</text>
+<rect x="457.7" y="60" width="69.0" height="30" rx="15" fill="none" stroke="#2e2e2e"/>
+<text x="492.2" y="80" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#a1a1a1" text-anchor="middle" letter-spacing="0">Devin</text>
+<rect x="536.7" y="60" width="170.4" height="30" rx="15" fill="none" stroke="#2e2e2e"/>
+<text x="621.9000000000001" y="80" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#a1a1a1" text-anchor="middle" letter-spacing="0">you, in a terminal</text>
+<line x1="480.0" y1="96" x2="480.0" y2="118" stroke="#666666" stroke-width="1.2"/><path d="M476.0 117 L480.0 124 L484.0 117" fill="none" stroke="#666666" stroke-width="1.2"/>
+<rect x="300" y="124" width="360" height="62" rx="12" fill="#111111" stroke="#2e2e2e" stroke-width="1"/>
+<text x="480.0" y="151" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" font-weight="600" fill="#ededed" text-anchor="middle" letter-spacing="0">pallium route &quot;&lt;task&gt;&quot;</text>
+<text x="480.0" y="173" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#a1a1a1" text-anchor="middle" letter-spacing="0">picks the right service, inside the authority you grant</text>
+<line x1="480.0" y1="186" x2="480.0" y2="208" stroke="#666666" stroke-width="1.2"/><path d="M476.0 207 L480.0 214 L484.0 207" fill="none" stroke="#666666" stroke-width="1.2"/>
+<text x="40" y="208" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#666666" text-anchor="start" letter-spacing="1.2">SERVICES</text>
+<rect x="40.0" y="216" width="136.7" height="96" rx="10" fill="#111111" stroke="#2e2e2e" stroke-width="1"/>
+<text x="108.3" y="250" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#ededed" text-anchor="middle" letter-spacing="0">start</text>
+<text x="108.3" y="274" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#a1a1a1" text-anchor="middle" letter-spacing="0">plain task → plan</text>
+<text x="108.3" y="291" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#a1a1a1" text-anchor="middle" letter-spacing="0">→ run → report</text>
+<rect x="188.7" y="216" width="136.7" height="96" rx="10" fill="#111111" stroke="#2e2e2e" stroke-width="1"/>
+<text x="257.0" y="250" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#ededed" text-anchor="middle" letter-spacing="0">workflows</text>
+<text x="257.0" y="274" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#a1a1a1" text-anchor="middle" letter-spacing="0">parallel workers,</text>
+<text x="257.0" y="291" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#a1a1a1" text-anchor="middle" letter-spacing="0">gates, resumable runs</text>
+<rect x="337.3" y="216" width="136.7" height="96" rx="10" fill="#111111" stroke="#2e2e2e" stroke-width="1"/>
+<text x="405.7" y="250" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#ededed" text-anchor="middle" letter-spacing="0">loops</text>
+<text x="405.7" y="274" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#a1a1a1" text-anchor="middle" letter-spacing="0">bounded cycles that</text>
+<text x="405.7" y="291" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#a1a1a1" text-anchor="middle" letter-spacing="0">stop on a named state</text>
+<rect x="486.0" y="216" width="136.7" height="96" rx="10" fill="#111111" stroke="#2e2e2e" stroke-width="1"/>
+<text x="554.3" y="250" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#ededed" text-anchor="middle" letter-spacing="0">agent teams</text>
+<text x="554.3" y="274" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#a1a1a1" text-anchor="middle" letter-spacing="0">peers sharing a task</text>
+<text x="554.3" y="291" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#a1a1a1" text-anchor="middle" letter-spacing="0">board and a mailbox</text>
+<rect x="634.7" y="216" width="136.7" height="96" rx="10" fill="#111111" stroke="#2e2e2e" stroke-width="1"/>
+<text x="703.0" y="250" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#ededed" text-anchor="middle" letter-spacing="0">repo intelligence</text>
+<text x="703.0" y="274" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#a1a1a1" text-anchor="middle" letter-spacing="0">symbols, risk,</text>
+<text x="703.0" y="291" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#a1a1a1" text-anchor="middle" letter-spacing="0">co-change, knowledge</text>
+<rect x="783.3" y="216" width="136.7" height="96" rx="10" fill="#111111" stroke="#2e2e2e" stroke-width="1"/>
+<text x="851.7" y="250" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#ededed" text-anchor="middle" letter-spacing="0">sessions</text>
+<text x="851.7" y="274" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#a1a1a1" text-anchor="middle" letter-spacing="0">recall what past</text>
+<text x="851.7" y="291" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#a1a1a1" text-anchor="middle" letter-spacing="0">agents did and decided</text>
+<text x="40" y="354" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#666666" text-anchor="start" letter-spacing="1.2">KERNEL · ONE BINARY, ONE LOCAL DATABASE</text>
+<rect x="40" y="366" width="880" height="92" rx="12" fill="#111111" stroke="#2e2e2e" stroke-width="1"/>
+<text x="480.0" y="396" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#ededed" text-anchor="middle" letter-spacing="0">durable state lives here, so work survives a crash, a restart, or the end of a chat</text>
+<rect x="88.6" y="412" width="123.6" height="30" rx="15" fill="none" stroke="#2e2e2e"/>
+<text x="150.40000000000003" y="432" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#a1a1a1" text-anchor="middle" letter-spacing="0">SQLite state</text>
+<rect x="222.2" y="412" width="178.2" height="30" rx="15" fill="none" stroke="#2e2e2e"/>
+<text x="311.3" y="432" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#a1a1a1" text-anchor="middle" letter-spacing="0">worktrees + patches</text>
+<rect x="410.4" y="412" width="170.4" height="30" rx="15" fill="none" stroke="#2e2e2e"/>
+<text x="495.59999999999997" y="432" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#a1a1a1" text-anchor="middle" letter-spacing="0">verification gates</text>
+<rect x="590.8" y="412" width="154.8" height="30" rx="15" fill="none" stroke="#2e2e2e"/>
+<text x="668.1999999999999" y="432" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#a1a1a1" text-anchor="middle" letter-spacing="0">budgets + leases</text>
+<rect x="755.6" y="412" width="115.8" height="30" rx="15" fill="none" stroke="#2e2e2e"/>
+<text x="813.4999999999999" y="432" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#a1a1a1" text-anchor="middle" letter-spacing="0">run journal</text>
+<line x1="480.0" y1="458" x2="480.0" y2="492" stroke="#666666" stroke-width="1.2"/><path d="M476.0 491 L480.0 498 L484.0 491" fill="none" stroke="#666666" stroke-width="1.2"/>
+<text x="40" y="492" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#666666" text-anchor="start" letter-spacing="1.2">ANY MODEL DOES THE WORK</text>
+<rect x="225.6" y="504" width="76.8" height="30" rx="15" fill="none" stroke="#2e2e2e"/>
+<text x="264.0" y="524" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#a1a1a1" text-anchor="middle" letter-spacing="0">Claude</text>
+<rect x="312.4" y="504" width="69.0" height="30" rx="15" fill="none" stroke="#2e2e2e"/>
+<text x="346.9" y="524" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#a1a1a1" text-anchor="middle" letter-spacing="0">Codex</text>
+<rect x="391.4" y="504" width="69.0" height="30" rx="15" fill="none" stroke="#2e2e2e"/>
+<text x="425.9" y="524" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#a1a1a1" text-anchor="middle" letter-spacing="0">Devin</text>
+<rect x="470.4" y="504" width="264.0" height="30" rx="15" fill="none" stroke="#2e2e2e"/>
+<text x="602.4" y="524" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#a1a1a1" text-anchor="middle" letter-spacing="0">any CLI behind a small wrapper</text>
+<text x="480.0" y="572" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#666666" text-anchor="middle" letter-spacing="0">the agent steering Pallium and the agents doing the work can be different models</text>
+</svg>
