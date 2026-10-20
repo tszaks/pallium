@@ -6,8 +6,8 @@ require (
 	github.com/creack/pty v1.1.24
 	github.com/dop251/goja v0.0.0-20260701091749-b07b74453ea9
 	github.com/google/uuid v1.6.0
-	golang.org/x/sys v0.48.0
-	golang.org/x/term v0.45.0
+	golang.org/x/sys v0.49.0
+	golang.org/x/term v0.47.0
 	modernc.org/sqlite v1.60.1
 )
 
