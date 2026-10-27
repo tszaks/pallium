@@ -6,6 +6,7 @@ All notable changes to Pallium are listed here. The format follows [Keep a Chang
 
 ## Releases
 
+- [0.10.1](docs/releases/v0.10.1.md) (2026-10-27): Cursor, first-class
 - [0.10.0](docs/releases/v0.10.0.md) (2026-09-22): Source-bound project knowledge
 - [0.9.23](docs/releases/v0.9.23.md) (2026-09-19): Update itself
 - [0.9.22](docs/releases/v0.9.22.md) (2026-09-19): Devin, first-class
