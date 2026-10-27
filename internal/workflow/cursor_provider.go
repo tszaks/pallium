@@ -191,7 +191,9 @@ func writeCursorUsage(usageFile string, u cursorUsage) {
 	}
 }
 
-// runCursorProcess runs one cursor-agent turn with the prompt on stdin.
+// runCursorProcess runs one cursor-agent turn with the prompt on stdin. It
+// marks the provider started only after the process starts, so a missing
+// binary is recorded as not dispatched (same as the claude path).
 func runCursorProcess(ctx context.Context, args []string, cwd, prompt string) (stdout, stderr string, err error) {
 	cmd := exec.CommandContext(ctx, cursorCLIName, args...)
 	cmd.Dir = cwd
@@ -200,7 +202,11 @@ func runCursorProcess(ctx context.Context, args []string, cwd, prompt string) (s
 	var so, se bytes.Buffer
 	cmd.Stdout = &so
 	cmd.Stderr = &se
-	err = cmd.Run()
+	err = cmd.Start()
+	if err == nil {
+		markProviderStarted(ctx)
+		err = cmd.Wait()
+	}
 	return so.String(), se.String(), err
 }
 

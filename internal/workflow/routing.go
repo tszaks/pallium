@@ -77,8 +77,12 @@ func ProviderAvailableWithNetwork(provider, codexBinary string, networkRequired 
 		return false
 	}
 	binary := provider
-	if provider == "codex" && codexBinary != "" {
+	switch {
+	case provider == "codex" && codexBinary != "":
 		binary = codexBinary
+	case provider == "cursor":
+		// Same executable the built-in dispatch runs (not "cursor", the IDE launcher).
+		binary = cursorCLIName
 	}
 	_, err := exec.LookPath(binary)
 	return err == nil

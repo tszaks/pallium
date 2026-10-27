@@ -326,3 +326,95 @@ func TestUntrackedCostProvidersIncludesCursor(t *testing.T) {
 		t.Fatalf("got %v", got)
 	}
 }
+
+func cursorInvocationStatus(t *testing.T, mode string, script string, missing bool) (string, error) {
+	t.Helper()
+	clearProviderEnv(t)
+	if missing {
+		setCursorCLI(t, filepath.Join(t.TempDir(), "no-such-cursor-agent"))
+	} else {
+		writeFakeCursor(t, script)
+	}
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run, err := store.CreateRun(Run{ID: "wf-cursor-dispatch", Task: "t", CWD: tmp, ScriptPath: "workflow.js"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent := &Agent{ID: "agent-cursor", Mode: mode, Prompt: "hello"}
+	r := &Runner{Store: store, Run: run}
+	_, callErr := r.runProviderCommand(context.Background(), "cursor", tmp, filepath.Join(tmp, "out.txt"), filepath.Join(tmp, "usage.json"), tmp, agent.Prompt, agent, AgentOptions{}, false)
+	invocations, err := store.ListInvocations(run.ID)
+	if err != nil || len(invocations) != 1 {
+		t.Fatalf("invocations = %+v err=%v", invocations, err)
+	}
+	return invocations[0].ConfigurationStatus, callErr
+}
+
+func TestCursorInvocationRecordedAsDispatchedOnSuccess(t *testing.T) {
+	status, err := cursorInvocationStatus(t, "read-only", "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"type\":\"result\",\"result\":\"ok\",\"session_id\":\"s\"}'\n", false)
+	if err != nil || status == "not_dispatched" {
+		t.Fatalf("status=%q err=%v", status, err)
+	}
+}
+
+func TestCursorInvocationRecordedAsDispatchedOnPostStartFailure(t *testing.T) {
+	status, err := cursorInvocationStatus(t, "read-only", "#!/bin/sh\ncat >/dev/null\necho boom >&2\nexit 2\n", false)
+	if err == nil || status == "not_dispatched" {
+		t.Fatalf("status=%q err=%v", status, err)
+	}
+}
+
+func TestCursorInvocationNotDispatchedWhenBinaryMissing(t *testing.T) {
+	status, err := cursorInvocationStatus(t, "read-only", "", true)
+	if err == nil || status != "not_dispatched" {
+		t.Fatalf("status=%q err=%v", status, err)
+	}
+}
+
+func TestCursorTeamTurnMarksProviderStartedOnlyAfterStart(t *testing.T) {
+	var dispatched bool
+	ctx := withProviderStartTracking(context.Background(), &dispatched)
+	writeFakeCursor(t, "#!/bin/sh\ncat >/dev/null\necho boom >&2\nexit 2\n")
+	r := &Runner{}
+	if _, _, _, err := r.runCursorTeamTurn(ctx, "read-only", "", "", t.TempDir(), "p", nil); err == nil {
+		t.Fatal("expected failure")
+	}
+	if !dispatched {
+		t.Fatal("post-start failure must count as dispatched")
+	}
+	dispatched = false
+	setCursorCLI(t, filepath.Join(t.TempDir(), "missing"))
+	if _, _, _, err := r.runCursorTeamTurn(ctx, "read-only", "", "", t.TempDir(), "p", nil); err == nil {
+		t.Fatal("expected failure")
+	}
+	if dispatched {
+		t.Fatal("start failure must not count as dispatched")
+	}
+}
+
+func TestProviderAvailableCursorUsesCursorAgentExecutable(t *testing.T) {
+	clearProviderEnv(t)
+	t.Setenv(providerCommandEnvName("cursor"), "")
+	write := func(dir, name string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	onlyAgent := t.TempDir()
+	write(onlyAgent, "cursor-agent")
+	t.Setenv("PATH", onlyAgent)
+	if !ProviderAvailable("cursor", "") {
+		t.Fatal("cursor-agent on PATH must make cursor available")
+	}
+	onlyIDE := t.TempDir()
+	write(onlyIDE, "cursor")
+	t.Setenv("PATH", onlyIDE)
+	if ProviderAvailable("cursor", "") {
+		t.Fatal("the cursor IDE launcher alone must not make cursor available")
+	}
+}
