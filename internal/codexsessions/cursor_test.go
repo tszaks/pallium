@@ -285,12 +285,12 @@ func TestLooksLikeCursorCommand(t *testing.T) {
 	yes := []string{
 		"cursor-agent",
 		"/Users/x/.local/bin/cursor-agent",
-		"/Users/x/.local/share/cursor-agent/versions/2026.10.22-abc/node",
 	}
 	no := []string{
 		"",
 		"node",
 		"/usr/local/bin/node",
+		"/Users/x/.local/share/cursor-agent/versions/2026.10.22-abc/node",
 		"/Users/x/Library/Application Support/Cursor/User/globalStorage/anysphere.cursor-agent-worker/agent-cli/.local/bin/cursor-agent",
 		"/Applications/Cursor.app/Contents/MacOS/Cursor",
 		"cursor",

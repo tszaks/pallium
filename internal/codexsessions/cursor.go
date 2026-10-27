@@ -541,20 +541,17 @@ func listLiveCursorProcesses(ctx context.Context) ([]liveAgentProcess, error) {
 }
 
 // looksLikeCursorCommand matches an interactive cursor-agent CLI run. On
-// macOS the launcher script execs a bundled node binary under
-// .../cursor-agent/versions/<v>/, so the process name is "node" (with that
-// path) rather than "cursor-agent". The IDE's own background worker lives
-// under anysphere.cursor-agent-worker and is not a chat, so it is excluded.
+// macOS the launcher script (comm ".../.local/bin/cursor-agent") starts a
+// bundled node child under .../cursor-agent/versions/<v>/; both carry the
+// terminal's TTY, so only the launcher is matched to count each run once.
+// Headless `-p` runs and the "index.js worker-server" helpers have no TTY and
+// never match. The IDE's own background worker lives under
+// anysphere.cursor-agent-worker and is not a chat, so it is excluded.
 func looksLikeCursorCommand(command string) bool {
 	command = strings.TrimSpace(strings.ReplaceAll(command, "\\", "/"))
 	if command == "" || strings.Contains(command, "cursor-agent-worker") {
 		return false
 	}
-	// comm= may carry the executable path; its arguments are never included,
-	// but the path itself can contain spaces (Application Support).
 	base := filepath.Base(command)
-	if base == "cursor-agent" || base == "cursor-agent.exe" {
-		return true
-	}
-	return base == "node" && strings.Contains(command, "/cursor-agent/versions/")
+	return base == "cursor-agent" || base == "cursor-agent.exe"
 }
