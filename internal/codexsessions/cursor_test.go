@@ -306,3 +306,25 @@ func TestLooksLikeCursorCommand(t *testing.T) {
 		}
 	}
 }
+
+func TestCursorRecentActionDropsRedactedMarkers(t *testing.T) {
+	line := cursorTranscriptLine{Role: "assistant"}
+	line.Message.Content = []byte(`[{"type":"text","text":"All done here.\n\n[REDACTED]"}]`)
+	if got := cursorRecentAction(line); got != "All done here." {
+		t.Fatalf("got %q", got)
+	}
+	line.Message.Content = []byte(`[{"type":"text","text":"[REDACTED]"}]`)
+	if got := cursorRecentAction(line); got != "" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestReadCursorRunningTerminalsOrdersNumerically(t *testing.T) {
+	f := newCursorFixture(t)
+	f.writeTerminal(t, "9.txt", os.Getpid(), "running")
+	f.writeTerminal(t, "10.txt", os.Getpid(), "running")
+	got := readCursorRunningTerminals(filepath.Join(f.home, "projects", f.slug, "terminals"))
+	if len(got) != 2 {
+		t.Fatalf("got %+v", got)
+	}
+}

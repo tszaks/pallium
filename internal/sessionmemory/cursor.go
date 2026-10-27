@@ -383,8 +383,8 @@ func handleCursorLine(p *ParsedSession, line cursorLine, raw []byte, lineNo int,
 		for _, item := range items {
 			switch item.Type {
 			case "text":
-				text := capMessageText(item.Text)
-				if text == "" || strings.TrimSpace(text) == "[REDACTED]" {
+				text := capMessageText(strings.TrimSpace(strings.ReplaceAll(item.Text, "[REDACTED]", "")))
+				if text == "" {
 					continue
 				}
 				if !isSub {

@@ -178,7 +178,7 @@ func collectCursorSessions(ctx context.Context, opts SessionCollectOptions, gene
 					newest = idx
 				}
 			}
-			terminal := terminals[0]
+			terminal := terminals[len(terminals)-1]
 			summaries[newest].RecentAction = "terminal running: " + compactSummaryText(firstNonEmpty(terminal.Title, terminal.Command), 80) + " (" + compactSummaryText(terminal.Command, 160) + ")"
 			markCursorTerminalRunning(&summaries[newest], terminal, len(terminals), generatedAt)
 		}
@@ -390,7 +390,8 @@ func cursorRecentAction(line cursorTranscriptLine) string {
 	}
 	for i := len(items) - 1; i >= 0; i-- {
 		if items[i].Type == "text" {
-			if text := compactSummaryText(items[i].Text, 160); text != "" && text != "[REDACTED]" {
+			text := compactSummaryText(strings.ReplaceAll(items[i].Text, "[REDACTED]", ""), 160)
+			if text != "" {
 				return text
 			}
 		}
@@ -442,7 +443,15 @@ func readCursorRunningTerminals(dir string) []cursorRunningTerminal {
 	if err != nil {
 		return nil
 	}
-	sort.Strings(files)
+	// Terminal files are numbered; the highest number is the newest.
+	sort.Slice(files, func(i, j int) bool {
+		a, aerr := strconv.Atoi(strings.TrimSuffix(filepath.Base(files[i]), ".txt"))
+		b, berr := strconv.Atoi(strings.TrimSuffix(filepath.Base(files[j]), ".txt"))
+		if aerr != nil || berr != nil {
+			return files[i] < files[j]
+		}
+		return a < b
+	})
 	var running []cursorRunningTerminal
 	for _, path := range files {
 		if t, ok := parseCursorTerminalHeader(path); ok && cursorPIDAlive(t.PID) {

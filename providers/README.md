@@ -2,9 +2,9 @@
 
 Pallium workflows are provider-agnostic: the engine orchestrates, and any
 agent CLI can do the work. Whichever model your guiding agent runs, Pallium
-workers can adopt it. Codex, Claude Code, and the Devin CLI all have a
+workers can adopt it. Codex, Claude Code, the Devin CLI, and Cursor's `cursor-agent` all have a
 built-in Go invocation (no wrapper script needed) — Pallium even
-auto-detects Claude Code or Devin as the steering agent and switches workers
+auto-detects Claude Code, Devin, or Cursor as the steering agent and switches workers
 to it with zero configuration (see `PALLIUM_WORKFLOW.md`). Everything else
 plugs in through a small wrapper script.
 
@@ -15,6 +15,7 @@ This directory ships reference wrappers:
 | Claude Code | `claude.sh` | Optional: the built-in claude provider covers the common case. Use this wrapper instead when you need its extra hardening (`--safe-mode`, `--setting-sources user`, `--strict-mcp-config`, `--permission-mode plan`) — set `PALLIUM_WORKFLOW_PROVIDER_CLAUDE_COMMAND` to it to override the built-in path |
 | Gemini CLI | `gemini.sh` | Structured output via prompt contract; see security note below |
 | Devin CLI | *(built-in)* | `provider: "devin"` needs only the `devin` CLI on PATH. `read-only` maps to `--permission-mode auto` (fail-closed, no writes or network); `edit`/`test`/`check` map to `dangerous`. Teammates resume natively via the ATIF export's `session_id`. Caveat: `dangerous` auto-approves network egress, so `network: true` vs `false` is not enforced for edit-capable devin agents |
+| Cursor (`cursor-agent`) | *(built-in)* | `provider: "cursor"` needs only `cursor-agent` on PATH, logged in. Runs `-p --output-format stream-json --trust` with the prompt on stdin. `read-only` maps to `--mode ask` (edit and shell tools removed, verified); plain `-p` is not read-only. `edit`/`test`/`check` map to `--force`. Teammates resume the same chat via `--resume <session_id>`. Caveats: `--force` also allows network egress (`network: true` vs `false` is not enforced for edit-capable cursor agents); the stream reports token counts but no USD, so cost is untracked |
 
 **Security note on `gemini.sh`:** Gemini CLI runs `SessionStart` hooks from
 the target repo's `.gemini/settings.json` at startup, before this wrapper's

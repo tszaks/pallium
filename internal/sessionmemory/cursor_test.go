@@ -202,3 +202,23 @@ func TestCursorSlugToDir(t *testing.T) {
 		t.Fatalf("got %q want %q", got, workdir)
 	}
 }
+
+func TestIndexCursorChatsDropsRedactedPlaceholders(t *testing.T) {
+	root, _, slug := cursorFixtureRoot(t)
+	id := "d5d5d5d5-0000-4000-8000-000000000005"
+	writeCursorChat(t, root, slug, id, []string{
+		`{"role":"user","message":{"content":[{"type":"text","text":"<user_query>\nhello there\n</user_query>"}]}}`,
+		`{"role":"assistant","message":{"content":[{"type":"text","text":"Final answer.\n\n[REDACTED]"}]}}`,
+	}, time.Now().Add(-time.Hour))
+	storeDB := filepath.Join(t.TempDir(), "pallium-sessions.sqlite")
+	if _, err := Index(context.Background(), Options{DBPath: storeDB, CursorRoot: root, Provider: "cursor", Force: true}, nil); err != nil {
+		t.Fatal(err)
+	}
+	sess, _, err := ShowPath(storeDB, id, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sess.LastAgentMessage != "Final answer." {
+		t.Fatalf("last agent message = %q", sess.LastAgentMessage)
+	}
+}
