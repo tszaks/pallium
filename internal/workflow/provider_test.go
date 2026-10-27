@@ -13,6 +13,7 @@ func clearProviderEnv(t *testing.T) {
 		"CLAUDECODE",
 		"CLAUDE_CODE_ENTRYPOINT",
 		devinSessionDBEnv,
+		cursorAgentEnv,
 	} {
 		t.Setenv(name, "")
 	}

@@ -59,8 +59,13 @@ func normalizeProvider(provider string) string {
 // detected. Structured as its own function so more signatures (codex,
 // cursor, gemini, ...) can be added later without touching ResolveProvider.
 // Devin's signature is CHISEL_SESSION_DB: the CLI sets it on every
-// subprocess it spawns, pointing at its sessions database.
+// subprocess it spawns, pointing at its sessions database. Cursor's is
+// CURSOR_AGENT, checked first because its child shells also inherit any
+// outer CLAUDECODE (see cursorAgentEnv).
 func DetectSteeringProvider() string {
+	if os.Getenv(cursorAgentEnv) != "" {
+		return "cursor"
+	}
 	if os.Getenv("CLAUDECODE") != "" || os.Getenv("CLAUDE_CODE_ENTRYPOINT") != "" {
 		return "claude"
 	}
@@ -122,6 +127,16 @@ func (r *Runner) runProviderCommand(ctx context.Context, provider, tmpDir, outFi
 			fmt.Fprintf(os.Stderr, "[workflow] agent %s requested network but the built-in devin provider denies egress in read-only mode; running without network\n", firstNonEmpty(agent.Label, agent.ID))
 		}
 		return r.runBuiltinDevinCommand(ctx, tmpDir, usageFile, cwd, prompt, agent, opts)
+	}
+	if provider == "cursor" {
+		// Read-only cursor workers (--mode ask) have no edit or shell tools,
+		// so a double-consented networked agent still runs offline.
+		// Edit-capable modes (--force) allow network unconditionally — see
+		// buildCursorArgs.
+		if networkAllowed && isReadOnlyAgentMode(agent.Mode) {
+			fmt.Fprintf(os.Stderr, "[workflow] agent %s requested network but the built-in cursor provider has no shell in read-only mode; running without network\n", firstNonEmpty(agent.Label, agent.ID))
+		}
+		return r.runBuiltinCursorCommand(ctx, usageFile, cwd, prompt, agent, opts)
 	}
 	return "", fmt.Errorf("workflow agent provider %q is not configured; set %s", provider, providerCommandEnvName(provider))
 }

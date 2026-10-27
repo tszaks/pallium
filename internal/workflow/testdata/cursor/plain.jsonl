@@ -1,0 +1,4 @@
+{"type":"system","subtype":"init","apiKeySource":"login","cwd":"/work/repo","session_id":"906cc0d7-4b51-4657-b939-3b7a76462d01","model":"Composer 2.5","permissionMode":"default"}
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Reply with exactly: PONG"}]},"session_id":"906cc0d7-4b51-4657-b939-3b7a76462d01"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"PONG"}]},"session_id":"906cc0d7-4b51-4657-b939-3b7a76462d01"}
+{"type":"result","subtype":"success","duration_ms":6051,"duration_api_ms":6051,"is_error":false,"result":"PONG","session_id":"906cc0d7-4b51-4657-b939-3b7a76462d01","request_id":"158b76ab-3ef3-4db1-bc83-de4b6b66249d","usage":{"inputTokens":14895,"outputTokens":33,"cacheReadTokens":4015,"cacheWriteTokens":0}}
