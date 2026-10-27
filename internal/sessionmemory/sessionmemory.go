@@ -69,6 +69,7 @@ type Options struct {
 	CodexHome      string
 	ClaudeHome     string
 	DevinDBPath    string
+	CursorRoot     string
 	Machine        string
 	Provider       string
 	Force          bool
@@ -431,8 +432,8 @@ func Index(ctx context.Context, opts Options, include []string) (int, error) {
 	if provider == "" {
 		provider = "all"
 	}
-	if provider != "all" && provider != "codex" && provider != "claude" && provider != "devin" {
-		return 0, fmt.Errorf("unsupported session provider %q (want codex, claude, devin, or all)", opts.Provider)
+	if provider != "all" && provider != "codex" && provider != "claude" && provider != "devin" && provider != "cursor" {
+		return 0, fmt.Errorf("unsupported session provider %q (want codex, claude, devin, cursor, or all)", opts.Provider)
 	}
 	store, err := Open(opts.DBPath)
 	if err != nil {
@@ -556,6 +557,13 @@ func Index(ctx context.Context, opts Options, include []string) (int, error) {
 			return count, err
 		}
 		count += devinCount
+	}
+	if provider == "all" || provider == "cursor" {
+		cursorCount, err := indexCursorSessions(ctx, store, opts, cutoff)
+		if err != nil {
+			return count, err
+		}
+		count += cursorCount
 	}
 	return count, nil
 }
