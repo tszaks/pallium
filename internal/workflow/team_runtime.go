@@ -836,6 +836,13 @@ func (r *Runner) dispatchTeamTurn(ctx context.Context, store *Store, teamID, lea
 		out, token, usage, derr := r.runDevinTeamTurn(ctx, member.Mode, member.Model, member.SessionToken, cwd, prompt, teamDecisionSchema)
 		observedUsage = usage
 		return out, token, 0, derr
+	case member.Provider == "cursor":
+		// cursor mints its own chat id (session_id on every stream event) and
+		// reports token counts but no USD, so costUSD is 0 and cursor joins
+		// the untracked-spend list like devin.
+		out, token, usage, cerr := r.runCursorTeamTurn(ctx, member.Mode, member.Model, member.SessionToken, cwd, prompt, teamDecisionSchema)
+		observedUsage = usage
+		return out, token, 0, cerr
 	default:
 		return "", "", 0, fmt.Errorf("team member provider %q is not configured; set %s", member.Provider, providerCommandEnvName(member.Provider))
 	}
@@ -896,8 +903,9 @@ func teamGateHasHook(team Team, hook string) bool {
 // known to under-report cost. "codex" has no machine-readable usage/cost
 // output the way claude and configured wrappers (via
 // PALLIUM_WORKFLOW_USAGE_FILE) do; "devin" reports token counts via its
-// ATIF export but no USD cost (it bills in ACU), so a codex- or
-// devin-backed member's turns are real spend that team status can never
+// ATIF export but no USD cost (it bills in ACU), and "cursor" reports token
+// counts in its stream but no USD, so a codex-, devin- or cursor-backed
+// member's turns are real spend that team status can never
 // see. Shared by the CLI's `team status` JSON and the team.status()
 // workflow primitive — found by review: the primitive used to omit this
 // caveat entirely, so a script managing a codex-backed team saw spend_usd
@@ -906,7 +914,7 @@ func UntrackedCostProviders(members []TeamMember) []string {
 	seen := map[string]bool{}
 	var untracked []string
 	for _, m := range members {
-		if (m.Provider == "codex" || m.Provider == "devin") && !seen[m.Provider] {
+		if (m.Provider == "codex" || m.Provider == "devin" || m.Provider == "cursor") && !seen[m.Provider] {
 			seen[m.Provider] = true
 			untracked = append(untracked, m.Provider)
 		}

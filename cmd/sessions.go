@@ -88,9 +88,13 @@ func runSessionsFind(out io.Writer, args []string, jsonOutput bool) error {
 	sortOrder := fs.String("sort", "", "")
 	limit := fs.Int("limit", 20, "")
 	details := fs.Bool("details", false, "")
+	providerFilter := fs.String("provider", "", "")
 	if err := parseSessionFlags(fs, args,
-		map[string]struct{}{"state": {}, "completion": {}, "updated-within": {}, "inactive-for": {}, "finished-within": {}, "sort": {}, "limit": {}},
+		map[string]struct{}{"state": {}, "completion": {}, "updated-within": {}, "inactive-for": {}, "finished-within": {}, "sort": {}, "limit": {}, "provider": {}},
 		map[string]struct{}{"details": {}}); err != nil {
+		return err
+	}
+	if err := validateSessionProviderFilter(*providerFilter); err != nil {
 		return err
 	}
 	if *limit <= 0 {
@@ -131,6 +135,7 @@ func runSessionsFind(out io.Writer, args []string, jsonOutput bool) error {
 	if err != nil {
 		return err
 	}
+	filterSnapshotByProvider(snapshot, *providerFilter)
 	report, err := codexsessions.FindSessions(snapshot, codexsessions.SessionFindOptions{
 		Query:          query,
 		States:         states,
@@ -213,7 +218,11 @@ func runSessionsLive(out io.Writer, args []string, jsonOutput bool, watch bool) 
 	includeAll := fs.Bool("all", false, "")
 	details := fs.Bool("details", false, "")
 	runningOnly := fs.Bool("running-only", false, "")
-	if err := parseSessionFlags(fs, args, nil, map[string]struct{}{"all": {}, "details": {}, "running-only": {}}); err != nil {
+	providerFilter := fs.String("provider", "", "")
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"provider": {}}, map[string]struct{}{"all": {}, "details": {}, "running-only": {}}); err != nil {
+		return err
+	}
+	if err := validateSessionProviderFilter(*providerFilter); err != nil {
 		return err
 	}
 	if fs.NArg() > 0 {
@@ -227,6 +236,7 @@ func runSessionsLive(out io.Writer, args []string, jsonOutput bool, watch bool) 
 		if err != nil {
 			return err
 		}
+		filterSnapshotByProvider(snapshot, *providerFilter)
 		if *runningOnly {
 			snapshot.Sessions = runningSessionSummaries(snapshot.Sessions)
 		}
@@ -250,6 +260,30 @@ func runSessionsLive(out io.Writer, args []string, jsonOutput bool, watch bool) 
 		}
 		time.Sleep(2 * time.Second)
 	}
+}
+
+// validateSessionProviderFilter checks a `--provider` value for the live
+// discovery commands ("" and "all" mean every provider).
+func validateSessionProviderFilter(provider string) error {
+	switch strings.TrimSpace(provider) {
+	case "", "all", "codex", "claude", "devin", "cursor":
+		return nil
+	}
+	return fmt.Errorf("unsupported --provider %q (want codex, claude, devin, cursor, or all)", provider)
+}
+
+func filterSnapshotByProvider(snapshot *codexsessions.SessionSnapshot, provider string) {
+	provider = strings.TrimSpace(provider)
+	if provider == "" || provider == "all" {
+		return
+	}
+	kept := make([]codexsessions.SessionSummary, 0, len(snapshot.Sessions))
+	for _, session := range snapshot.Sessions {
+		if session.Provider == provider {
+			kept = append(kept, session)
+		}
+	}
+	snapshot.Sessions = kept
 }
 
 func runningSessionSummaries(sessions []codexsessions.SessionSummary) []codexsessions.SessionSummary {
@@ -349,6 +383,7 @@ func runSessionsIndex(out io.Writer, args []string, jsonOutput bool) error {
 	fs.StringVar(&opts.CodexHome, "codex-home", "", "")
 	fs.StringVar(&opts.ClaudeHome, "claude-home", "", "")
 	fs.StringVar(&opts.DevinDBPath, "devin-db", "", "")
+	fs.StringVar(&opts.CursorRoot, "cursor-root", "", "")
 	fs.StringVar(&opts.Provider, "provider", "", "")
 	fs.StringVar(&opts.DBPath, "db", "", "")
 	fs.StringVar(&opts.Machine, "machine", "", "")
@@ -358,7 +393,7 @@ func runSessionsIndex(out io.Writer, args []string, jsonOutput bool) error {
 	fs.BoolVar(&opts.Force, "force", false, "")
 	fs.BoolVar(&opts.StoreRawEvents, "raw-events", false, "")
 	fs.Var((*multiStringFlag)(&include), "include", "")
-	if err := parseSessionFlags(fs, args, map[string]struct{}{"codex-home": {}, "claude-home": {}, "devin-db": {}, "provider": {}, "db": {}, "machine": {}, "include": {}, "model": {}, "since": {}, "safety-buffer": {}}, map[string]struct{}{"force": {}, "raw-events": {}}); err != nil {
+	if err := parseSessionFlags(fs, args, map[string]struct{}{"codex-home": {}, "claude-home": {}, "devin-db": {}, "cursor-root": {}, "provider": {}, "db": {}, "machine": {}, "include": {}, "model": {}, "since": {}, "safety-buffer": {}}, map[string]struct{}{"force": {}, "raw-events": {}}); err != nil {
 		return err
 	}
 	if fs.NArg() > 0 {
@@ -396,6 +431,7 @@ func runSessionsSync(out io.Writer, args []string, jsonOutput bool) error {
 	fs.StringVar(&opts.Index.CodexHome, "codex-home", "", "")
 	fs.StringVar(&opts.Index.ClaudeHome, "claude-home", "", "")
 	fs.StringVar(&opts.Index.DevinDBPath, "devin-db", "", "")
+	fs.StringVar(&opts.Index.CursorRoot, "cursor-root", "", "")
 	fs.StringVar(&opts.Index.Provider, "provider", "", "")
 	fs.StringVar(&opts.Index.DBPath, "db", "", "")
 	fs.StringVar(&opts.Index.Machine, "machine", "", "")
@@ -409,7 +445,7 @@ func runSessionsSync(out io.Writer, args []string, jsonOutput bool) error {
 	fs.IntVar(&opts.EmbedLimit, "embed-limit", 1_000_000, "")
 	fs.IntVar(&opts.BatchSize, "batch-size", 64, "")
 	fs.Var((*multiStringFlag)(&include), "include", "")
-	valueFlags := map[string]struct{}{"codex-home": {}, "claude-home": {}, "devin-db": {}, "provider": {}, "db": {}, "machine": {}, "include": {}, "model": {}, "since": {}, "safety-buffer": {}, "timeout": {}, "embed-limit": {}, "batch-size": {}}
+	valueFlags := map[string]struct{}{"codex-home": {}, "claude-home": {}, "devin-db": {}, "cursor-root": {}, "provider": {}, "db": {}, "machine": {}, "include": {}, "model": {}, "since": {}, "safety-buffer": {}, "timeout": {}, "embed-limit": {}, "batch-size": {}}
 	boolFlags := map[string]struct{}{"force": {}, "raw-events": {}, "no-embed": {}}
 	if err := parseSessionFlags(fs, args, valueFlags, boolFlags); err != nil {
 		return err
@@ -901,6 +937,9 @@ func runSessionsOpen(out io.Writer, args []string, jsonOutput bool) error {
 		if strings.HasPrefix(location.RolloutPath, "devin-cli://") {
 			return fmt.Errorf("devin sessions live in the Devin CLI database, not a transcript file; resume one with `devin -r %s`", location.SessionID)
 		}
+		if strings.HasPrefix(location.RolloutPath, "cursor://") {
+			return fmt.Errorf("cursor chats live in Cursor's data folder, not one transcript file; open the chat in Cursor, or for a CLI chat resume it with `cursor-agent --resume %s`", location.SessionID)
+		}
 		if err := exec.Command("open", location.RolloutPath).Start(); err != nil {
 			return fmt.Errorf("open source transcript: %w", err)
 		}
@@ -1268,19 +1307,20 @@ func parseSessionRetentionAge(value string) (time.Duration, error) {
 func printSessionsHelp(out io.Writer) {
 	fmt.Fprintln(out, `pallium sessions
 
-Live discovery covers local Codex CLI/Desktop, Claude Code, and Devin CLI
-sessions. It is best-effort and reports provider coverage plus explicit
+Live discovery covers local Codex CLI/Desktop, Claude Code, Devin CLI, and
+Cursor (IDE and cursor-agent) sessions. Cursor writes no per-line timestamps,
+so its recency is the transcript file modification time. It is best-effort and reports provider coverage plus explicit
 exclusions in JSON.
 
 Usage:
-  pallium sessions live [--all] [--running-only] [--details] [--json]
-  pallium sessions watch [--all] [--running-only] [--details]
-  pallium sessions find [query] [--state active|waiting|blocked|stuck|finished|idle|inactive] [--completion finished|not_finished|unknown] [--updated-within 2h] [--inactive-for 3h] [--finished-within 10m] [--sort updated|finished|status] [--limit 20] [--details] [--json]
-  pallium sessions index [--provider all|codex|claude|devin] [--codex-home ~/.codex] [--claude-home ~/.claude] [--devin-db path] [--include path] [--machine name] [--model text-embedding-3-small] [--safety-buffer 30m] [--since 24h] [--force] [--raw-events] [--json]
-  pallium sessions sync [--provider all|codex|claude|devin] [--devin-db path] [--include path] [--model name] [--force] [--no-embed] [--json]
+  pallium sessions live [--provider all|codex|claude|devin|cursor] [--all] [--running-only] [--details] [--json]
+  pallium sessions watch [--provider name] [--all] [--running-only] [--details]
+  pallium sessions find [query] [--provider name] [--state active|waiting|blocked|stuck|finished|idle|inactive] [--completion finished|not_finished|unknown] [--updated-within 2h] [--inactive-for 3h] [--finished-within 10m] [--sort updated|finished|status] [--limit 20] [--details] [--json]
+  pallium sessions index [--provider all|codex|claude|devin|cursor] [--codex-home ~/.codex] [--claude-home ~/.claude] [--devin-db path] [--cursor-root ~/.cursor] [--include path] [--machine name] [--model text-embedding-3-small] [--safety-buffer 30m] [--since 24h] [--force] [--raw-events] [--json]
+  pallium sessions sync [--provider all|codex|claude|devin|cursor] [--devin-db path] [--cursor-root ~/.cursor] [--include path] [--model name] [--force] [--no-embed] [--json]
   pallium sessions list [--limit 20] [--json]
-  pallium sessions search <query> [--limit 10] [--hybrid] [--repo path] [--cwd path] [--source codex|claude|devin] [--file path] [--since 30d] [--before YYYY-MM-DD] [--model name] [--json]
-  pallium sessions recall <question> [--repo path] [--source codex|claude|devin] [--file path] [--since 30d] [--lexical-only] [--json]
+  pallium sessions search <query> [--limit 10] [--hybrid] [--repo path] [--cwd path] [--source codex|claude|devin|cursor] [--file path] [--since 30d] [--before YYYY-MM-DD] [--model name] [--json]
+  pallium sessions recall <question> [--repo path] [--source codex|claude|devin|cursor] [--file path] [--since 30d] [--lexical-only] [--json]
   pallium sessions related [repo-path] [--file path] [--limit 10] [--json]
   pallium sessions grep <query> [--limit 20] [--json]
   pallium sessions show <session-id> [--db path] [--transcript] [--json]

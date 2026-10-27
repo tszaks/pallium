@@ -293,7 +293,11 @@ func TestCollectSessionsPreservesOtherProviderWhenOneFails(t *testing.T) {
 	originalCodexProcesses := listLiveCodexProcessesVar
 	originalClaudeProcesses := listLiveClaudeProcessesVar
 	originalDevinProcesses := listLiveDevinProcessesVar
+	originalCursorHome := cursorHomeDirFunc
+	originalCursorProcesses := listLiveCursorProcessesVar
 	t.Cleanup(func() {
+		cursorHomeDirFunc = originalCursorHome
+		listLiveCursorProcessesVar = originalCursorProcesses
 		codexHomeDirFunc = originalCodexHome
 		claudeHomeDirFunc = originalClaudeHome
 		devinDBPathFunc = originalDevinDB
@@ -308,6 +312,8 @@ func TestCollectSessionsPreservesOtherProviderWhenOneFails(t *testing.T) {
 	listLiveCodexProcessesVar = func(context.Context) ([]liveAgentProcess, error) { return nil, errors.New("process lookup failed") }
 	listLiveClaudeProcessesVar = func(context.Context) ([]liveAgentProcess, error) { return nil, nil }
 	listLiveDevinProcessesVar = func(context.Context) ([]liveAgentProcess, error) { return nil, nil }
+	cursorHomeDirFunc = func() (string, error) { return tmp, nil }
+	listLiveCursorProcessesVar = func(context.Context) ([]liveAgentProcess, error) { return nil, nil }
 	snapshot, err := CollectSessions(context.Background(), SessionCollectOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -315,7 +321,7 @@ func TestCollectSessionsPreservesOtherProviderWhenOneFails(t *testing.T) {
 	if len(snapshot.Warnings) != 1 || !strings.Contains(snapshot.Warnings[0], "codex") {
 		t.Fatalf("unexpected warnings: %+v", snapshot.Warnings)
 	}
-	if snapshot.Coverage.Scope != "local-agent-sessions" || len(snapshot.Coverage.Excludes) == 0 || len(snapshot.Coverage.Providers) != 3 {
+	if snapshot.Coverage.Scope != "local-agent-sessions" || len(snapshot.Coverage.Excludes) == 0 || len(snapshot.Coverage.Providers) != 4 {
 		t.Fatalf("coverage must disclose discovery scope: %+v", snapshot.Coverage)
 	}
 }

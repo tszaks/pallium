@@ -68,7 +68,7 @@ func editAllowedTools() string {
 // prompt when a schema is set, matching the instruction configured provider
 // wrappers use (see providers/claude.sh) so Pallium's local schema
 // validation sees the same bare-JSON contract either way. Shared by every
-// built-in provider whose CLI lacks a native schema flag (claude, devin).
+// built-in provider whose CLI lacks a native schema flag (claude, devin, cursor).
 func buildSchemaPrompt(prompt string, schema map[string]any) (string, error) {
 	if len(schema) == 0 {
 		return prompt, nil

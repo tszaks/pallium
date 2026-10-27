@@ -59,13 +59,13 @@ Pallium strips `meta` before execution. Phase names should match `phase()` calls
 ### `await agent(prompt, opts?)`
 
 Spawns one worker. Pallium adopts the model of whatever agent is steering
-it: run `pallium workflow run` from inside Claude Code or the Devin CLI and
-workers use that agent automatically, no `provider` option or env var
+it: run `pallium workflow run` from inside Claude Code, the Devin CLI, or
+Cursor's `cursor-agent` and workers use that agent automatically, no `provider` option or env var
 required. Precedence, highest first:
 
 1. The `provider` option on this `agent()` call.
 2. `PALLIUM_WORKFLOW_PROVIDER` (forces a provider for the whole run).
-3. The detected steering agent (Claude Code via `CLAUDECODE`/`CLAUDE_CODE_ENTRYPOINT`; Devin via `CHISEL_SESSION_DB`).
+3. The detected steering agent (Claude Code via `CLAUDECODE`/`CLAUDE_CODE_ENTRYPOINT`; Devin via `CHISEL_SESSION_DB`; Cursor via `CURSOR_AGENT`, which wins over `CLAUDECODE` because `cursor-agent` child shells inherit the outer environment).
 4. `codex` (fallback when nothing else applies).
 
 ```js
@@ -122,6 +122,20 @@ maps to `--permission-mode auto` (verified fail-closed: write, exec, and
 networked tool calls are all rejected in print mode); `edit`/`test`/`check`
 map to `--permission-mode dangerous`. `PALLIUM_WORKFLOW_PROVIDER_DEVIN_COMMAND`
 overrides it with a wrapper the same way.
+
+`provider: "cursor"` needs only the `cursor-agent` CLI on PATH (logged in).
+Pallium runs it headless (`-p --output-format stream-json --trust`, prompt on
+stdin) and reads the answer, chat id, and token counts from the stream.
+`read-only` maps to `--mode ask`, which removes the edit and shell tools
+(verified: a requested file append and shell command both did not run).
+Plain `-p` is NOT read-only, so Pallium never runs a read-only worker without
+`--mode ask`. `edit`/`test`/`check` map to `--force` (without it, `-p`
+rejects shell commands). Teammates resume the same chat via `--resume`.
+Caveats: `--force` also allows network egress, so `network: true` vs `false`
+is not enforced for edit-capable cursor agents, and cursor reports tokens but
+no USD, so its cost is untracked. `PALLIUM_WORKFLOW_PROVIDER_CURSOR_COMMAND`
+overrides it with a wrapper. Cursor runs bill the user's Cursor plan, so name
+`provider: "cursor"` explicitly.
 
 Other non-Codex providers: `PALLIUM_WORKFLOW_PROVIDER_<NAME>_COMMAND`.
 Reference wrappers (Claude Code, Gemini CLI) and the full environment
