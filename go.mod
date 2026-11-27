@@ -7,7 +7,7 @@ require (
 	github.com/dop251/goja v0.0.0-20260701091749-b07b74453ea9
 	github.com/google/uuid v1.6.0
 	golang.org/x/sys v0.50.0
-	golang.org/x/term v0.47.0
+	golang.org/x/term v0.48.0
 	modernc.org/sqlite v1.63.0
 )
 
