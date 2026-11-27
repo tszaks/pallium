@@ -10,10 +10,12 @@
 package codeindex
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -212,11 +214,29 @@ func readContained(repoRoot, path string) ([]byte, int64, bool) {
 	if err != nil || !info.Mode().IsRegular() || info.Size() > maxParsedFileBytes {
 		return nil, 0, false
 	}
+	if isDataless(info) {
+		// A cloud placeholder can block forever in ReadFile while Git's staged
+		// blob is already local. The index is allowed to use that exact blob.
+		if original, err := os.Lstat(absolute); err != nil || !original.Mode().IsRegular() {
+			return nil, 0, false
+		}
+		content, err := stagedBlob(repoRoot, path)
+		if err != nil || len(content) > maxParsedFileBytes {
+			return nil, 0, false
+		}
+		return content, int64(len(content)), true
+	}
 	content, err := os.ReadFile(target)
 	if err != nil {
 		return nil, 0, false
 	}
 	return content, info.Size(), true
+}
+
+func stagedBlob(repoRoot, path string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, "git", "-C", repoRoot, "show", ":"+path).Output()
 }
 
 func UnindexedCandidates(repoRoot string, indexed map[string]struct{}) ([]string, error) {

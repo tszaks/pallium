@@ -37,6 +37,21 @@ func main() {
 	s, _ := store.Open("x")
 	_ = s.Name()
 }
+
+func TestStagedBlobReadsLocalGitContent(t *testing.T) {
+	repo := newRepo(t, map[string]string{"example.go": "package example\nfunc Original() {}\n"})
+	path := filepath.Join(repo, "example.go")
+	if err := os.WriteFile(path, []byte("package example\nfunc Changed() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	content, err := stagedBlob(repo, "example.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "Original") || strings.Contains(string(content), "Changed") {
+		t.Fatalf("expected staged content, got %q", content)
+	}
+}
 `,
 	})
 

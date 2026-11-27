@@ -85,6 +85,11 @@ type edgeKey struct {
 	related string
 }
 
+// A broad import or generated-file sweep does not provide useful pairwise
+// co-change evidence. Bounding it also prevents one commit from producing
+// millions of SQLite rows during a repo's first index.
+const maxCochangeFilesPerCommit = 100
+
 func repopulate(store *db.Store, branch, lastIndexedCommit string, indexedAt time.Time, commits []gitlog.Commit) (Result, error) {
 	repo, err := store.UpsertRepo(branch, lastIndexedCommit, indexedAt)
 	if err != nil {
@@ -143,6 +148,9 @@ func repopulate(store *db.Store, branch, lastIndexedCommit string, indexedAt tim
 			}
 		}
 
+		if len(uniqueFiles) > maxCochangeFilesPerCommit {
+			continue
+		}
 		for _, source := range uniqueFiles {
 			for _, related := range uniqueFiles {
 				if source == related {
